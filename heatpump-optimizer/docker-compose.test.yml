@@ -1,0 +1,29 @@
+# Docker Compose for E2E testing.
+# Provides isolated PostgreSQL and Redis instances for test runs.
+
+services:
+  test-db:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: heatpump
+      POSTGRES_PASSWORD: heatpump_test
+      POSTGRES_DB: heatpump_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U heatpump -d heatpump_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    tmpfs:
+      - /var/lib/postgresql/data  # RAM disk for speed
+
+  test-redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5

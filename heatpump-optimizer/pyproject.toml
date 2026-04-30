@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heatpump-optimizer"
+version = "0.1.0"
+description = "Cost-optimizing controller for Panasonic Aquarea heat pumps"
+requires-python = ">=3.11"
+dependencies = [
+    "aioaquarea @ git+https://github.com/cjaliaga/aioaquarea.git@main",
+    "aiohttp>=3.9,<4",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "redis[hiredis]>=5.0",
+    "apscheduler>=3.10,<4",
+    "structlog>=24.1",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+optimizer = [
+    "pulp>=2.8",
+    "numpy>=1.26",
+]
+ml = [
+    "scikit-learn>=1.4",
+    "lightgbm>=4.2",
+    "pandas>=2.1",
+    "numpy>=1.26",
+]
+all = [
+    "heatpump-optimizer[api,optimizer,ml]",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.3",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+include = ["packages*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
