@@ -23,6 +23,11 @@ from packages.core.models import (
     PriceRecord,
     WeatherRecord,
 )
+from packages.core.settings_service import (
+    SETTINGS_SCHEMA,
+    get_all_settings,
+    set_settings_bulk,
+)
 
 app = FastAPI(
     title="Heat Pump Optimizer API",
@@ -469,6 +474,58 @@ async def cancel_override(override_id: int):
             .values(active=False)
         )
     return {"status": "cancelled"}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Get all configurable settings with schema metadata."""
+    values = await get_all_settings()
+    result = {}
+    for key, schema in SETTINGS_SCHEMA.items():
+        val = values.get(key, "")
+        # Mask secrets in response
+        if schema.get("type") == "secret" and val:
+            display_val = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
+        else:
+            display_val = val
+        result[key] = {
+            "value": display_val,
+            "type": schema["type"],
+            "description": schema.get("description", ""),
+            "options": schema.get("options"),
+        }
+    return result
+
+
+class SettingsUpdate(BaseModel):
+    settings: dict[str, str]
+
+
+@app.put("/api/settings")
+async def update_settings(body: SettingsUpdate):
+    """Update multiple settings at once."""
+    # Validate keys
+    invalid_keys = [k for k in body.settings if k not in SETTINGS_SCHEMA]
+    if invalid_keys:
+        raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
+
+    await set_settings_bulk(body.settings)
+
+    # Audit log
+    async with get_session() as session:
+        session.add(
+            AuditLogRecord(
+                actor="user",
+                action="update_settings",
+                payload_json=json.dumps(
+                    {k: "***" if SETTINGS_SCHEMA[k].get("type") == "secret" else v
+                     for k, v in body.settings.items()}
+                ),
+                result="updated",
+            )
+        )
+
+    return {"status": "updated", "count": len(body.settings)}
 
 
 @app.get("/api/audit", response_model=list[dict])

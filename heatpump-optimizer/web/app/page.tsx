@@ -72,9 +72,12 @@ export default function Home() {
     <div className="dashboard">
       <div className="header">
         <h1>Heat Pump Optimizer</h1>
-        <span className={`status-badge ${data?.current_status ? "online" : "offline"}`}>
-          {data?.current_status ? "● Connected" : "● Disconnected"}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+          <a href="/settings" className="btn">Settings</a>
+          <span className={`status-badge ${data?.current_status ? "online" : "offline"}`}>
+            {data?.current_status ? "● Connected" : "● Disconnected"}
+          </span>
+        </div>
       </div>
 
       {error && (

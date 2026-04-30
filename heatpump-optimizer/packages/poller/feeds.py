@@ -8,6 +8,7 @@ from xml.etree import ElementTree
 import httpx
 
 from packages.core.config import settings
+from packages.core.settings_service import get_setting
 
 # ENTSO-E Transparency Platform day-ahead prices
 ENTSOE_URL = "https://web-api.tp.entsoe.eu/api"
@@ -24,9 +25,25 @@ async def fetch_prices() -> list[tuple[dt.datetime, float]]:
     Fetch electricity prices from the configured provider.
     Returns list of (timestamp_utc, EUR/kWh).
     """
-    if settings.price_provider == "tibber":
+    provider = await get_setting("price_provider")
+
+    if provider == "manual":
+        return await _get_manual_prices()
+    elif provider == "tibber":
         return await _fetch_prices_tibber()
     return await _fetch_prices_entsoe()
+
+
+async def _get_manual_prices() -> list[tuple[dt.datetime, float]]:
+    """Generate static price entries for the next 48h using manual price setting."""
+    price_str = await get_setting("manual_price_eur_per_kwh")
+    try:
+        price = float(price_str)
+    except (ValueError, TypeError):
+        price = 0.25
+
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return [(now + dt.timedelta(hours=h), price) for h in range(48)]
 
 
 async def _fetch_prices_entsoe() -> list[tuple[dt.datetime, float]]:
@@ -34,7 +51,10 @@ async def _fetch_prices_entsoe() -> list[tuple[dt.datetime, float]]:
     Fetch day-ahead electricity prices from ENTSO-E for the next 24-48h.
     Returns list of (timestamp_utc, EUR/kWh).
     """
-    if not settings.entsoe_api_token or settings.entsoe_api_token == "your_entsoe_token":
+    token = await get_setting("entsoe_api_token")
+    area = await get_setting("entsoe_area")
+
+    if not token or token == "your_entsoe_token":
         return []
 
     now = dt.datetime.now(dt.timezone.utc)
@@ -43,10 +63,10 @@ async def _fetch_prices_entsoe() -> list[tuple[dt.datetime, float]]:
     period_end = period_start + dt.timedelta(days=2)
 
     params = {
-        "securityToken": settings.entsoe_api_token,
+        "securityToken": token,
         "documentType": "A44",  # Day-ahead prices
-        "in_Domain": settings.entsoe_area,
-        "out_Domain": settings.entsoe_area,
+        "in_Domain": area,
+        "out_Domain": area,
         "periodStart": period_start.strftime("%Y%m%d%H00"),
         "periodEnd": period_end.strftime("%Y%m%d%H00"),
     }
@@ -97,7 +117,8 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
     Fetch electricity prices from Tibber GraphQL API.
     Returns today's and tomorrow's prices as (timestamp_utc, EUR/kWh).
     """
-    if not settings.tibber_api_token:
+    token = await get_setting("tibber_api_token")
+    if not token:
         return []
 
     query = """
@@ -122,7 +143,7 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
     """
 
     headers = {
-        "Authorization": f"Bearer {settings.tibber_api_token}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
@@ -155,12 +176,19 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
 
 async def fetch_weather() -> list[dict]:
     """
-    Fetch 48h weather forecast from Open-Meteo (free, no API key).
+    Fetch 48h weather forecast from Open-Meteo (free, no API key) or manual static values.
     Returns list of dicts with ts, temperature, irradiance, wind_speed, humidity.
     """
+    provider = await get_setting("weather_provider")
+    if provider == "manual":
+        return await _get_manual_weather()
+
+    lat = await get_setting("latitude")
+    lng = await get_setting("longitude")
+
     params = {
-        "latitude": settings.latitude,
-        "longitude": settings.longitude,
+        "latitude": float(lat) if lat else settings.latitude,
+        "longitude": float(lng) if lng else settings.longitude,
         "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation",
         "forecast_days": 2,
         "timezone": "UTC",
@@ -192,3 +220,40 @@ async def fetch_weather() -> list[dict]:
         )
 
     return results
+
+
+async def _get_manual_weather() -> list[dict]:
+    """Generate static weather entries for the next 48h using manual settings."""
+    temp_str = await get_setting("manual_outdoor_temp")
+    wind_str = await get_setting("manual_wind_speed")
+    humidity_str = await get_setting("manual_humidity")
+    irradiance_str = await get_setting("manual_irradiance")
+
+    try:
+        temp = float(temp_str)
+    except (ValueError, TypeError):
+        temp = 10.0
+    try:
+        wind = float(wind_str)
+    except (ValueError, TypeError):
+        wind = 5.0
+    try:
+        humidity = float(humidity_str)
+    except (ValueError, TypeError):
+        humidity = 60.0
+    try:
+        irradiance = float(irradiance_str)
+    except (ValueError, TypeError):
+        irradiance = 200.0
+
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return [
+        {
+            "ts": now + dt.timedelta(hours=h),
+            "temperature": temp,
+            "humidity": humidity,
+            "wind_speed": wind,
+            "irradiance": irradiance,
+        }
+        for h in range(48)
+    ]

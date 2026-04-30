@@ -38,6 +38,7 @@ from packages.core.models import (  # noqa: E402
     PlanActionRecord,
     PlanRecord,
     PriceRecord,
+    SettingRecord,
     WeatherRecord,
 )
 

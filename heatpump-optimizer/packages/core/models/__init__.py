@@ -145,3 +145,15 @@ class AuditLogRecord(Base):
     target_device: Mapped[str | None] = mapped_column(String(128))
     payload_json: Mapped[str | None] = mapped_column(Text)
     result: Mapped[str | None] = mapped_column(String(32))
+
+
+class SettingRecord(Base):
+    """Key-value settings configurable via GUI."""
+
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

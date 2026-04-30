@@ -2,9 +2,9 @@ FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# Install system deps for asyncpg and scientific libs
+# Install system deps for asyncpg, scientific libs, and git (for VCS deps)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev && \
+    gcc libpq-dev git && \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./

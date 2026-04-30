@@ -1,7 +1,7 @@
 """E2E tests: Price provider integration (Tibber and ENTSO-E feeds)."""
 
 import datetime as dt
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import respx
@@ -63,11 +63,10 @@ class TestEntsoeIntegration:
             return_value=Response(200, text=SAMPLE_ENTSOE_XML)
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.entsoe_api_token = "test-token"
-            mock_settings.entsoe_area = "10Y1001A1001A46L"
-            mock_settings.price_provider = "entsoe"
+        async def mock_get_setting(key):
+            return {"entsoe_api_token": "test-token", "entsoe_area": "10Y1001A1001A46L", "price_provider": "entsoe"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_entsoe()
 
         assert len(prices) == 4
@@ -79,10 +78,10 @@ class TestEntsoeIntegration:
     @respx.mock
     async def test_fetch_entsoe_empty_token(self):
         """No fetch when token is empty."""
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.entsoe_api_token = ""
-            mock_settings.price_provider = "entsoe"
+        async def mock_get_setting(key):
+            return {"entsoe_api_token": "", "entsoe_area": "10Y1001A1001A46L", "price_provider": "entsoe"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_entsoe()
 
         assert prices == []
@@ -97,10 +96,10 @@ class TestTibberIntegration:
             return_value=Response(200, json=SAMPLE_TIBBER_RESPONSE)
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.tibber_api_token = "test-tibber-token"
-            mock_settings.price_provider = "tibber"
+        async def mock_get_setting(key):
+            return {"tibber_api_token": "test-tibber-token", "price_provider": "tibber"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_tibber()
 
         # 4 today + 2 tomorrow = 6
@@ -113,10 +112,10 @@ class TestTibberIntegration:
     @respx.mock
     async def test_fetch_tibber_empty_token(self):
         """No fetch when token is empty."""
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.tibber_api_token = ""
-            mock_settings.price_provider = "tibber"
+        async def mock_get_setting(key):
+            return {"tibber_api_token": "", "price_provider": "tibber"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_tibber()
 
         assert prices == []
@@ -128,10 +127,10 @@ class TestTibberIntegration:
             return_value=Response(200, json={"data": {"viewer": {"homes": []}}})
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.tibber_api_token = "test-token"
-            mock_settings.price_provider = "tibber"
+        async def mock_get_setting(key):
+            return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_tibber()
 
         assert prices == []
@@ -162,10 +161,10 @@ class TestTibberIntegration:
             return_value=Response(200, json=response)
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.tibber_api_token = "test-token"
-            mock_settings.price_provider = "tibber"
+        async def mock_get_setting(key):
+            return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_tibber()
 
         assert len(prices) == 2
@@ -180,11 +179,10 @@ class TestProviderRouting:
             return_value=Response(200, text=SAMPLE_ENTSOE_XML)
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.price_provider = "entsoe"
-            mock_settings.entsoe_api_token = "test-token"
-            mock_settings.entsoe_area = "10Y1001A1001A46L"
+        async def mock_get_setting(key):
+            return {"price_provider": "entsoe", "entsoe_api_token": "test-token", "entsoe_area": "10Y1001A1001A46L"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await fetch_prices()
 
         assert len(prices) == 4
@@ -196,10 +194,10 @@ class TestProviderRouting:
             return_value=Response(200, json=SAMPLE_TIBBER_RESPONSE)
         )
 
-        with patch("packages.poller.feeds.settings") as mock_settings:
-            mock_settings.price_provider = "tibber"
-            mock_settings.tibber_api_token = "test-token"
+        async def mock_get_setting(key):
+            return {"price_provider": "tibber", "tibber_api_token": "test-token"}.get(key, "")
 
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await fetch_prices()
 
         assert len(prices) == 6
