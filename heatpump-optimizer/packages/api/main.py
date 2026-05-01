@@ -933,16 +933,19 @@ async def get_optimizer_status():
     demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
 
     # Count training samples from DB
+    # COP model trains on consumption deltas (consecutive same-day records with positive diff)
     async with get_session() as session:
-        cop_count = await session.execute(
-            select(func.count()).select_from(COPRecord)
-        )
-        cop_samples = cop_count.scalar() or 0
-
         consumption_count = await session.execute(
             select(func.count()).select_from(ConsumptionRecord)
         )
-        demand_samples = consumption_count.scalar() or 0
+        total_consumption = consumption_count.scalar() or 0
+
+        # Usable COP samples ≈ total records minus one per day (first record has no prev).
+        # With 15-min polling, ~96 records/day → ~95 potential deltas/day.
+        # Estimate days from total records (96 polls/day).
+        estimated_days = max(1, total_consumption // 96) if total_consumption > 0 else 0
+        cop_samples = max(0, total_consumption - estimated_days)
+        demand_samples = total_consumption
 
     return {
         "configured_layer": layer,

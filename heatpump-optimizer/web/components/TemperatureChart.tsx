@@ -42,18 +42,24 @@ export function TemperatureChart() {
       .catch(() => {});
   }, []);
 
-  // Merge indoor temp data into the chart by matching to nearest time bucket
-  const indoorByMinute = new Map<string, number>();
+  // Merge indoor temp data into the chart by matching to nearest 5-minute bucket
+  const indoorByBucket = new Map<string, number>();
   indoorData.forEach((p) => {
-    const key = new Date(p.timestamp).toLocaleTimeString([], {
+    const d = new Date(p.timestamp);
+    // Round to nearest 5 minutes
+    d.setMinutes(Math.round(d.getMinutes() / 5) * 5, 0, 0);
+    const key = d.toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });
-    indoorByMinute.set(key, p.temperature);
+    indoorByBucket.set(key, p.temperature);
   });
 
   const chartData = data.map((d) => {
-    const time = new Date(d.ts).toLocaleTimeString([], {
+    const raw = new Date(d.ts);
+    // Round status timestamps to same 5-minute bucket
+    raw.setMinutes(Math.round(raw.getMinutes() / 5) * 5, 0, 0);
+    const time = raw.toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });
@@ -64,7 +70,7 @@ export function TemperatureChart() {
       zone1: d.zone1_temp,
       zone1Target: d.zone1_target_temp,
       outdoor: d.outdoor_temp,
-      indoor: indoorByMinute.get(time) ?? null,
+      indoor: indoorByBucket.get(time) ?? null,
     };
   });
 
