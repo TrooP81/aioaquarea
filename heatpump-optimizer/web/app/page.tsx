@@ -33,6 +33,9 @@ interface DashboardData {
     optimizer_version: string;
     cost_estimate_eur: number | null;
     actions_count: number;
+    horizon_start?: string;
+    horizon_end?: string;
+    created_at?: string;
   } | null;
   has_override: boolean;
   override_id: number | null;

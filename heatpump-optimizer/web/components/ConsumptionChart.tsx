@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import {
-  AreaChart,
-  Area,
+  BarChart,
+  Bar,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -57,7 +57,7 @@ export function ConsumptionChart() {
     <div className="chart-container">
       <div className="chart-title">Energy Consumption — 24h</div>
       <ResponsiveContainer width="100%" height={220}>
-        <AreaChart data={chartData}>
+        <BarChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
           <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={3} />
           <YAxis stroke="#94a3b8" fontSize={11} unit=" kWh" />
@@ -70,31 +70,28 @@ export function ConsumptionChart() {
             formatter={(value: number, name: string) => [`${value.toFixed(2)} kWh`, name]}
           />
           <Legend />
-          <Area
-            type="monotone"
+          <Bar
             dataKey="heat"
             stackId="1"
-            stroke="#f59e0b"
-            fill="rgba(245, 158, 11, 0.3)"
+            fill="#f59e0b"
             name="Heating"
+            radius={[0, 0, 0, 0]}
           />
-          <Area
-            type="monotone"
+          <Bar
             dataKey="tank"
             stackId="1"
-            stroke="#3b82f6"
-            fill="rgba(59, 130, 246, 0.3)"
+            fill="#3b82f6"
             name="Hot Water"
+            radius={[0, 0, 0, 0]}
           />
-          <Area
-            type="monotone"
+          <Bar
             dataKey="cool"
             stackId="1"
-            stroke="#22c55e"
-            fill="rgba(34, 197, 94, 0.3)"
+            fill="#22c55e"
             name="Cooling"
+            radius={[2, 2, 0, 0]}
           />
-        </AreaChart>
+        </BarChart>
       </ResponsiveContainer>
     </div>
   );

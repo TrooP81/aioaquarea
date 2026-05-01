@@ -10,7 +10,6 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
-  ReferenceLine,
 } from "recharts";
 
 interface StatusPoint {
@@ -22,27 +21,52 @@ interface StatusPoint {
   outdoor_temp: number | null;
 }
 
+interface IndoorTempPoint {
+  timestamp: string;
+  temperature: number;
+}
+
 export function TemperatureChart() {
   const [data, setData] = useState<StatusPoint[]>([]);
+  const [indoorData, setIndoorData] = useState<IndoorTempPoint[]>([]);
 
   useEffect(() => {
     fetch("/api/status/history?hours=24")
       .then((r) => r.json())
       .then(setData)
       .catch(() => {});
+
+    fetch("/api/indoor-temp?hours=24")
+      .then((r) => r.json())
+      .then(setIndoorData)
+      .catch(() => {});
   }, []);
 
-  const chartData = data.map((d) => ({
-    time: new Date(d.ts).toLocaleTimeString([], {
+  // Merge indoor temp data into the chart by matching to nearest time bucket
+  const indoorByMinute = new Map<string, number>();
+  indoorData.forEach((p) => {
+    const key = new Date(p.timestamp).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
-    }),
-    tank: d.tank_temp,
-    tankTarget: d.tank_target_temp,
-    zone1: d.zone1_temp,
-    zone1Target: d.zone1_target_temp,
-    outdoor: d.outdoor_temp,
-  }));
+    });
+    indoorByMinute.set(key, p.temperature);
+  });
+
+  const chartData = data.map((d) => {
+    const time = new Date(d.ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    return {
+      time,
+      tank: d.tank_temp,
+      tankTarget: d.tank_target_temp,
+      zone1: d.zone1_temp,
+      zone1Target: d.zone1_target_temp,
+      outdoor: d.outdoor_temp,
+      indoor: indoorByMinute.get(time) ?? null,
+    };
+  });
 
   if (chartData.length === 0) {
     return (
@@ -113,6 +137,15 @@ export function TemperatureChart() {
             strokeWidth={2}
             dot={false}
             name="Outdoor"
+          />
+          <Line
+            type="monotone"
+            dataKey="indoor"
+            stroke="#ec4899"
+            strokeWidth={2}
+            dot={false}
+            name="Indoor"
+            connectNulls
           />
         </LineChart>
       </ResponsiveContainer>
