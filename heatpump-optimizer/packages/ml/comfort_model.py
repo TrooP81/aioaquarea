@@ -37,6 +37,9 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 MIN_TRAINING_ROWS = 100
 DEFAULT_THERMAL_LAG_MINUTES = 30
 
+# Candidate lags to search when auto-detecting (minutes)
+_LAG_CANDIDATES = [10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
+
 # Reasonable bounds for bisection search
 MIN_ZONE_WATER_TEMP = 20.0
 MAX_ZONE_WATER_TEMP = 65.0
@@ -93,14 +96,59 @@ class ComfortModel:
         """
         Train (or retrain) the comfort model from the database.
 
-        Returns a dict with training metrics or raises if not enough data.
+        If *thermal_lag_minutes* is ``None``, the optimal lag is discovered
+        automatically by training with each candidate in ``_LAG_CANDIDATES``
+        and picking the lag that minimises MAE on the training set.
+
+        Returns a dict with training metrics or an insufficient-data status.
         """
         if not HAS_SKLEARN:
             raise ImportError("scikit-learn is required for the comfort model")
 
         if thermal_lag_minutes is not None:
+            # Explicit lag — train once
             self._thermal_lag_minutes = thermal_lag_minutes
+            return await self._train_with_current_lag()
 
+        # --- Auto-detect optimal thermal lag ---
+        best_lag: int = DEFAULT_THERMAL_LAG_MINUTES
+        best_mae: float = float("inf")
+        best_result: dict[str, Any] | None = None
+
+        for candidate in _LAG_CANDIDATES:
+            self._thermal_lag_minutes = candidate
+            result = await self._train_with_current_lag()
+
+            if result.get("status") == "insufficient_data":
+                continue
+
+            mae = result.get("mae", float("inf"))
+            if mae < best_mae:
+                best_mae = mae
+                best_lag = candidate
+                best_result = result
+
+        if best_result is None:
+            # None of the candidates had enough data
+            self._thermal_lag_minutes = DEFAULT_THERMAL_LAG_MINUTES
+            return await self._train_with_current_lag()
+
+        # Re-train with the best lag so the model state is correct
+        if self._thermal_lag_minutes != best_lag:
+            self._thermal_lag_minutes = best_lag
+            best_result = await self._train_with_current_lag()
+
+        logger.info(
+            "comfort_model_auto_lag",
+            best_lag_min=best_lag,
+            mae=best_mae,
+            candidates_tested=len(_LAG_CANDIDATES),
+        )
+        best_result["auto_lag_minutes"] = best_lag
+        return best_result
+
+    async def _train_with_current_lag(self) -> dict[str, Any]:
+        """Train once using the currently set ``_thermal_lag_minutes``."""
         X, y, n_rows = await self._build_dataset()
 
         if n_rows < MIN_TRAINING_ROWS:
@@ -136,7 +184,11 @@ class ComfortModel:
         r2 = r2_score(y, y_pred)
 
         self._model = pipeline
-        self._metrics = {"mae": round(mae, 3), "r2": round(r2, 3)}
+        self._metrics = {
+            "mae": round(mae, 3),
+            "r2": round(r2, 3),
+            "thermal_lag_min": self._thermal_lag_minutes,
+        }
         self._last_trained = dt.datetime.now(dt.timezone.utc)
         self._training_samples = n_rows
 
@@ -159,13 +211,21 @@ class ComfortModel:
         wind_speed: float = 3.0,
         irradiance: float = 0.0,
         hour: int = 12,
+        indoor_temp: float | None = None,
     ) -> float | None:
-        """Predict the indoor air temperature given operating conditions."""
+        """Predict the indoor air temperature given operating conditions.
+
+        *indoor_temp* is the current measured indoor temperature (from
+        SmartThings).  Providing it makes the prediction autoregressive:
+        the model learns how indoor temp *changes* from the current value
+        given the applied water temperature over the thermal-lag window.
+        """
         if not self.is_trained:
             return None
 
         features = self._make_features(
-            zone_water_temp, outdoor_temp, wind_speed, irradiance, hour
+            zone_water_temp, outdoor_temp, wind_speed, irradiance, hour,
+            indoor_temp=indoor_temp,
         )
         return float(self._model.predict(features.reshape(1, -1))[0])
 
@@ -176,10 +236,15 @@ class ComfortModel:
         wind_speed: float = 3.0,
         irradiance: float = 0.0,
         hour: int = 12,
+        indoor_temp: float | None = None,
     ) -> float | None:
         """
         Inverse prediction: find the water supply temperature needed to
         achieve *target_indoor* air temperature.
+
+        *indoor_temp* is the current measured indoor temperature (from
+        SmartThings).  When provided it anchors the bisection search to
+        the building's actual thermal state.
 
         Uses bisection search over ``[MIN_ZONE_WATER_TEMP, MAX_ZONE_WATER_TEMP]``.
         """
@@ -189,8 +254,8 @@ class ComfortModel:
         lo, hi = MIN_ZONE_WATER_TEMP, MAX_ZONE_WATER_TEMP
 
         # Early bounds check
-        pred_lo = self.predict_indoor_temp(lo, outdoor_temp, wind_speed, irradiance, hour)
-        pred_hi = self.predict_indoor_temp(hi, outdoor_temp, wind_speed, irradiance, hour)
+        pred_lo = self.predict_indoor_temp(lo, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
+        pred_hi = self.predict_indoor_temp(hi, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
 
         if pred_lo is None or pred_hi is None:
             return None
@@ -206,7 +271,7 @@ class ComfortModel:
         # Bisection
         for _ in range(50):
             mid = (lo + hi) / 2.0
-            pred = self.predict_indoor_temp(mid, outdoor_temp, wind_speed, irradiance, hour)
+            pred = self.predict_indoor_temp(mid, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
             if pred is None:
                 return None
             if abs(pred - target_indoor) < 0.05:
@@ -311,11 +376,16 @@ class ComfortModel:
             if weathers
             else np.array([])
         )
+        # Indoor-temp lookup: find prev indoor temp at (T - lag) for each sample
+        reading_times = np.array(
+            [(r.timestamp - earliest).total_seconds() for r in readings]
+        )
+        reading_temps = np.array([r.temperature for r in readings])
 
         X_rows = []
         y_rows = []
 
-        for reading in readings:
+        for i, reading in enumerate(readings):
             target_ts = reading.timestamp - lag
             t_sec = (target_ts - earliest).total_seconds()
 
@@ -341,9 +411,17 @@ class ComfortModel:
                 wind_speed = w.wind_speed if w.wind_speed is not None else 3.0
                 irradiance = getattr(w, "irradiance", 0.0) or 0.0
 
+            # Previous indoor temp at the lag-shifted time
+            prev_indoor: float | None = None
+            prev_idx = int(np.argmin(np.abs(reading_times - t_sec)))
+            prev_gap = abs(reading_times[prev_idx] - t_sec)
+            if prev_gap <= 900 and prev_idx != i:  # within 15 min, not self
+                prev_indoor = float(reading_temps[prev_idx])
+
             hour = reading.timestamp.hour
             features = self._make_features(
-                zone_water_temp, outdoor_temp, wind_speed, irradiance, hour
+                zone_water_temp, outdoor_temp, wind_speed, irradiance, hour,
+                indoor_temp=prev_indoor,
             )
             X_rows.append(features)
             y_rows.append(reading.temperature)
@@ -365,6 +443,7 @@ class ComfortModel:
         wind_speed: float,
         irradiance: float,
         hour: int,
+        indoor_temp: float | None = None,
     ) -> np.ndarray:
         hour_rad = 2.0 * np.pi * hour / 24.0
         return np.array(
@@ -375,6 +454,7 @@ class ComfortModel:
                 irradiance,
                 np.sin(hour_rad),
                 np.cos(hour_rad),
+                indoor_temp if indoor_temp is not None else outdoor_temp,
             ]
         )
 

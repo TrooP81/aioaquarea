@@ -16,7 +16,8 @@ except ImportError:
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord
+from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
+from packages.core.settings_service import get_setting
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
@@ -64,6 +65,15 @@ class MILPOptimizer:
             weather = await self._get_weather(session, horizon_start, horizon_end)
             last_status = await self._get_last_status(session)
 
+            # Latest indoor temp from SmartThings (if available)
+            latest_indoor_temp: float | None = (
+                await session.execute(
+                    select(IndoorTempReading.temperature)
+                    .order_by(IndoorTempReading.timestamp.desc())
+                    .limit(1)
+                )
+            ).scalar()
+
         if not prices:
             raise DataIncompleteError("No price data available for the planning horizon")
 
@@ -95,6 +105,7 @@ class MILPOptimizer:
             cop_fn,
             demand_per_hour,
             current_tank_temp,
+            latest_indoor_temp,
         )
         return plan
 
@@ -142,6 +153,7 @@ class MILPOptimizer:
         cop_fn,
         demand_per_hour: list[float],
         current_tank_temp: float,
+        current_indoor_temp: float | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -225,10 +237,13 @@ class MILPOptimizer:
 
         for h in range(H):
             if use_comfort:
+                # Use actual indoor temp for hour 0, None for future hours
+                indoor_now = current_indoor_temp if h == 0 else None
                 required_water = comfort_model.required_zone_temp(
                     target_indoor=comfort_target,
                     outdoor_temp=temps[h],
                     hour=hours[h],
+                    indoor_temp=indoor_now,
                 )
                 if required_water is not None and required_water > 25:
                     # Higher required water temp → higher SH fraction needed
@@ -316,9 +331,23 @@ class MILPOptimizer:
     async def _get_prices(
         self, session, start: dt.datetime, end: dt.datetime
     ) -> list[tuple[dt.datetime, float]]:
+        provider = await get_setting("price_provider")
+        if provider == "entsoe":
+            area = (await get_setting("entsoe_area")) or "10YNL----------L"
+        elif provider == "manual":
+            area = "manual"
+        else:
+            area = "tibber"
+
         result = await session.execute(
             select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
-            .where(and_(PriceRecord.ts >= start, PriceRecord.ts < end))
+            .where(
+                and_(
+                    PriceRecord.ts >= start,
+                    PriceRecord.ts < end,
+                    PriceRecord.area == area,
+                )
+            )
             .order_by(PriceRecord.ts)
         )
         return [(row.ts, row.price_eur_per_kwh) for row in result.all()]

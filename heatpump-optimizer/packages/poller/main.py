@@ -158,7 +158,13 @@ async def poll_prices() -> None:
 
     try:
         prices = await fetch_prices()
-        area = settings.entsoe_area if settings.price_provider == "entsoe" else "tibber"
+        provider = await get_setting("price_provider")
+        if provider == "entsoe":
+            area = (await get_setting("entsoe_area")) or settings.entsoe_area
+        elif provider == "manual":
+            area = "manual"
+        else:
+            area = "tibber"
         async with get_session() as session:
             for ts, price in prices:
                 stmt = pg_insert(PriceRecord).values(

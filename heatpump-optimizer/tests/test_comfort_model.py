@@ -28,7 +28,17 @@ class TestComfortModelUntrained:
 class TestComfortModelFeatures:
     def test_make_features_shape(self):
         features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
-        assert features.shape == (6,)
+        assert features.shape == (7,)
+
+    def test_make_features_indoor_temp(self):
+        # When indoor_temp is provided, it should be used as the 7th feature
+        features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12, indoor_temp=21.0)
+        assert features[6] == 21.0
+
+    def test_make_features_indoor_temp_fallback(self):
+        # When indoor_temp is None, falls back to outdoor_temp
+        features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
+        assert features[6] == 5.0  # outdoor_temp
 
     def test_make_features_cyclical_hour(self):
         features_0 = ComfortModel._make_features(35.0, 5.0, 3.0, 0.0, 0)
@@ -59,6 +69,8 @@ class TestComfortModelTrained:
         wind = rng.uniform(0, 10, n)
         irradiance = rng.uniform(0, 500, n)
         hours = rng.randint(0, 24, n)
+        # Previous indoor temp — slightly correlated with target
+        prev_indoor = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 2.0, n)
 
         X = np.column_stack([
             water_temps,
@@ -67,6 +79,7 @@ class TestComfortModelTrained:
             irradiance,
             np.sin(2.0 * np.pi * hours / 24.0),
             np.cos(2.0 * np.pi * hours / 24.0),
+            prev_indoor,
         ])
         # Simplified thermal relationship
         y = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 0.5, n)

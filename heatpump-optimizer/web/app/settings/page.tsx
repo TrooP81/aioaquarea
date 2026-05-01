@@ -16,6 +16,11 @@ type SettingsMap = Record<string, SettingMeta>;
 
 const SETTING_GROUPS = [
   {
+    title: "Optimizer Layer",
+    description: "Choose which optimization engine drives scheduling",
+    keys: ["optimizer_layer"],
+  },
+  {
     title: "Price Provider",
     description: "Configure how electricity prices are fetched",
     keys: ["price_provider", "entsoe_api_token", "entsoe_area", "tibber_api_token", "manual_price_eur_per_kwh"],
@@ -61,6 +66,16 @@ const SETTING_GROUPS = [
     keys: ["poll_interval_seconds"],
   },
   {
+    title: "SmartThings Integration",
+    description: "Indoor temperature sensors via Samsung SmartThings",
+    keys: ["smartthings_enabled", "smartthings_pat", "smartthings_device_ids", "smartthings_poll_interval"],
+  },
+  {
+    title: "Comfort Model",
+    description: "ML model that learns indoor temperature from water supply temp",
+    keys: ["use_comfort_model", "comfort_temp_target", "thermal_lag_minutes"],
+  },
+  {
     title: "Display",
     description: "Currency and display preferences",
     keys: ["currency"],
@@ -73,7 +88,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
-  const { code: currencyCode, symbol: currencySymbol } = useCurrency();
+  const currency = useCurrency();
 
   useEffect(() => {
     fetchSettings();
@@ -151,6 +166,12 @@ export default function SettingsPage() {
       if (isManualWeatherMode && false) return false; // show manual fields
       if (!isManualWeatherMode && ["manual_outdoor_temp", "manual_wind_speed", "manual_humidity", "manual_irradiance"].includes(key)) return false;
     }
+    if (groupTitle === "SmartThings Integration") {
+      if (editValues["smartthings_enabled"] !== "true" && key !== "smartthings_enabled") return false;
+    }
+    if (groupTitle === "Comfort Model") {
+      if (editValues["use_comfort_model"] !== "true" && key !== "use_comfort_model") return false;
+    }
     return true;
   };
 
@@ -192,7 +213,7 @@ export default function SettingsPage() {
           <h2 className="chart-title">{group.title}</h2>
           <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
             {group.title === "Price Provider"
-              ? `Configure how electricity prices are fetched (displaying in ${currencyCode})`
+              ? `Configure how electricity prices are fetched (displaying in ${currency.code})`
               : group.description}
           </p>
 
@@ -203,7 +224,7 @@ export default function SettingsPage() {
                 const meta = settings[key];
                 const description =
                   key === "manual_price_eur_per_kwh"
-                    ? `Static electricity price (${currencyCode}/kWh)`
+                    ? `Static electricity price (${currency.code}/kWh)`
                     : meta.description;
                 return (
                   <div key={key} style={{ display: "flex", alignItems: "center", gap: "1rem" }}>

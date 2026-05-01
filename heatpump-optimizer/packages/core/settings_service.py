@@ -203,9 +203,9 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "description": "Target indoor air temperature (°C) for comfort model optimization",
     },
     "thermal_lag_minutes": {
-        "type": "int",
-        "default": "30",
-        "description": "Thermal lag between water supply temp change and indoor air temp change (minutes)",
+        "type": "str",
+        "default": "",
+        "description": "Thermal lag override (minutes). Leave empty to auto-detect from data",
     },
     # --- Comfort schedule ---
     "comfort_schedule": {

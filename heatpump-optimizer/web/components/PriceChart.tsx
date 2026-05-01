@@ -10,7 +10,7 @@ import {
   Area,
   ComposedChart,
 } from "recharts";
-import { useCurrency } from "./useCurrency";
+import { useCurrency, priceAxisLabel } from "./useCurrency";
 
 interface PricePoint {
   ts: string;
@@ -19,7 +19,7 @@ interface PricePoint {
 
 export function PriceChart() {
   const [prices, setPrices] = useState<PricePoint[]>([]);
-  const { symbol } = useCurrency();
+  const currency = useCurrency();
 
   useEffect(() => {
     fetch("/api/prices?hours=48")
@@ -28,25 +28,27 @@ export function PriceChart() {
       .catch(() => {});
   }, []);
 
-  const chartData = prices.map((p) => {
-    const hour = new Date(p.ts).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-    const now = new Date();
-    const priceTime = new Date(p.ts);
-    const isFuture = priceTime > now;
+  const chartData = currency.loaded
+    ? prices.map((p) => {
+        const hour = new Date(p.ts).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        const now = new Date();
+        const priceTime = new Date(p.ts);
+        const isFuture = priceTime > now;
 
-    return {
-      time: hour,
-      price: p.price_eur_per_kwh * 100, // Convert to cents
-      isFuture,
-    };
-  });
+        return {
+          time: hour,
+          price: +(p.price_eur_per_kwh * currency.multiplier).toFixed(2),
+          isFuture,
+        };
+      })
+    : [];
 
   return (
     <div className="chart-container">
-      <div className="chart-title">Electricity Price ({symbol} cents/kWh) — 48h</div>
+      <div className="chart-title">Electricity Price ({priceAxisLabel(currency)}) — 48h</div>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={250}>
           <ComposedChart data={chartData}>

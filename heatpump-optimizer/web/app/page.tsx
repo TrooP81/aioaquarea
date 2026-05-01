@@ -151,13 +151,13 @@ export default function Home() {
       )}
 
       <Dashboard data={data} />
+      <OptimizerStatus />
       <PriceChart />
       <TemperatureChart />
       <ConsumptionChart />
       <ForecastChart />
       <ThermalPredictionChart />
       <PlanView plan={data?.active_plan ?? null} />
-      <OptimizerStatus />
       <Controls />
     </div>
   );

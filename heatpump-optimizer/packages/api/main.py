@@ -43,6 +43,16 @@ app = FastAPI(
     description="API for monitoring and optimizing Panasonic Aquarea heat pump costs",
 )
 
+
+async def _get_price_area() -> str:
+    """Return the price-record area for the currently configured provider."""
+    provider = await get_setting("price_provider")
+    if provider == "entsoe":
+        return (await get_setting("entsoe_area")) or "10YNL----------L"
+    if provider == "manual":
+        return "manual"
+    return "tibber"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3500"],
@@ -154,12 +164,14 @@ async def get_dashboard():
         status = status_result.scalar_one_or_none()
 
         # Current price
+        area = await _get_price_area()
         price_result = await session.execute(
             select(PriceRecord.price_eur_per_kwh)
             .where(
                 and_(
                     PriceRecord.ts <= now,
                     PriceRecord.ts > now - dt.timedelta(hours=1),
+                    PriceRecord.area == area,
                 )
             )
             .order_by(desc(PriceRecord.ts))
@@ -316,11 +328,18 @@ async def get_prices(hours: int = Query(48, ge=1, le=168)):
     now = dt.datetime.now(dt.timezone.utc)
     since = now - dt.timedelta(hours=hours // 2)
     until = now + dt.timedelta(hours=hours // 2)
+    area = await _get_price_area()
 
     async with get_session() as session:
         result = await session.execute(
             select(PriceRecord)
-            .where(and_(PriceRecord.ts >= since, PriceRecord.ts <= until))
+            .where(
+                and_(
+                    PriceRecord.ts >= since,
+                    PriceRecord.ts <= until,
+                    PriceRecord.area == area,
+                )
+            )
             .order_by(PriceRecord.ts)
         )
         rows = result.scalars().all()
@@ -674,19 +693,44 @@ async def get_audit_log(limit: int = Query(50, ge=1, le=200)):
 
 # --- Currency ---
 
-CURRENCY_SYMBOLS: dict[str, str] = {
-    "EUR": "€", "GBP": "£", "USD": "$", "SEK": "kr", "NOK": "kr",
-    "DKK": "kr", "CHF": "CHF", "PLN": "zł", "CZK": "Kč", "HUF": "Ft",
+CURRENCY_META: dict[str, dict] = {
+    "EUR": {"prefix": "€", "suffix": "", "sub": "c", "multiplier": 100},
+    "GBP": {"prefix": "£", "suffix": "", "sub": "p", "multiplier": 100},
+    "USD": {"prefix": "$", "suffix": "", "sub": "¢", "multiplier": 100},
+    "CHF": {"prefix": "", "suffix": " CHF", "sub": "Rp", "multiplier": 100},
+    "SEK": {"prefix": "", "suffix": " kr", "sub": "öre", "multiplier": 1},
+    "NOK": {"prefix": "", "suffix": " kr", "sub": "øre", "multiplier": 1},
+    "DKK": {"prefix": "", "suffix": " kr", "sub": "øre", "multiplier": 1},
+    "PLN": {"prefix": "", "suffix": " zł", "sub": "", "multiplier": 1},
+    "CZK": {"prefix": "", "suffix": " Kč", "sub": "", "multiplier": 1},
+    "HUF": {"prefix": "", "suffix": " Ft", "sub": "", "multiplier": 1},
 }
 
 
 @app.get("/api/currency")
 async def get_currency():
-    """Get the configured display currency and its symbol."""
+    """Get the configured display currency with all formatting info.
+
+    The frontend should NEVER decide how to scale prices — it just uses
+    ``multiplier`` from this response.  For subunit currencies (EUR → cents)
+    multiplier=100; for main-unit currencies (SEK → kr) multiplier=1.
+    """
     code = await get_setting("currency") or "EUR"
+    meta = CURRENCY_META.get(code, {"prefix": code + " ", "suffix": "", "sub": "", "multiplier": 1})
+    m = meta["multiplier"]
+    # Build ready-to-use labels so the frontend has zero conditional logic
+    if m == 100:
+        # e.g. "€c/kWh", "£p/kWh"
+        price_label = f"{meta['prefix']}{meta['sub']}/kWh"
+    else:
+        # e.g. "kr/kWh", "zł/kWh"
+        price_label = f"{code}/kWh"
     return {
         "code": code,
-        "symbol": CURRENCY_SYMBOLS.get(code, code),
+        "prefix": meta["prefix"],
+        "suffix": meta["suffix"],
+        "multiplier": m,
+        "price_label": price_label,
     }
 
 
@@ -812,6 +856,7 @@ async def predict_indoor_temp(
     water_temp: float = Query(..., description="Zone water supply temperature (°C)"),
     outdoor_temp: float = Query(..., description="Outdoor temperature (°C)"),
     hour: int = Query(12, ge=0, le=23),
+    indoor_temp: float | None = Query(None, description="Current indoor temperature (°C) from SmartThings"),
 ):
     """Predict indoor air temp from operating conditions using the comfort model."""
     from packages.ml.comfort_model import comfort_model
@@ -823,11 +868,13 @@ async def predict_indoor_temp(
         zone_water_temp=water_temp,
         outdoor_temp=outdoor_temp,
         hour=hour,
+        indoor_temp=indoor_temp,
     )
     required_water = comfort_model.required_zone_temp(
         target_indoor=21.0,
         outdoor_temp=outdoor_temp,
         hour=hour,
+        indoor_temp=indoor_temp,
     )
 
     return {
@@ -910,6 +957,32 @@ async def get_optimizer_status():
             else None,
         },
     }
+
+
+@app.post("/api/ml/train")
+async def trigger_ml_training():
+    """Manually trigger COP and demand model training."""
+    from packages.ml.models import COPModel, DemandModel
+
+    cop = COPModel()
+    demand = DemandModel()
+
+    cop_result = await cop.train()
+    demand_result = await demand.train()
+
+    async with get_session() as session:
+        session.add(
+            AuditLogRecord(
+                actor="user",
+                action="train_ml_models",
+                payload_json=json.dumps(
+                    {"cop": cop_result, "demand": demand_result}, default=str
+                ),
+                result="ok",
+            )
+        )
+
+    return {"cop": cop_result, "demand": demand_result}
 
 
 # --- Thermal predictions ---
@@ -1177,7 +1250,7 @@ async def poll_now():
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             price_provider = await get_setting("price_provider")
-            area = (await get_setting("entsoe_area")) if price_provider == "entsoe" else "tibber"
+            area = await _get_price_area()
             async with get_session() as db:
                 for ts, price in prices:
                     stmt = pg_insert(PriceRecord).values(
@@ -1234,11 +1307,12 @@ async def poll_now():
 
 
 class TestConnectionRequest(BaseModel):
-    service: str  # "aquarea", "entsoe", "tibber"
+    service: str  # "aquarea", "entsoe", "tibber", "smartthings"
     username: Optional[str] = None
     password: Optional[str] = None
     api_token: Optional[str] = None
     area: Optional[str] = None
+    pat: Optional[str] = None
 
 
 class TestConnectionResponse(BaseModel):
@@ -1260,6 +1334,8 @@ async def test_connection(body: TestConnectionRequest):
         return await _test_entsoe(body.api_token, body.area)
     elif body.service == "tibber":
         return await _test_tibber(body.api_token)
+    elif body.service == "smartthings":
+        return await _test_smartthings(body.pat)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown service: {body.service}")
 
@@ -1466,6 +1542,55 @@ async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
     except Exception as e:
         return TestConnectionResponse(
             service="tibber",
+            success=False,
+            message=f"Connection failed: {str(e)}",
+        )
+
+
+async def _test_smartthings(pat: Optional[str]) -> TestConnectionResponse:
+    """Test SmartThings PAT by discovering temperature sensors."""
+    from packages.poller.smartthings import SmartThingsClient, SmartThingsAuthError
+
+    from packages.core.settings_service import get_setting
+
+    if not pat:
+        pat = await get_setting("smartthings_pat")
+
+    if not pat:
+        return TestConnectionResponse(
+            service="smartthings",
+            success=False,
+            message="SmartThings Personal Access Token is required",
+        )
+
+    try:
+        client = SmartThingsClient(pat)
+        devices = await client.discover_temp_sensors()
+
+        if not devices:
+            return TestConnectionResponse(
+                service="smartthings",
+                success=True,
+                message="Authentication successful but no temperature sensors found.",
+                details={"device_count": 0},
+            )
+
+        names = [d.get("label", d.get("name", "?")) for d in devices[:5]]
+        return TestConnectionResponse(
+            service="smartthings",
+            success=True,
+            message=f"Connected. Found {len(devices)} sensor(s): {', '.join(names)}",
+            details={"device_count": len(devices), "devices": names},
+        )
+    except SmartThingsAuthError as e:
+        return TestConnectionResponse(
+            service="smartthings",
+            success=False,
+            message=f"Authentication failed: {str(e)}",
+        )
+    except Exception as e:
+        return TestConnectionResponse(
+            service="smartthings",
             success=False,
             message=f"Connection failed: {str(e)}",
         )

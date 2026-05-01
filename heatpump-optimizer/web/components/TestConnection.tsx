@@ -42,6 +42,9 @@ export function TestConnection({ editValues }: TestConnectionProps) {
     } else if (service === "tibber") {
       const token = editValues["tibber_api_token"] || "";
       if (token && !token.includes("***")) body.api_token = token;
+    } else if (service === "smartthings") {
+      const pat = editValues["smartthings_pat"] || "";
+      if (pat && !pat.includes("***")) body.pat = pat;
     }
 
     try {
@@ -78,6 +81,7 @@ export function TestConnection({ editValues }: TestConnectionProps) {
     const priceProvider = editValues["price_provider"] || "";
     if (priceProvider === "entsoe") services.push("entsoe");
     if (priceProvider === "tibber") services.push("tibber");
+    if (editValues["smartthings_enabled"] === "true") services.push("smartthings");
     return services;
   };
 
@@ -213,6 +217,44 @@ export function TestConnection({ editValues }: TestConnectionProps) {
                 }}
               >
                 {results["tibber"].message}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* SmartThings test (only if enabled) */}
+        {editValues["smartthings_enabled"] === "true" && (
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+            <span
+              style={{
+                color: getStatusColor("smartthings"),
+                fontWeight: 600,
+                fontSize: "1.1rem",
+                width: "1.5rem",
+                textAlign: "center",
+              }}
+            >
+              {getStatusIcon("smartthings")}
+            </span>
+            <span style={{ minWidth: "140px", fontSize: "0.875rem" }}>
+              SmartThings
+            </span>
+            <button
+              className="btn"
+              onClick={() => testService("smartthings")}
+              disabled={testing["smartthings"]}
+              style={{ fontSize: "0.8rem", padding: "0.25rem 0.75rem" }}
+            >
+              {testing["smartthings"] ? "Testing..." : "Test"}
+            </button>
+            {results["smartthings"] && (
+              <span
+                style={{
+                  fontSize: "0.8rem",
+                  color: results["smartthings"].success ? "var(--success)" : "var(--danger)",
+                }}
+              >
+                {results["smartthings"].message}
               </span>
             )}
           </div>

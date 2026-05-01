@@ -22,6 +22,12 @@ interface ComfortInfo {
   metrics: Record<string, number> | null;
 }
 
+interface IndoorTempLatest {
+  avg_temperature: number | null;
+  latest_reading: string | null;
+  sensor_count: number;
+}
+
 interface OptimizerStatusData {
   configured_layer: string;
   active_layer: string;
@@ -62,19 +68,77 @@ function formatDate(iso: string | null): string {
 export function OptimizerStatus() {
   const [status, setStatus] = useState<OptimizerStatusData | null>(null);
   const [comfort, setComfort] = useState<ComfortInfo | null>(null);
+  const [indoorTemp, setIndoorTemp] = useState<IndoorTempLatest | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [training, setTraining] = useState<Record<string, boolean>>({});
+  const [trainMsg, setTrainMsg] = useState<{ text: string; ok: boolean } | null>(null);
 
-  useEffect(() => {
+  const refresh = () =>
     Promise.all([
       fetch("/api/optimizer/status").then((r) => (r.ok ? r.json() : null)),
       fetch("/api/comfort-model/status").then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/indoor-temp/latest").then((r) => (r.ok ? r.json() : null)),
     ])
-      .then(([opt, cmf]) => {
+      .then(([opt, cmf, temp]) => {
         setStatus(opt);
         setComfort(cmf);
+        setIndoorTemp(temp);
       })
       .catch(() => setError("Failed to load optimizer status"));
-  }, []);
+
+  useEffect(() => { refresh(); }, []);
+
+  const trainMl = async () => {
+    setTraining((p) => ({ ...p, ml: true }));
+    setTrainMsg(null);
+    try {
+      const res = await fetch("/api/ml/train", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Training failed");
+      const fmtResult = (r: any) =>
+        r?.error ? `✗ ${r.error} (${r.samples ?? 0} samples)` : r?.version ? `✓ trained` : "unknown";
+      const copStatus = fmtResult(data.cop);
+      const demandStatus = fmtResult(data.demand);
+      setTrainMsg({ text: `COP: ${copStatus} · Demand: ${demandStatus}`, ok: !data.cop?.error && !data.demand?.error });
+      await refresh();
+    } catch (e) {
+      setTrainMsg({ text: e instanceof Error ? e.message : "Training failed", ok: false });
+    } finally {
+      setTraining((p) => ({ ...p, ml: false }));
+    }
+  };
+
+  const trainComfort = async () => {
+    setTraining((p) => ({ ...p, comfort: true }));
+    setTrainMsg(null);
+    try {
+      const res = await fetch("/api/comfort-model/train", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Training failed");
+      setTrainMsg({ text: `Comfort model: ${data.status ?? "done"}`, ok: true });
+      await refresh();
+    } catch (e) {
+      setTrainMsg({ text: e instanceof Error ? e.message : "Training failed", ok: false });
+    } finally {
+      setTraining((p) => ({ ...p, comfort: false }));
+    }
+  };
+
+  const calibrateThermal = async () => {
+    setTraining((p) => ({ ...p, thermal: true }));
+    setTrainMsg(null);
+    try {
+      const res = await fetch("/api/thermal/calibrate", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Calibration failed");
+      setTrainMsg({ text: "Thermal model calibrated", ok: true });
+      await refresh();
+    } catch (e) {
+      setTrainMsg({ text: e instanceof Error ? e.message : "Calibration failed", ok: false });
+    } finally {
+      setTraining((p) => ({ ...p, thermal: false }));
+    }
+  };
 
   if (error) {
     return (
@@ -190,6 +254,70 @@ export function OptimizerStatus() {
           </div>
         ))}
       </div>
+
+      {/* Training controls */}
+      <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginTop: "1.25rem" }}>
+        <button
+          className="btn"
+          onClick={trainMl}
+          disabled={training.ml}
+          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+        >
+          {training.ml ? "Training..." : "Train COP & Demand"}
+        </button>
+        <button
+          className="btn"
+          onClick={trainComfort}
+          disabled={training.comfort}
+          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+        >
+          {training.comfort ? "Training..." : "Train Comfort Model"}
+        </button>
+        <button
+          className="btn"
+          onClick={calibrateThermal}
+          disabled={training.thermal}
+          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+        >
+          {training.thermal ? "Calibrating..." : "Calibrate Thermal"}
+        </button>
+      </div>
+      {trainMsg && (
+        <p style={{
+          fontSize: "0.8rem",
+          marginTop: "0.5rem",
+          color: trainMsg.ok ? "var(--success)" : "var(--danger)",
+        }}>
+          {trainMsg.text}
+        </p>
+      )}
+
+      {/* SmartThings indoor temperature */}
+      {indoorTemp && indoorTemp.avg_temperature != null && (
+        <>
+          <h3 style={{ fontSize: "0.875rem", fontWeight: 600, marginTop: "1.25rem", marginBottom: "0.75rem" }}>
+            SmartThings Indoor Temperature
+          </h3>
+          <div
+            style={{
+              display: "flex",
+              gap: "1rem",
+              alignItems: "center",
+              background: "var(--bg)",
+              borderRadius: "0.5rem",
+              padding: "0.75rem 1rem",
+            }}
+          >
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--warning)" }}>
+              {indoorTemp.avg_temperature.toFixed(1)}°C
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", lineHeight: 1.6 }}>
+              <div>Average across {indoorTemp.sensor_count} sensor{indoorTemp.sensor_count !== 1 ? "s" : ""}</div>
+              <div>Last reading: {formatDate(indoorTemp.latest_reading)}</div>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord
+from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
 from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
@@ -69,15 +69,28 @@ class RulesOptimizer:
 
         # Estimate current indoor air temp via comfort model (SmartThings-trained)
         # Falls back to a simple heuristic when model is not trained
+        latest_indoor_temp: float | None = None
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(IndoorTempReading.temperature)
+                    .order_by(IndoorTempReading.timestamp.desc())
+                    .limit(1)
+                )
+            ).scalar()
+            if row is not None:
+                latest_indoor_temp = float(row)
+
         if comfort_model.is_trained:
             predicted_indoor = comfort_model.predict_indoor_temp(
                 zone_water_temp=current_water_temp,
                 outdoor_temp=current_outdoor_temp,
                 hour=now.hour,
+                indoor_temp=latest_indoor_temp,
             )
-            current_indoor_temp = predicted_indoor if predicted_indoor is not None else 20.0
+            current_indoor_temp = predicted_indoor if predicted_indoor is not None else (latest_indoor_temp or 20.0)
         else:
-            current_indoor_temp = 20.0  # safe default when no model available
+            current_indoor_temp = latest_indoor_temp or 20.0  # prefer real reading over default
 
         actions = []
 
@@ -258,6 +271,7 @@ class RulesOptimizer:
                 target_indoor=target_indoor,
                 outdoor_temp=outdoor_at_cold,
                 hour=first_cold.hour,
+                indoor_temp=current_indoor_temp,
             )
             if required_water is None:
                 required_water = current_water_temp + 2.0
@@ -530,10 +544,24 @@ class RulesOptimizer:
     async def _get_prices(
         self, session: AsyncSession, start: dt.datetime, end: dt.datetime
     ) -> list[tuple[dt.datetime, float]]:
-        """Fetch prices from DB."""
+        """Fetch prices from DB for the active provider's area."""
+        provider = await get_setting("price_provider")
+        if provider == "entsoe":
+            area = (await get_setting("entsoe_area")) or "10YNL----------L"
+        elif provider == "manual":
+            area = "manual"
+        else:
+            area = "tibber"
+
         result = await session.execute(
             select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
-            .where(and_(PriceRecord.ts >= start, PriceRecord.ts < end))
+            .where(
+                and_(
+                    PriceRecord.ts >= start,
+                    PriceRecord.ts < end,
+                    PriceRecord.area == area,
+                )
+            )
             .order_by(PriceRecord.ts)
         )
         return [(row.ts, row.price_eur_per_kwh) for row in result.all()]
