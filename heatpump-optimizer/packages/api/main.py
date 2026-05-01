@@ -299,7 +299,7 @@ async def get_status_history(
 
 @app.get("/api/consumption/history", response_model=list[ConsumptionResponse])
 async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
-    """Get consumption history."""
+    """Get consumption history as per-interval deltas (not cumulative totals)."""
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
     async with get_session() as session:
         result = await session.execute(
@@ -309,17 +309,27 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
         )
         rows = result.scalars().all()
 
-    return [
-        ConsumptionResponse(
-            ts=r.ts,
-            heat_kwh=r.heat_kwh,
-            cool_kwh=r.cool_kwh,
-            tank_kwh=r.tank_kwh,
-            total_kwh=(r.heat_kwh or 0) + (r.cool_kwh or 0) + (r.tank_kwh or 0),
-            outdoor_temp=r.outdoor_temp,
-        )
-        for r in rows
-    ]
+    # Compute deltas between consecutive same-day records
+    responses = []
+    prev = None
+    for r in rows:
+        if prev is not None and r.ts.date() == prev.ts.date():
+            heat_delta = max(0.0, (r.heat_kwh or 0) - (prev.heat_kwh or 0))
+            cool_delta = max(0.0, (r.cool_kwh or 0) - (prev.cool_kwh or 0))
+            tank_delta = max(0.0, (r.tank_kwh or 0) - (prev.tank_kwh or 0))
+            responses.append(
+                ConsumptionResponse(
+                    ts=r.ts,
+                    heat_kwh=heat_delta,
+                    cool_kwh=cool_delta,
+                    tank_kwh=tank_delta,
+                    total_kwh=heat_delta + cool_delta + tank_delta,
+                    outdoor_temp=r.outdoor_temp,
+                )
+            )
+        prev = r
+
+    return responses
 
 
 @app.get("/api/prices", response_model=list[PriceResponse])
