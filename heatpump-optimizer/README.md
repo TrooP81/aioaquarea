@@ -18,13 +18,18 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 
 ## Features
 
-- **Real-time monitoring**: Device status, temperatures, consumption
+- **Real-time monitoring**: Device status, temperatures, compressor direction, device action, consumption
+- **Fault detection**: Automatic detection and logging of device faults
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
-- **Weather-aware**: Open-Meteo forecast for COP estimation
-- **Rules-based optimizer**: DHW shifting, pre-heating, peak avoidance
+- **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
+- **Rules-based optimizer (v3)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
+- **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
+- **Direction-aware COP**: Real COP computation from compressor direction and consumption data
 - **MILP optimizer**: Optimal scheduling via linear programming
 - **ML models**: COP prediction and demand forecasting (trains on your data)
+- **Action verification**: Confirms commands took effect by polling device after execution
 - **Manual overrides**: Always-wins pause button for the optimizer
+- **Configurable settings**: Quiet mode hours, price sensitivity, learning thresholds — all editable via UI
 - **Audit log**: Every action is logged
 
 ## Quick Start
@@ -73,7 +78,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 
 ## API Endpoints
 
-- `GET /api/dashboard` — Overview data
+- `GET /api/dashboard` — Overview data (includes direction, device action, defrost, fault indicators)
 - `GET /api/status/history?hours=24` — Device history
 - `GET /api/consumption/history?hours=24` — Energy data
 - `GET /api/prices?hours=48` — Electricity prices
@@ -84,13 +89,30 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - `POST /api/overrides` — Create manual override
 - `DELETE /api/overrides/{id}` — Cancel override
 - `GET /api/audit` — Audit log
+- `GET /api/comfort-schedule` — Current comfort schedule
+- `PUT /api/comfort-schedule` — Update comfort schedule
+- `GET /api/comfort-schedule/learned` — Learned usage patterns
+- `POST /api/comfort-schedule/apply-learned` — Merge learned patterns into schedule
+- `GET /api/faults` — Device fault history
+- `POST /api/faults/{id}/resolve` — Resolve a fault
+- `GET /api/cop/history` — COP values over time
+- `GET /api/cop/stats` — COP statistics by mode
+- `POST /api/cop/compute` — Trigger COP computation
+- `GET /api/compressor/activity` — Compressor direction/action history
+- `GET /api/settings` — All configurable settings
+- `PUT /api/settings` — Update settings
 
 ## How the Optimizer Works
 
-### Rules Engine (v1)
-1. **DHW Shifting**: Heats hot water during the cheapest 2 hours before each deadline (default 06:00, 18:00)
+### Rules Engine (v3)
+1. **DHW Shifting**: Uses the thermal model to find the cheapest slot before each deadline, with direction-aware heating time estimation
 2. **Pre-heating**: Boosts zone temperature during cheap hours before forecast cold spells
 3. **Peak avoidance**: Activates quiet mode during the 5% most expensive hours (if outdoor temp allows)
+4. **Comfort schedule**: Switches between eco and comfort modes based on weekday/weekend schedule with configurable price overrides
+5. **Quiet mode**: Reduces compressor speed during configurable night hours (default 22:00–06:00)
+6. **Adaptive learning**: Automatically detects regular heating patterns and merges them into the comfort schedule
+7. **Holiday mode**: Suspends all optimization when device is in holiday mode
+8. **Action verification**: Polls device after each command to confirm it took effect
 
 ### MILP Optimizer (v2)
 Solves a 24h cost-minimization problem with:

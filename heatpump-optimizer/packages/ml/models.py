@@ -20,11 +20,11 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
-from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord
+from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord, COPRecord
 
 MODEL_DIR = Path("/app/models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -338,3 +338,215 @@ class DemandModel:
             self._model = pickle.load(f)
         self._version = models[-1].stem.replace("demand_model_", "")
         return True
+
+
+class DirectionAwareCOP:
+    """
+    Computes real COP from direction-tagged device status + consumption data.
+
+    Approach:
+    - Groups consecutive status records by device_action (HEATING, HEATING_WATER, COOLING)
+    - For each active interval, calculates:
+      * Thermal energy delivered: ΔT × mass_flow_estimate
+      * Electrical energy consumed: matched consumption record
+      * COP = thermal / electrical
+    - Stores results in cop_history table for trending
+
+    This replaces the old black-box COP model with measured COP values.
+    """
+
+    # Estimated thermal capacity (kW) per °C/hour of temperature change
+    # These are rough estimates — calibrated over time from consumption data
+    TANK_THERMAL_MASS_KWH_PER_DEG = 0.058  # ~50L tank ≈ 58 Wh per °C
+    ZONE_THERMAL_MASS_KWH_PER_DEG = 0.5  # Building thermal mass estimate
+
+    async def compute_cop_intervals(self, hours: int = 24) -> list[dict]:
+        """
+        Compute COP for each active heating/cooling interval in the last N hours.
+
+        Returns list of {ts, mode, cop, outdoor_temp, electrical_kwh, thermal_kwh}
+        """
+        from packages.core.models import COPRecord
+
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+
+        async with get_session() as session:
+            status_result = await session.execute(
+                select(DeviceStatusRecord)
+                .where(DeviceStatusRecord.ts >= since)
+                .order_by(DeviceStatusRecord.ts)
+            )
+            records = status_result.scalars().all()
+
+            consumption_result = await session.execute(
+                select(ConsumptionRecord)
+                .where(ConsumptionRecord.ts >= since)
+                .order_by(ConsumptionRecord.ts)
+            )
+            consumption_records = consumption_result.scalars().all()
+
+        if len(records) < 2:
+            return []
+
+        cop_intervals = []
+
+        for i in range(1, len(records)):
+            prev = records[i - 1]
+            curr = records[i]
+
+            action = getattr(curr, 'device_action', None)
+            if not action or action in ("OFF", "IDLE"):
+                continue
+
+            dt_hours = (curr.ts - prev.ts).total_seconds() / 3600.0
+            if dt_hours <= 0 or dt_hours > 2.0:
+                continue
+
+            # Skip defrost — not real heating
+            if getattr(curr, 'defrost_active', None):
+                continue
+
+            outdoor = curr.outdoor_temp or 5.0
+            thermal_kwh = 0.0
+
+            if action == "HEATING_WATER":
+                # Tank heating: thermal = mass × ΔT
+                if prev.tank_temp and curr.tank_temp and curr.tank_temp > prev.tank_temp:
+                    delta_t = curr.tank_temp - prev.tank_temp
+                    thermal_kwh = delta_t * self.TANK_THERMAL_MASS_KWH_PER_DEG
+            elif action == "HEATING":
+                # Zone heating: thermal = building_mass × ΔT
+                if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp > prev.zone1_temp:
+                    delta_t = curr.zone1_temp - prev.zone1_temp
+                    thermal_kwh = delta_t * self.ZONE_THERMAL_MASS_KWH_PER_DEG
+            elif action == "COOLING":
+                # Cooling: thermal = building_mass × |ΔT|
+                if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp < prev.zone1_temp:
+                    delta_t = prev.zone1_temp - curr.zone1_temp
+                    thermal_kwh = delta_t * self.ZONE_THERMAL_MASS_KWH_PER_DEG
+
+            if thermal_kwh <= 0:
+                continue
+
+            # Estimate electrical consumption for this interval
+            electrical_kwh = self._estimate_electrical(
+                curr.ts, dt_hours, consumption_records, action
+            )
+
+            if electrical_kwh <= 0:
+                continue
+
+            cop = thermal_kwh / electrical_kwh
+
+            # Sanity check: COP should be between 1 and 8 for heat pumps
+            if 0.5 < cop < 10.0:
+                cop_intervals.append({
+                    "ts": curr.ts,
+                    "device_id": curr.device_id,
+                    "mode": action,
+                    "cop": round(cop, 2),
+                    "outdoor_temp": outdoor,
+                    "electrical_kwh": round(electrical_kwh, 4),
+                    "thermal_kwh": round(thermal_kwh, 4),
+                })
+
+        # Persist COP records
+        if cop_intervals:
+            async with get_session() as session:
+                for entry in cop_intervals:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(COPRecord).values(
+                        ts=entry["ts"],
+                        device_id=entry["device_id"],
+                        cop_value=entry["cop"],
+                        mode=entry["mode"],
+                        outdoor_temp=entry["outdoor_temp"],
+                        electrical_kwh=entry["electrical_kwh"],
+                        thermal_kwh=entry["thermal_kwh"],
+                    )
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["ts", "device_id"],
+                        set_={
+                            "cop_value": entry["cop"],
+                            "mode": entry["mode"],
+                            "outdoor_temp": entry["outdoor_temp"],
+                            "electrical_kwh": entry["electrical_kwh"],
+                            "thermal_kwh": entry["thermal_kwh"],
+                        },
+                    )
+                    await session.execute(stmt)
+
+        return cop_intervals
+
+    @staticmethod
+    def _estimate_electrical(
+        ts: dt.datetime,
+        dt_hours: float,
+        consumption_records: list,
+        action: str,
+    ) -> float:
+        """
+        Estimate electrical kWh consumed during an interval.
+
+        Uses the closest consumption record and proportions by action type.
+        """
+        if not consumption_records:
+            return 0.0
+
+        # Find closest consumption record by time
+        closest = min(
+            consumption_records,
+            key=lambda c: abs((c.ts - ts).total_seconds()),
+        )
+
+        # Only use if within 30 minutes
+        if abs((closest.ts - ts).total_seconds()) > 1800:
+            return 0.0
+
+        # Estimate hourly rate from daily consumption
+        if action == "HEATING_WATER":
+            daily_kwh = closest.tank_kwh or 0
+        elif action in ("HEATING", "COOLING"):
+            daily_kwh = (closest.heat_kwh or 0) + (closest.cool_kwh or 0)
+        else:
+            daily_kwh = (closest.heat_kwh or 0) + (closest.tank_kwh or 0) + (closest.cool_kwh or 0)
+
+        # Rough: assume consumption is spread across 10 active hours/day
+        hourly_rate = daily_kwh / 10.0 if daily_kwh > 0 else 0
+        return hourly_rate * dt_hours
+
+    async def get_average_cop(self, hours: int = 24, mode: str | None = None) -> dict:
+        """Get average COP statistics for a time period."""
+        from packages.core.models import COPRecord
+
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+
+        async with get_session() as session:
+            query = select(
+                func.avg(COPRecord.cop_value),
+                func.count(COPRecord.cop_value),
+                func.min(COPRecord.cop_value),
+                func.max(COPRecord.cop_value),
+            ).where(COPRecord.ts >= since)
+
+            if mode:
+                query = query.where(COPRecord.mode == mode)
+
+            result = await session.execute(query)
+            row = result.one()
+
+        return {
+            "avg_cop": round(row[0], 2) if row[0] else None,
+            "sample_count": row[1] or 0,
+            "min_cop": round(row[2], 2) if row[2] else None,
+            "max_cop": round(row[3], 2) if row[3] else None,
+            "period_hours": hours,
+            "mode_filter": mode,
+        }
+
+
+# Module-level singletons
+cop_model = COPModel()
+demand_model = DemandModel()
+direction_cop = DirectionAwareCOP()

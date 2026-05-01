@@ -42,6 +42,20 @@ class DeviceStatusRecord(Base):
     quiet_mode: Mapped[int | None] = mapped_column(Integer)
     powerful_mode: Mapped[int | None] = mapped_column(Integer)
     special_status: Mapped[int | None] = mapped_column(Integer)
+    # Phase 1: compressor activity fields
+    direction: Mapped[str | None] = mapped_column(String(16))  # IDLE/PUMP/WATER
+    pump_duty: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
+    device_action: Mapped[str | None] = mapped_column(String(24))  # OFF/IDLE/HEATING/COOLING/HEATING_WATER
+    defrost_active: Mapped[bool | None] = mapped_column(Boolean)
+    force_dhw: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
+    force_heater: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
+    holiday_mode: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
+    # Zone operation status
+    zone1_operation_status: Mapped[int | None] = mapped_column(Integer)
+    zone2_operation_status: Mapped[int | None] = mapped_column(Integer)
+    # Tank limits
+    tank_heat_max: Mapped[int | None] = mapped_column(Integer)
+    tank_heat_min: Mapped[int | None] = mapped_column(Integer)
 
 
 class ConsumptionRecord(Base):
@@ -157,3 +171,35 @@ class SettingRecord(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class FaultRecord(Base):
+    """Device fault/error log — tracks equipment errors over time."""
+
+    __tablename__ = "faults"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    device_id: Mapped[str] = mapped_column(String(128))
+    error_code: Mapped[str] = mapped_column(String(32))
+    error_message: Mapped[str | None] = mapped_column(String(256))
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    outdoor_temp: Mapped[float | None] = mapped_column(Float)
+
+
+class COPRecord(Base):
+    """Computed COP snapshots — derived from direction + consumption intervals."""
+
+    __tablename__ = "cop_history"
+
+    ts: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True, server_default=func.now()
+    )
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cop_value: Mapped[float | None] = mapped_column(Float)
+    mode: Mapped[str | None] = mapped_column(String(24))  # HEATING/COOLING/HEATING_WATER
+    outdoor_temp: Mapped[float | None] = mapped_column(Float)
+    electrical_kwh: Mapped[float | None] = mapped_column(Float)
+    thermal_kwh: Mapped[float | None] = mapped_column(Float)

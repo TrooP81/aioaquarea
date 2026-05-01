@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { TestConnection } from "../../components/TestConnection";
+import { ComfortSchedule } from "../../components/ComfortSchedule";
 
 interface SettingMeta {
   value: string;
@@ -36,6 +38,21 @@ const SETTING_GROUPS = [
     title: "Optimizer Constraints",
     description: "Temperature and scheduling boundaries",
     keys: ["tank_min_temp", "tank_max_temp", "comfort_temp_min", "comfort_temp_max", "dhw_ready_by_hours"],
+  },
+  {
+    title: "Quiet Mode",
+    description: "Compressor noise reduction schedule",
+    keys: ["quiet_mode_start", "quiet_mode_end"],
+  },
+  {
+    title: "Price Sensitivity",
+    description: "How aggressively the optimizer reacts to electricity prices",
+    keys: ["price_comfort_override_pct", "price_eco_upgrade_pct"],
+  },
+  {
+    title: "Adaptive Learning",
+    description: "Automatic schedule adjustment from observed usage",
+    keys: ["learned_schedule_threshold"],
   },
   {
     title: "Polling",
@@ -237,6 +254,10 @@ export default function SettingsPage() {
           </div>
         </div>
       ))}
+
+      <ComfortSchedule />
+
+      <TestConnection editValues={editValues} />
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
         <button className="btn btn-primary" onClick={handleSave} disabled={saving}>

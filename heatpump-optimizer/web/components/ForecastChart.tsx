@@ -1,0 +1,117 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Legend,
+  ReferenceLine,
+} from "recharts";
+
+interface WeatherPoint {
+  ts: string;
+  temperature: number | null;
+  wind_speed: number | null;
+  humidity: number | null;
+}
+
+export function ForecastChart() {
+  const [data, setData] = useState<WeatherPoint[]>([]);
+
+  useEffect(() => {
+    fetch("/api/weather?hours=48")
+      .then((r) => r.json())
+      .then(setData)
+      .catch(() => {});
+  }, []);
+
+  const now = new Date();
+
+  const chartData = data.map((d) => {
+    const ts = new Date(d.ts);
+    return {
+      time: ts.toLocaleString([], {
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      temperature: d.temperature,
+      windSpeed: d.wind_speed,
+      humidity: d.humidity,
+      isForecast: ts > now,
+    };
+  });
+
+  if (chartData.length === 0) {
+    return (
+      <div className="chart-container">
+        <div className="chart-title">Weather Forecast — 48h</div>
+        <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "3rem" }}>
+          No weather data yet. Data will appear after weather fetch.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chart-container">
+      <div className="chart-title">Weather Forecast — 48h</div>
+      <ResponsiveContainer width="100%" height={250}>
+        <LineChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={5} />
+          <YAxis
+            yAxisId="temp"
+            stroke="#94a3b8"
+            fontSize={11}
+            unit="°C"
+          />
+          <YAxis
+            yAxisId="wind"
+            orientation="right"
+            stroke="#94a3b8"
+            fontSize={11}
+            unit=" m/s"
+          />
+          <Tooltip
+            contentStyle={{
+              background: "#1e293b",
+              border: "1px solid #334155",
+              borderRadius: "8px",
+            }}
+            formatter={(value: number, name: string) => {
+              if (name === "Temperature") return [`${value}°C`, name];
+              if (name === "Wind Speed") return [`${value} m/s`, name];
+              if (name === "Humidity") return [`${value}%`, name];
+              return [value, name];
+            }}
+          />
+          <Legend />
+          <Line
+            yAxisId="temp"
+            type="monotone"
+            dataKey="temperature"
+            stroke="#f59e0b"
+            strokeWidth={2}
+            dot={false}
+            name="Temperature"
+          />
+          <Line
+            yAxisId="wind"
+            type="monotone"
+            dataKey="windSpeed"
+            stroke="#6366f1"
+            strokeWidth={1.5}
+            dot={false}
+            name="Wind Speed"
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}

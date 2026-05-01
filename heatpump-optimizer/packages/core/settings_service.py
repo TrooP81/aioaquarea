@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
+    # --- Optimizer layer ---
+    "optimizer_layer": {
+        "type": "str",
+        "default": "rules_only",
+        "description": "Which optimizer layer to use",
+        "options": ["rules_only", "milp_preferred", "auto"],
+    },
     # --- Service modes ---
     "price_provider": {
         "type": "str",
@@ -94,6 +101,34 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "dhw_ready_by_hours",
         "description": "DHW ready-by hours (comma-separated)",
     },
+    # --- Quiet mode ---
+    "quiet_mode_start": {
+        "type": "int",
+        "default": "22",
+        "description": "Quiet mode start hour (0-23)",
+    },
+    "quiet_mode_end": {
+        "type": "int",
+        "default": "6",
+        "description": "Quiet mode end hour (0-23)",
+    },
+    # --- Price sensitivity ---
+    "price_comfort_override_pct": {
+        "type": "int",
+        "default": "90",
+        "description": "Skip comfort when price is above this percentile (0-100)",
+    },
+    "price_eco_upgrade_pct": {
+        "type": "int",
+        "default": "25",
+        "description": "Upgrade eco to normal when price is below this percentile (0-100)",
+    },
+    # --- Adaptive learning ---
+    "learned_schedule_threshold": {
+        "type": "float",
+        "default": "0.3",
+        "description": "Min heating activity score (0-1) to auto-add comfort hour",
+    },
     # --- Polling ---
     "poll_interval_seconds": {
         "type": "int",
@@ -125,6 +160,12 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "float",
         "default": "200.0",
         "description": "Static solar irradiance (W/m²) when weather provider is 'manual'",
+    },
+    # --- Comfort schedule ---
+    "comfort_schedule": {
+        "type": "json",
+        "default": '{"weekday":[7,8,9,17,18,19,20,21],"weekend":[8,9,10,11,12,13,14,15,16,17,18,19,20,21]}',
+        "description": "Hours (0-23) when comfort mode is preferred, by day type (JSON)",
     },
 }
 
@@ -198,3 +239,83 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
                 set_={"value": value},
             )
             await session.execute(stmt)
+
+
+async def get_comfort_schedule() -> dict[str, list[int]]:
+    """Get the parsed comfort schedule. Returns {"weekday": [...hours], "weekend": [...hours]}."""
+    raw = await get_setting("comfort_schedule")
+    try:
+        schedule = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        schedule = json.loads(SETTINGS_SCHEMA["comfort_schedule"]["default"])
+
+    # Validate structure
+    if not isinstance(schedule, dict):
+        schedule = json.loads(SETTINGS_SCHEMA["comfort_schedule"]["default"])
+    for key in ("weekday", "weekend"):
+        if key not in schedule or not isinstance(schedule[key], list):
+            schedule[key] = []
+        schedule[key] = [h for h in schedule[key] if isinstance(h, int) and 0 <= h <= 23]
+
+    return schedule
+
+
+def is_comfort_hour(schedule: dict[str, list[int]], ts: "dt.datetime") -> bool:
+    """Check if a given timestamp falls within a comfort hour."""
+    # Monday=0 ... Sunday=6; weekday = Mon-Fri
+    day_type = "weekday" if ts.weekday() < 5 else "weekend"
+    return ts.hour in schedule.get(day_type, [])
+
+
+async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
+    """Analyze recent device_status records to get per-hour heating activity scores."""
+    import datetime as dt
+    from collections import defaultdict
+    from packages.core.models import DeviceStatusRecord
+
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+
+    async with get_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DeviceStatusRecord.ts, DeviceStatusRecord.device_action)
+            .where(DeviceStatusRecord.ts >= since)
+            .order_by(DeviceStatusRecord.ts)
+        )
+        rows = result.all()
+
+    heating_counts: dict[str, dict[int, int]] = {"weekday": defaultdict(int), "weekend": defaultdict(int)}
+    total_counts: dict[str, dict[int, int]] = {"weekday": defaultdict(int), "weekend": defaultdict(int)}
+
+    for ts, action in rows:
+        day_type = "weekday" if ts.weekday() < 5 else "weekend"
+        hour = ts.hour
+        total_counts[day_type][hour] += 1
+        if action and action.upper() in ("HEATING", "HEATING_WATER"):
+            heating_counts[day_type][hour] += 1
+
+    learned: dict[str, dict[int, float]] = {"weekday": {}, "weekend": {}}
+    for day_type in ("weekday", "weekend"):
+        for hour in range(24):
+            total = total_counts[day_type].get(hour, 0)
+            if total > 0:
+                score = heating_counts[day_type].get(hour, 0) / total
+                if score > 0.05:
+                    learned[day_type][hour] = round(score, 3)
+
+    return learned
+
+
+async def get_effective_schedule(learned_threshold: float = 0.3) -> dict[str, list[int]]:
+    """Get the comfort schedule merged with learned usage patterns."""
+    base = await get_comfort_schedule()
+    learned = await get_learned_usage()
+
+    merged = {"weekday": list(base["weekday"]), "weekend": list(base["weekend"])}
+    for day_type in ("weekday", "weekend"):
+        for hour, score in learned[day_type].items():
+            if score >= learned_threshold and hour not in merged[day_type]:
+                merged[day_type].append(hour)
+        merged[day_type] = sorted(merged[day_type])
+
+    return merged

@@ -14,17 +14,79 @@ from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PlanActionRecord, PlanRecord
 from packages.core.services import AquareaWrapper
+from packages.core.settings_service import get_setting
+from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
 from packages.optimizer.rules import RulesOptimizer
+from packages.optimizer.milp import MILPOptimizer
 from packages.optimizer.executor import PlanExecutor
+from packages.ml.models import COPModel, DemandModel
 
 logger = structlog.get_logger()
 
+# Global ML model instances (loaded once, reused across optimization cycles)
+_cop_model = COPModel()
+_demand_model = DemandModel()
+
+
+def _load_ml_models() -> None:
+    """Load the latest ML model checkpoints from disk."""
+    _cop_model.load_latest()
+    _demand_model.load_latest()
+    logger.info(
+        "ml_models_loaded",
+        cop_trained=_cop_model.is_trained,
+        demand_trained=_demand_model.is_trained,
+    )
+
+
+async def _select_optimizer(layer: str) -> tuple[str, object]:
+    """Return (layer_name, optimizer_instance) based on the configured layer setting."""
+    if layer == "rules_only":
+        return "rules", RulesOptimizer()
+
+    # milp_preferred or auto: build MILP with ML models if available
+    milp = MILPOptimizer(
+        cop_model=_cop_model if _cop_model.is_trained else None,
+        demand_model=_demand_model if _demand_model.is_trained else None,
+    )
+
+    if layer == "milp_preferred":
+        return "milp", milp
+
+    # auto: use MILP only when ML models are trained (better data = better MILP)
+    if _cop_model.is_trained and _demand_model.is_trained:
+        return "milp", milp
+
+    return "rules", RulesOptimizer()
+
 
 async def run_optimization() -> None:
-    """Run the optimizer and store the plan."""
+    """Run the optimizer and store the plan, with layer selection and fallback."""
     try:
-        optimizer = RulesOptimizer()
-        plan = await optimizer.generate_plan()
+        layer = await get_setting("optimizer_layer") or "rules_only"
+        layer_name, optimizer = await _select_optimizer(layer)
+
+        logger.info("optimization_starting", configured_layer=layer, selected=layer_name)
+
+        plan = None
+        if layer_name == "milp":
+            try:
+                plan = await optimizer.generate_plan()
+            except (InfeasibleError, DataIncompleteError, SolverTimeoutError) as exc:
+                logger.warning(
+                    "milp_fallback_to_rules",
+                    error=type(exc).__name__,
+                    detail=str(exc),
+                )
+                plan = await RulesOptimizer().generate_plan()
+            except Exception as exc:
+                logger.error(
+                    "milp_unexpected_error_fallback",
+                    error=str(exc),
+                )
+                plan = await RulesOptimizer().generate_plan()
+        else:
+            plan = await optimizer.generate_plan()
 
         if plan is None:
             logger.info("optimizer_no_plan", reason="insufficient data")
@@ -76,6 +138,9 @@ async def main() -> None:
     )
 
     logger.info("optimizer_starting")
+
+    # Load ML model checkpoints so MILP can use them
+    _load_ml_models()
 
     wrapper = AquareaWrapper()
     await wrapper.start()

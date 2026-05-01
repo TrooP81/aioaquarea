@@ -14,6 +14,7 @@ from packages.core.database import get_session
 from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
+    FaultRecord,
     PriceRecord,
     WeatherRecord,
 )
@@ -27,88 +28,145 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
     """Poll device status and persist to DB."""
     try:
         device = await wrapper.refresh_device()
-        status = device.status
 
-        zones = status.zones if hasattr(status, "zones") else []
-        zone1 = zones[0] if len(zones) > 0 else None
-        zone2 = zones[1] if len(zones) > 1 else None
+        zones = device.zones
+        zone1 = zones.get(1)
+        zone2 = zones.get(2)
+
+        # Compressor activity
+        direction = device.current_direction.name  # IDLE/PUMP/WATER
+        device_action = device.current_action.name  # OFF/IDLE/HEATING/COOLING/HEATING_WATER
+        defrost_active = device.device_mode_status.name == "DEFROST"
 
         record = DeviceStatusRecord(
             ts=dt.datetime.now(dt.timezone.utc),
-            device_id=device.long_id if hasattr(device, "long_id") else "default",
-            mode=str(status.operation_mode) if hasattr(status, "operation_mode") else None,
-            operation_status=status.operation_status.value
-            if hasattr(status, "operation_status")
-            else None,
-            outdoor_temp=status.outdoor_temperature
-            if hasattr(status, "outdoor_temperature")
-            else None,
-            tank_temp=status.tank.temperature if hasattr(status, "tank") and status.tank else None,
-            tank_target_temp=status.tank.heat_set
-            if hasattr(status, "tank") and status.tank
-            else None,
-            tank_operation_status=status.tank.operation_status.value
-            if hasattr(status, "tank") and status.tank
-            else None,
+            device_id=device.long_id,
+            mode=str(device.mode),
+            operation_status=device.operation_status.value,
+            outdoor_temp=device.temperature_outdoor,
+            tank_temp=device.tank.temperature if device.tank else None,
+            tank_target_temp=device.tank.target_temperature if device.tank else None,
+            tank_operation_status=device.tank.operation_status.value if device.tank else None,
             zone1_temp=zone1.temperature if zone1 else None,
-            zone1_target_temp=zone1.heat_set if zone1 else None,
+            zone1_target_temp=zone1.heat_target_temperature if zone1 else None,
             zone2_temp=zone2.temperature if zone2 else None,
-            zone2_target_temp=zone2.heat_set if zone2 else None,
-            quiet_mode=status.quiet_mode.value if hasattr(status, "quiet_mode") else None,
-            powerful_mode=status.powerful_time.value
-            if hasattr(status, "powerful_time")
-            else None,
-            special_status=status.special_status.value
-            if hasattr(status, "special_status")
-            else None,
+            zone2_target_temp=zone2.heat_target_temperature if zone2 else None,
+            quiet_mode=device.quiet_mode.value,
+            powerful_mode=device.powerful_time.value,
+            special_status=device.special_status.value if device.special_status else None,
+            # New compressor/activity fields
+            direction=direction,
+            pump_duty=device.pump_duty,
+            device_action=device_action,
+            defrost_active=defrost_active,
+            force_dhw=device.force_dhw.value,
+            force_heater=device.force_heater.value,
+            holiday_mode=device.holiday_timer.value,
+            # Zone operation status
+            zone1_operation_status=zone1.operation_status.value if zone1 else None,
+            zone2_operation_status=zone2.operation_status.value if zone2 else None,
+            # Tank limits
+            tank_heat_max=device.tank.heat_max if device.tank else None,
+            tank_heat_min=device.tank.heat_min if device.tank else None,
         )
 
         async with get_session() as session:
             session.add(record)
 
-        logger.info("device_status_polled", device_id=record.device_id, outdoor_temp=record.outdoor_temp)
+        logger.info(
+            "device_status_polled",
+            device_id=record.device_id,
+            outdoor_temp=record.outdoor_temp,
+            action=device_action,
+            direction=direction,
+        )
+
+        # --- Fault detection ---
+        if device.is_on_error and device.current_error:
+            await _record_fault(device)
 
     except Exception as e:
         logger.error("device_poll_failed", error=str(e))
 
 
+async def _record_fault(device) -> None:
+    """Record a new fault if not already open."""
+    from sqlalchemy import select, and_
+
+    fault = device.current_error
+    async with get_session() as session:
+        # Check if this fault is already recorded and unresolved
+        existing = await session.execute(
+            select(FaultRecord).where(
+                and_(
+                    FaultRecord.device_id == device.long_id,
+                    FaultRecord.error_code == fault.error_code,
+                    FaultRecord.resolved_at.is_(None),
+                )
+            )
+        )
+        if existing.scalar_one_or_none() is None:
+            session.add(
+                FaultRecord(
+                    device_id=device.long_id,
+                    error_code=fault.error_code,
+                    error_message=fault.error_message,
+                    outdoor_temp=device.temperature_outdoor,
+                )
+            )
+            logger.warning(
+                "fault_detected",
+                device_id=device.long_id,
+                error_code=fault.error_code,
+                error_message=fault.error_message,
+            )
+
+
 async def poll_consumption(wrapper: AquareaWrapper) -> None:
     """Poll consumption data and persist."""
+    from aioaquarea.statistics import ConsumptionType
+
     try:
         device = await wrapper.get_device()
-        consumption = device.consumption
+        now = dt.datetime.now(dt.timezone.utc)
 
-        if consumption:
-            for entry in consumption:
-                record = ConsumptionRecord(
-                    ts=dt.datetime.now(dt.timezone.utc),
-                    device_id=device.long_id if hasattr(device, "long_id") else "default",
-                    heat_kwh=entry.heat_consumption,
-                    cool_kwh=entry.cool_consumption,
-                    tank_kwh=entry.tank_consumption,
-                    outdoor_temp=entry.outdoor_temp,
-                )
-                async with get_session() as session:
-                    session.add(record)
+        heat = await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
+        cool = await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
+        tank = await device.get_and_refresh_consumption(now, ConsumptionType.WATER_TANK) or 0
 
-        logger.info("consumption_polled")
+        record = ConsumptionRecord(
+            ts=now,
+            device_id=device.long_id,
+            heat_kwh=heat,
+            cool_kwh=cool,
+            tank_kwh=tank,
+            outdoor_temp=device.temperature_outdoor,
+        )
+        async with get_session() as session:
+            session.add(record)
+
+        logger.info("consumption_polled", heat=heat, cool=cool, tank=tank)
     except Exception as e:
         logger.error("consumption_poll_failed", error=str(e))
 
 
 async def poll_prices() -> None:
     """Fetch and store electricity prices."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     try:
         prices = await fetch_prices()
         area = settings.entsoe_area if settings.price_provider == "entsoe" else "tibber"
         async with get_session() as session:
             for ts, price in prices:
-                record = PriceRecord(
-                    ts=ts,
-                    area=area,
-                    price_eur_per_kwh=price,
+                stmt = pg_insert(PriceRecord).values(
+                    ts=ts, area=area, price_eur_per_kwh=price
                 )
-                session.add(record)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["ts", "area"],
+                    set_={"price_eur_per_kwh": price},
+                )
+                await session.execute(stmt)
         logger.info("prices_fetched", count=len(prices), provider=settings.price_provider)
     except Exception as e:
         logger.error("price_fetch_failed", error=str(e))
@@ -116,11 +174,13 @@ async def poll_prices() -> None:
 
 async def poll_weather() -> None:
     """Fetch and store weather data."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     try:
         weather_data = await fetch_weather()
         async with get_session() as session:
             for entry in weather_data:
-                record = WeatherRecord(
+                stmt = pg_insert(WeatherRecord).values(
                     ts=entry["ts"],
                     source="open-meteo",
                     temperature=entry["temperature"],
@@ -128,7 +188,16 @@ async def poll_weather() -> None:
                     wind_speed=entry.get("wind_speed"),
                     humidity=entry.get("humidity"),
                 )
-                session.add(record)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["ts", "source"],
+                    set_={
+                        "temperature": entry["temperature"],
+                        "irradiance": entry.get("irradiance"),
+                        "wind_speed": entry.get("wind_speed"),
+                        "humidity": entry.get("humidity"),
+                    },
+                )
+                await session.execute(stmt)
         logger.info("weather_fetched", count=len(weather_data))
     except Exception as e:
         logger.error("weather_fetch_failed", error=str(e))

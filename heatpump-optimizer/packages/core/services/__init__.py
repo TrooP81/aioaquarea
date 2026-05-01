@@ -13,7 +13,7 @@ import redis.asyncio as redis
 
 from aioaquarea import Client, AquareaEnvironment, DeviceInfo
 
-from ..core.config import settings
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ class AquareaWrapper:
         await self._read_limiter.acquire()
 
         if self._device is None:
-            devices = await self._client.get_devices(include_long_id=True)
+            devices = await self._client.get_devices()
             if not devices:
                 raise RuntimeError("No devices found on account")
             self._device_info = devices[0]
@@ -187,6 +187,45 @@ class AquareaWrapper:
         device = await self.get_device()
         await device.set_force_dhw(state)
         logger.info(f"Set force DHW to {state}")
+
+    async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
+        """Set zone heating target temperature."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        await device.set_temperature(temperature, zone_id=zone_id or 1)
+        logger.info(f"Set zone {zone_id} heat target to {temperature}°C")
+
+    async def set_special_status(self, status: str) -> None:
+        """Set special status (ECO or COMFORT)."""
+        from aioaquarea.data import SpecialStatus
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        mode = SpecialStatus.ECO if status == "ECO" else SpecialStatus.COMFORT
+        zones = []
+        for zone_id, zone_obj in device.zones.items():
+            from aioaquarea.data import ZoneTemperatureSetUpdate
+            zones.append(ZoneTemperatureSetUpdate(
+                zone_id=zone_id,
+                heat_set=zone_obj.heat_target_temperature,
+                cool_set=zone_obj.cool_target_temperature,
+            ))
+        await device._DeviceImpl__set_special_status__(mode, zones)
+        logger.info(f"Set special status to {status}")
+
+    async def clear_special_status(self) -> None:
+        """Clear special status (return to normal)."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        zones = []
+        for zone_id, zone_obj in device.zones.items():
+            from aioaquarea.data import ZoneTemperatureSetUpdate
+            zones.append(ZoneTemperatureSetUpdate(
+                zone_id=zone_id,
+                heat_set=zone_obj.heat_target_temperature,
+                cool_set=zone_obj.cool_target_temperature,
+            ))
+        await device._DeviceImpl__set_special_status__(None, zones)
+        logger.info("Cleared special status")
 
     async def get_consumption(self, date_type="date"):
         """Get consumption data."""
