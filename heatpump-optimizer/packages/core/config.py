@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     latitude: float = 52.37
     longitude: float = 4.89
 
+    # SmartThings
+    smartthings_pat: str = ""
+
     # Optimizer constraints
     tank_min_temp: int = 45
     tank_max_temp: int = 55

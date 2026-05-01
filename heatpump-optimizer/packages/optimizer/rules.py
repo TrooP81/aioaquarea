@@ -13,6 +13,7 @@ from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord
 from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour
 from packages.ml.thermal import thermal_model
+from packages.ml.comfort_model import comfort_model
 
 
 class RulesOptimizer:
@@ -63,8 +64,20 @@ class RulesOptimizer:
         # Extract current state for thermal predictions
         current_tank_temp = last_status.tank_temp if last_status and last_status.tank_temp else 48.0
         current_outdoor_temp = last_status.outdoor_temp if last_status and last_status.outdoor_temp else 7.0
-        current_zone_temp = last_status.zone1_temp if last_status and last_status.zone1_temp else 20.0
+        current_water_temp = last_status.zone1_temp if last_status and last_status.zone1_temp else 35.0
         tank_target = last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
+
+        # Estimate current indoor air temp via comfort model (SmartThings-trained)
+        # Falls back to a simple heuristic when model is not trained
+        if comfort_model.is_trained:
+            predicted_indoor = comfort_model.predict_indoor_temp(
+                zone_water_temp=current_water_temp,
+                outdoor_temp=current_outdoor_temp,
+                hour=now.hour,
+            )
+            current_indoor_temp = predicted_indoor if predicted_indoor is not None else 20.0
+        else:
+            current_indoor_temp = 20.0  # safe default when no model available
 
         actions = []
 
@@ -78,7 +91,7 @@ class RulesOptimizer:
         # --- Rule 2: Pre-heat during cheap hours before cold ---
         preheat_actions = self._plan_preheat(
             prices, weather, horizon_start,
-            current_zone_temp, current_outdoor_temp,
+            current_indoor_temp, current_outdoor_temp, current_water_temp,
         )
         actions.extend(preheat_actions)
 
@@ -211,14 +224,16 @@ class RulesOptimizer:
         prices: list[tuple[dt.datetime, float]],
         weather: list[tuple[dt.datetime, float]],
         horizon_start: dt.datetime,
-        current_zone_temp: float,
+        current_indoor_temp: float,
         current_outdoor_temp: float,
+        current_water_temp: float,
     ) -> list[dict]:
         """
         Pre-heat zones using thermal model to determine exact timing.
 
-        Uses zone heating rate to calculate how early to start boosting
-        so the zone is warm before the cold spell hits.
+        Uses the comfort model (when trained) to translate a target indoor
+        air temperature into the required water supply temperature.  Falls
+        back to a simple +2 °C water temp boost otherwise.
         """
         actions = []
 
@@ -232,12 +247,29 @@ class RulesOptimizer:
             return actions
 
         first_cold = cold_hours[0][0]
-        target_zone_boost = current_zone_temp + 2.0  # Boost by 2°C
+
+        # Determine the target: raise indoor temp by 2 °C before the cold spell
+        target_indoor = current_indoor_temp + 2.0
+
+        # Compute required water supply temperature
+        if comfort_model.is_trained:
+            outdoor_at_cold = cold_hours[0][1] if cold_hours[0][1] is not None else 0.0
+            required_water = comfort_model.required_zone_temp(
+                target_indoor=target_indoor,
+                outdoor_temp=outdoor_at_cold,
+                hour=first_cold.hour,
+            )
+            if required_water is None:
+                required_water = current_water_temp + 2.0
+            target_zone_boost = required_water
+        else:
+            # Fallback: boost water temp by 2 °C
+            target_zone_boost = current_water_temp + 2.0
 
         # Use thermal model to find optimal start time for zone boost
         outdoor_at_cold = cold_hours[0][1] if cold_hours[0][1] is not None else 0.0
         prediction = thermal_model.predict_zone_heating_time(
-            current_temp=current_zone_temp,
+            current_temp=current_water_temp,
             target_temp=target_zone_boost,
             outdoor_temp=outdoor_at_cold,
         )

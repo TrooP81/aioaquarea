@@ -161,6 +161,45 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "200.0",
         "description": "Static solar irradiance (W/m²) when weather provider is 'manual'",
     },
+    # --- SmartThings indoor temperature ---
+    "smartthings_enabled": {
+        "type": "str",
+        "default": "false",
+        "description": "Enable SmartThings indoor temperature polling",
+        "options": ["true", "false"],
+    },
+    "smartthings_pat": {
+        "type": "secret",
+        "default_env": "smartthings_pat",
+        "description": "SmartThings Personal Access Token (scopes: l:devices, r:devices:*)",
+    },
+    "smartthings_device_ids": {
+        "type": "str",
+        "default": "",
+        "description": "Comma-separated SmartThings device IDs (empty = auto-discover)",
+    },
+    "smartthings_poll_interval": {
+        "type": "int",
+        "default": "300",
+        "description": "SmartThings poll interval in seconds (default 300 = 5 min)",
+    },
+    # --- Comfort model ---
+    "use_comfort_model": {
+        "type": "str",
+        "default": "false",
+        "description": "Enable ML comfort model for indoor temp prediction",
+        "options": ["true", "false"],
+    },
+    "comfort_temp_target": {
+        "type": "float",
+        "default": "20.5",
+        "description": "Target indoor air temperature (°C) for comfort model optimization",
+    },
+    "thermal_lag_minutes": {
+        "type": "int",
+        "default": "30",
+        "description": "Thermal lag between water supply temp change and indoor air temp change (minutes)",
+    },
     # --- Comfort schedule ---
     "comfort_schedule": {
         "type": "json",

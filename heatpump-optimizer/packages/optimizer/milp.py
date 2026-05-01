@@ -18,6 +18,7 @@ from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord
 from packages.ml.thermal import thermal_model
+from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
 
 import structlog
@@ -217,9 +218,28 @@ class MILPOptimizer:
         prob += pulp.lpSum(x_dhw) <= max_changes
 
         # Space heating: ensure minimum comfort when freezing
+        # When comfort model is trained, derive a minimum SH fraction from
+        # the required water supply temperature to maintain the target indoor temp.
+        comfort_target = float(settings.comfort_temp_min) if hasattr(settings, 'comfort_temp_min') else 20.0
+        use_comfort = comfort_model.is_trained
+
         for h in range(H):
-            if temps[h] < 0:
-                prob += x_sh[h] >= 0.5
+            if use_comfort:
+                required_water = comfort_model.required_zone_temp(
+                    target_indoor=comfort_target,
+                    outdoor_temp=temps[h],
+                    hour=hours[h],
+                )
+                if required_water is not None and required_water > 25:
+                    # Higher required water temp → higher SH fraction needed
+                    # Scale linearly: water=25 → 0.0, water=55 → 1.0
+                    min_sh = max(0.0, min(1.0, (required_water - 25.0) / 30.0))
+                    prob += x_sh[h] >= min_sh
+                elif temps[h] < 0:
+                    prob += x_sh[h] >= 0.5
+            else:
+                if temps[h] < 0:
+                    prob += x_sh[h] >= 0.5
 
         # --- Solve ---
         solver = pulp.PULP_CBC_CMD(

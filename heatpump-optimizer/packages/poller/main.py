@@ -20,6 +20,8 @@ from packages.core.models import (
 )
 from packages.core.services import AquareaWrapper
 from packages.poller.feeds import fetch_prices, fetch_weather
+from packages.poller.smartthings import poll_smartthings_temps
+from packages.core.settings_service import get_setting
 
 logger = structlog.get_logger()
 
@@ -203,6 +205,40 @@ async def poll_weather() -> None:
         logger.error("weather_fetch_failed", error=str(e))
 
 
+async def poll_indoor_temp() -> None:
+    """Fetch indoor air temperatures from SmartThings sensors."""
+    try:
+        enabled = await get_setting("smartthings_enabled")
+        if enabled != "true":
+            return
+
+        async with get_session() as session:
+            count = await poll_smartthings_temps(session)
+
+        if count:
+            logger.info("smartthings_polled", readings=count)
+    except Exception as e:
+        logger.error("smartthings_poll_failed", error=str(e))
+
+
+async def retrain_comfort_model() -> None:
+    """Periodically retrain the comfort model from accumulated SmartThings data."""
+    try:
+        enabled = await get_setting("use_comfort_model")
+        if enabled != "true":
+            return
+
+        from packages.ml.comfort_model import comfort_model
+
+        lag_str = await get_setting("thermal_lag_minutes")
+        lag = int(lag_str) if lag_str else None
+
+        result = await comfort_model.train(thermal_lag_minutes=lag)
+        logger.info("comfort_model_retrain", **result)
+    except Exception as e:
+        logger.error("comfort_model_retrain_failed", error=str(e))
+
+
 async def main() -> None:
     """Main entry point for the poller service."""
     structlog.configure(
@@ -254,6 +290,26 @@ async def main() -> None:
         minutes=30,
         id="weather",
         next_run_time=dt.datetime.now() + dt.timedelta(seconds=15),
+    )
+
+    # SmartThings indoor temp (uses smartthings_poll_interval setting, default 300s)
+    st_interval_str = await get_setting("smartthings_poll_interval")
+    st_interval = int(st_interval_str) if st_interval_str else 300
+    scheduler.add_job(
+        poll_indoor_temp,
+        "interval",
+        seconds=st_interval,
+        id="indoor_temp",
+        next_run_time=dt.datetime.now() + dt.timedelta(seconds=20),
+    )
+
+    # Comfort model retraining every 6 hours
+    scheduler.add_job(
+        retrain_comfort_model,
+        "interval",
+        hours=6,
+        id="comfort_model_retrain",
+        next_run_time=dt.datetime.now() + dt.timedelta(minutes=5),
     )
 
     scheduler.start()

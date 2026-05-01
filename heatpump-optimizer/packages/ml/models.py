@@ -358,7 +358,7 @@ class DirectionAwareCOP:
     # Estimated thermal capacity (kW) per °C/hour of temperature change
     # These are rough estimates — calibrated over time from consumption data
     TANK_THERMAL_MASS_KWH_PER_DEG = 0.058  # ~50L tank ≈ 58 Wh per °C
-    ZONE_THERMAL_MASS_KWH_PER_DEG = 0.5  # Building thermal mass estimate
+    WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG = 0.5  # Water circuit thermal mass estimate (zone1_temp is water supply temp)
 
     async def compute_cop_intervals(self, hours: int = 24) -> list[dict]:
         """
@@ -413,17 +413,18 @@ class DirectionAwareCOP:
                 # Tank heating: thermal = mass × ΔT
                 if prev.tank_temp and curr.tank_temp and curr.tank_temp > prev.tank_temp:
                     delta_t = curr.tank_temp - prev.tank_temp
-                    thermal_kwh = delta_t * self.TANK_THERMAL_MASS_KWH_PER_DEG
+                    thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
             elif action == "HEATING":
-                # Zone heating: thermal = building_mass × ΔT
+                # Zone heating: thermal output from water circuit ΔT
+                # (zone1_temp is water supply temperature, not indoor air)
                 if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp > prev.zone1_temp:
                     delta_t = curr.zone1_temp - prev.zone1_temp
-                    thermal_kwh = delta_t * self.ZONE_THERMAL_MASS_KWH_PER_DEG
+                    thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
             elif action == "COOLING":
                 # Cooling: thermal = building_mass × |ΔT|
                 if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp < prev.zone1_temp:
                     delta_t = prev.zone1_temp - curr.zone1_temp
-                    thermal_kwh = delta_t * self.ZONE_THERMAL_MASS_KWH_PER_DEG
+                    thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
 
             if thermal_kwh <= 0:
                 continue

@@ -19,6 +19,7 @@ from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
     FaultRecord,
+    IndoorTempReading,
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
@@ -31,6 +32,7 @@ from packages.core.settings_service import (
     get_comfort_schedule,
     get_effective_schedule,
     get_learned_usage,
+    get_setting,
     set_settings_bulk,
     set_setting,
 )
@@ -165,12 +167,12 @@ async def get_dashboard():
         )
         current_price_row = price_result.scalar_one_or_none()
 
-        # Today's consumption
+        # Today's consumption (values are cumulative from midnight, so MAX gives the latest total)
         consumption_result = await session.execute(
             select(
-                func.sum(ConsumptionRecord.heat_kwh),
-                func.sum(ConsumptionRecord.cool_kwh),
-                func.sum(ConsumptionRecord.tank_kwh),
+                func.max(ConsumptionRecord.heat_kwh),
+                func.max(ConsumptionRecord.cool_kwh),
+                func.max(ConsumptionRecord.tank_kwh),
             ).where(ConsumptionRecord.ts >= today_start)
         )
         consumption_row = consumption_result.one_or_none()
@@ -435,13 +437,23 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
         since = now - dt.timedelta(days=30)
 
     async with get_session() as session:
-        # Total consumption
+        # Total consumption (values are cumulative from midnight, so take MAX per day then SUM across days)
+        daily_max = (
+            select(
+                func.max(ConsumptionRecord.heat_kwh).label("heat"),
+                func.max(ConsumptionRecord.cool_kwh).label("cool"),
+                func.max(ConsumptionRecord.tank_kwh).label("tank"),
+            )
+            .where(ConsumptionRecord.ts >= since)
+            .group_by(func.date(ConsumptionRecord.ts))
+            .subquery()
+        )
         cons_result = await session.execute(
             select(
-                func.sum(ConsumptionRecord.heat_kwh),
-                func.sum(ConsumptionRecord.cool_kwh),
-                func.sum(ConsumptionRecord.tank_kwh),
-            ).where(ConsumptionRecord.ts >= since)
+                func.sum(daily_max.c.heat),
+                func.sum(daily_max.c.cool),
+                func.sum(daily_max.c.tank),
+            )
         )
         cons = cons_result.one()
         total_kwh = (cons[0] or 0) + (cons[1] or 0) + (cons[2] or 0)
@@ -658,6 +670,152 @@ async def get_audit_log(limit: int = Query(50, ge=1, le=200)):
         }
         for r in rows
     ]
+
+
+# --- SmartThings indoor temperature ---
+
+
+class IndoorTempResponse(BaseModel):
+    id: int
+    timestamp: dt.datetime
+    device_id: str
+    device_label: Optional[str] = None
+    room: Optional[str] = None
+    temperature: float
+
+
+@app.get("/api/indoor-temp", response_model=list[IndoorTempResponse])
+async def get_indoor_temp(
+    hours: int = Query(24, ge=1, le=720),
+    device_id: Optional[str] = Query(None),
+):
+    """Get indoor air temperature history from SmartThings sensors."""
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    async with get_session() as session:
+        stmt = select(IndoorTempReading).where(IndoorTempReading.timestamp >= since)
+        if device_id:
+            stmt = stmt.where(IndoorTempReading.device_id == device_id)
+        stmt = stmt.order_by(IndoorTempReading.timestamp)
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+
+    return [
+        IndoorTempResponse(
+            id=r.id,
+            timestamp=r.timestamp,
+            device_id=r.device_id,
+            device_label=r.device_label,
+            room=r.room,
+            temperature=r.temperature,
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/indoor-temp/latest")
+async def get_latest_indoor_temp():
+    """Get the most recent indoor temperature reading (average across all sensors)."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                func.avg(IndoorTempReading.temperature),
+                func.max(IndoorTempReading.timestamp),
+                func.count(IndoorTempReading.id),
+            ).where(
+                IndoorTempReading.timestamp
+                >= dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
+            )
+        )
+        row = result.one()
+
+    return {
+        "avg_temperature": round(row[0], 1) if row[0] is not None else None,
+        "latest_reading": row[1].isoformat() if row[1] else None,
+        "sensor_count": row[2] or 0,
+    }
+
+
+@app.get("/api/smartthings/devices")
+async def list_smartthings_devices():
+    """Discover temperature sensors available via SmartThings."""
+    from packages.poller.smartthings import SmartThingsClient, SmartThingsAuthError
+
+    pat = await get_setting("smartthings_pat")
+    if not pat:
+        raise HTTPException(status_code=400, detail="SmartThings PAT not configured")
+
+    try:
+        client = SmartThingsClient(pat)
+        devices = await client.discover_temp_sensors()
+    except SmartThingsAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    return {"devices": devices}
+
+
+@app.get("/api/comfort-model/status")
+async def get_comfort_model_status():
+    """Get comfort model training status and metrics."""
+    from packages.ml.comfort_model import comfort_model
+
+    return {
+        "trained": comfort_model.is_trained,
+        "last_trained": comfort_model.last_trained.isoformat() if comfort_model.last_trained else None,
+        "training_samples": comfort_model.training_samples,
+        "metrics": comfort_model.metrics,
+    }
+
+
+@app.post("/api/comfort-model/train")
+async def trigger_comfort_model_training():
+    """Manually trigger comfort model training."""
+    from packages.ml.comfort_model import comfort_model
+
+    lag_str = await get_setting("thermal_lag_minutes")
+    lag = int(lag_str) if lag_str else None
+
+    result = await comfort_model.train(thermal_lag_minutes=lag)
+
+    async with get_session() as session:
+        session.add(
+            AuditLogRecord(
+                actor="user",
+                action="train_comfort_model",
+                payload_json=json.dumps(result, default=str),
+                result=result.get("status", "unknown"),
+            )
+        )
+
+    return result
+
+
+@app.get("/api/comfort-model/predict")
+async def predict_indoor_temp(
+    water_temp: float = Query(..., description="Zone water supply temperature (°C)"),
+    outdoor_temp: float = Query(..., description="Outdoor temperature (°C)"),
+    hour: int = Query(12, ge=0, le=23),
+):
+    """Predict indoor air temp from operating conditions using the comfort model."""
+    from packages.ml.comfort_model import comfort_model
+
+    if not comfort_model.is_trained:
+        raise HTTPException(status_code=409, detail="Comfort model not yet trained")
+
+    indoor = comfort_model.predict_indoor_temp(
+        zone_water_temp=water_temp,
+        outdoor_temp=outdoor_temp,
+        hour=hour,
+    )
+    required_water = comfort_model.required_zone_temp(
+        target_indoor=21.0,
+        outdoor_temp=outdoor_temp,
+        hour=hour,
+    )
+
+    return {
+        "predicted_indoor_temp": round(indoor, 1) if indoor is not None else None,
+        "required_water_temp_for_21c": round(required_water, 1) if required_water is not None else None,
+    }
 
 
 @app.get("/health")

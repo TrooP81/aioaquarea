@@ -144,7 +144,7 @@ async def seed_weather(db_session: AsyncSession):
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def seed_consumption(db_session: AsyncSession):
-    """Seed consumption records for today."""
+    """Seed consumption records for today (cumulative values — most recent is highest)."""
     now = dt.datetime.now(dt.timezone.utc)
     records = []
     for h in range(6):
@@ -152,7 +152,7 @@ async def seed_consumption(db_session: AsyncSession):
         record = ConsumptionRecord(
             ts=ts,
             device_id="test-device-001",
-            heat_kwh=1.2 + h * 0.1,
+            heat_kwh=1.7 - h * 0.1,
             cool_kwh=0.0,
             tank_kwh=0.5,
             outdoor_temp=5.0 + h,

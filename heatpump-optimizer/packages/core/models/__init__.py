@@ -203,3 +203,18 @@ class COPRecord(Base):
     outdoor_temp: Mapped[float | None] = mapped_column(Float)
     electrical_kwh: Mapped[float | None] = mapped_column(Float)
     thermal_kwh: Mapped[float | None] = mapped_column(Float)
+
+
+class IndoorTempReading(Base):
+    """Actual indoor air temperature from SmartThings sensors."""
+
+    __tablename__ = "indoor_temp_reading"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(100))
+    device_label: Mapped[str | None] = mapped_column(String(200))
+    room: Mapped[str | None] = mapped_column(String(200))
+    temperature: Mapped[float] = mapped_column(Float, nullable=False)

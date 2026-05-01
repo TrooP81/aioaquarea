@@ -12,7 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PlanActionRecord, PlanRecord
+from packages.core.models import PlanActionRecord, PlanRecord, COPRecord, ConsumptionRecord
 from packages.core.services import AquareaWrapper
 from packages.core.settings_service import get_setting
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
@@ -22,6 +22,9 @@ from packages.optimizer.executor import PlanExecutor
 from packages.ml.models import COPModel, DemandModel
 
 logger = structlog.get_logger()
+
+# Minimum data history (days) before trusting ML models in auto mode
+ML_MIN_DATA_DAYS = 14
 
 # Global ML model instances (loaded once, reused across optimization cycles)
 _cop_model = COPModel()
@@ -53,11 +56,46 @@ async def _select_optimizer(layer: str) -> tuple[str, object]:
     if layer == "milp_preferred":
         return "milp", milp
 
-    # auto: use MILP only when ML models are trained (better data = better MILP)
+    # auto: use MILP only when ML models are trained AND have enough data history
     if _cop_model.is_trained and _demand_model.is_trained:
-        return "milp", milp
+        if await _has_sufficient_ml_data():
+            return "milp", milp
+        else:
+            logger.info(
+                "auto_mode_insufficient_data",
+                required_days=ML_MIN_DATA_DAYS,
+                reason="ML models trained but less than 14 days of data history",
+            )
 
     return "rules", RulesOptimizer()
+
+
+async def _has_sufficient_ml_data() -> bool:
+    """Check that we have at least ML_MIN_DATA_DAYS of COP and consumption history."""
+    from sqlalchemy import func, select
+
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=ML_MIN_DATA_DAYS)
+
+    try:
+        async with get_session() as session:
+            cop_result = await session.execute(
+                select(func.count()).select_from(COPRecord).where(COPRecord.ts >= cutoff)
+            )
+            cop_count = cop_result.scalar() or 0
+
+            cons_result = await session.execute(
+                select(func.count()).select_from(ConsumptionRecord).where(
+                    ConsumptionRecord.ts >= cutoff
+                )
+            )
+            cons_count = cons_result.scalar() or 0
+
+        # Require at least some records spanning the period
+        # 14 days × ~4 COP intervals/day = ~56; ~4 consumption records/day = ~56
+        return cop_count >= 50 and cons_count >= 50
+    except Exception as exc:
+        logger.warning("ml_data_check_failed", error=str(exc))
+        return False
 
 
 async def run_optimization() -> None:
