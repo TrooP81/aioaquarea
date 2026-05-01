@@ -146,7 +146,7 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     "manual_price_eur_per_kwh": {
         "type": "float",
         "default": "0.25",
-        "description": "Static electricity price (EUR/kWh) when price provider is 'manual'",
+        "description": "Static electricity price per kWh when provider is 'manual'",
     },
     "manual_outdoor_temp": {
         "type": "float",

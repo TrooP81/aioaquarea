@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { TestConnection } from "../../components/TestConnection";
 import { ComfortSchedule } from "../../components/ComfortSchedule";
+import { useCurrency } from "../../components/useCurrency";
 
 interface SettingMeta {
   value: string;
@@ -72,6 +73,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const { code: currencyCode, symbol: currencySymbol } = useCurrency();
 
   useEffect(() => {
     fetchSettings();
@@ -189,7 +191,9 @@ export default function SettingsPage() {
         <div key={group.title} className="plan-section">
           <h2 className="chart-title">{group.title}</h2>
           <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-            {group.description}
+            {group.title === "Price Provider"
+              ? `Configure how electricity prices are fetched (displaying in ${currencyCode})`
+              : group.description}
           </p>
 
           <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
@@ -197,6 +201,10 @@ export default function SettingsPage() {
               .filter((key) => settings[key] && shouldShowKey(group.title, key))
               .map((key) => {
                 const meta = settings[key];
+                const description =
+                  key === "manual_price_eur_per_kwh"
+                    ? `Static electricity price (${currencyCode}/kWh)`
+                    : meta.description;
                 return (
                   <div key={key} style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
                     <label
@@ -205,9 +213,9 @@ export default function SettingsPage() {
                         fontSize: "0.875rem",
                         color: "var(--text-muted)",
                       }}
-                      title={meta.description}
+                      title={description}
                     >
-                      {meta.description}
+                      {description}
                     </label>
 
                     {meta.options ? (
