@@ -178,27 +178,27 @@ class MILPOptimizer:
         hours = [(prices[h][0]).hour for h in range(H)]
         cops = [cop_fn(temps[h], hours[h]) for h in range(H)]
 
+        # Consistent conversion factor: 200L tank ≈ 0.23 kWh per °C
+        # (water specific heat × mass: 200 kg × 4186 J/(kg·°C) / 3.6e6)
+        kwh_per_degree = 0.23
+        avg_cop = sum(cops) / len(cops) if cops else 3.5
+
         # --- Use thermal model parameters if calibrated ---
         if thermal_model.params.last_calibrated:
-            # Convert thermal model rates (°C/h) to thermal kWh using tank capacity
-            # Typical 200L tank ≈ 0.23 kWh/°C (water specific heat × mass)
-            kwh_per_degree = 0.23
             tank_loss_kwh_per_h = abs(thermal_model.params.tank_standby_loss) * kwh_per_degree
-            # DHW power derived from heating rate and COP
-            avg_cop = sum(cops) / len(cops)
             dhw_thermal_kw = thermal_model.params.tank_heating_rate * kwh_per_degree
-            dhw_power_kw = dhw_thermal_kw / avg_cop if avg_cop > 0 else 2.0
+            dhw_power_kw = dhw_thermal_kw / avg_cop if avg_cop > 0 else 0.27
         else:
-            dhw_power_kw = 2.0
-            tank_loss_kwh_per_h = 0.3
+            # Default: ~5 °C/h heating rate, ~0.5 °C/h standby loss
+            dhw_power_kw = (5.0 * kwh_per_degree) / avg_cop if avg_cop > 0 else 0.27
+            tank_loss_kwh_per_h = 0.5 * kwh_per_degree
 
         sh_max_power_kw = 3.0  # Max electrical input for space heating
 
-        # Tank state (thermal kWh stored)
-        tank_min = settings.tank_min_temp * 0.15
-        tank_max = settings.tank_max_temp * 0.15
-        # Use actual current tank temp to initialize
-        tank_init = max(tank_min, min(tank_max, current_tank_temp * 0.15))
+        # Tank state (thermal kWh stored, using same kwh_per_degree factor)
+        tank_min = settings.tank_min_temp * kwh_per_degree
+        tank_max = settings.tank_max_temp * kwh_per_degree
+        tank_init = max(tank_min, min(tank_max, current_tank_temp * kwh_per_degree))
 
         # --- Problem setup ---
         prob = pulp.LpProblem("HeatPumpCostMin", pulp.LpMinimize)

@@ -36,9 +36,14 @@ def sample_weather():
 
 
 class TestRulesOptimizer:
-    def test_plan_dhw_picks_cheapest_hours(self, sample_prices):
+    def test_plan_dhw_picks_cheapest_hours(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
-        actions = optimizer._plan_dhw(sample_prices, sample_prices[0][0])
+        comfort_schedule = {"weekday": [7, 8, 9, 17, 18, 19, 20, 21], "weekend": [8, 9, 10, 11, 17, 18, 19, 20, 21]}
+        actions = optimizer._plan_dhw(
+            sample_prices, sample_weather, sample_prices[0][0],
+            current_tank_temp=42.0, tank_target=50,
+            current_outdoor_temp=5.0, comfort_schedule=comfort_schedule,
+        )
 
         # Should have DHW actions (on/off pairs)
         dhw_on_actions = [a for a in actions if a["type"] == "force_dhw_on"]
@@ -62,13 +67,21 @@ class TestRulesOptimizer:
 
     def test_plan_preheat_before_cold(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
-        actions = optimizer._plan_preheat(sample_prices, sample_weather, sample_prices[0][0])
+        actions = optimizer._plan_preheat(
+            sample_prices, sample_weather, sample_prices[0][0],
+            current_indoor_temp=20.0, current_outdoor_temp=5.0, current_water_temp=35.0,
+        )
 
         boost_actions = [a for a in actions if a["type"] == "zone_temp_boost"]
         # Should have pre-heat actions since we have sub-zero temps
         assert len(boost_actions) > 0
 
-    def test_no_plan_without_prices(self):
+    def test_no_plan_without_prices(self, sample_weather):
         optimizer = RulesOptimizer()
-        actions = optimizer._plan_dhw([], dt.datetime.now(dt.timezone.utc))
+        comfort_schedule = {"weekday": [7, 8, 9, 17, 18, 19, 20, 21], "weekend": [8, 9, 10, 11, 17, 18, 19, 20, 21]}
+        actions = optimizer._plan_dhw(
+            [], sample_weather, dt.datetime.now(dt.timezone.utc),
+            current_tank_temp=42.0, tank_target=50,
+            current_outdoor_temp=5.0, comfort_schedule=comfort_schedule,
+        )
         assert actions == []

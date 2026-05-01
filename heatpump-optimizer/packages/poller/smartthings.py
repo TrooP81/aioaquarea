@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import logging
 import time
 from typing import Any
 
 import httpx
+import structlog
 
 from packages.core.settings_service import get_setting
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 SMARTTHINGS_API_BASE = "https://api.smartthings.com/v1"
 

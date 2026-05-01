@@ -160,21 +160,47 @@ class COPModel:
         if not consumption_rows:
             return np.array([]), np.array([])
 
+        # Build a lookup of tank_target by hour from status records
+        # Key: (date, hour) -> tank_target_temp
+        status_by_hour: dict[tuple, float] = {}
+        for s in status_rows:
+            if s.tank_target_temp is not None:
+                key = (s.ts.date(), s.ts.hour)
+                status_by_hour[key] = s.tank_target_temp
+
+        # Consumption values are cumulative per day — compute hourly deltas.
+        # Group consecutive records by (device day) and diff them.
         X_list = []
         y_list = []
 
+        prev_row = None
         for row in consumption_rows:
-            total_kwh = (row.heat_kwh or 0) + (row.tank_kwh or 0)
-            if total_kwh <= 0:
-                continue
+            if prev_row is not None and row.ts.date() == prev_row.ts.date():
+                # Same day: delta = current cumulative - previous cumulative
+                delta_kwh = (
+                    ((row.heat_kwh or 0) + (row.tank_kwh or 0))
+                    - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
+                )
+                elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
 
-            outdoor_temp = row.outdoor_temp or 5.0
-            hour = row.ts.hour
-            tank_target = 50  # Default; could match with status
+                # Only use if positive delta and reasonable time gap (15 min to 2 hours)
+                if delta_kwh > 0 and 0.2 <= elapsed_hours <= 2.0:
+                    # Normalize to per-hour consumption
+                    kwh_per_hour = delta_kwh / elapsed_hours
 
-            features = self._make_features(outdoor_temp, tank_target, hour)
-            X_list.append(features)
-            y_list.append(total_kwh)
+                    outdoor_temp = row.outdoor_temp or 5.0
+                    hour = row.ts.hour
+                    # Look up tank_target from nearest status record
+                    tank_target = status_by_hour.get(
+                        (row.ts.date(), hour),
+                        status_by_hour.get((row.ts.date(), hour - 1), 50),
+                    )
+
+                    features = self._make_features(outdoor_temp, int(tank_target), hour)
+                    X_list.append(features)
+                    y_list.append(kwh_per_hour)
+
+            prev_row = row
 
         return np.array(X_list), np.array(y_list)
 
