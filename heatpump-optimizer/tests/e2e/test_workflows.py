@@ -68,15 +68,18 @@ class TestOptimizerWorkflow:
 
         # 3. Dashboard detects override
         resp = await client.get("/api/dashboard")
-        assert resp.json()["has_override"] is True
+        dashboard = resp.json()
+        assert dashboard["has_override"] is True
+        override_id = dashboard["override_id"]
+        assert override_id is not None
 
         # 4. Audit log records the action
         resp = await client.get("/api/audit?limit=5")
         entries = resp.json()
         assert any(e["action"] == "create_override" for e in entries)
 
-        # 5. Cancel override (need to get ID from db — we know it's id=1 since tables are clean)
-        resp = await client.delete("/api/overrides/1")
+        # 5. Cancel override
+        resp = await client.delete(f"/api/overrides/{override_id}")
         assert resp.status_code == 200
 
         # 6. Dashboard no longer shows override

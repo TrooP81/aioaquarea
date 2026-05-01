@@ -132,6 +132,7 @@ class DashboardResponse(BaseModel):
     today_cost_eur: float = 0
     active_plan: Optional[PlanResponse] = None
     has_override: bool = False
+    override_id: Optional[int] = None
 
 
 # --- Routes ---
@@ -185,15 +186,17 @@ async def get_dashboard():
 
         # Active override
         override_result = await session.execute(
-            select(func.count(OverrideRecord.id)).where(
+            select(OverrideRecord.id).where(
                 and_(
                     OverrideRecord.active == True,
                     OverrideRecord.ts_from <= now,
                     OverrideRecord.ts_to >= now,
                 )
             )
+            .order_by(desc(OverrideRecord.id))
+            .limit(1)
         )
-        override_count = override_result.scalar() or 0
+        active_override_id = override_result.scalar_one_or_none()
 
     today_kwh = 0.0
     if consumption_row and consumption_row[0] is not None:
@@ -237,7 +240,8 @@ async def get_dashboard():
         )
         if active_plan
         else None,
-        has_override=override_count > 0,
+        has_override=active_override_id is not None,
+        override_id=active_override_id,
     )
 
 

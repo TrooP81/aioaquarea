@@ -34,6 +34,7 @@ interface DashboardData {
     actions_count: number;
   } | null;
   has_override: boolean;
+  override_id: number | null;
 }
 
 export default function Home() {
@@ -86,6 +87,17 @@ export default function Home() {
     }
   };
 
+  const cancelOverride = async () => {
+    if (!data?.override_id) return;
+    try {
+      const res = await fetch(`/api/overrides/${data.override_id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      await fetchData();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to cancel override");
+    }
+  };
+
   if (loading) {
     return (
       <div className="dashboard">
@@ -133,7 +145,7 @@ export default function Home() {
       {data?.has_override && (
         <div className="override-banner">
           <p>⚠ Manual override active — optimizer paused</p>
-          <button className="btn btn-danger">Cancel Override</button>
+          <button className="btn btn-danger" onClick={cancelOverride}>Cancel Override</button>
         </div>
       )}
 
