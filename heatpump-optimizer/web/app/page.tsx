@@ -9,6 +9,7 @@ import { ForecastChart } from "@/components/ForecastChart";
 import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
 import { PlanView } from "@/components/PlanView";
 import { Controls } from "@/components/Controls";
+import { OptimizerStatus } from "@/components/OptimizerStatus";
 
 interface DashboardData {
   current_status: {
@@ -156,6 +157,7 @@ export default function Home() {
       <ForecastChart />
       <ThermalPredictionChart />
       <PlanView plan={data?.active_plan ?? null} />
+      <OptimizerStatus />
       <Controls />
     </div>
   );

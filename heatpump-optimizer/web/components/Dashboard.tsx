@@ -1,5 +1,7 @@
 "use client";
 
+import { useCurrency, formatPriceCents, formatCost } from "./useCurrency";
+
 interface DashboardProps {
   data: {
     current_status: {
@@ -17,6 +19,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ data }: DashboardProps) {
+  const { symbol } = useCurrency();
   const status = data?.current_status;
 
   return (
@@ -26,9 +29,7 @@ export function Dashboard({ data }: DashboardProps) {
           <span className="card-title">Current Price</span>
         </div>
         <div className="card-value price">
-          {data?.current_price != null
-            ? `€${(data.current_price * 100).toFixed(1)}c`
-            : "—"}
+          {formatPriceCents(data?.current_price, symbol)}
         </div>
         <div className="card-subtitle">per kWh</div>
       </div>
@@ -75,7 +76,7 @@ export function Dashboard({ data }: DashboardProps) {
           {data?.today_kwh?.toFixed(1) ?? "0"} kWh
         </div>
         <div className="card-subtitle">
-          Cost: €{data?.today_cost_eur?.toFixed(2) ?? "0.00"}
+          Cost: {formatCost(data?.today_cost_eur, symbol)}
         </div>
       </div>
 

@@ -135,6 +135,13 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "poll_interval_seconds",
         "description": "Device poll interval (seconds)",
     },
+    # --- Display ---
+    "currency": {
+        "type": "str",
+        "default": "EUR",
+        "description": "Display currency",
+        "options": ["EUR", "GBP", "USD", "SEK", "NOK", "DKK", "CHF", "PLN", "CZK", "HUF"],
+    },
     # --- Manual static values ---
     "manual_price_eur_per_kwh": {
         "type": "float",

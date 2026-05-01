@@ -10,6 +10,7 @@ import {
   Area,
   ComposedChart,
 } from "recharts";
+import { useCurrency } from "./useCurrency";
 
 interface PricePoint {
   ts: string;
@@ -18,6 +19,7 @@ interface PricePoint {
 
 export function PriceChart() {
   const [prices, setPrices] = useState<PricePoint[]>([]);
+  const { symbol } = useCurrency();
 
   useEffect(() => {
     fetch("/api/prices?hours=48")
@@ -44,7 +46,7 @@ export function PriceChart() {
 
   return (
     <div className="chart-container">
-      <div className="chart-title">Electricity Price (€ cents/kWh) — 48h</div>
+      <div className="chart-title">Electricity Price ({symbol} cents/kWh) — 48h</div>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={250}>
           <ComposedChart data={chartData}>

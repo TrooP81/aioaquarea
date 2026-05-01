@@ -672,6 +672,24 @@ async def get_audit_log(limit: int = Query(50, ge=1, le=200)):
     ]
 
 
+# --- Currency ---
+
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "EUR": "€", "GBP": "£", "USD": "$", "SEK": "kr", "NOK": "kr",
+    "DKK": "kr", "CHF": "CHF", "PLN": "zł", "CZK": "Kč", "HUF": "Ft",
+}
+
+
+@app.get("/api/currency")
+async def get_currency():
+    """Get the configured display currency and its symbol."""
+    code = await get_setting("currency") or "EUR"
+    return {
+        "code": code,
+        "symbol": CURRENCY_SYMBOLS.get(code, code),
+    }
+
+
 # --- SmartThings indoor temperature ---
 
 

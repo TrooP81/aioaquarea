@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useCurrency, formatCost } from "./useCurrency";
 
 interface PlanProps {
   plan: {
@@ -22,6 +23,7 @@ interface PlanAction {
 
 export function PlanView({ plan }: PlanProps) {
   const [actions, setActions] = useState<PlanAction[]>([]);
+  const { symbol } = useCurrency();
 
   useEffect(() => {
     if (plan?.id) {
@@ -52,8 +54,7 @@ export function PlanView({ plan }: PlanProps) {
           <h2 className="chart-title">Active Plan</h2>
           {plan ? (
             <p style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>
-              {plan.optimizer_version} • Est. cost: €
-              {plan.cost_estimate_eur?.toFixed(2) ?? "—"} • {plan.actions_count} actions
+              {plan.optimizer_version} • Est. cost: {formatCost(plan.cost_estimate_eur, symbol)} • {plan.actions_count} actions
             </p>
           ) : (
             <p style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>

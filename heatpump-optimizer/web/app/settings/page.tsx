@@ -59,6 +59,11 @@ const SETTING_GROUPS = [
     description: "Data fetch intervals",
     keys: ["poll_interval_seconds"],
   },
+  {
+    title: "Display",
+    description: "Currency and display preferences",
+    keys: ["currency"],
+  },
 ];
 
 export default function SettingsPage() {
