@@ -17,7 +17,7 @@ except ImportError:
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
-from packages.core.settings_service import get_setting
+from packages.core.settings_service import get_setting, dhw_deadlines_from_schedule, get_comfort_schedule
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
@@ -97,6 +97,10 @@ class MILPOptimizer:
         # Build demand estimates: prefer ML model, fall back to constant
         demand_per_hour = self._build_demand_estimates(weather)
 
+        # Get comfort schedule to derive DHW deadlines
+        comfort_schedule = await get_comfort_schedule()
+        dhw_deadlines = dhw_deadlines_from_schedule(comfort_schedule, horizon_start)
+
         # Solve synchronously in a thread to avoid blocking the event loop
         plan = await asyncio.to_thread(
             self._solve,
@@ -106,6 +110,7 @@ class MILPOptimizer:
             demand_per_hour,
             current_tank_temp,
             latest_indoor_temp,
+            dhw_deadlines,
         )
         return plan
 
@@ -154,6 +159,7 @@ class MILPOptimizer:
         demand_per_hour: list[float],
         current_tank_temp: float,
         current_indoor_temp: float | None = None,
+        dhw_deadlines: list[int] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -220,8 +226,8 @@ class MILPOptimizer:
             heat_added = x_dhw[h] * dhw_power_kw * cops[h]
             prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h
 
-        # Tank must be above minimum at deadline hours
-        for ready_hour in settings.dhw_ready_hours:
+        # Tank must be above minimum at comfort-schedule deadline hours
+        for ready_hour in (dhw_deadlines or []):
             if ready_hour < H:
                 prob += tank_state[ready_hour] >= tank_min * 1.2
 

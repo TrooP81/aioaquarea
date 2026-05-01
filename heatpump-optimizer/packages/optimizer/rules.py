@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
-from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour
+from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour, dhw_deadlines_from_schedule, get_comfort_schedule
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 
@@ -94,10 +94,15 @@ class RulesOptimizer:
 
         actions = []
 
+        # Fetch comfort schedule early — used by DHW shifting and eco/comfort rules
+        learned_threshold = float(await get_setting("learned_schedule_threshold") or 0.3)
+        comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
+
         # --- Rule 1: DHW shifting (thermal-model-aware) ---
         dhw_actions = self._plan_dhw(
             prices, weather, horizon_start,
             current_tank_temp, tank_target, current_outdoor_temp,
+            comfort_schedule,
         )
         actions.extend(dhw_actions)
 
@@ -119,10 +124,8 @@ class RulesOptimizer:
         actions.extend(quiet_actions)
 
         # --- Rule 5: Eco/Comfort mode based on schedule + price ---
-        learned_threshold = float(await get_setting("learned_schedule_threshold") or 0.3)
         comfort_override_pct = int(await get_setting("price_comfort_override_pct") or 90)
         eco_upgrade_pct = int(await get_setting("price_eco_upgrade_pct") or 25)
-        comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
         eco_actions = self._plan_eco_comfort(
             prices, horizon_start, comfort_schedule,
             comfort_override_pct, eco_upgrade_pct,
@@ -154,13 +157,13 @@ class RulesOptimizer:
         current_tank_temp: float,
         tank_target: int,
         current_outdoor_temp: float,
+        comfort_schedule: dict[str, list[int]],
     ) -> list[dict]:
         """
         Schedule DHW heating using thermal model predictions.
 
-        Instead of a fixed 2-hour window, calculates exactly how long
-        heating will take based on current tank temp, target, and outdoor conditions.
-        Then finds the cheapest contiguous slot that fits.
+        Deadlines are derived from the comfort schedule: the tank must be
+        at temperature by the start of each contiguous comfort block.
         """
         actions = []
 
@@ -180,7 +183,10 @@ class RulesOptimizer:
             outdoor_temp=current_outdoor_temp,
         )
 
-        for ready_hour in settings.dhw_ready_hours:
+        # Derive deadlines from the comfort schedule
+        ready_hours = dhw_deadlines_from_schedule(comfort_schedule, horizon_start)
+
+        for ready_hour in ready_hours:
             deadline = horizon_start.replace(hour=ready_hour, minute=0)
             if deadline <= horizon_start:
                 deadline += dt.timedelta(days=1)

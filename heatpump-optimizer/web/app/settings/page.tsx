@@ -43,7 +43,7 @@ const SETTING_GROUPS = [
   {
     title: "Optimizer Constraints",
     description: "Temperature and scheduling boundaries",
-    keys: ["tank_min_temp", "tank_max_temp", "comfort_temp_min", "comfort_temp_max", "dhw_ready_by_hours"],
+    keys: ["tank_min_temp", "tank_max_temp", "comfort_temp_min", "comfort_temp_max"],
   },
   {
     title: "Quiet Mode",

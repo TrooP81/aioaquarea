@@ -96,11 +96,6 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "comfort_temp_max",
         "description": "Comfort zone maximum (°C)",
     },
-    "dhw_ready_by_hours": {
-        "type": "str",
-        "default_env": "dhw_ready_by_hours",
-        "description": "DHW ready-by hours (comma-separated)",
-    },
     # --- Quiet mode ---
     "quiet_mode_start": {
         "type": "int",
@@ -311,6 +306,25 @@ def is_comfort_hour(schedule: dict[str, list[int]], ts: "dt.datetime") -> bool:
     # Monday=0 ... Sunday=6; weekday = Mon-Fri
     day_type = "weekday" if ts.weekday() < 5 else "weekend"
     return ts.hour in schedule.get(day_type, [])
+
+
+def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: "dt.datetime") -> list[int]:
+    """
+    Derive DHW ready-by hours from the comfort schedule.
+
+    Returns the first hour of each contiguous comfort block for the day type
+    of `ts`. The tank must be at temperature by the start of each comfort block.
+    """
+    day_type = "weekday" if ts.weekday() < 5 else "weekend"
+    hours = sorted(set(schedule.get(day_type, [])))
+    if not hours:
+        return []
+
+    deadlines = [hours[0]]
+    for i in range(1, len(hours)):
+        if hours[i] - hours[i - 1] > 1:
+            deadlines.append(hours[i])
+    return deadlines
 
 
 async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:

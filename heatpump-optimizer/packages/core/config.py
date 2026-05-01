@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     tank_max_temp: int = 55
     comfort_temp_min: float = 20.0
     comfort_temp_max: float = 22.0
-    dhw_ready_by_hours: str = "6,18"
 
     # App
     secret_key: str = "change-this-to-a-random-string"
@@ -42,10 +41,6 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 300
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
-
-    @property
-    def dhw_ready_hours(self) -> list[int]:
-        return [int(h.strip()) for h in self.dhw_ready_by_hours.split(",")]
 
 
 settings = Settings()
