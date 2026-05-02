@@ -20,6 +20,7 @@ interface PlanAction {
   payload: Record<string, any>;
   status: string;
   executed_at: string | null;
+  result: Record<string, any> | null;
 }
 
 const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
@@ -33,6 +34,53 @@ const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
   eco_mode:         { emoji: "🌿", label: "Eco Mode" },
   comfort_mode:     { emoji: "☀️", label: "Comfort Mode" },
 };
+
+function formatReason(payload: Record<string, any>): string | null {
+  const reason = payload?.reason;
+  if (!reason || typeof reason !== "string") return null;
+
+  // thermal_optimized_before_7:00
+  const thermalMatch = reason.match(/^thermal_optimized_before_(\d+:\d+)$/);
+  if (thermalMatch) return `Cheapest slot before ${thermalMatch[1]} comfort window`;
+
+  // peak_price_0.3000_eur_kwh
+  const peakMatch = reason.match(/^peak_price_([\d.]+)_eur_kwh$/);
+  if (peakMatch) return `Price peak at ${parseFloat(peakMatch[1]).toFixed(2)} /kWh`;
+
+  // comfort_hour_but_peak_price_0.3000
+  const comfortPeakMatch = reason.match(/^comfort_hour_but_peak_price_([\d.]+)$/);
+  if (comfortPeakMatch) return `Comfort hour skipped — price at ${parseFloat(comfortPeakMatch[1]).toFixed(2)} /kWh`;
+
+  // eco_hour_but_cheap_price_0.0500
+  const ecoUpgradeMatch = reason.match(/^eco_hour_but_cheap_price_([\d.]+)$/);
+  if (ecoUpgradeMatch) return `Eco upgraded — cheap price ${parseFloat(ecoUpgradeMatch[1]).toFixed(2)} /kWh`;
+
+  const REASON_MAP: Record<string, string> = {
+    dhw_target_reached: "Tank reached target temperature",
+    thermal_preheat_before_cold: "Pre-heating before forecast cold spell",
+    preheat_complete: "Pre-heat complete",
+    peak_avoidance_end: "Peak price window ended",
+    night_quiet_schedule: "Night quiet hours",
+    night_quiet_end: "Night quiet hours ended",
+    comfort_schedule: "Comfort schedule active",
+    outside_comfort_schedule: "Outside comfort hours",
+  };
+
+  if (REASON_MAP[reason]) return REASON_MAP[reason];
+
+  // Fallback: humanize underscore-separated string
+  return reason.replace(/_/g, " ");
+}
+
+function formatPayloadExtras(payload: Record<string, any>): string | null {
+  const extras: string[] = [];
+  if (payload?.predicted_minutes != null) extras.push(`~${payload.predicted_minutes} min heating`);
+  if (payload?.heating_rate != null) extras.push(`${payload.heating_rate} °C/h`);
+  if (payload?.confidence != null) extras.push(`${Math.round(payload.confidence * 100)}% confidence`);
+  if (payload?.offset != null) extras.push(`${payload.offset > 0 ? "+" : ""}${payload.offset} °C`);
+  if (payload?.level != null) extras.push(`level ${payload.level}`);
+  return extras.length > 0 ? extras.join(" · ") : null;
+}
 
 const STATUS_DISPLAY: Record<string, { text: string; className: string }> = {
   pending:              { text: "Scheduled",           className: "pending" },
@@ -48,6 +96,53 @@ function effectiveStatus(action: PlanAction): string {
     return "expired";
   }
   return action.status;
+}
+
+/**
+ * Explain WHY an action ended up in its current state.
+ * Covers executed, failed, expired (not-executed), and still-pending actions.
+ */
+function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: boolean): string | null {
+  const result = action.result;
+
+  switch (eStatus) {
+    case "executed":
+      if (result?.verified === true) return "Sent to heat pump and verified";
+      return "Sent to heat pump successfully";
+
+    case "executed_unverified":
+      return "Sent to heat pump but state change could not be confirmed";
+
+    case "failed": {
+      const err = result?.error;
+      if (typeof err === "string") {
+        // Humanize common errors
+        if (err.includes("timeout") || err.includes("Timeout")) return "Heat pump did not respond in time";
+        if (err.includes("connection") || err.includes("Connection")) return "Lost connection to heat pump";
+        if (err.includes("rate") || err.includes("Rate")) return "API rate limit reached";
+        return `Error: ${err}`;
+      }
+      return "Execution failed (no details recorded)";
+    }
+
+    case "expired": {
+      // The action was pending but its time has passed — figure out why
+      if (!isLatestPlan) {
+        return "Superseded by a newer plan before this action's scheduled time";
+      }
+      // Still the latest plan but time passed — likely override was active or executor was down
+      return "Scheduled time passed without execution — optimizer may have been paused or offline";
+    }
+
+    case "skipped":
+      return "Skipped by the optimizer";
+
+    case "pending":
+      return "Waiting to execute at scheduled time";
+
+    default:
+      return null;
+  }
 }
 
 const LAYER_LABELS: Record<string, string> = {
@@ -203,27 +298,47 @@ export function PlanHistory() {
                         const status = STATUS_DISPLAY[eStatus] || { text: eStatus, className: "" };
                         const isDone = eStatus === "executed" || eStatus === "executed_unverified";
                         const isExpired = eStatus === "expired";
+                        const isFailed = eStatus === "failed";
+                        const reason = formatReason(action.payload);
+                        const extras = formatPayloadExtras(action.payload);
+                        const isLatest = plans.length > 0 && plan.id === plans[0].id;
+                        const explanation = statusExplanation(action, eStatus, isLatest);
                         return (
                           <div
                             key={action.id}
-                            className="plan-action"
+                            className="plan-action plan-action--history"
                             style={{ opacity: isDone || isExpired ? 0.5 : 1 }}
                           >
-                            <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
-                            <span className="plan-action-type">
-                              {info ? (
-                                <>
-                                  <span role="img" aria-label={info.label}>{info.emoji}</span>{" "}
-                                  {info.label}
-                                </>
-                              ) : action.action_type}
-                            </span>
-                            {action.executed_at && (
-                              <span className="plan-history-executed-at">
-                                ran {formatTime(action.executed_at)}
+                            <div className="plan-action-main-row">
+                              <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
+                              <span className="plan-action-type">
+                                {info ? (
+                                  <>
+                                    <span role="img" aria-label={info.label}>{info.emoji}</span>{" "}
+                                    {info.label}
+                                  </>
+                                ) : action.action_type}
                               </span>
+                              {action.executed_at && (
+                                <span className="plan-history-executed-at">
+                                  ran {formatTime(action.executed_at)}
+                                </span>
+                              )}
+                              <span className={`plan-action-status ${status.className}`}>{status.text}</span>
+                            </div>
+                            {(reason || extras) && (
+                              <div className="plan-action-reason-row">
+                                {reason && <span className="plan-action-reason">{reason}</span>}
+                                {extras && <span className="plan-action-extras">{extras}</span>}
+                              </div>
                             )}
-                            <span className={`plan-action-status ${status.className}`}>{status.text}</span>
+                            {(isExpired || isFailed) && explanation && (
+                              <div className="plan-action-reason-row plan-action-explanation-row">
+                                <span className={`plan-action-explanation ${isFailed ? "plan-action-explanation--failed" : ""}`}>
+                                  {isFailed ? "⚠ " : "ℹ "}{explanation}
+                                </span>
+                              </div>
+                            )}
                           </div>
                         );
                       })}

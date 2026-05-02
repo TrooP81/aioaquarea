@@ -467,6 +467,7 @@ async def get_plan_detail(plan_id: int):
                 "payload": json.loads(a.payload_json) if a.payload_json else {},
                 "status": a.status,
                 "executed_at": a.executed_at.isoformat() if a.executed_at else None,
+                "result": json.loads(a.result_json) if a.result_json else None,
             }
             for a in actions
         ],
