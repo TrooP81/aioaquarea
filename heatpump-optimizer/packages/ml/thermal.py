@@ -326,13 +326,16 @@ class ThermalModel:
                 confidence="learned" if self.params.last_calibrated else "default",
             )
 
-        delta_until_min = current_temp - min_temp
+        # Can't cool below outdoor temperature
+        effective_min = max(min_temp, outdoor_temp)
+
+        delta_until_min = current_temp - effective_min
         if delta_until_min <= 0:
             return ThermalPrediction(
                 current_temp=current_temp,
                 target_temp=min_temp,
                 outdoor_temp=outdoor_temp,
-                estimated_minutes=0.0,
+                estimated_minutes=0.0 if current_temp <= min_temp else float("inf"),
                 heating_rate_per_hour=loss_rate,
                 confidence="learned" if self.params.last_calibrated else "default",
             )
@@ -418,7 +421,13 @@ class ThermalModel:
                     temp = target_temp
                     state = "standby"
             else:
-                temp += loss_rate
+                # Scale loss by delta-T: loss slows as temp approaches outdoor
+                # (Newton's law of cooling). Reference delta is 30°C.
+                delta = max(temp - outdoor_temp, 0.0)
+                scale = delta / 30.0 if delta < 30.0 else 1.0
+                temp += loss_rate * scale
+                # Can never cool below outdoor temperature
+                temp = max(temp, outdoor_temp)
 
             curve.append({
                 "hour": h + 1,
@@ -471,7 +480,7 @@ class ThermalModel:
             self.params.tank_standby_loss
             + self.params.tank_loss_outdoor_factor * outdoor_temp
         )
-        return min(0.0, loss)  # Always negative or zero
+        return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
     def _zone_heating_rate(self, outdoor_temp: float) -> float:
         """Zone heating rate (°C/hour)."""
@@ -485,7 +494,7 @@ class ThermalModel:
             self.params.zone_standby_loss
             + self.params.zone_loss_outdoor_factor * outdoor_temp
         )
-        return min(0.0, loss)
+        return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
 
 # Singleton instance

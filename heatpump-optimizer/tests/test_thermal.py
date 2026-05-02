@@ -139,6 +139,33 @@ class TestTemperatureCurve:
         assert curve[-1]["predicted_temp"] < curve[0]["predicted_temp"]
         assert all(entry["state"] == "standby" for entry in curve)
 
+    def test_standby_curve_never_below_outdoor(self):
+        """Tank can never cool below outdoor temperature."""
+        model = ThermalModel()
+        curve = model.predict_temperature_curve(
+            current_temp=50.0, outdoor_temp=5.0, hours=168, is_tank=True  # 7 days
+        )
+        for entry in curve:
+            assert entry["predicted_temp"] >= 5.0, (
+                f"hour {entry['hour']}: {entry['predicted_temp']}°C is below "
+                f"outdoor temp 5.0°C"
+            )
+
+    def test_standby_curve_loss_slows_near_outdoor(self):
+        """Loss rate should diminish as temp approaches outdoor (Newton's law)."""
+        model = ThermalModel()
+        curve = model.predict_temperature_curve(
+            current_temp=50.0, outdoor_temp=10.0, hours=48, is_tank=True
+        )
+        # Hourly drops should decrease over time
+        drops = [
+            curve[i]["predicted_temp"] - curve[i + 1]["predicted_temp"]
+            for i in range(len(curve) - 1)
+            if curve[i + 1]["predicted_temp"] > 10.0  # still above outdoor
+        ]
+        if len(drops) > 2:
+            assert drops[0] >= drops[-1], "Loss should slow as temp approaches outdoor"
+
     def test_heating_then_standby_curve(self):
         model = ThermalModel()
         curve = model.predict_temperature_curve(
@@ -258,6 +285,12 @@ class TestInternalRates:
         model.params.tank_heating_rate = 0.5
         model.params.tank_heating_outdoor_factor = 0.0
         assert model._tank_heating_rate(-20.0) == 1.0
+
+    def test_tank_loss_rate_capped(self):
+        """Tank loss rate should be capped to -3.0 maximum."""
+        model = ThermalModel()
+        model.params.tank_standby_loss = -10.0
+        assert model._tank_loss_rate(0.0) == -3.0
 
     def test_tank_loss_rate_never_positive(self):
         """Tank loss rate should always be <= 0."""

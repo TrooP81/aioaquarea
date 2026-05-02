@@ -30,23 +30,29 @@ def upgrade() -> None:
     if not has_timescale:
         return
 
-    # Add retention policies (idempotent — will raise if already exists, which is fine)
+    # Only apply retention to tables that are actually hypertables
     policies = [
         ("device_status", "90 days"),
         ("weather", "90 days"),
-        ("indoor_temp_readings", "90 days"),
+        ("indoor_temp_reading", "90 days"),
         ("prices", "365 days"),
         ("consumption", "365 days"),
     ]
 
     for table, interval in policies:
-        try:
+        # Check if the table is a hypertable before adding a policy;
+        # a failed SQL in PostgreSQL aborts the whole transaction.
+        is_hypertable = conn.execute(text(
+            "SELECT EXISTS("
+            "  SELECT 1 FROM timescaledb_information.hypertables"
+            "  WHERE hypertable_name = :tbl"
+            ")"
+        ), {"tbl": table}).scalar()
+
+        if is_hypertable:
             conn.execute(text(
                 f"SELECT add_retention_policy('{table}', INTERVAL '{interval}', if_not_exists => true)"
             ))
-        except Exception:
-            # Table might not be a hypertable
-            pass
 
 
 def downgrade() -> None:
@@ -58,8 +64,13 @@ def downgrade() -> None:
     if not result.scalar():
         return
 
-    for table in ("device_status", "weather", "indoor_temp_readings", "prices", "consumption"):
-        try:
+    for table in ("device_status", "weather", "indoor_temp_reading", "prices", "consumption"):
+        is_hypertable = conn.execute(text(
+            "SELECT EXISTS("
+            "  SELECT 1 FROM timescaledb_information.hypertables"
+            "  WHERE hypertable_name = :tbl"
+            ")"
+        ), {"tbl": table}).scalar()
+
+        if is_hypertable:
             conn.execute(text(f"SELECT remove_retention_policy('{table}', if_exists => true)"))
-        except Exception:
-            pass
