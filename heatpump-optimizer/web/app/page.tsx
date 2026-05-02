@@ -8,6 +8,8 @@ import { ConsumptionChart } from "@/components/ConsumptionChart";
 import { ForecastChart } from "@/components/ForecastChart";
 import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
 import { PlanView } from "@/components/PlanView";
+import { PlanHistory } from "@/components/PlanHistory";
+import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
 
@@ -154,13 +156,15 @@ export default function Home() {
       )}
 
       <Dashboard data={data} />
+      <NextActionCard plan={data?.active_plan ?? null} />
       <OptimizerStatus />
+      <PlanView plan={data?.active_plan ?? null} />
+      <PlanHistory />
       <PriceChart />
       <TemperatureChart />
       <ConsumptionChart />
       <ForecastChart />
       <ThermalPredictionChart />
-      <PlanView plan={data?.active_plan ?? null} />
       <Controls />
     </div>
   );

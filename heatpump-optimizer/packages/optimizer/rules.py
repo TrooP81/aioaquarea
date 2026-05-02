@@ -399,6 +399,11 @@ class RulesOptimizer:
         if not prices:
             return actions
 
+        # When prices are flat (e.g. manual provider), there are no peaks to avoid
+        unique_prices = set(p for _, p in prices)
+        if len(unique_prices) <= 1:
+            return actions
+
         # Find the top 5% most expensive hours
         sorted_prices = sorted(prices, key=lambda x: x[1], reverse=True)
         n_expensive = max(1, len(sorted_prices) // 20)  # top 5%
@@ -488,6 +493,10 @@ class RulesOptimizer:
         p_eco = price_values[max(0, len(price_values) * eco_upgrade_pct // 100 - 1)]
         p_comfort = price_values[min(len(price_values) - 1, len(price_values) * comfort_override_pct // 100)]
 
+        # When prices are flat (e.g. manual provider), price-based overrides
+        # are meaningless — just follow the comfort schedule directly.
+        flat_price = len(set(price_values)) <= 1
+
         current_mode = None  # Track mode to avoid redundant switches
 
         for ts, price in prices:
@@ -495,7 +504,8 @@ class RulesOptimizer:
 
             if scheduled_comfort:
                 # Comfort hour — but override to normal if price is extreme
-                if price >= p_comfort:
+                # (skip override when prices are flat)
+                if not flat_price and price >= p_comfort:
                     target_mode = "normal"
                     reason = f"comfort_hour_but_peak_price_{price:.4f}"
                 else:
@@ -503,7 +513,8 @@ class RulesOptimizer:
                     reason = "comfort_schedule"
             else:
                 # Non-comfort hour — eco unless price is very cheap
-                if price <= p_eco:
+                # (skip upgrade when prices are flat)
+                if not flat_price and price <= p_eco:
                     target_mode = "normal"
                     reason = f"eco_hour_but_cheap_price_{price:.4f}"
                 else:

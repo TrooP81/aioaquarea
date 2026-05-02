@@ -85,3 +85,44 @@ class TestRulesOptimizer:
             current_outdoor_temp=5.0, comfort_schedule=comfort_schedule,
         )
         assert actions == []
+
+
+class TestFlatPriceOptimizer:
+    """Verify that flat (manual) pricing skips price-based logic."""
+
+    @pytest.fixture
+    def flat_prices(self):
+        """24 hours of identical prices (simulates manual provider)."""
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        return [(base + dt.timedelta(hours=h), 0.25) for h in range(24)]
+
+    @pytest.fixture
+    def sample_weather(self):
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        temps = [
+            3, 2, 1, 0, -1, -1,
+            0, 2, 5, 8, 10, 12,
+            13, 14, 14, 13, 11, 9,
+            7, 5, 4, 3, 3, 2,
+        ]
+        return [(base + dt.timedelta(hours=h), t) for h, t in enumerate(temps)]
+
+    def test_peak_avoidance_skipped_for_flat_price(self, flat_prices, sample_weather):
+        optimizer = RulesOptimizer()
+        actions = optimizer._plan_peak_avoidance(flat_prices, sample_weather, flat_prices[0][0])
+        # With identical prices there are no peaks — should produce no actions
+        assert actions == []
+
+    def test_eco_comfort_follows_schedule_for_flat_price(self, flat_prices):
+        optimizer = RulesOptimizer()
+        comfort_schedule = {"weekday": [7, 8, 9, 17, 18, 19, 20, 21], "weekend": [8, 9, 10, 11, 17, 18, 19, 20, 21]}
+        actions = optimizer._plan_eco_comfort(
+            flat_prices, flat_prices[0][0], comfort_schedule,
+        )
+        # All comfort hours should produce comfort_mode_on, not "normal" overrides
+        for a in actions:
+            if a["type"] == "comfort_mode_on":
+                assert "peak_price" not in a["payload"].get("reason", "")
+            # No eco hours should be "upgraded" due to cheap price
+            if a["type"] == "eco_mode_off":
+                assert "cheap_price" not in a["payload"].get("reason", "")

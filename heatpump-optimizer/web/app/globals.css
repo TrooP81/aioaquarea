@@ -138,8 +138,61 @@ body {
 .plan-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   margin-bottom: 1rem;
+}
+
+.plan-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.plan-layer-badge {
+  padding: 0.2rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: help;
+}
+
+.plan-cost-highlight {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.plan-cost-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.plan-cost-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.plan-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+.plan-meta-sep {
+  color: var(--border);
+}
+
+.plan-empty-msg {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  margin-top: 0.25rem;
 }
 
 .plan-actions {
@@ -156,16 +209,35 @@ body {
   background: var(--bg);
   border-radius: 0.5rem;
   font-size: 0.875rem;
+  border-left: 3px solid transparent;
+  padding-left: 0.5rem;
+}
+
+.plan-action--next {
+  border-left-color: var(--accent);
 }
 
 .plan-action-time {
   color: var(--text-muted);
   font-family: monospace;
-  min-width: 5rem;
+  min-width: 3.5rem;
+  font-size: 0.8rem;
 }
 
 .plan-action-type {
   font-weight: 500;
+}
+
+.plan-action-payload {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.plan-action-relative {
+  font-size: 0.7rem;
+  color: var(--accent);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .plan-action-status {
@@ -173,6 +245,7 @@ body {
   font-size: 0.75rem;
   padding: 0.125rem 0.5rem;
   border-radius: 4px;
+  white-space: nowrap;
 }
 
 .plan-action-status.pending {
@@ -188,6 +261,158 @@ body {
 .plan-action-status.failed {
   background: rgba(239, 68, 68, 0.15);
   color: var(--danger);
+}
+
+.plan-action-status.skipped {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+}
+
+/* Next action callout */
+.plan-next-callout {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  background: rgba(59,130,246,0.08);
+  border-radius: 0.5rem;
+  border: 1px solid rgba(59,130,246,0.2);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.plan-next-badge {
+  font-size: 0.7rem;
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.plan-next-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.plan-next-time {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.plan-next-relative {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* Time-of-day group dividers */
+.plan-time-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.plan-time-divider span {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.plan-time-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* Show all / collapse button */
+.plan-show-all-btn {
+  display: block;
+  width: 100%;
+  padding: 0.5rem;
+  margin-top: 0.5rem;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 0.5rem;
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.plan-show-all-btn:hover {
+  background: rgba(59,130,246,0.08);
+}
+
+/* Loading skeleton */
+.plan-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.plan-loading-skeleton {
+  height: 2.5rem;
+  border-radius: 0.5rem;
+  background: linear-gradient(90deg, var(--bg) 25%, var(--border) 50%, var(--bg) 75%);
+  background-size: 200% 100%;
+  animation: plan-shimmer 1.5s infinite;
+}
+
+@keyframes plan-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Error state */
+.plan-error {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: 0.5rem;
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+
+/* Next action card (dashboard summary) */
+.next-action-card {
+  border-left: 3px solid var(--accent);
+}
+
+.next-action-card--empty {
+  border-left-color: var(--border);
+}
+
+.next-action-countdown {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(59,130,246,0.12);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+}
+
+.next-action-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.next-action-emoji {
+  font-size: 1.5rem;
+}
+
+.next-action-label {
+  font-size: 1.25rem;
+  font-weight: 600;
 }
 
 .controls {
@@ -261,4 +486,168 @@ body {
 .tab.active {
   color: var(--accent);
   border-bottom-color: var(--accent);
+}
+
+/* ── Responsive: plan & next-action ── */
+@media (max-width: 640px) {
+  .plan-section {
+    padding: 1rem;
+  }
+
+  .plan-action {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .plan-action-time {
+    min-width: auto;
+  }
+
+  .plan-action-status {
+    margin-left: 0;
+  }
+
+  .plan-action-payload {
+    width: 100%;
+  }
+
+  .plan-next-callout {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .plan-next-time {
+    margin-left: 0;
+  }
+
+  .plan-cost-value {
+    font-size: 1.25rem;
+  }
+
+  .plan-meta-row {
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .plan-meta-sep {
+    display: none;
+  }
+
+  .next-action-label {
+    font-size: 1rem;
+  }
+
+  .next-action-emoji {
+    font-size: 1.25rem;
+  }
+}
+
+/* ── Plan History ── */
+.plan-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.plan-history-item {
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-history-item:last-child {
+  border-bottom: none;
+}
+
+.plan-history-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+  padding: 0.75rem 0.5rem;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.plan-history-row:hover {
+  background: rgba(59,130,246,0.05);
+}
+
+.plan-history-date {
+  min-width: 9rem;
+  color: var(--text-muted);
+  font-family: monospace;
+  font-size: 0.8rem;
+}
+
+.plan-history-horizon {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.plan-history-layer {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+  background: rgba(148,163,184,0.15);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.plan-history-cost {
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.plan-history-count {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.plan-history-chevron {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.plan-history-detail {
+  padding: 0 0.5rem 0.75rem;
+}
+
+.plan-history-summary {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+  flex-wrap: wrap;
+}
+
+.plan-history-executed-at {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .plan-history-row {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .plan-history-date {
+    min-width: auto;
+    width: 100%;
+  }
+
+  .plan-history-horizon {
+    display: none;
+  }
 }

@@ -147,6 +147,18 @@ test.describe("Plan View", () => {
 
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
+
+    // Next action card should be visible in dashboard area
+    await expect(page.locator(".next-action-card").first()).toBeVisible({ timeout: 10000 });
+
+    // Active Plan section should show the plan header
+    await expect(page.locator("text=Active Plan")).toBeVisible();
+
+    // Should show human-readable status "Scheduled" instead of raw "pending"
+    await expect(page.locator("text=Scheduled").first()).toBeVisible({ timeout: 5000 });
+
+    // Should show human-readable action label
+    await expect(page.locator("text=Hot Water Heating ON").first()).toBeVisible();
   });
 
   test("handles no active plan gracefully", async ({ page }) => {
@@ -171,5 +183,35 @@ test.describe("Plan View", () => {
     // Should not crash — page loads normally
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     await expect(page.locator(".status-badge.online")).toBeVisible();
+    // Empty next action card should be present
+    await expect(page.locator(".next-action-card--empty")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("shows error state when plan actions fail to load", async ({ page }) => {
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockDashboard),
+      })
+    );
+    await page.route("**/api/prices*", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+    );
+    await page.route("**/api/consumption*", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+    );
+    // Plan actions endpoint returns 500
+    await page.route("**/api/plans/**", (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: "{}" })
+    );
+    await page.route("**/api/plans", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+    );
+
+    await page.goto("/");
+    await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
+    // Should display error message instead of empty list
+    await expect(page.locator(".plan-error")).toBeVisible({ timeout: 5000 });
   });
 });

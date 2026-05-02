@@ -24,22 +24,107 @@ interface PlanAction {
   executed_at: string | null;
 }
 
+/* ── User-facing optimizer tier labels ── */
 const LAYER_LABELS: Record<string, string> = {
-  rules_v3: "Rules Engine",
-  milp_v1: "MILP Optimizer",
-  "milp_v1+ml": "MILP + ML",
+  rules_v3: "Basic",
+  milp_v1: "Smart",
+  "milp_v1+ml": "Advanced",
 };
+
+const LAYER_TOOLTIPS: Record<string, string> = {
+  rules_v3: "Rule-based scheduling using price windows",
+  milp_v1: "Mathematical optimisation across the full horizon",
+  "milp_v1+ml": "Mathematical optimisation enhanced with machine-learning predictions",
+};
+
+/* ── Action labels: emoji + accessible text ── */
+const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
+  force_dhw_on:     { emoji: "🔥", label: "Hot Water Heating ON" },
+  force_dhw_off:    { emoji: "⏹", label: "Hot Water Heating OFF" },
+  quiet_mode_on:    { emoji: "🤫", label: "Quiet Mode ON" },
+  quiet_mode_off:   { emoji: "🔊", label: "Quiet Mode OFF" },
+  zone_temp_boost:  { emoji: "⬆️", label: "Zone Temp Boost +2 °C" },
+  zone_temp_restore:{ emoji: "↩️", label: "Zone Temp Restore" },
+  set_tank_temp:    { emoji: "🌡️", label: "Set Tank Temperature" },
+  eco_mode:         { emoji: "🌿", label: "Eco Mode" },
+  comfort_mode:     { emoji: "☀️", label: "Comfort Mode" },
+};
+
+/* ── Status display mapping ── */
+const STATUS_DISPLAY: Record<string, { text: string; className: string }> = {
+  pending:              { text: "Scheduled",        className: "pending" },
+  executed:             { text: "Done",             className: "executed" },
+  executed_unverified:  { text: "Done (unconfirmed)", className: "executed" },
+  failed:               { text: "Failed",           className: "failed" },
+  skipped:              { text: "Skipped",          className: "skipped" },
+};
+
+/* ── Payload key → human-readable + unit ── */
+const PAYLOAD_LABELS: Record<string, { label: string; unit: string }> = {
+  target_temp:     { label: "Target", unit: "°C" },
+  tank_temp:       { label: "Tank target", unit: "°C" },
+  zone_temp:       { label: "Zone target", unit: "°C" },
+  duration_min:    { label: "Duration", unit: "min" },
+  temperature:     { label: "Temperature", unit: "°C" },
+};
+
+/* ── Time-of-day groups ── */
+type TimeGroup = "morning" | "afternoon" | "evening" | "night";
+function getTimeGroup(iso: string): TimeGroup {
+  const h = new Date(iso).getHours();
+  if (h >= 6 && h < 12) return "morning";
+  if (h >= 12 && h < 18) return "afternoon";
+  if (h >= 18 && h < 22) return "evening";
+  return "night";
+}
+const TIME_GROUP_LABELS: Record<TimeGroup, string> = {
+  morning: "Morning",
+  afternoon: "Afternoon",
+  evening: "Evening",
+  night: "Night",
+};
+
+/* ── Helpers ── */
+function formatRelativeTime(iso: string): string {
+  const diffMs = new Date(iso).getTime() - Date.now();
+  if (diffMs < 0) return "now";
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "< 1 min";
+  if (mins < 60) return `in ${mins} min`;
+  const hrs = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  if (remainMins === 0) return `in ${hrs} h`;
+  return `in ${hrs} h ${remainMins} min`;
+}
+
+function formatTime(iso: string | undefined): string {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function formatPayload(payload: Record<string, any>): string {
+  return Object.entries(payload)
+    .map(([k, v]) => {
+      const meta = PAYLOAD_LABELS[k];
+      if (meta) return `${meta.label}: ${v} ${meta.unit}`;
+      return `${k.replace(/_/g, " ")}: ${v}`;
+    })
+    .join(", ");
+}
+
+const DEFAULT_VISIBLE = 12;
+
+/* ── Sub-components ── */
 
 function LayerBadge({ version }: { version: string }) {
   const isMl = version.includes("ml");
   const isMilp = version.includes("milp");
+  const tooltip = LAYER_TOOLTIPS[version] || version;
   return (
     <span
+      title={tooltip}
+      className="plan-layer-badge"
       style={{
-        padding: "0.2rem 0.6rem",
-        borderRadius: "9999px",
-        fontSize: "0.7rem",
-        fontWeight: 600,
         background: isMl
           ? "rgba(34,197,94,0.15)"
           : isMilp
@@ -60,8 +145,15 @@ function LayerBadge({ version }: { version: string }) {
 function ProgressBar({ completed, total }: { completed: number; total: number }) {
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem" }}>
+    <div
+      style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem" }}
+    >
       <div
+        role="progressbar"
+        aria-valuenow={completed}
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-label={`${completed} of ${total} actions completed`}
         style={{
           flex: 1,
           height: 6,
@@ -80,140 +172,206 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
           }}
         />
       </div>
-      <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+      <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
         {completed}/{total} done
       </span>
     </div>
   );
 }
 
+function ActionRow({
+  action,
+  isNext,
+}: {
+  action: PlanAction;
+  isNext: boolean;
+}) {
+  const info = ACTION_LABELS[action.action_type];
+  const status = STATUS_DISPLAY[action.status] || { text: action.status, className: "" };
+  const isDone = action.status === "executed" || action.status === "executed_unverified";
+  const hasPayload = action.payload && Object.keys(action.payload).length > 0;
+
+  return (
+    <div
+      className={`plan-action ${isNext ? "plan-action--next" : ""}`}
+      style={{ opacity: isDone ? 0.6 : 1 }}
+    >
+      <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
+      <span className="plan-action-type">
+        {info ? (
+          <>
+            <span role="img" aria-label={info.label}>{info.emoji}</span>{" "}
+            {info.label}
+          </>
+        ) : (
+          action.action_type
+        )}
+      </span>
+      {hasPayload && (
+        <span className="plan-action-payload">{formatPayload(action.payload)}</span>
+      )}
+      {isNext && (
+        <span className="plan-action-relative">{formatRelativeTime(action.scheduled_ts)}</span>
+      )}
+      <span className={`plan-action-status ${status.className}`}>{status.text}</span>
+    </div>
+  );
+}
+
+function TimeGroupDivider({ group }: { group: TimeGroup }) {
+  return (
+    <div className="plan-time-divider">
+      <span>{TIME_GROUP_LABELS[group]}</span>
+    </div>
+  );
+}
+
+/* ── Main Component ── */
+
 export function PlanView({ plan }: PlanProps) {
   const [actions, setActions] = useState<PlanAction[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
   const currency = useCurrency();
 
   useEffect(() => {
-    if (plan?.id) {
-      fetch(`/api/plans/${plan.id}`)
-        .then((r) => r.json())
-        .then((data) => setActions(data.actions || []))
-        .catch(() => {});
+    if (!plan?.id) {
+      setActions([]);
+      return;
     }
+    setLoading(true);
+    setFetchError(null);
+    fetch(`/api/plans/${plan.id}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`Failed to load actions (${r.status})`);
+        return r.json();
+      })
+      .then((data) => setActions(data.actions || []))
+      .catch((e) => setFetchError(e instanceof Error ? e.message : "Failed to load plan actions"))
+      .finally(() => setLoading(false));
   }, [plan?.id]);
 
-  const formatAction = (type: string) => {
-    const labels: Record<string, string> = {
-      force_dhw_on: "🔥 DHW Heating ON",
-      force_dhw_off: "⏹ DHW Heating OFF",
-      quiet_mode_on: "🤫 Quiet Mode ON",
-      quiet_mode_off: "🔊 Quiet Mode OFF",
-      zone_temp_boost: "⬆️ Zone Temp +2°C",
-      zone_temp_restore: "↩️ Zone Temp Restore",
-      set_tank_temp: "🌡️ Set Tank Temp",
-      eco_mode: "🌿 Eco Mode",
-      comfort_mode: "☀️ Comfort Mode",
-    };
-    return labels[type] || type;
-  };
-
-  const formatTime = (iso: string | undefined) => {
-    if (!iso) return "—";
-    return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  };
-
-  const completedCount = actions.filter((a) => a.status === "executed" || a.status === "executed_unverified").length;
+  const completedCount = actions.filter(
+    (a) => a.status === "executed" || a.status === "executed_unverified"
+  ).length;
   const pendingCount = actions.filter((a) => a.status === "pending").length;
   const now = new Date();
 
-  // Determine next upcoming action
   const nextAction = actions.find(
     (a) => a.status === "pending" && new Date(a.scheduled_ts) > now
   );
 
+  // Group actions by time-of-day for display
+  const visibleActions = showAll ? actions : actions.slice(0, DEFAULT_VISIBLE);
+  const grouped: { group: TimeGroup; actions: PlanAction[] }[] = [];
+  let lastGroup: TimeGroup | null = null;
+  for (const a of visibleActions) {
+    const g = getTimeGroup(a.scheduled_ts);
+    if (g !== lastGroup) {
+      grouped.push({ group: g, actions: [a] });
+      lastGroup = g;
+    } else {
+      grouped[grouped.length - 1].actions.push(a);
+    }
+  }
+
   return (
     <div className="plan-section">
+      {/* ── Header ── */}
       <div className="plan-header">
         <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.25rem" }}>
+          <div className="plan-title-row">
             <h2 className="chart-title" style={{ margin: 0 }}>Active Plan</h2>
             {plan && <LayerBadge version={plan.optimizer_version} />}
           </div>
+
           {plan ? (
             <>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "1.5rem", color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "0.5rem" }}>
-                <span>Est. cost: <strong style={{ color: "var(--text)" }}>{formatCost(plan.cost_estimate_eur, currency)}</strong></span>
-                <span>Horizon: {formatTime(plan.horizon_start)} – {formatTime(plan.horizon_end)}</span>
-                <span>{plan.actions_count} actions ({completedCount} done, {pendingCount} pending)</span>
+              {/* Cost highlight */}
+              <div className="plan-cost-highlight">
+                <span className="plan-cost-value">{formatCost(plan.cost_estimate_eur, currency)}</span>
+                <span className="plan-cost-label">estimated cost</span>
               </div>
+
+              {/* Meta row */}
+              <div className="plan-meta-row">
+                <span>
+                  {formatTime(plan.horizon_start)} – {formatTime(plan.horizon_end)}
+                </span>
+                <span className="plan-meta-sep" aria-hidden="true">·</span>
+                <span>{completedCount} done, {pendingCount} scheduled</span>
+              </div>
+
               <ProgressBar completed={completedCount} total={plan.actions_count} />
             </>
           ) : (
-            <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginTop: "0.25rem" }}>
+            <p className="plan-empty-msg">
               No active plan. Optimizer will generate one when price data is available.
             </p>
           )}
         </div>
       </div>
 
-      {/* Next action highlight */}
+      {/* ── Next action callout ── */}
       {nextAction && (
-        <div
-          style={{
-            marginTop: "1rem",
-            padding: "0.75rem 1rem",
-            background: "rgba(59,130,246,0.08)",
-            borderRadius: "0.5rem",
-            border: "1px solid rgba(59,130,246,0.2)",
-            display: "flex",
-            alignItems: "center",
-            gap: "0.75rem",
-          }}
-        >
-          <span style={{ fontSize: "0.75rem", color: "var(--accent)", fontWeight: 600 }}>NEXT</span>
-          <span style={{ fontSize: "0.85rem", fontWeight: 500 }}>
-            {formatAction(nextAction.action_type)}
+        <div className="plan-next-callout">
+          <span className="plan-next-badge">NEXT</span>
+          <span className="plan-next-label">
+            <span role="img" aria-label={ACTION_LABELS[nextAction.action_type]?.label || nextAction.action_type}>
+              {ACTION_LABELS[nextAction.action_type]?.emoji || "⚡"}
+            </span>{" "}
+            {ACTION_LABELS[nextAction.action_type]?.label || nextAction.action_type}
           </span>
-          <span style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginLeft: "auto" }}>
-            @ {formatTime(nextAction.scheduled_ts)}
+          <span className="plan-next-time">
+            {formatTime(nextAction.scheduled_ts)}
+            <span className="plan-next-relative"> ({formatRelativeTime(nextAction.scheduled_ts)})</span>
           </span>
         </div>
       )}
 
-      {actions.length > 0 && (
+      {/* ── Loading state ── */}
+      {loading && (
+        <div className="plan-loading">
+          <div className="plan-loading-skeleton" />
+          <div className="plan-loading-skeleton" style={{ width: "70%" }} />
+          <div className="plan-loading-skeleton" style={{ width: "85%" }} />
+        </div>
+      )}
+
+      {/* ── Error state ── */}
+      {fetchError && (
+        <div className="plan-error">
+          <span>Could not load plan actions: {fetchError}</span>
+        </div>
+      )}
+
+      {/* ── Actions timeline ── */}
+      {!loading && !fetchError && actions.length > 0 && (
         <div className="plan-actions" style={{ marginTop: "0.75rem" }}>
-          {actions.slice(0, 12).map((action) => {
-            const isPast = new Date(action.scheduled_ts) <= now;
-            const isNext = action.id === nextAction?.id;
-            return (
-              <div
-                key={action.id}
-                className="plan-action"
-                style={{
-                  opacity: action.status === "executed" || action.status === "executed_unverified" ? 0.6 : 1,
-                  borderLeft: isNext ? "3px solid var(--accent)" : "3px solid transparent",
-                  paddingLeft: "0.5rem",
-                }}
-              >
-                <span className="plan-action-time">
-                  {formatTime(action.scheduled_ts)}
-                </span>
-                <span className="plan-action-type">
-                  {formatAction(action.action_type)}
-                </span>
-                {action.payload && Object.keys(action.payload).length > 0 && (
-                  <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
-                    {Object.entries(action.payload).map(([k, v]) => `${k}: ${v}`).join(", ")}
-                  </span>
-                )}
-                <span className={`plan-action-status ${action.status}`} style={{ marginLeft: "auto" }}>
-                  {action.status === "executed" ? "✓" : action.status === "executed_unverified" ? "✓?" : action.status}
-                </span>
-              </div>
-            );
-          })}
-          {actions.length > 12 && (
-            <p style={{ color: "var(--text-muted)", fontSize: "0.75rem", paddingTop: "0.5rem" }}>
-              + {actions.length - 12} more actions
-            </p>
+          {grouped.map((g, gi) => (
+            <div key={`${g.group}-${gi}`}>
+              <TimeGroupDivider group={g.group} />
+              {g.actions.map((action) => (
+                <ActionRow
+                  key={action.id}
+                  action={action}
+                  isNext={action.id === nextAction?.id}
+                />
+              ))}
+            </div>
+          ))}
+
+          {/* Show all / collapse toggle */}
+          {actions.length > DEFAULT_VISIBLE && (
+            <button
+              className="plan-show-all-btn"
+              onClick={() => setShowAll((v) => !v)}
+            >
+              {showAll
+                ? "Show less"
+                : `Show all ${actions.length} actions (+${actions.length - DEFAULT_VISIBLE} more)`}
+            </button>
           )}
         </div>
       )}
