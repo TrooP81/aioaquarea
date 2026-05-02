@@ -32,6 +32,7 @@ interface PlanAction {
   payload: Record<string, any>;
   status: string;
   executed_at: string | null;
+  result: Record<string, any> | null;
 }
 
 /* ── Time-of-day groups ── */
@@ -128,15 +129,23 @@ function ActionRow({
 }) {
   const info = ACTION_LABELS[action.action_type];
   const isPastDuePending = action.status === "pending" && new Date(action.scheduled_ts) < new Date();
+  const isExpired = action.status === "expired";
+  const isSkipped = action.status === "skipped";
   const displayStatus = isPastDuePending ? "expired" : action.status;
   const status = STATUS_DISPLAY[displayStatus] || { text: displayStatus, className: "" };
   const isDone = action.status === "executed" || action.status === "executed_unverified";
+  const isFaded = isDone || isPastDuePending || isExpired || isSkipped;
   const hasPayload = action.payload && Object.keys(action.payload).length > 0;
+
+  // Show diagnostic detail for missed/expired/skipped actions
+  const detail = (isExpired || isSkipped) && action.result?.detail
+    ? String(action.result.detail)
+    : null;
 
   return (
     <div
       className={`plan-action ${isNext ? "plan-action--next" : ""}`}
-      style={{ opacity: isDone || isPastDuePending ? 0.6 : 1 }}
+      style={{ opacity: isFaded ? 0.6 : 1 }}
     >
       <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
       <span className="plan-action-type">
@@ -156,6 +165,11 @@ function ActionRow({
         <span className="plan-action-relative">{formatRelativeTime(action.scheduled_ts)}</span>
       )}
       <span className={`plan-action-status ${status.className}`}>{status.text}</span>
+      {detail && (
+        <span className="plan-action-detail" style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginLeft: "0.5rem" }}>
+          — {detail}
+        </span>
+      )}
     </div>
   );
 }

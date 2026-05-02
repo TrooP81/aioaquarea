@@ -175,3 +175,89 @@ class TestVerifyAction:
             result = await executor._verify_action("force_dhw_on")
 
         assert result is False
+
+
+class TestExpireStaleActions:
+    @pytest.mark.asyncio
+    async def test_superseded_action_gets_expired(self, executor):
+        """Actions from old plans are expired with reason=superseded."""
+        stale = _make_action(
+            "comfort_mode_on",
+            scheduled_ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+        )
+        stale.plan_id = 10
+
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            # Queries: stale actions, latest plan id, update
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = [stale]
+
+            latest_plan_result = MagicMock()
+            latest_plan_result.scalar_one_or_none.return_value = 20  # different plan
+
+            override_result = MagicMock()
+            override_result.scalar_one_or_none.return_value = None
+
+            mock_session.execute = AsyncMock(
+                side_effect=[stale_result, latest_plan_result, None]
+            )
+
+            await executor.expire_stale_actions()
+
+        # stale query + latest plan query + update = 3 calls
+        assert mock_session.execute.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_override_blocked_action_gets_expired(self, executor):
+        """Actions blocked by an override are expired with reason=override_active."""
+        stale = _make_action(
+            "comfort_mode_on",
+            scheduled_ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+        )
+        stale.plan_id = 20
+
+        override_mock = MagicMock()
+        override_mock.reason = "comfort_schedule"
+
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = [stale]
+
+            latest_plan_result = MagicMock()
+            latest_plan_result.scalar_one_or_none.return_value = 20  # same plan
+
+            override_result = MagicMock()
+            override_result.scalar_one_or_none.return_value = override_mock
+
+            mock_session.execute = AsyncMock(
+                side_effect=[stale_result, latest_plan_result, override_result, None]
+            )
+
+            await executor.expire_stale_actions()
+
+        # stale + latest plan + override query + update = 4 calls
+        assert mock_session.execute.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_no_stale_actions_is_noop(self, executor):
+        """When no stale actions exist, no updates are made."""
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = []
+            mock_session.execute = AsyncMock(return_value=stale_result)
+
+            await executor.expire_stale_actions()
+
+        assert mock_session.execute.call_count == 1  # only the initial query

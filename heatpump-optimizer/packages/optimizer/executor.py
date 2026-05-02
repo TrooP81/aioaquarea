@@ -11,7 +11,7 @@ import structlog
 from sqlalchemy import select, and_, update
 
 from packages.core.database import get_session
-from packages.core.models import PlanActionRecord, OverrideRecord, AuditLogRecord
+from packages.core.models import PlanActionRecord, PlanRecord, OverrideRecord, AuditLogRecord
 from packages.core.services import AquareaWrapper
 
 logger = structlog.get_logger()
@@ -234,3 +234,106 @@ class PlanExecutor:
             )
         except Exception as e:
             logger.error("deferred_verify_failed", action_id=action.id, error=str(e))
+
+    async def expire_stale_actions(self) -> None:
+        """Mark stale pending actions as expired with a diagnostic reason.
+
+        Runs periodically to catch actions that the executor never picked up
+        (e.g. scheduled during an override window, or from a superseded plan).
+        Only expires actions older than 2 minutes to avoid racing with
+        execute_due_actions.
+        """
+        now = dt.datetime.now(dt.timezone.utc)
+        cutoff = now - dt.timedelta(minutes=2)
+
+        async with get_session() as session:
+            # Find stale pending actions
+            result = await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    and_(
+                        PlanActionRecord.status == "pending",
+                        PlanActionRecord.scheduled_ts <= cutoff,
+                    )
+                )
+                .order_by(PlanActionRecord.scheduled_ts)
+                .limit(20)
+            )
+            stale = result.scalars().all()
+
+            if not stale:
+                return
+
+            # Find the latest plan id
+            latest_plan_result = await session.execute(
+                select(PlanRecord.id).order_by(PlanRecord.created_at.desc()).limit(1)
+            )
+            latest_plan_id = latest_plan_result.scalar_one_or_none()
+
+            for action in stale:
+                reason = await self._diagnose_missed(
+                    session, action, latest_plan_id, now,
+                )
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="expired",
+                        executed_at=now,
+                        result_json=json.dumps(reason),
+                    )
+                )
+                logger.info(
+                    "action_expired",
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    diagnosis=reason.get("reason"),
+                )
+
+    @staticmethod
+    async def _diagnose_missed(
+        session, action: PlanActionRecord, latest_plan_id: int | None, now
+    ) -> dict:
+        """Determine why a pending action was never executed."""
+        scheduled = action.scheduled_ts
+
+        # 1. Superseded by a newer plan?
+        if latest_plan_id and action.plan_id != latest_plan_id:
+            return {
+                "reason": "superseded",
+                "detail": f"Replaced by plan #{latest_plan_id}",
+            }
+
+        # 2. Was an override active during the action's scheduled window?
+        #    Check overrides that overlapped the scheduled time.
+        override_result = await session.execute(
+            select(OverrideRecord).where(
+                and_(
+                    OverrideRecord.ts_from <= scheduled,
+                    OverrideRecord.ts_to >= scheduled,
+                )
+            ).limit(1)
+        )
+        blocking_override = override_result.scalar_one_or_none()
+        if blocking_override:
+            return {
+                "reason": "override_active",
+                "override": blocking_override.reason or "manual override",
+                "detail": f"Override '{blocking_override.reason}' was active at scheduled time",
+            }
+
+        # 3. Large gap since scheduled time → executor likely wasn't running
+        gap_minutes = (now - scheduled).total_seconds() / 60
+        if gap_minutes > 10:
+            return {
+                "reason": "executor_gap",
+                "gap_minutes": round(gap_minutes),
+                "detail": f"Executor did not run for ~{round(gap_minutes)} min after scheduled time",
+            }
+
+        # 4. Fallback: small gap, likely a timing edge case
+        return {
+            "reason": "timing",
+            "gap_minutes": round(gap_minutes, 1),
+            "detail": "Scheduled time passed between executor cycles",
+        }

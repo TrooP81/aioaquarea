@@ -165,6 +165,7 @@ async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
     """Execute any pending plan actions whose time has come."""
     executor = PlanExecutor(wrapper)
     await executor.execute_due_actions()
+    await executor.expire_stale_actions()
 
 
 async def main() -> None:

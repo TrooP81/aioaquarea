@@ -106,12 +106,15 @@ function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: bo
     }
 
     case "expired": {
-      // The action was pending but its time has passed — figure out why
+      // Server-side diagnosis available?
+      if (result?.detail && typeof result.detail === "string") {
+        return result.detail;
+      }
+      // Client-side fallback for actions not yet swept by the expiry task
       if (!isLatestPlan) {
         return "Superseded by a newer plan before this action's scheduled time";
       }
-      // Still the latest plan but time passed — likely override was active or executor was down
-      return "Scheduled time passed without execution — optimizer may have been paused or offline";
+      return "Scheduled time passed — waiting for diagnostic sweep";
     }
 
     case "skipped": {
