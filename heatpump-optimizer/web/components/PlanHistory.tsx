@@ -36,11 +36,19 @@ const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
 
 const STATUS_DISPLAY: Record<string, { text: string; className: string }> = {
   pending:              { text: "Scheduled",           className: "pending" },
+  expired:              { text: "Not executed",        className: "skipped" },
   executed:             { text: "Done",                className: "executed" },
   executed_unverified:  { text: "Done (unconfirmed)",  className: "executed" },
   failed:               { text: "Failed",              className: "failed" },
   skipped:              { text: "Skipped",             className: "skipped" },
 };
+
+function effectiveStatus(action: PlanAction): string {
+  if (action.status === "pending" && new Date(action.scheduled_ts) < new Date()) {
+    return "expired";
+  }
+  return action.status;
+}
 
 const LAYER_LABELS: Record<string, string> = {
   rules_v3: "Basic",
@@ -57,12 +65,14 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-function statusSummary(actions: PlanAction[]): { done: number; failed: number; skipped: number; pending: number } {
-  const done = actions.filter((a) => a.status === "executed" || a.status === "executed_unverified").length;
-  const failed = actions.filter((a) => a.status === "failed").length;
-  const skipped = actions.filter((a) => a.status === "skipped").length;
-  const pending = actions.filter((a) => a.status === "pending").length;
-  return { done, failed, skipped, pending };
+function statusSummary(actions: PlanAction[]): { done: number; failed: number; skipped: number; pending: number; expired: number } {
+  const statuses = actions.map(effectiveStatus);
+  const done = statuses.filter((s) => s === "executed" || s === "executed_unverified").length;
+  const failed = statuses.filter((s) => s === "failed").length;
+  const skipped = statuses.filter((s) => s === "skipped").length;
+  const pending = statuses.filter((s) => s === "pending").length;
+  const expired = statuses.filter((s) => s === "expired").length;
+  return { done, failed, skipped, pending, expired };
 }
 
 export function PlanHistory() {
@@ -179,6 +189,7 @@ export function PlanHistory() {
                               {s.done > 0 && <span className="plan-action-status executed">{s.done} done</span>}
                               {s.failed > 0 && <span className="plan-action-status failed">{s.failed} failed</span>}
                               {s.skipped > 0 && <span className="plan-action-status skipped">{s.skipped} skipped</span>}
+                              {s.expired > 0 && <span className="plan-action-status skipped">{s.expired} not executed</span>}
                               {s.pending > 0 && <span className="plan-action-status pending">{s.pending} scheduled</span>}
                             </>
                           );
@@ -188,13 +199,15 @@ export function PlanHistory() {
                       {/* Action rows */}
                       {expandedActions.map((action) => {
                         const info = ACTION_LABELS[action.action_type];
-                        const status = STATUS_DISPLAY[action.status] || { text: action.status, className: "" };
-                        const isDone = action.status === "executed" || action.status === "executed_unverified";
+                        const eStatus = effectiveStatus(action);
+                        const status = STATUS_DISPLAY[eStatus] || { text: eStatus, className: "" };
+                        const isDone = eStatus === "executed" || eStatus === "executed_unverified";
+                        const isExpired = eStatus === "expired";
                         return (
                           <div
                             key={action.id}
                             className="plan-action"
-                            style={{ opacity: isDone ? 0.7 : 1 }}
+                            style={{ opacity: isDone || isExpired ? 0.5 : 1 }}
                           >
                             <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
                             <span className="plan-action-type">

@@ -12,6 +12,7 @@ import { PlanHistory } from "@/components/PlanHistory";
 import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
+import { SettingsPanel } from "@/components/SettingsPanel";
 
 interface DashboardData {
   current_status: {
@@ -165,6 +166,7 @@ export default function Home() {
       <ConsumptionChart />
       <ForecastChart />
       <ThermalPredictionChart />
+      <SettingsPanel />
       <Controls />
     </div>
   );
