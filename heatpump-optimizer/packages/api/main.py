@@ -99,6 +99,36 @@ class DeviceStatusResponse(BaseModel):
     holiday_mode: Optional[int] = None
 
 
+class DeviceSettingsResponse(BaseModel):
+    """Settings polled from the heat pump itself (read-only snapshot)."""
+    polled_at: dt.datetime
+    device_id: str
+    mode: Optional[str] = None
+    operation_status: Optional[int] = None
+    tank_temp: Optional[float] = None
+    tank_target_temp: Optional[int] = None
+    tank_heat_max: Optional[int] = None
+    tank_heat_min: Optional[int] = None
+    tank_operation_status: Optional[int] = None
+    zone1_temp: Optional[float] = None
+    zone1_target_temp: Optional[float] = None
+    zone1_operation_status: Optional[int] = None
+    zone2_temp: Optional[float] = None
+    zone2_target_temp: Optional[float] = None
+    zone2_operation_status: Optional[int] = None
+    quiet_mode: Optional[int] = None
+    powerful_mode: Optional[int] = None
+    special_status: Optional[int] = None
+    force_dhw: Optional[int] = None
+    force_heater: Optional[int] = None
+    holiday_mode: Optional[int] = None
+    outdoor_temp: Optional[float] = None
+    direction: Optional[str] = None
+    device_action: Optional[str] = None
+    defrost_active: Optional[bool] = None
+    pump_duty: Optional[int] = None
+
+
 class ConsumptionResponse(BaseModel):
     ts: dt.datetime
     heat_kwh: Optional[float] = None
@@ -308,6 +338,48 @@ async def get_status_history(
         )
         for r in rows
     ]
+
+
+@app.get("/api/device/settings", response_model=DeviceSettingsResponse)
+async def get_device_settings():
+    """Return the latest polled settings/state from the heat pump."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
+        )
+        row = result.scalar_one_or_none()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No device data available yet")
+
+    return DeviceSettingsResponse(
+        polled_at=row.ts,
+        device_id=row.device_id,
+        mode=row.mode,
+        operation_status=row.operation_status,
+        tank_temp=row.tank_temp,
+        tank_target_temp=row.tank_target_temp,
+        tank_heat_max=row.tank_heat_max,
+        tank_heat_min=row.tank_heat_min,
+        tank_operation_status=row.tank_operation_status,
+        zone1_temp=row.zone1_temp,
+        zone1_target_temp=row.zone1_target_temp,
+        zone1_operation_status=row.zone1_operation_status,
+        zone2_temp=row.zone2_temp,
+        zone2_target_temp=row.zone2_target_temp,
+        zone2_operation_status=row.zone2_operation_status,
+        quiet_mode=row.quiet_mode,
+        powerful_mode=row.powerful_mode,
+        special_status=row.special_status,
+        force_dhw=row.force_dhw,
+        force_heater=row.force_heater,
+        holiday_mode=row.holiday_mode,
+        outdoor_temp=row.outdoor_temp,
+        direction=row.direction,
+        device_action=row.device_action,
+        defrost_active=row.defrost_active,
+        pump_duty=row.pump_duty,
+    )
 
 
 @app.get("/api/consumption/history", response_model=list[ConsumptionResponse])

@@ -705,6 +705,13 @@ body {
   margin-bottom: 1rem;
 }
 
+.settings-polled-at {
+  font-size: 0.75rem;
+  color: var(--fg);
+  opacity: 0.5;
+  font-style: italic;
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
