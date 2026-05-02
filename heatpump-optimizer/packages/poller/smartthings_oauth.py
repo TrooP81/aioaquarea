@@ -80,11 +80,10 @@ async def exchange_code_for_tokens(
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             TOKEN_URL,
+            auth=(client_id, client_secret),
             data={
                 "grant_type": "authorization_code",
                 "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
                 "redirect_uri": redirect_uri,
             },
         )
@@ -114,11 +113,10 @@ async def refresh_access_token(
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             TOKEN_URL,
+            auth=(client_id, client_secret),
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
             },
         )
 
