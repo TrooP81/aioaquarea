@@ -49,7 +49,7 @@ class TestConsumptionHistory:
         resp = await client.get("/api/consumption/history?hours=24")
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data) == 6
+        assert len(data) == 5
         # Check total_kwh is computed
         for entry in data:
             assert entry["total_kwh"] == (

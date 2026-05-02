@@ -9,7 +9,7 @@ class TestHealth:
     async def test_health_returns_ok(self, client: AsyncClient):
         resp = await client.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        assert resp.json() == {"status": "ok", "db": "connected"}
 
 
 @pytest.mark.asyncio(loop_scope="session")

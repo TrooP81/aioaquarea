@@ -31,7 +31,7 @@ async def seed_indoor_temps(db_session: AsyncSession):
             temperature=20.0,
         ),
         IndoorTempReading(
-            timestamp=now - dt.timedelta(minutes=60),
+            timestamp=now - dt.timedelta(minutes=55),
             device_id="sensor-living-room",
             device_label="Living Room Sensor",
             room="Living Room",
