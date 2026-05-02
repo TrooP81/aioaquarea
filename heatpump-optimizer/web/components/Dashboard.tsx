@@ -16,9 +16,11 @@ interface DashboardProps {
     today_kwh: number;
     today_cost_eur: number;
   } | null;
+  indoorTemp: number | null;
+  indoorSensorCount: number;
 }
 
-export function Dashboard({ data }: DashboardProps) {
+export function Dashboard({ data, indoorTemp, indoorSensorCount }: DashboardProps) {
   const currency = useCurrency();
   const status = data?.current_status;
 
@@ -53,6 +55,20 @@ export function Dashboard({ data }: DashboardProps) {
         </div>
         <div className="card-subtitle">
           Target: {status?.tank_target_temp ?? "—"}°C
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">Indoor Temperature</span>
+        </div>
+        <div className="card-value temp">
+          {indoorTemp != null ? `${indoorTemp.toFixed(1)}°C` : "—"}
+        </div>
+        <div className="card-subtitle">
+          {indoorSensorCount > 0
+            ? `${indoorSensorCount} sensor${indoorSensorCount !== 1 ? "s" : ""}`
+            : "No sensors connected"}
         </div>
       </div>
 

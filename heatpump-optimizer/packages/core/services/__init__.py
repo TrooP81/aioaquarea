@@ -201,30 +201,14 @@ class AquareaWrapper:
         await self._write_limiter.acquire()
         device = await self.get_device()
         mode = SpecialStatus.ECO if status == "ECO" else SpecialStatus.COMFORT
-        zones = []
-        for zone_id, zone_obj in device.zones.items():
-            from aioaquarea.data import ZoneTemperatureSetUpdate
-            zones.append(ZoneTemperatureSetUpdate(
-                zone_id=zone_id,
-                heat_set=zone_obj.heat_target_temperature,
-                cool_set=zone_obj.cool_target_temperature,
-            ))
-        await device._DeviceImpl__set_special_status__(mode, zones)
+        await device.set_special_status(mode)
         logger.info(f"Set special status to {status}")
 
     async def clear_special_status(self) -> None:
         """Clear special status (return to normal)."""
         await self._write_limiter.acquire()
         device = await self.get_device()
-        zones = []
-        for zone_id, zone_obj in device.zones.items():
-            from aioaquarea.data import ZoneTemperatureSetUpdate
-            zones.append(ZoneTemperatureSetUpdate(
-                zone_id=zone_id,
-                heat_set=zone_obj.heat_target_temperature,
-                cool_set=zone_obj.cool_target_temperature,
-            ))
-        await device._DeviceImpl__set_special_status__(None, zones)
+        await device.set_special_status(None)
         logger.info("Cleared special status")
 
     async def get_consumption(self, date_type="date"):

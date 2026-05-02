@@ -49,12 +49,19 @@ interface PollResult {
   message: string;
 }
 
+interface IndoorTempData {
+  avg_temperature: number | null;
+  latest_reading: string | null;
+  sensor_count: number;
+}
+
 function formatLastUpdated(date: Date): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
+  const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
@@ -65,10 +72,14 @@ export default function Home() {
 
   const fetchData = async () => {
     try {
-      const res = await fetch("/api/dashboard");
-      if (!res.ok) throw new Error(`API error: ${res.status}`);
-      const json = await res.json();
+      const [dashRes, tempRes] = await Promise.all([
+        fetch("/api/dashboard"),
+        fetch("/api/indoor-temp/latest").then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      ]);
+      if (!dashRes.ok) throw new Error(`API error: ${dashRes.status}`);
+      const json = await dashRes.json();
       setData(json);
+      setIndoorTemp(tempRes);
       setError(null);
       setLastUpdated(new Date());
     } catch (e) {
@@ -219,7 +230,7 @@ export default function Home() {
 
       {/* ── Overview section ── */}
       <section id="overview">
-        <Dashboard data={data} />
+        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} />
         <NextActionCard plan={data?.active_plan ?? null} />
       </section>
 
