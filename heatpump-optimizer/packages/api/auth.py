@@ -11,6 +11,11 @@ from packages.core.config import settings
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
+# Paths that skip auth (OAuth callbacks from external services, health checks)
+_PUBLIC_PATHS: set[str] = {
+    "/api/smartthings/oauth/callback",
+}
+
 
 def _is_auth_enabled() -> bool:
     """Auth is enabled when api_token is set to a non-placeholder value."""
@@ -25,9 +30,13 @@ async def require_auth(
     """
     Dependency that enforces Bearer token auth on protected routes.
 
-    Auth is skipped when api_token is not configured (dev/test convenience).
+    Auth is skipped when api_token is not configured (dev/test convenience),
+    and for public paths such as OAuth callbacks.
     """
     if not _is_auth_enabled():
+        return
+
+    if request.url.path in _PUBLIC_PATHS:
         return
 
     if credentials is None:

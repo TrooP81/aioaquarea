@@ -180,6 +180,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "smartthings_client_secret",
         "description": "SmartThings OAuth client secret",
     },
+    "smartthings_redirect_uri": {
+        "type": "str",
+        "default_env": "smartthings_redirect_uri",
+        "description": "OAuth redirect URI (must match SmartThings app registration exactly)",
+    },
     "smartthings_pat": {
         "type": "secret",
         "default_env": "smartthings_pat",

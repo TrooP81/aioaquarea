@@ -940,33 +940,61 @@ async def smartthings_oauth_authorize(request: Request):
             detail="smartthings_client_id not configured — register an app via `smartthings apps:create`",
         )
 
-    # Build redirect_uri from the current request's base URL
-    base = str(request.base_url).rstrip("/")
-    redirect_uri = f"{base}/api/smartthings/oauth/callback"
+    # Use the explicitly configured redirect URI (must match SmartThings app registration)
+    redirect_uri = await get_setting("smartthings_redirect_uri")
+    if not redirect_uri:
+        raise HTTPException(
+            status_code=400,
+            detail="smartthings_redirect_uri not configured — set it to your registered redirect URI",
+        )
 
     url, state = build_authorize_url(client_id, redirect_uri)
 
-    # Store state in a short-lived setting for CSRF verification
+    # Store state in both a secure cookie and the DB for CSRF verification.
+    # The cookie travels with the browser through the redirect chain.
     await set_setting("_smartthings_oauth_state", state)
 
-    return {"authorize_url": url, "state": state}
+    response = Response(
+        content=json.dumps({"authorize_url": url, "state": state}),
+        media_type="application/json",
+    )
+    response.set_cookie(
+        key="smartthings_oauth_state",
+        value=state,
+        max_age=600,  # 10 minutes — enough for the user to authorize
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+    )
+    return response
 
 
 @app.get("/api/smartthings/oauth/callback")
 async def smartthings_oauth_callback(
     request: Request,
-    code: str = Query(...),
-    state: str = Query(...),
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
 ):
-    """Handle the SmartThings OAuth callback — exchange code for tokens."""
+    """Handle the SmartThings OAuth callback — exchange code for tokens.
+
+    Also responds to bare GET requests (no params) so SmartThings can verify
+    the redirect URI exists during app registration.
+    """
+    # SmartThings CLI/platform may probe the URL without parameters
+    if code is None or state is None:
+        return {"status": "ok", "message": "SmartThings OAuth callback endpoint ready"}
+
     from packages.poller.smartthings_oauth import (
         exchange_code_for_tokens,
         save_tokens,
         SmartThingsOAuthError,
     )
 
-    # Verify CSRF state
-    expected_state = await get_setting("_smartthings_oauth_state")
+    # Verify CSRF state — check cookie first (most reliable across redirects),
+    # then fall back to DB-stored state.
+    expected_state = request.cookies.get("smartthings_oauth_state") or ""
+    if not expected_state:
+        expected_state = await get_setting("_smartthings_oauth_state")
     if not expected_state or state != expected_state:
         raise HTTPException(status_code=400, detail="Invalid OAuth state (possible CSRF)")
 
@@ -975,11 +1003,9 @@ async def smartthings_oauth_callback(
 
     client_id = await get_setting("smartthings_client_id")
     client_secret = await get_setting("smartthings_client_secret")
-    if not client_id or not client_secret:
+    redirect_uri = await get_setting("smartthings_redirect_uri")
+    if not client_id or not client_secret or not redirect_uri:
         raise HTTPException(status_code=400, detail="SmartThings OAuth credentials not configured")
-
-    base = str(request.base_url).rstrip("/")
-    redirect_uri = f"{base}/api/smartthings/oauth/callback"
 
     try:
         token_data = await exchange_code_for_tokens(code, client_id, client_secret, redirect_uri)
@@ -988,11 +1014,13 @@ async def smartthings_oauth_callback(
 
     await save_tokens(token_data)
 
-    # Redirect to settings page with success indicator
-    return Response(
+    # Redirect to settings page with success indicator, clearing the state cookie
+    response = Response(
         status_code=302,
         headers={"Location": "/settings?smartthings_oauth=connected"},
     )
+    response.delete_cookie("smartthings_oauth_state")
+    return response
 
 
 @app.get("/api/smartthings/oauth/status")

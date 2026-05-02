@@ -69,7 +69,7 @@ const SETTING_GROUPS = [
   {
     title: "SmartThings Integration",
     description: "Indoor temperature sensors via Samsung SmartThings",
-    keys: ["smartthings_enabled", "smartthings_client_id", "smartthings_client_secret", "smartthings_pat", "smartthings_device_ids", "smartthings_poll_interval"],
+    keys: ["smartthings_enabled", "smartthings_client_id", "smartthings_client_secret", "smartthings_redirect_uri", "smartthings_pat", "smartthings_device_ids", "smartthings_poll_interval"],
   },
   {
     title: "Comfort Model",

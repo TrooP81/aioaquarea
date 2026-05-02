@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # SmartThings
     smartthings_client_id: str = ""
     smartthings_client_secret: str = ""
+    smartthings_redirect_uri: str = ""
     smartthings_pat: str = ""  # Legacy fallback
 
     # Optimizer constraints
