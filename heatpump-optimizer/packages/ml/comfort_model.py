@@ -7,7 +7,6 @@ temperature should the heat pump deliver?
 from __future__ import annotations
 
 import datetime as dt
-import pickle
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +25,13 @@ from sqlalchemy import select, and_, func
 
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading
+from packages.core.config import settings as app_settings
 
 import structlog
 
 logger = structlog.get_logger()
 
-MODEL_DIR = Path("/app/models")
+MODEL_DIR = Path(app_settings.model_dir)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 MIN_TRAINING_ROWS = 100
@@ -288,28 +288,34 @@ class ComfortModel:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
+        from packages.ml.safe_persistence import safe_dump
+
         ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
         path = MODEL_DIR / f"comfort_model_{ts}.pkl"
-        with open(path, "wb") as f:
-            pickle.dump(
-                {
-                    "model": self._model,
-                    "metrics": self._metrics,
-                    "trained_at": self._last_trained,
-                    "samples": self._training_samples,
-                    "thermal_lag": self._thermal_lag_minutes,
-                },
-                f,
-            )
+        safe_dump(
+            {
+                "model": self._model,
+                "metrics": self._metrics,
+                "trained_at": self._last_trained,
+                "samples": self._training_samples,
+                "thermal_lag": self._thermal_lag_minutes,
+            },
+            path,
+        )
         logger.info("comfort_model_saved", path=str(path))
 
     def load_latest(self) -> bool:
         """Load the most recent saved model.  Returns True if loaded."""
+        from packages.ml.safe_persistence import safe_load
+
         models = sorted(MODEL_DIR.glob("comfort_model_*.pkl"))
         if not models:
             return False
-        with open(models[-1], "rb") as f:
-            data = pickle.load(f)
+        try:
+            data = safe_load(models[-1])
+        except ValueError:
+            logger.warning("comfort_model_integrity_failed", path=str(models[-1]))
+            return False
         self._model = data["model"]
         self._metrics = data.get("metrics", {})
         self._last_trained = data.get("trained_at")
@@ -325,13 +331,18 @@ class ComfortModel:
         """
         Join indoor_temp_reading + device_status + weather on time, shifting
         by thermal lag so we correlate *past* water temp with *current* air temp.
+
+        Limits data to the last 30 days to bound memory usage.
         """
         lag = dt.timedelta(minutes=self._thermal_lag_minutes)
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
 
         async with get_session() as session:
-            # Get all indoor temp readings
+            # Get indoor temp readings from the last 30 days
             result = await session.execute(
-                select(IndoorTempReading).order_by(IndoorTempReading.timestamp)
+                select(IndoorTempReading)
+                .where(IndoorTempReading.timestamp >= cutoff)
+                .order_by(IndoorTempReading.timestamp)
             )
             readings = result.scalars().all()
 

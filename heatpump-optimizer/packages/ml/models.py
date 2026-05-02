@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import pickle
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord, COPRecord
+from packages.core.config import settings as app_settings
 
-MODEL_DIR = Path("/app/models")
+MODEL_DIR = Path(app_settings.model_dir)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -91,8 +91,8 @@ class COPModel:
 
         # Save model
         model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(pipeline, f)
+        from packages.ml.safe_persistence import safe_dump
+        safe_dump(pipeline, model_path)
 
         return {
             "version": self._version,
@@ -206,11 +206,15 @@ class COPModel:
 
     def load_latest(self) -> bool:
         """Load the latest saved model."""
+        from packages.ml.safe_persistence import safe_load
+
         models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
         if not models:
             return False
-        with open(models[-1], "rb") as f:
-            self._model = pickle.load(f)
+        try:
+            self._model = safe_load(models[-1])
+        except ValueError:
+            return False
         self._version = models[-1].stem.replace("cop_model_", "")
         return True
 
@@ -266,8 +270,8 @@ class DemandModel:
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
 
         model_path = MODEL_DIR / f"demand_model_{self._version}.pkl"
-        with open(model_path, "wb") as f:
-            pickle.dump(pipeline, f)
+        from packages.ml.safe_persistence import safe_dump
+        safe_dump(pipeline, model_path)
 
         return {
             "version": self._version,
@@ -357,11 +361,15 @@ class DemandModel:
 
     def load_latest(self) -> bool:
         """Load the latest saved model."""
+        from packages.ml.safe_persistence import safe_load
+
         models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
         if not models:
             return False
-        with open(models[-1], "rb") as f:
-            self._model = pickle.load(f)
+        try:
+            self._model = safe_load(models[-1])
+        except ValueError:
+            return False
         self._version = models[-1].stem.replace("demand_model_", "")
         return True
 

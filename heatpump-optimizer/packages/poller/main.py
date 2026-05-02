@@ -166,13 +166,13 @@ async def poll_prices() -> None:
         else:
             area = "tibber"
         async with get_session() as session:
-            for ts, price in prices:
+            if prices:
                 stmt = pg_insert(PriceRecord).values(
-                    ts=ts, area=area, price_eur_per_kwh=price
+                    [{"ts": ts, "area": area, "price_eur_per_kwh": price} for ts, price in prices]
                 )
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["ts", "area"],
-                    set_={"price_eur_per_kwh": price},
+                    set_={"price_eur_per_kwh": stmt.excluded.price_eur_per_kwh},
                 )
                 await session.execute(stmt)
         logger.info("prices_fetched", count=len(prices), provider=settings.price_provider)
@@ -187,22 +187,27 @@ async def poll_weather() -> None:
     try:
         weather_data = await fetch_weather()
         async with get_session() as session:
-            for entry in weather_data:
+            if weather_data:
                 stmt = pg_insert(WeatherRecord).values(
-                    ts=entry["ts"],
-                    source="open-meteo",
-                    temperature=entry["temperature"],
-                    irradiance=entry.get("irradiance"),
-                    wind_speed=entry.get("wind_speed"),
-                    humidity=entry.get("humidity"),
+                    [
+                        {
+                            "ts": entry["ts"],
+                            "source": "open-meteo",
+                            "temperature": entry["temperature"],
+                            "irradiance": entry.get("irradiance"),
+                            "wind_speed": entry.get("wind_speed"),
+                            "humidity": entry.get("humidity"),
+                        }
+                        for entry in weather_data
+                    ]
                 )
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["ts", "source"],
                     set_={
-                        "temperature": entry["temperature"],
-                        "irradiance": entry.get("irradiance"),
-                        "wind_speed": entry.get("wind_speed"),
-                        "humidity": entry.get("humidity"),
+                        "temperature": stmt.excluded.temperature,
+                        "irradiance": stmt.excluded.irradiance,
+                        "wind_speed": stmt.excluded.wind_speed,
+                        "humidity": stmt.excluded.humidity,
                     },
                 )
                 await session.execute(stmt)
@@ -320,11 +325,26 @@ async def main() -> None:
 
     scheduler.start()
 
+    shutdown_event = asyncio.Event()
+
+    def _signal_shutdown():
+        shutdown_event.set()
+
+    import signal
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_shutdown)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        pass
+    finally:
+        scheduler.shutdown(wait=True)
         await wrapper.stop()
         logger.info("poller_stopped")
 

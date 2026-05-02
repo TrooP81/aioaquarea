@@ -332,46 +332,20 @@ class MILPOptimizer:
             "cost_estimate": total_cost,
         }
 
-    # --- Data fetching (same pattern as RulesOptimizer) ---
+    # --- Data fetching (delegates to shared data_access module) ---
 
     async def _get_prices(
         self, session, start: dt.datetime, end: dt.datetime
     ) -> list[tuple[dt.datetime, float]]:
-        provider = await get_setting("price_provider")
-        if provider == "entsoe":
-            area = (await get_setting("entsoe_area")) or "10YNL----------L"
-        elif provider == "manual":
-            area = "manual"
-        else:
-            area = "tibber"
-
-        result = await session.execute(
-            select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
-            .where(
-                and_(
-                    PriceRecord.ts >= start,
-                    PriceRecord.ts < end,
-                    PriceRecord.area == area,
-                )
-            )
-            .order_by(PriceRecord.ts)
-        )
-        return [(row.ts, row.price_eur_per_kwh) for row in result.all()]
+        from packages.optimizer.data_access import get_prices
+        return await get_prices(session, start, end)
 
     async def _get_weather(
         self, session, start: dt.datetime, end: dt.datetime
     ) -> list[tuple[dt.datetime, float]]:
-        result = await session.execute(
-            select(WeatherRecord.ts, WeatherRecord.temperature)
-            .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
-            .order_by(WeatherRecord.ts)
-        )
-        return [(row.ts, row.temperature) for row in result.all()]
+        from packages.optimizer.data_access import get_weather
+        return await get_weather(session, start, end)
 
     async def _get_last_status(self, session):
-        result = await session.execute(
-            select(DeviceStatusRecord)
-            .order_by(DeviceStatusRecord.ts.desc())
-            .limit(1)
-        )
-        return result.scalar_one_or_none()
+        from packages.optimizer.data_access import get_last_status
+        return await get_last_status(session)

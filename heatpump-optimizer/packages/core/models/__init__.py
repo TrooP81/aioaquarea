@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
@@ -120,6 +121,10 @@ class PlanActionRecord(Base):
     """Individual action within a plan."""
 
     __tablename__ = "plan_actions"
+    __table_args__ = (
+        Index("ix_plan_actions_plan_id", "plan_id"),
+        Index("ix_plan_actions_status_scheduled", "status", "scheduled_ts"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     plan_id: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -135,6 +140,9 @@ class OverrideRecord(Base):
     """Manual user overrides that block the optimizer."""
 
     __tablename__ = "overrides"
+    __table_args__ = (
+        Index("ix_overrides_active_ts", "active", "ts_from", "ts_to"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
@@ -177,6 +185,9 @@ class FaultRecord(Base):
     """Device fault/error log — tracks equipment errors over time."""
 
     __tablename__ = "faults"
+    __table_args__ = (
+        Index("ix_faults_device_resolved", "device_id", "resolved_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[dt.datetime] = mapped_column(

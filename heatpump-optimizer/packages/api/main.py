@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import uuid
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, and_, func, desc
@@ -36,11 +37,13 @@ from packages.core.settings_service import (
     set_settings_bulk,
     set_setting,
 )
+from packages.api.auth import require_auth
 
 app = FastAPI(
     title="Heat Pump Optimizer API",
     version="0.1.0",
     description="API for monitoring and optimizing Panasonic Aquarea heat pump costs",
+    dependencies=[Depends(require_auth)],
 )
 
 
@@ -55,11 +58,21 @@ async def _get_price_area() -> str:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3500"],
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Attach a unique request ID to each request/response."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response: Response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # --- Schemas ---
@@ -387,19 +400,25 @@ async def get_weather(hours: int = Query(48, ge=1, le=168)):
 async def get_plans(limit: int = Query(10, ge=1, le=50)):
     """Get recent optimizer plans."""
     async with get_session() as session:
-        result = await session.execute(
-            select(PlanRecord).order_by(desc(PlanRecord.created_at)).limit(limit)
+        # Single query with subquery for action counts (avoids N+1)
+        count_subq = (
+            select(
+                PlanActionRecord.plan_id,
+                func.count(PlanActionRecord.id).label("cnt"),
+            )
+            .group_by(PlanActionRecord.plan_id)
+            .subquery()
         )
-        plans = result.scalars().all()
+
+        result = await session.execute(
+            select(PlanRecord, count_subq.c.cnt)
+            .outerjoin(count_subq, PlanRecord.id == count_subq.c.plan_id)
+            .order_by(desc(PlanRecord.created_at))
+            .limit(limit)
+        )
 
         responses = []
-        for p in plans:
-            actions_count_result = await session.execute(
-                select(func.count(PlanActionRecord.id)).where(
-                    PlanActionRecord.plan_id == p.id
-                )
-            )
-            count = actions_count_result.scalar() or 0
+        for p, count in result.all():
             responses.append(
                 PlanResponse(
                     id=p.id,
@@ -408,7 +427,7 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
                     horizon_end=p.horizon_end,
                     optimizer_version=p.optimizer_version,
                     cost_estimate_eur=p.cost_estimate_eur,
-                    actions_count=count,
+                    actions_count=count or 0,
                 )
             )
     return responses
@@ -506,6 +525,12 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
 @app.post("/api/overrides")
 async def create_override(override: OverrideCreate):
     """Create a manual override (pauses optimizer for a period)."""
+    if override.ts_to <= override.ts_from:
+        raise HTTPException(status_code=422, detail="ts_to must be after ts_from")
+    max_duration = dt.timedelta(days=7)
+    if override.ts_to - override.ts_from > max_duration:
+        raise HTTPException(status_code=422, detail="Override duration cannot exceed 7 days")
+
     async with get_session() as session:
         record = OverrideRecord(
             ts_from=override.ts_from,
@@ -555,7 +580,7 @@ async def get_settings():
         val = values.get(key, "")
         # Mask secrets in response
         if schema.get("type") == "secret" and val:
-            display_val = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
+            display_val = val[:1] + "***" + val[-1:] if len(val) > 8 else "***"
         else:
             display_val = val
         result[key] = {
@@ -615,10 +640,11 @@ async def get_schedule():
 @app.put("/api/comfort-schedule")
 async def update_schedule(body: ComfortScheduleUpdate):
     """Update the comfort schedule. Hours are 0-23."""
-    # Validate hours are in range
     for h in body.weekday + body.weekend:
         if not (0 <= h <= 23):
             raise HTTPException(status_code=400, detail=f"Invalid hour: {h}. Must be 0-23.")
+    if len(set(body.weekday)) > 24 or len(set(body.weekend)) > 24:
+        raise HTTPException(status_code=400, detail="Too many hours specified.")
 
     schedule = {
         "weekday": sorted(set(body.weekday)),
@@ -895,7 +921,16 @@ async def predict_indoor_temp(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Health check with DB connectivity verification."""
+    from sqlalchemy import text
+    from packages.core.database import engine
+
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return {"status": "ok", "db": "connected"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unreachable")
 
 
 # --- Optimizer status ---

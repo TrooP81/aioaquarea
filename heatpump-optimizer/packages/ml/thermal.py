@@ -17,17 +17,17 @@ Phase 3 improvements:
 from __future__ import annotations
 
 import datetime as dt
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+import structlog
 from sqlalchemy import select, and_, func
 
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass

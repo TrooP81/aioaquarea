@@ -206,11 +206,25 @@ async def main() -> None:
 
     scheduler.start()
 
+    shutdown_event = asyncio.Event()
+
+    def _signal_shutdown():
+        shutdown_event.set()
+
+    import signal
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_shutdown)
+        except NotImplementedError:
+            pass
+
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        pass
+    finally:
+        scheduler.shutdown(wait=True)
         await wrapper.stop()
         logger.info("optimizer_stopped")
 

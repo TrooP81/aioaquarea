@@ -104,10 +104,9 @@ class TestCOPModel:
 
         # Save and reload
         with patch("packages.ml.models.MODEL_DIR", tmp_path):
+            from packages.ml.safe_persistence import safe_dump
             model_path = tmp_path / "cop_model_test.pkl"
-            import pickle
-            with open(model_path, "wb") as f:
-                pickle.dump(pipeline, f)
+            safe_dump(pipeline, model_path)
 
             model2 = COPModel()
             assert model2.load_latest()

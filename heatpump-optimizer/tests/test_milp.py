@@ -267,5 +267,6 @@ class TestMILPGeneratePlan:
             mock_result.all.return_value = []
             mock_session.execute = AsyncMock(return_value=mock_result)
 
-            with pytest.raises(DataIncompleteError, match="No price data"):
-                await milp.generate_plan()
+            with patch("packages.optimizer.data_access.get_setting", new_callable=AsyncMock, return_value="tibber"):
+                with pytest.raises(DataIncompleteError, match="No price data"):
+                    await milp.generate_plan()

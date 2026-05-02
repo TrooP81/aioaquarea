@@ -132,16 +132,18 @@ class SmartThingsClient:
 _device_cache: list[dict[str, Any]] = []
 _device_cache_ts: float = 0.0
 _DEVICE_CACHE_TTL = 3600.0  # 1 hour
+_device_cache_lock = asyncio.Lock()
 
 
 async def _get_cached_devices(client: SmartThingsClient) -> list[dict[str, Any]]:
     """Return discovered devices, refreshing cache hourly."""
     global _device_cache, _device_cache_ts
-    now = time.monotonic()
-    if not _device_cache or (now - _device_cache_ts) > _DEVICE_CACHE_TTL:
-        _device_cache = await client.discover_temp_sensors()
-        _device_cache_ts = now
-    return _device_cache
+    async with _device_cache_lock:
+        now = time.monotonic()
+        if not _device_cache or (now - _device_cache_ts) > _DEVICE_CACHE_TTL:
+            _device_cache = await client.discover_temp_sensors()
+            _device_cache_ts = now
+        return _device_cache
 
 
 def invalidate_device_cache() -> None:

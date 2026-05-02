@@ -37,6 +37,9 @@ class Settings(BaseSettings):
 
     # App
     secret_key: str = "change-this-to-a-random-string"
+    api_token: str = "disabled"  # Set to a strong token to enable API auth; "disabled" = no auth
+    model_dir: str = "/app/models"
+    cors_origins: str = "http://localhost:3500"  # Comma-separated allowed origins
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
 
@@ -44,3 +47,11 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.secret_key == "change-this-to-a-random-string":
+    import warnings
+    warnings.warn(
+        "SECRET_KEY is using the insecure default. "
+        "Set SECRET_KEY environment variable to a random string in production.",
+        stacklevel=1,
+    )

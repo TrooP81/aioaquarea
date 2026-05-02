@@ -84,7 +84,7 @@ class PlanExecutor:
 
                 case "quiet_mode_on":
                     from aioaquarea import QuietMode
-                    await self._wrapper.set_quiet_mode(QuietMode.LEVEL_1)
+                    await self._wrapper.set_quiet_mode(QuietMode.LEVEL1)
 
                 case "quiet_mode_off":
                     from aioaquarea import QuietMode
@@ -121,36 +121,13 @@ class PlanExecutor:
                     logger.warning("executor_unknown_action", action_type=action.action_type)
                     return
 
-            # --- Action Verification ---
-            verified = await self._verify_action(action.action_type)
-
-            # Mark as executed
-            status = "executed" if verified else "executed_unverified"
-            async with get_session() as session:
-                await session.execute(
-                    update(PlanActionRecord)
-                    .where(PlanActionRecord.id == action.id)
-                    .values(
-                        status=status,
-                        executed_at=dt.datetime.now(dt.timezone.utc),
-                        result_json=json.dumps({"success": True, "verified": verified}),
-                    )
-                )
-                # Audit log
-                session.add(
-                    AuditLogRecord(
-                        actor="optimizer",
-                        action=action.action_type,
-                        payload_json=action.payload_json,
-                        result="success" if verified else "unverified",
-                    )
-                )
+            # --- Action Verification (non-blocking) ---
+            asyncio.create_task(self._deferred_verify(action))
 
             logger.info(
-                "action_executed",
+                "action_dispatched",
                 action_type=action.action_type,
                 action_id=action.id,
-                verified=verified,
             )
 
         except Exception as e:
@@ -201,3 +178,35 @@ class PlanExecutor:
         except Exception as e:
             logger.warning("verification_failed", action_type=action_type, error=str(e))
             return False
+
+    async def _deferred_verify(self, action: PlanActionRecord) -> None:
+        """Background task: wait, verify, then update action status and audit log."""
+        try:
+            verified = await self._verify_action(action.action_type)
+            status = "executed" if verified else "executed_unverified"
+            async with get_session() as session:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status=status,
+                        executed_at=dt.datetime.now(dt.timezone.utc),
+                        result_json=json.dumps({"success": True, "verified": verified}),
+                    )
+                )
+                session.add(
+                    AuditLogRecord(
+                        actor="optimizer",
+                        action=action.action_type,
+                        payload_json=action.payload_json,
+                        result="success" if verified else "unverified",
+                    )
+                )
+            logger.info(
+                "action_verified",
+                action_type=action.action_type,
+                action_id=action.id,
+                verified=verified,
+            )
+        except Exception as e:
+            logger.error("deferred_verify_failed", action_id=action.id, error=str(e))
