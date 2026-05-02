@@ -170,10 +170,20 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "description": "Enable SmartThings indoor temperature polling",
         "options": ["true", "false"],
     },
+    "smartthings_client_id": {
+        "type": "secret",
+        "default_env": "smartthings_client_id",
+        "description": "SmartThings OAuth client ID (from smartthings apps:create)",
+    },
+    "smartthings_client_secret": {
+        "type": "secret",
+        "default_env": "smartthings_client_secret",
+        "description": "SmartThings OAuth client secret",
+    },
     "smartthings_pat": {
         "type": "secret",
         "default_env": "smartthings_pat",
-        "description": "SmartThings Personal Access Token (scopes: l:devices, r:devices:*)",
+        "description": "Legacy: SmartThings Personal Access Token (use OAuth instead)",
     },
     "smartthings_device_ids": {
         "type": "str",
@@ -184,6 +194,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "int",
         "default": "300",
         "description": "SmartThings poll interval in seconds (default 300 = 5 min)",
+    },
+    "_smartthings_oauth_state": {
+        "type": "secret",
+        "default": "",
+        "description": "Transient CSRF state for SmartThings OAuth flow (internal)",
     },
     # --- Comfort model ---
     "use_comfort_model": {

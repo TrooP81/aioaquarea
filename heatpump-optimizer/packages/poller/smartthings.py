@@ -1,4 +1,7 @@
-"""SmartThings API client — polls temperatureMeasurement devices for indoor air temp."""
+"""SmartThings API client — polls temperatureMeasurement devices for indoor air temp.
+
+Supports OAuth 2.0 Authorization Code tokens (auto-refreshed) with legacy PAT fallback.
+"""
 
 from __future__ import annotations
 
@@ -25,12 +28,15 @@ BASE_BACKOFF_SECONDS = 2.0
 
 
 class SmartThingsClient:
-    """Thin async wrapper around the SmartThings REST API."""
+    """Thin async wrapper around the SmartThings REST API.
 
-    def __init__(self, pat: str):
-        self._pat = pat
+    Accepts either an explicit *access_token* (from OAuth or legacy PAT).
+    """
+
+    def __init__(self, access_token: str):
+        self._access_token = access_token
         self._headers = {
-            "Authorization": f"Bearer {pat}",
+            "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         }
 
@@ -164,12 +170,13 @@ async def poll_smartthings_temps(session) -> int:
     write ``IndoorTempReading`` rows.  Returns the number of readings written.
     """
     from packages.core.models import IndoorTempReading
+    from packages.poller.smartthings_oauth import get_valid_access_token
 
-    pat = await get_setting("smartthings_pat")
-    if not pat:
+    access_token = await get_valid_access_token()
+    if not access_token:
         return 0
 
-    client = SmartThingsClient(pat)
+    client = SmartThingsClient(access_token)
 
     # Resolve which devices to poll
     device_ids_str = await get_setting("smartthings_device_ids")
@@ -230,7 +237,7 @@ class SmartThingsError(Exception):
 
 
 class SmartThingsAuthError(SmartThingsError):
-    """PAT is invalid or missing required scopes."""
+    """Access token is invalid or missing required scopes."""
 
 
 class SmartThingsRateLimited(SmartThingsError):
@@ -289,10 +296,10 @@ async def _request_with_retry(
 
 def _check_response(resp: httpx.Response) -> None:
     if resp.status_code == 401:
-        raise SmartThingsAuthError("Invalid or expired SmartThings PAT")
+        raise SmartThingsAuthError("Invalid or expired SmartThings access token")
     if resp.status_code == 403:
         raise SmartThingsAuthError(
-            "SmartThings PAT missing required scopes (need l:devices, r:devices:*)"
+            "SmartThings token missing required scopes (need r:devices:*)"
         )
     if resp.status_code == 429:
         raise SmartThingsRateLimited("SmartThings rate limit exceeded")

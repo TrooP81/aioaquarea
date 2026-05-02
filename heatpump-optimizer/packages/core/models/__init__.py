@@ -229,3 +229,19 @@ class IndoorTempReading(Base):
     device_label: Mapped[str | None] = mapped_column(String(200))
     room: Mapped[str | None] = mapped_column(String(200))
     temperature: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class SmartThingsToken(Base):
+    """Persisted SmartThings OAuth 2.0 tokens (single-row, id=1)."""
+
+    __tablename__ = "smartthings_oauth_token"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    token_type: Mapped[str] = mapped_column(String(32), default="bearer")
+    scope: Mapped[str | None] = mapped_column(String(256))
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

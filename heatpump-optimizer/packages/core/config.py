@@ -27,7 +27,9 @@ class Settings(BaseSettings):
     longitude: float = 4.89
 
     # SmartThings
-    smartthings_pat: str = ""
+    smartthings_client_id: str = ""
+    smartthings_client_secret: str = ""
+    smartthings_pat: str = ""  # Legacy fallback
 
     # Optimizer constraints
     tank_min_temp: int = 45

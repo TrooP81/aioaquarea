@@ -910,18 +910,119 @@ async def get_latest_indoor_temp():
 async def list_smartthings_devices():
     """Discover temperature sensors available via SmartThings."""
     from packages.poller.smartthings import SmartThingsClient, SmartThingsAuthError
+    from packages.poller.smartthings_oauth import get_valid_access_token
 
-    pat = await get_setting("smartthings_pat")
-    if not pat:
-        raise HTTPException(status_code=400, detail="SmartThings PAT not configured")
+    access_token = await get_valid_access_token()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="SmartThings not connected (configure OAuth or PAT)")
 
     try:
-        client = SmartThingsClient(pat)
+        client = SmartThingsClient(access_token)
         devices = await client.discover_temp_sensors()
     except SmartThingsAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
     return {"devices": devices}
+
+
+# --- SmartThings OAuth 2.0 endpoints ---
+
+
+@app.get("/api/smartthings/oauth/authorize")
+async def smartthings_oauth_authorize(request: Request):
+    """Return the SmartThings authorization URL for the browser redirect."""
+    from packages.poller.smartthings_oauth import build_authorize_url
+
+    client_id = await get_setting("smartthings_client_id")
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="smartthings_client_id not configured — register an app via `smartthings apps:create`",
+        )
+
+    # Build redirect_uri from the current request's base URL
+    base = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base}/api/smartthings/oauth/callback"
+
+    url, state = build_authorize_url(client_id, redirect_uri)
+
+    # Store state in a short-lived setting for CSRF verification
+    await set_setting("_smartthings_oauth_state", state)
+
+    return {"authorize_url": url, "state": state}
+
+
+@app.get("/api/smartthings/oauth/callback")
+async def smartthings_oauth_callback(
+    request: Request,
+    code: str = Query(...),
+    state: str = Query(...),
+):
+    """Handle the SmartThings OAuth callback — exchange code for tokens."""
+    from packages.poller.smartthings_oauth import (
+        exchange_code_for_tokens,
+        save_tokens,
+        SmartThingsOAuthError,
+    )
+
+    # Verify CSRF state
+    expected_state = await get_setting("_smartthings_oauth_state")
+    if not expected_state or state != expected_state:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state (possible CSRF)")
+
+    # Clear used state
+    await set_setting("_smartthings_oauth_state", "")
+
+    client_id = await get_setting("smartthings_client_id")
+    client_secret = await get_setting("smartthings_client_secret")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="SmartThings OAuth credentials not configured")
+
+    base = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base}/api/smartthings/oauth/callback"
+
+    try:
+        token_data = await exchange_code_for_tokens(code, client_id, client_secret, redirect_uri)
+    except SmartThingsOAuthError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    await save_tokens(token_data)
+
+    # Redirect to settings page with success indicator
+    return Response(
+        status_code=302,
+        headers={"Location": "/settings?smartthings_oauth=connected"},
+    )
+
+
+@app.get("/api/smartthings/oauth/status")
+async def smartthings_oauth_status():
+    """Check whether SmartThings OAuth tokens are stored and valid."""
+    from packages.poller.smartthings_oauth import load_tokens
+
+    tokens = await load_tokens()
+    if tokens is None:
+        # Check legacy PAT
+        pat = await get_setting("smartthings_pat")
+        if pat:
+            return {"connected": True, "method": "pat", "expires_at": None}
+        return {"connected": False, "method": None, "expires_at": None}
+
+    return {
+        "connected": True,
+        "method": "oauth",
+        "expires_at": tokens["expires_at"].isoformat(),
+        "scope": tokens.get("scope", ""),
+    }
+
+
+@app.delete("/api/smartthings/oauth/disconnect")
+async def smartthings_oauth_disconnect():
+    """Remove stored SmartThings OAuth tokens."""
+    from packages.poller.smartthings_oauth import delete_tokens
+
+    await delete_tokens()
+    return {"disconnected": True}
 
 
 @app.get("/api/comfort-model/status")
@@ -1669,23 +1770,27 @@ async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
 
 
 async def _test_smartthings(pat: Optional[str]) -> TestConnectionResponse:
-    """Test SmartThings PAT by discovering temperature sensors."""
+    """Test SmartThings connection using OAuth tokens (preferred) or legacy PAT."""
     from packages.poller.smartthings import SmartThingsClient, SmartThingsAuthError
+    from packages.poller.smartthings_oauth import get_valid_access_token
 
     from packages.core.settings_service import get_setting
 
-    if not pat:
-        pat = await get_setting("smartthings_pat")
+    # Use explicitly provided PAT for testing, otherwise use OAuth/stored PAT
+    if pat and not pat.startswith("***"):
+        access_token = pat
+    else:
+        access_token = await get_valid_access_token()
 
-    if not pat:
+    if not access_token:
         return TestConnectionResponse(
             service="smartthings",
             success=False,
-            message="SmartThings Personal Access Token is required",
+            message="SmartThings not connected — configure OAuth or provide a PAT",
         )
 
     try:
-        client = SmartThingsClient(pat)
+        client = SmartThingsClient(access_token)
         devices = await client.discover_temp_sensors()
 
         if not devices:

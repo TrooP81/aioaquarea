@@ -302,22 +302,26 @@ class TestStaleReadingExclusion:
         mock_session.add = MagicMock()
 
         with patch(
-            "packages.poller.smartthings.get_setting",
+            "packages.poller.smartthings_oauth.get_valid_access_token",
             new_callable=AsyncMock,
-            side_effect=lambda k: {
-                "smartthings_pat": "test-pat",
-                "smartthings_device_ids": "d1",
-            }.get(k),
+            return_value="test-token",
         ):
-            with patch.object(
-                SmartThingsClient,
-                "get_temperatures_batch",
+            with patch(
+                "packages.poller.smartthings.get_setting",
                 new_callable=AsyncMock,
-                return_value=[
-                    {"device_id": "d1", "value": 21.0, "timestamp": stale_ts},
-                ],
+                side_effect=lambda k: {
+                    "smartthings_device_ids": "d1",
+                }.get(k),
             ):
-                count = await poll_smartthings_temps(mock_session)
+                with patch.object(
+                    SmartThingsClient,
+                    "get_temperatures_batch",
+                    new_callable=AsyncMock,
+                    return_value=[
+                        {"device_id": "d1", "value": 21.0, "timestamp": stale_ts},
+                    ],
+                ):
+                    count = await poll_smartthings_temps(mock_session)
 
         assert count == 0
         mock_session.add.assert_not_called()
@@ -337,22 +341,26 @@ class TestStaleReadingExclusion:
         mock_session.add = MagicMock()
 
         with patch(
-            "packages.poller.smartthings.get_setting",
+            "packages.poller.smartthings_oauth.get_valid_access_token",
             new_callable=AsyncMock,
-            side_effect=lambda k: {
-                "smartthings_pat": "test-pat",
-                "smartthings_device_ids": "d1",
-            }.get(k),
+            return_value="test-token",
         ):
-            with patch.object(
-                SmartThingsClient,
-                "get_temperatures_batch",
+            with patch(
+                "packages.poller.smartthings.get_setting",
                 new_callable=AsyncMock,
-                return_value=[
-                    {"device_id": "d1", "value": 21.0, "timestamp": fresh_ts},
-                ],
+                side_effect=lambda k: {
+                    "smartthings_device_ids": "d1",
+                }.get(k),
             ):
-                count = await poll_smartthings_temps(mock_session)
+                with patch.object(
+                    SmartThingsClient,
+                    "get_temperatures_batch",
+                    new_callable=AsyncMock,
+                    return_value=[
+                        {"device_id": "d1", "value": 21.0, "timestamp": fresh_ts},
+                    ],
+                ):
+                    count = await poll_smartthings_temps(mock_session)
 
         assert count == 1
         mock_session.add.assert_called_once()

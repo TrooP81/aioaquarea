@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { TestConnection } from "../../components/TestConnection";
 import { ComfortSchedule } from "../../components/ComfortSchedule";
+import { SmartThingsOAuth } from "../../components/SmartThingsOAuth";
 import { useCurrency } from "../../components/useCurrency";
 
 interface SettingMeta {
@@ -68,7 +69,7 @@ const SETTING_GROUPS = [
   {
     title: "SmartThings Integration",
     description: "Indoor temperature sensors via Samsung SmartThings",
-    keys: ["smartthings_enabled", "smartthings_pat", "smartthings_device_ids", "smartthings_poll_interval"],
+    keys: ["smartthings_enabled", "smartthings_client_id", "smartthings_client_secret", "smartthings_pat", "smartthings_device_ids", "smartthings_poll_interval"],
   },
   {
     title: "Comfort Model",
@@ -216,6 +217,10 @@ export default function SettingsPage() {
               ? `Configure how electricity prices are fetched (displaying in ${currency.code})`
               : group.description}
           </p>
+
+          {group.title === "SmartThings Integration" && editValues["smartthings_enabled"] === "true" && (
+            <SmartThingsOAuth />
+          )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
             {group.keys
