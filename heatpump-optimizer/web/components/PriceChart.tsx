@@ -47,7 +47,7 @@ export function PriceChart() {
     : [];
 
   return (
-    <div className="chart-container">
+    <div className="chart-container" role="region" aria-label="Electricity price chart">
       <div className="chart-title">Electricity Price ({priceAxisLabel(currency)}) — 48h</div>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={250}>
@@ -77,9 +77,11 @@ export function PriceChart() {
           </ComposedChart>
         </ResponsiveContainer>
       ) : (
-        <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "3rem" }}>
-          No price data yet. Prices will appear after the first price fetch.
-        </p>
+        <div className="chart-skeleton-wrapper">
+          <div className="chart-skeleton" />
+          <div className="chart-skeleton" style={{ width: "70%" }} />
+          <p className="text-muted text-center">No price data yet. Prices will appear after the first price fetch.</p>
+        </div>
       )}
     </div>
   );

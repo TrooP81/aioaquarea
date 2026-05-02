@@ -2,6 +2,16 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
+import {
+  ACTION_LABELS,
+  LAYER_LABELS,
+  LAYER_TOOLTIPS,
+  STATUS_DISPLAY,
+  PAYLOAD_LABELS,
+  formatRelativeTime,
+  formatTime,
+  formatPayload,
+} from "@/lib/constants";
 
 interface PlanProps {
   plan: {
@@ -24,50 +34,6 @@ interface PlanAction {
   executed_at: string | null;
 }
 
-/* ── User-facing optimizer tier labels ── */
-const LAYER_LABELS: Record<string, string> = {
-  rules_v3: "Basic",
-  milp_v1: "Smart",
-  "milp_v1+ml": "Advanced",
-};
-
-const LAYER_TOOLTIPS: Record<string, string> = {
-  rules_v3: "Rule-based scheduling using price windows",
-  milp_v1: "Mathematical optimisation across the full horizon",
-  "milp_v1+ml": "Mathematical optimisation enhanced with machine-learning predictions",
-};
-
-/* ── Action labels: emoji + accessible text ── */
-const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
-  force_dhw_on:     { emoji: "🔥", label: "Hot Water Heating ON" },
-  force_dhw_off:    { emoji: "⏹", label: "Hot Water Heating OFF" },
-  quiet_mode_on:    { emoji: "🤫", label: "Quiet Mode ON" },
-  quiet_mode_off:   { emoji: "🔊", label: "Quiet Mode OFF" },
-  zone_temp_boost:  { emoji: "⬆️", label: "Zone Temp Boost +2 °C" },
-  zone_temp_restore:{ emoji: "↩️", label: "Zone Temp Restore" },
-  set_tank_temp:    { emoji: "🌡️", label: "Set Tank Temperature" },
-  eco_mode:         { emoji: "🌿", label: "Eco Mode" },
-  comfort_mode:     { emoji: "☀️", label: "Comfort Mode" },
-};
-
-/* ── Status display mapping ── */
-const STATUS_DISPLAY: Record<string, { text: string; className: string }> = {
-  pending:              { text: "Scheduled",        className: "pending" },
-  executed:             { text: "Done",             className: "executed" },
-  executed_unverified:  { text: "Done (unconfirmed)", className: "executed" },
-  failed:               { text: "Failed",           className: "failed" },
-  skipped:              { text: "Skipped",          className: "skipped" },
-};
-
-/* ── Payload key → human-readable + unit ── */
-const PAYLOAD_LABELS: Record<string, { label: string; unit: string }> = {
-  target_temp:     { label: "Target", unit: "°C" },
-  tank_temp:       { label: "Tank target", unit: "°C" },
-  zone_temp:       { label: "Zone target", unit: "°C" },
-  duration_min:    { label: "Duration", unit: "min" },
-  temperature:     { label: "Temperature", unit: "°C" },
-};
-
 /* ── Time-of-day groups ── */
 type TimeGroup = "morning" | "afternoon" | "evening" | "night";
 function getTimeGroup(iso: string): TimeGroup {
@@ -85,32 +51,6 @@ const TIME_GROUP_LABELS: Record<TimeGroup, string> = {
 };
 
 /* ── Helpers ── */
-function formatRelativeTime(iso: string): string {
-  const diffMs = new Date(iso).getTime() - Date.now();
-  if (diffMs < 0) return "now";
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 1) return "< 1 min";
-  if (mins < 60) return `in ${mins} min`;
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
-  if (remainMins === 0) return `in ${hrs} h`;
-  return `in ${hrs} h ${remainMins} min`;
-}
-
-function formatTime(iso: string | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-}
-
-function formatPayload(payload: Record<string, any>): string {
-  return Object.entries(payload)
-    .map(([k, v]) => {
-      const meta = PAYLOAD_LABELS[k];
-      if (meta) return `${meta.label}: ${v} ${meta.unit}`;
-      return `${k.replace(/_/g, " ")}: ${v}`;
-    })
-    .join(", ");
-}
 
 const DEFAULT_VISIBLE = 12;
 

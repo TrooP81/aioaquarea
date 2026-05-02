@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
+import { ACTION_LABELS, formatRelativeTime, formatTime } from "@/lib/constants";
 
 interface NextActionCardProps {
   plan: {
@@ -20,35 +21,6 @@ interface PlanAction {
   action_type: string;
   payload: Record<string, any>;
   status: string;
-}
-
-const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
-  force_dhw_on: { emoji: "🔥", label: "Hot Water Heating ON" },
-  force_dhw_off: { emoji: "⏹", label: "Hot Water Heating OFF" },
-  quiet_mode_on: { emoji: "🤫", label: "Quiet Mode ON" },
-  quiet_mode_off: { emoji: "🔊", label: "Quiet Mode OFF" },
-  zone_temp_boost: { emoji: "⬆️", label: "Zone Temp Boost +2 °C" },
-  zone_temp_restore: { emoji: "↩️", label: "Zone Temp Restore" },
-  set_tank_temp: { emoji: "🌡️", label: "Set Tank Temperature" },
-  eco_mode: { emoji: "🌿", label: "Eco Mode" },
-  comfort_mode: { emoji: "☀️", label: "Comfort Mode" },
-};
-
-function formatRelativeTime(iso: string): string {
-  const diffMs = new Date(iso).getTime() - Date.now();
-  if (diffMs < 0) return "now";
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 1) return "< 1 min";
-  if (mins < 60) return `in ${mins} min`;
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
-  if (remainMins === 0) return `in ${hrs} h`;
-  return `in ${hrs} h ${remainMins} min`;
-}
-
-function formatTime(iso: string | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 export function NextActionCard({ plan }: NextActionCardProps) {
@@ -119,7 +91,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
             </span>
           </div>
           <div className="card-subtitle">
-            at {formatTime(nextAction.scheduled_ts)} · Est. cost: {formatCost(plan.cost_estimate_eur, currency)}
+            at {formatTime(nextAction.scheduled_ts)} · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
           </div>
         </>
       ) : (
@@ -128,7 +100,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
             All caught up
           </div>
           <div className="card-subtitle">
-            No pending actions · Est. cost: {formatCost(plan.cost_estimate_eur, currency)}
+            No pending actions · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
           </div>
         </>
       )}

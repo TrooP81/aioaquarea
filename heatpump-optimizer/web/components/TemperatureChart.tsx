@@ -76,17 +76,19 @@ export function TemperatureChart() {
 
   if (chartData.length === 0) {
     return (
-      <div className="chart-container">
+      <div className="chart-container" role="region" aria-label="Temperature history chart">
         <div className="chart-title">Temperature History — 24h</div>
-        <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "3rem" }}>
-          No temperature data yet. Data will appear after device polling.
-        </p>
+        <div className="chart-skeleton-wrapper">
+          <div className="chart-skeleton" />
+          <div className="chart-skeleton" style={{ width: "60%" }} />
+          <p className="text-muted text-center">No temperature data yet. Data will appear after device polling.</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="chart-container">
+    <div className="chart-container" role="region" aria-label="Temperature history chart">
       <div className="chart-title">Temperature History — 24h</div>
       <ResponsiveContainer width="100%" height={280}>
         <LineChart data={chartData}>

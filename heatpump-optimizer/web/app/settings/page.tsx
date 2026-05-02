@@ -232,13 +232,10 @@ export default function SettingsPage() {
                     ? `Static electricity price (${currency.code}/kWh)`
                     : meta.description;
                 return (
-                  <div key={key} style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+                  <div key={key} className="settings-form-row">
                     <label
-                      style={{
-                        minWidth: "220px",
-                        fontSize: "0.875rem",
-                        color: "var(--text-muted)",
-                      }}
+                      htmlFor={`setting-${key}`}
+                      className="settings-form-label"
                       title={description}
                     >
                       {description}
@@ -246,20 +243,12 @@ export default function SettingsPage() {
 
                     {meta.options ? (
                       <select
+                        id={`setting-${key}`}
                         value={editValues[key] || ""}
                         onChange={(e) =>
                           setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
                         }
-                        style={{
-                          flex: 1,
-                          maxWidth: "300px",
-                          background: "var(--bg)",
-                          color: "var(--text)",
-                          border: "1px solid var(--border)",
-                          borderRadius: "0.375rem",
-                          padding: "0.5rem 0.75rem",
-                          fontSize: "0.875rem",
-                        }}
+                        className="form-select"
                       >
                         {meta.options.map((opt) => (
                           <option key={opt} value={opt}>
@@ -269,22 +258,14 @@ export default function SettingsPage() {
                       </select>
                     ) : (
                       <input
+                        id={`setting-${key}`}
                         type={meta.type === "secret" ? "password" : "text"}
                         value={editValues[key] || ""}
                         onChange={(e) =>
                           setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
                         }
                         placeholder={meta.description}
-                        style={{
-                          flex: 1,
-                          maxWidth: "300px",
-                          background: "var(--bg)",
-                          color: "var(--text)",
-                          border: "1px solid var(--border)",
-                          borderRadius: "0.375rem",
-                          padding: "0.5rem 0.75rem",
-                          fontSize: "0.875rem",
-                        }}
+                        className="form-input"
                       />
                     )}
                   </div>

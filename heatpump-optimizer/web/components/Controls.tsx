@@ -4,9 +4,13 @@ import { useState } from "react";
 
 export function Controls() {
   const [overrideHours, setOverrideHours] = useState(2);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
 
   const createOverride = async () => {
+    if (!window.confirm(`Pause the optimizer for ${overrideHours} hour(s)? Manual overrides take priority over all scheduling.`)) {
+      return;
+    }
+
     const now = new Date();
     const end = new Date(now.getTime() + overrideHours * 60 * 60 * 1000);
 
@@ -22,12 +26,12 @@ export function Controls() {
         }),
       });
       if (res.ok) {
-        setMessage(`Optimizer paused for ${overrideHours} hours`);
+        setMessage({ text: `Optimizer paused for ${overrideHours} hours`, ok: true });
       } else {
-        setMessage("Failed to create override");
+        setMessage({ text: "Failed to create override", ok: false });
       }
     } catch {
-      setMessage("Network error");
+      setMessage({ text: "Network error", ok: false });
     }
   };
 
@@ -40,20 +44,14 @@ export function Controls() {
 
       <div className="controls">
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <label style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>
+          <label htmlFor="pause-duration" style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>
             Pause optimizer for:
           </label>
           <select
+            id="pause-duration"
             value={overrideHours}
             onChange={(e) => setOverrideHours(Number(e.target.value))}
-            style={{
-              background: "var(--bg)",
-              color: "var(--text)",
-              border: "1px solid var(--border)",
-              borderRadius: "0.375rem",
-              padding: "0.375rem 0.75rem",
-              fontSize: "0.875rem",
-            }}
+            className="form-select"
           >
             <option value={1}>1 hour</option>
             <option value={2}>2 hours</option>
@@ -68,8 +66,8 @@ export function Controls() {
       </div>
 
       {message && (
-        <p style={{ color: "var(--success)", fontSize: "0.875rem", marginTop: "1rem" }}>
-          {message}
+        <p style={{ color: message.ok ? "var(--success)" : "var(--danger)", fontSize: "0.875rem", marginTop: "1rem" }}>
+          {message.text}
         </p>
       )}
     </div>

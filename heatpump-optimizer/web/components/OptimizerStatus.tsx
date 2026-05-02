@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { LAYER_LABELS } from "@/lib/constants";
 
 interface ModelInfo {
   trained: boolean;
@@ -37,25 +38,9 @@ interface OptimizerStatusData {
   thermal_model: ThermalInfo;
 }
 
-const LAYER_LABELS: Record<string, string> = {
-  rules_v3: "Rules Engine",
-  milp_v1: "MILP Optimizer",
-  "milp_v1+ml": "MILP + ML Models",
-};
-
 function StatusDot({ ok }: { ok: boolean }) {
   return (
-    <span
-      style={{
-        display: "inline-block",
-        width: 10,
-        height: 10,
-        borderRadius: "50%",
-        background: ok ? "var(--success)" : "var(--text-muted)",
-        marginRight: "0.5rem",
-        flexShrink: 0,
-      }}
-    />
+    <span className={`status-dot ${ok ? "status-dot--ok" : ""}`} />
   );
 }
 
@@ -63,6 +48,12 @@ function formatDate(iso: string | null): string {
   if (!iso) return "never";
   const d = new Date(iso);
   return d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function layerBadgeClass(layer: string): string {
+  if (layer.includes("ml")) return "opt-layer-badge opt-layer-badge--ml";
+  if (layer.includes("milp")) return "opt-layer-badge opt-layer-badge--milp";
+  return "opt-layer-badge";
 }
 
 export function OptimizerStatus() {
@@ -144,7 +135,7 @@ export function OptimizerStatus() {
     return (
       <div className="plan-section">
         <h2 className="chart-title">Optimizer & ML Status</h2>
-        <p style={{ color: "var(--danger)" }}>{error}</p>
+        <p className="text-danger">{error}</p>
       </div>
     );
   }
@@ -153,7 +144,10 @@ export function OptimizerStatus() {
     return (
       <div className="plan-section">
         <h2 className="chart-title">Optimizer & ML Status</h2>
-        <p style={{ color: "var(--text-muted)" }}>Loading...</p>
+        <div className="plan-loading">
+          <div className="plan-loading-skeleton" />
+          <div className="plan-loading-skeleton" style={{ width: "60%" }} />
+        </div>
       </div>
     );
   }
@@ -198,55 +192,25 @@ export function OptimizerStatus() {
       <h2 className="chart-title">Optimizer & ML Status</h2>
 
       {/* Active layer badge */}
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.25rem" }}>
-        <span style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>Active layer</span>
-        <span
-          style={{
-            padding: "0.25rem 0.75rem",
-            borderRadius: "9999px",
-            fontSize: "0.75rem",
-            fontWeight: 600,
-            background: status.active_layer.includes("ml")
-              ? "rgba(34,197,94,0.15)"
-              : status.active_layer.includes("milp")
-              ? "rgba(59,130,246,0.15)"
-              : "rgba(148,163,184,0.15)",
-            color: status.active_layer.includes("ml")
-              ? "var(--success)"
-              : status.active_layer.includes("milp")
-              ? "var(--accent)"
-              : "var(--text-muted)",
-          }}
-        >
+      <div className="opt-layer-row">
+        <span className="text-muted text-sm">Active layer</span>
+        <span className={layerBadgeClass(status.active_layer)}>
           {LAYER_LABELS[status.active_layer] || status.active_layer}
         </span>
-        <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>
+        <span className="text-muted text-xs">
           (configured: {status.configured_layer})
         </span>
       </div>
 
       {/* Model cards */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-          gap: "1rem",
-        }}
-      >
+      <div className="model-grid">
         {models.map((m) => (
-          <div
-            key={m.label}
-            style={{
-              background: "var(--bg)",
-              borderRadius: "0.5rem",
-              padding: "1rem",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", marginBottom: "0.5rem" }}>
+          <div key={m.label} className="model-card">
+            <div className="model-card-header">
               <StatusDot ok={m.trained} />
-              <span style={{ fontWeight: 600, fontSize: "0.875rem" }}>{m.label}</span>
+              <span className="model-card-name">{m.label}</span>
             </div>
-            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", lineHeight: 1.6 }}>
+            <div className="model-card-details">
               <div>Status: {m.trained ? "Trained" : "Not trained"}</div>
               <div>Last trained: {formatDate(m.lastTrained)}</div>
               <div>{m.detail}</div>
@@ -256,38 +220,34 @@ export function OptimizerStatus() {
       </div>
 
       {/* Training controls */}
-      <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginTop: "1.25rem" }}>
+      <div className="training-controls">
         <button
-          className="btn"
+          className="btn btn-sm"
           onClick={trainMl}
           disabled={training.ml}
-          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+          aria-busy={training.ml}
         >
           {training.ml ? "Training..." : "Train COP & Demand"}
         </button>
         <button
-          className="btn"
+          className="btn btn-sm"
           onClick={trainComfort}
           disabled={training.comfort}
-          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+          aria-busy={training.comfort}
         >
           {training.comfort ? "Training..." : "Train Comfort Model"}
         </button>
         <button
-          className="btn"
+          className="btn btn-sm"
           onClick={calibrateThermal}
           disabled={training.thermal}
-          style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}
+          aria-busy={training.thermal}
         >
           {training.thermal ? "Calibrating..." : "Calibrate Thermal"}
         </button>
       </div>
       {trainMsg && (
-        <p style={{
-          fontSize: "0.8rem",
-          marginTop: "0.5rem",
-          color: trainMsg.ok ? "var(--success)" : "var(--danger)",
-        }}>
+        <p className={`train-msg ${trainMsg.ok ? "train-msg--ok" : "train-msg--err"}`}>
           {trainMsg.text}
         </p>
       )}
@@ -295,23 +255,12 @@ export function OptimizerStatus() {
       {/* SmartThings indoor temperature */}
       {indoorTemp && indoorTemp.avg_temperature != null && (
         <>
-          <h3 style={{ fontSize: "0.875rem", fontWeight: 600, marginTop: "1.25rem", marginBottom: "0.75rem" }}>
-            SmartThings Indoor Temperature
-          </h3>
-          <div
-            style={{
-              display: "flex",
-              gap: "1rem",
-              alignItems: "center",
-              background: "var(--bg)",
-              borderRadius: "0.5rem",
-              padding: "0.75rem 1rem",
-            }}
-          >
-            <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--warning)" }}>
+          <h3 className="indoor-temp-heading">SmartThings Indoor Temperature</h3>
+          <div className="indoor-temp-card">
+            <div className="indoor-temp-value">
               {indoorTemp.avg_temperature.toFixed(1)}°C
             </div>
-            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", lineHeight: 1.6 }}>
+            <div className="model-card-details">
               <div>Average across {indoorTemp.sensor_count} sensor{indoorTemp.sensor_count !== 1 ? "s" : ""}</div>
               <div>Last reading: {formatDate(indoorTemp.latest_reading)}</div>
             </div>

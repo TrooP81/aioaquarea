@@ -44,17 +44,19 @@ export function ConsumptionChart() {
 
   if (chartData.length === 0) {
     return (
-      <div className="chart-container">
+      <div className="chart-container" role="region" aria-label="Energy consumption chart">
         <div className="chart-title">Energy Consumption — 24h</div>
-        <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "3rem" }}>
-          No consumption data yet. Data will appear after device polling.
-        </p>
+        <div className="chart-skeleton-wrapper">
+          <div className="chart-skeleton" />
+          <div className="chart-skeleton" style={{ width: "55%" }} />
+          <p className="text-muted text-center">No consumption data yet. Data will appear after device polling.</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="chart-container">
+    <div className="chart-container" role="region" aria-label="Energy consumption chart">
       <div className="chart-title">Energy Consumption — 24h</div>
       <ResponsiveContainer width="100%" height={220}>
         <BarChart data={chartData}>

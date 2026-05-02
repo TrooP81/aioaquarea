@@ -49,17 +49,19 @@ export function ForecastChart() {
 
   if (chartData.length === 0) {
     return (
-      <div className="chart-container">
+      <div className="chart-container" role="region" aria-label="Weather forecast chart">
         <div className="chart-title">Weather Forecast — 48h</div>
-        <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "3rem" }}>
-          No weather data yet. Data will appear after weather fetch.
-        </p>
+        <div className="chart-skeleton-wrapper">
+          <div className="chart-skeleton" />
+          <div className="chart-skeleton" style={{ width: "65%" }} />
+          <p className="text-muted text-center">No weather data yet. Data will appear after weather fetch.</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="chart-container">
+    <div className="chart-container" role="region" aria-label="Weather forecast chart">
       <div className="chart-title">Weather Forecast — 48h</div>
       <ResponsiveContainer width="100%" height={250}>
         <LineChart data={chartData}>

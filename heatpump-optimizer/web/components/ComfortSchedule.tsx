@@ -204,6 +204,16 @@ export function ComfortSchedule() {
                       }}
                     >
                       <div
+                        role="checkbox"
+                        aria-checked={active}
+                        aria-label={`${dayType} ${formatHour(h)}:00 — ${active ? "comfort" : "eco"}`}
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === " " || e.key === "Enter") {
+                            e.preventDefault();
+                            toggleHour(dayType, h);
+                          }
+                        }}
                         style={{
                           position: "relative",
                           height: "32px",

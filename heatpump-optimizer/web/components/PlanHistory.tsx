@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
+import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
 
 interface PlanSummary {
   id: number;
@@ -22,18 +23,6 @@ interface PlanAction {
   executed_at: string | null;
   result: Record<string, any> | null;
 }
-
-const ACTION_LABELS: Record<string, { emoji: string; label: string }> = {
-  force_dhw_on:     { emoji: "🔥", label: "Hot Water Heating ON" },
-  force_dhw_off:    { emoji: "⏹", label: "Hot Water Heating OFF" },
-  quiet_mode_on:    { emoji: "🤫", label: "Quiet Mode ON" },
-  quiet_mode_off:   { emoji: "🔊", label: "Quiet Mode OFF" },
-  zone_temp_boost:  { emoji: "⬆️", label: "Zone Temp Boost +2 °C" },
-  zone_temp_restore:{ emoji: "↩️", label: "Zone Temp Restore" },
-  set_tank_temp:    { emoji: "🌡️", label: "Set Tank Temperature" },
-  eco_mode:         { emoji: "🌿", label: "Eco Mode" },
-  comfort_mode:     { emoji: "☀️", label: "Comfort Mode" },
-};
 
 function formatReason(payload: Record<string, any>): string | null {
   const reason = payload?.reason;
@@ -81,15 +70,6 @@ function formatPayloadExtras(payload: Record<string, any>): string | null {
   if (payload?.level != null) extras.push(`level ${payload.level}`);
   return extras.length > 0 ? extras.join(" · ") : null;
 }
-
-const STATUS_DISPLAY: Record<string, { text: string; className: string }> = {
-  pending:              { text: "Scheduled",           className: "pending" },
-  expired:              { text: "Not executed",        className: "skipped" },
-  executed:             { text: "Done",                className: "executed" },
-  executed_unverified:  { text: "Done (unconfirmed)",  className: "executed" },
-  failed:               { text: "Failed",              className: "failed" },
-  skipped:              { text: "Skipped",             className: "skipped" },
-};
 
 function effectiveStatus(action: PlanAction): string {
   if (action.status === "pending" && new Date(action.scheduled_ts) < new Date()) {
@@ -143,17 +123,6 @@ function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: bo
     default:
       return null;
   }
-}
-
-const LAYER_LABELS: Record<string, string> = {
-  rules_v3: "Basic",
-  milp_v1: "Smart",
-  "milp_v1+ml": "Advanced",
-};
-
-function formatTime(iso: string | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function formatDate(iso: string): string {

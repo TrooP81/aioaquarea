@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Dashboard } from "@/components/Dashboard";
 import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
@@ -12,7 +12,7 @@ import { PlanHistory } from "@/components/PlanHistory";
 import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
-import { SettingsPanel } from "@/components/SettingsPanel";
+import { SECTIONS, SectionId } from "@/lib/constants";
 
 interface DashboardData {
   current_status: {
@@ -44,12 +44,24 @@ interface DashboardData {
   override_id: number | null;
 }
 
+interface PollResult {
+  success: boolean;
+  message: string;
+}
+
+function formatLastUpdated(date: Date): string {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
-  const [pollResult, setPollResult] = useState<string | null>(null);
+  const [pollResult, setPollResult] = useState<PollResult | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [activeSection, setActiveSection] = useState<SectionId>("overview");
+  const mainRef = useRef<HTMLDivElement>(null);
 
   const fetchData = async () => {
     try {
@@ -58,6 +70,7 @@ export default function Home() {
       const json = await res.json();
       setData(json);
       setError(null);
+      setLastUpdated(new Date());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to fetch data");
     } finally {
@@ -67,9 +80,33 @@ export default function Home() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 30000); // Refresh every 30s
+    const interval = setInterval(fetchData, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  /* ── Intersection observer for active section highlighting ── */
+  useEffect(() => {
+    const ids = SECTIONS.map((s) => s.id);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setActiveSection(entry.target.id as SectionId);
+          }
+        }
+      },
+      { rootMargin: "-40% 0px -55% 0px" },
+    );
+    ids.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) observer.observe(el);
+    });
+    return () => observer.disconnect();
+  }, [loading]);
+
+  const scrollTo = (id: SectionId) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   const pollNow = async () => {
     setPolling(true);
@@ -78,17 +115,17 @@ export default function Home() {
       const res = await fetch("/api/poll-now", { method: "POST" });
       const json = await res.json();
       if (json.status === "ok") {
-        setPollResult("All data fetched successfully");
+        setPollResult({ success: true, message: "All data fetched successfully" });
       } else {
         const msgs = Object.entries(json.results || {})
           .filter(([, v]: [string, any]) => !v?.success)
           .map(([k, v]: [string, any]) => `${k}: ${v?.message}`)
           .join("; ");
-        setPollResult(msgs || "Partial success");
+        setPollResult({ success: false, message: msgs || "Partial success" });
       }
       await fetchData();
     } catch {
-      setPollResult("Network error — is the API running?");
+      setPollResult({ success: false, message: "Network error — is the API running?" });
     } finally {
       setPolling(false);
     }
@@ -110,17 +147,39 @@ export default function Home() {
       <div className="dashboard">
         <div className="header">
           <h1>Heat Pump Optimizer</h1>
-          <span className="status-badge offline">Loading...</span>
+          <span className="status-badge loading">Loading...</span>
+        </div>
+        <div className="chart-container">
+          <div className="chart-skeleton" />
+          <div className="chart-skeleton" style={{ width: "60%" }} />
         </div>
       </div>
     );
   }
 
   return (
-    <div className="dashboard">
+    <div className="dashboard" ref={mainRef}>
+      {/* ── Sticky section nav ── */}
+      <nav className="section-nav" aria-label="Dashboard sections">
+        {SECTIONS.map((s) => (
+          <button
+            key={s.id}
+            className={`section-nav-item ${activeSection === s.id ? "active" : ""}`}
+            onClick={() => scrollTo(s.id)}
+          >
+            {s.label}
+          </button>
+        ))}
+      </nav>
+
       <div className="header">
         <h1>Heat Pump Optimizer</h1>
-        <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+        <div className="header-actions">
+          {lastUpdated && (
+            <span className="last-updated">
+              Updated {formatLastUpdated(lastUpdated)}
+            </span>
+          )}
           <button className="btn btn-primary" onClick={pollNow} disabled={polling}>
             {polling ? "Polling..." : "Poll Now"}
           </button>
@@ -135,17 +194,19 @@ export default function Home() {
         <div
           className="override-banner"
           style={{
-            borderColor: pollResult.includes("successfully") ? "var(--success)" : "var(--warning, orange)",
-            background: pollResult.includes("successfully") ? "rgba(34,197,94,0.1)" : "rgba(251,191,36,0.1)",
+            borderColor: pollResult.success ? "var(--success)" : "var(--warning, orange)",
+            background: pollResult.success ? "rgba(34,197,94,0.1)" : "rgba(251,191,36,0.1)",
           }}
         >
-          <p>{pollResult}</p>
+          <p style={{ color: pollResult.success ? "var(--success)" : "var(--warning)" }}>
+            {pollResult.message}
+          </p>
         </div>
       )}
 
       {error && (
-        <div className="override-banner">
-          <p>API Error: {error}</p>
+        <div className="override-banner" style={{ borderColor: "var(--danger)", background: "rgba(239,68,68,0.1)" }}>
+          <p style={{ color: "var(--danger)" }}>API Error: {error}</p>
         </div>
       )}
 
@@ -156,18 +217,36 @@ export default function Home() {
         </div>
       )}
 
-      <Dashboard data={data} />
-      <NextActionCard plan={data?.active_plan ?? null} />
-      <OptimizerStatus />
-      <PlanView plan={data?.active_plan ?? null} />
-      <PlanHistory />
-      <PriceChart />
-      <TemperatureChart />
-      <ConsumptionChart />
-      <ForecastChart />
-      <ThermalPredictionChart />
-      <SettingsPanel />
-      <Controls />
+      {/* ── Overview section ── */}
+      <section id="overview">
+        <Dashboard data={data} />
+        <NextActionCard plan={data?.active_plan ?? null} />
+      </section>
+
+      {/* ── Controls (moved up — emergency actions should be accessible) ── */}
+      <section id="controls">
+        <Controls />
+      </section>
+
+      {/* ── Plan section ── */}
+      <section id="plan">
+        <PlanView plan={data?.active_plan ?? null} />
+        <PlanHistory />
+      </section>
+
+      {/* ── Charts section ── */}
+      <section id="charts">
+        <PriceChart />
+        <TemperatureChart />
+        <ConsumptionChart />
+        <ForecastChart />
+        <ThermalPredictionChart />
+      </section>
+
+      {/* ── Status section ── */}
+      <section id="status">
+        <OptimizerStatus />
+      </section>
     </div>
   );
 }
