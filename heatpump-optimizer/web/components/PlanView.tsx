@@ -127,14 +127,16 @@ function ActionRow({
   isNext: boolean;
 }) {
   const info = ACTION_LABELS[action.action_type];
-  const status = STATUS_DISPLAY[action.status] || { text: action.status, className: "" };
+  const isPastDuePending = action.status === "pending" && new Date(action.scheduled_ts) < new Date();
+  const displayStatus = isPastDuePending ? "expired" : action.status;
+  const status = STATUS_DISPLAY[displayStatus] || { text: displayStatus, className: "" };
   const isDone = action.status === "executed" || action.status === "executed_unverified";
   const hasPayload = action.payload && Object.keys(action.payload).length > 0;
 
   return (
     <div
       className={`plan-action ${isNext ? "plan-action--next" : ""}`}
-      style={{ opacity: isDone ? 0.6 : 1 }}
+      style={{ opacity: isDone || isPastDuePending ? 0.6 : 1 }}
     >
       <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
       <span className="plan-action-type">
@@ -192,11 +194,16 @@ export function PlanView({ plan }: PlanProps) {
       .finally(() => setLoading(false));
   }, [plan?.id]);
 
+  const now = new Date();
   const completedCount = actions.filter(
     (a) => a.status === "executed" || a.status === "executed_unverified"
   ).length;
-  const pendingCount = actions.filter((a) => a.status === "pending").length;
-  const now = new Date();
+  const skippedCount = actions.filter(
+    (a) => a.status === "skipped" || (a.status === "pending" && new Date(a.scheduled_ts) < now)
+  ).length;
+  const pendingCount = actions.filter(
+    (a) => a.status === "pending" && new Date(a.scheduled_ts) >= now
+  ).length;
 
   const nextAction = actions.find(
     (a) => a.status === "pending" && new Date(a.scheduled_ts) > now
@@ -240,7 +247,10 @@ export function PlanView({ plan }: PlanProps) {
                   {formatTime(plan.horizon_start)} – {formatTime(plan.horizon_end)}
                 </span>
                 <span className="plan-meta-sep" aria-hidden="true">·</span>
-                <span>{completedCount} done, {pendingCount} scheduled</span>
+                <span>
+                  {completedCount} done{pendingCount > 0 ? `, ${pendingCount} scheduled` : ""}
+                  {skippedCount > 0 ? `, ${skippedCount} skipped` : ""}
+                </span>
               </div>
 
               <ProgressBar completed={completedCount} total={plan.actions_count} />

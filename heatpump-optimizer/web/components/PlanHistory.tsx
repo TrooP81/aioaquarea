@@ -114,8 +114,18 @@ function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: bo
       return "Scheduled time passed without execution — optimizer may have been paused or offline";
     }
 
-    case "skipped":
+    case "skipped": {
+      const overrideReason = result?.override;
+      if (result?.reason === "override_active" && typeof overrideReason === "string") {
+        const OVERRIDE_REASONS: Record<string, string> = {
+          comfort_schedule: "Comfort schedule override was active",
+          night_quiet_schedule: "Night quiet override was active",
+          manual: "Manual override was active",
+        };
+        return OVERRIDE_REASONS[overrideReason] || `Override was active: ${overrideReason.replace(/_/g, " ")}`;
+      }
       return "Skipped by the optimizer";
+    }
 
     case "pending":
       return "Waiting to execute at scheduled time";
@@ -253,7 +263,7 @@ export function PlanHistory() {
                               {s.done > 0 && <span className="plan-action-status executed">{s.done} done</span>}
                               {s.failed > 0 && <span className="plan-action-status failed">{s.failed} failed</span>}
                               {s.skipped > 0 && <span className="plan-action-status skipped">{s.skipped} skipped</span>}
-                              {s.expired > 0 && <span className="plan-action-status skipped">{s.expired} not executed</span>}
+                              {s.expired > 0 && <span className="plan-action-status skipped">{s.expired} missed</span>}
                               {s.pending > 0 && <span className="plan-action-status pending">{s.pending} scheduled</span>}
                             </>
                           );
@@ -301,7 +311,7 @@ export function PlanHistory() {
                                 {extras && <span className="plan-action-extras">{extras}</span>}
                               </div>
                             )}
-                            {(isExpired || isFailed) && explanation && (
+                            {(isExpired || isFailed || eStatus === "skipped") && explanation && (
                               <div className="plan-action-reason-row plan-action-explanation-row">
                                 <span className={`plan-action-explanation ${isFailed ? "plan-action-explanation--failed" : ""}`}>
                                   {isFailed ? "⚠ " : "ℹ "}{explanation}

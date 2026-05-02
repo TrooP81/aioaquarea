@@ -43,14 +43,6 @@ class PlanExecutor:
             )
             active_overrides = override_result.scalars().all()
 
-            if active_overrides:
-                logger.info(
-                    "executor_overrides_active",
-                    count=len(active_overrides),
-                    reason=active_overrides[0].reason,
-                )
-                return  # Manual override wins
-
             # Get pending actions that are due
             result = await session.execute(
                 select(PlanActionRecord)
@@ -64,6 +56,38 @@ class PlanExecutor:
                 .limit(5)  # Max 5 actions per cycle to respect rate limits
             )
             actions = result.scalars().all()
+
+            if active_overrides and actions:
+                override_reason = active_overrides[0].reason or "manual override"
+                logger.info(
+                    "executor_overrides_active",
+                    count=len(active_overrides),
+                    reason=override_reason,
+                    skipping=len(actions),
+                )
+                # Mark blocked actions as skipped with a clear reason
+                for action in actions:
+                    await session.execute(
+                        update(PlanActionRecord)
+                        .where(PlanActionRecord.id == action.id)
+                        .values(
+                            status="skipped",
+                            executed_at=now,
+                            result_json=json.dumps({
+                                "reason": "override_active",
+                                "override": override_reason,
+                            }),
+                        )
+                    )
+                return
+
+            if active_overrides:
+                logger.info(
+                    "executor_overrides_active",
+                    count=len(active_overrides),
+                    reason=active_overrides[0].reason,
+                )
+                return  # Override active but no due actions
 
         for action in actions:
             await self._execute_action(action)

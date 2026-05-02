@@ -94,15 +94,44 @@ class TestExecuteDueActions:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            # First query returns overrides
+            # First query returns overrides, second returns no actions
             override_result = MagicMock()
             override_result.scalars.return_value.all.return_value = [override_mock]
-            mock_session.execute = AsyncMock(return_value=override_result)
+            actions_result = MagicMock()
+            actions_result.scalars.return_value.all.return_value = []
+            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result])
 
             await executor.execute_due_actions()
 
         # The wrapper should not have been called
         executor._wrapper.force_dhw.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_active_override_marks_due_actions_skipped(self, executor):
+        """When an override is active and actions are due, they are marked skipped with reason."""
+        override_mock = MagicMock()
+        override_mock.reason = "comfort_schedule"
+
+        action_mock = _make_action("comfort_mode_on")
+
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            override_result = MagicMock()
+            override_result.scalars.return_value.all.return_value = [override_mock]
+            actions_result = MagicMock()
+            actions_result.scalars.return_value.all.return_value = [action_mock]
+            # execute called 3 times: overrides query, actions query, update statement
+            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result, None])
+
+            await executor.execute_due_actions()
+
+        # The wrapper should not have been called
+        executor._wrapper.set_special_status.assert_not_awaited()
+        # The update should have been called to mark action as skipped
+        assert mock_session.execute.call_count == 3
 
 
 class TestVerifyAction:
