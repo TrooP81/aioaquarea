@@ -399,6 +399,11 @@ class RulesOptimizer:
             target = comfort_temp_target if in_comfort else comfort_temp_min
 
             if indoor < target and in_comfort:
+                # Only trigger if the drop is meaningful (not just rounding)
+                if target - indoor < 0.3:
+                    indoor = target
+                    continue
+
                 # Indoor temp has dropped below comfort target — need zone heating
                 heating_pred = thermal_model.predict_indoor_heating_time(
                     current_temp=indoor,
@@ -437,7 +442,15 @@ class RulesOptimizer:
                 break  # Only one guardrail action per plan cycle
 
             # Simulate indoor evolution for next hour
-            if current_water_temp > indoor + 5.0:
+            # During comfort hours, the heat pump is normally active (eco/comfort
+            # mode), so use the heating rate. Only simulate cooling during non-comfort
+            # hours or when water temp is too low to meaningfully heat.
+            next_hour_ts = horizon_start + dt.timedelta(hours=h + 1)
+            next_in_comfort = is_comfort_hour(comfort_schedule, next_hour_ts)
+            if next_in_comfort and current_water_temp > indoor:
+                # Heat pump is running in comfort/eco mode — indoor holds or rises slowly
+                rate = thermal_model._indoor_heating_rate(outdoor) * 0.5  # partial: eco isn't full power
+            elif current_water_temp > indoor + 5.0:
                 rate = thermal_model._indoor_heating_rate(outdoor)
             else:
                 rate = thermal_model._indoor_cooling_rate(outdoor)
@@ -449,32 +462,35 @@ class RulesOptimizer:
             indoor = max(indoor, outdoor)
 
         # Additional trigger: if indoor is predicted to cool below target soon
-        cooling_pred = thermal_model.predict_indoor_cooling_time(
-            current_temp=current_indoor_temp,
-            min_temp=comfort_temp_target - 1.0,
-            outdoor_temp=current_outdoor_temp,
-        )
-        if (
-            cooling_pred.estimated_minutes < 120
-            and cooling_pred.estimated_minutes > 0
-            and not actions  # Don't double up with the trajectory check
-        ):
-            actions.append({
-                "ts": horizon_start.isoformat(),
-                "type": "zone_temp_boost",
-                "payload": {
-                    "offset": +2,
-                    "reason": "indoor_cooling_imminent",
-                    "minutes_until_cold": round(cooling_pred.estimated_minutes),
-                    "current_indoor": round(current_indoor_temp, 1),
-                },
-            })
-            boost_hours = max(1, int(cooling_pred.estimated_minutes / 60))
-            actions.append({
-                "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
-                "type": "zone_temp_restore",
-                "payload": {"reason": "indoor_cooling_boost_complete"},
-            })
+        # Only check if we're currently in a comfort hour and temp is already marginal
+        current_is_comfort = is_comfort_hour(comfort_schedule, horizon_start)
+        if current_is_comfort and current_indoor_temp < comfort_temp_target + 1.0:
+            cooling_pred = thermal_model.predict_indoor_cooling_time(
+                current_temp=current_indoor_temp,
+                min_temp=comfort_temp_target - 1.0,
+                outdoor_temp=current_outdoor_temp,
+            )
+            if (
+                cooling_pred.estimated_minutes < 120
+                and cooling_pred.estimated_minutes > 0
+                and not actions  # Don't double up with the trajectory check
+            ):
+                actions.append({
+                    "ts": horizon_start.isoformat(),
+                    "type": "zone_temp_boost",
+                    "payload": {
+                        "offset": +2,
+                        "reason": "indoor_cooling_imminent",
+                        "minutes_until_cold": round(cooling_pred.estimated_minutes),
+                        "current_indoor": round(current_indoor_temp, 1),
+                    },
+                })
+                boost_hours = max(1, int(cooling_pred.estimated_minutes / 60))
+                actions.append({
+                    "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
+                    "type": "zone_temp_restore",
+                    "payload": {"reason": "indoor_cooling_boost_complete"},
+                })
 
         return actions
 
