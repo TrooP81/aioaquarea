@@ -112,8 +112,8 @@ class ThermalModel:
         - Only counts zone heating when direction=PUMP (compressor heating zones)
         """
         async with get_session() as session:
-            # Get last 7 days of device status, ordered by time
-            since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
+            # Get last 90 days of device status, ordered by time
+            since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
             result = await session.execute(
                 select(DeviceStatusRecord)
                 .where(DeviceStatusRecord.ts >= since)

@@ -1377,6 +1377,45 @@ async def calibrate_thermal_model():
     return result
 
 
+@app.post("/api/optimize-now")
+async def optimize_now():
+    """Manually trigger a one-off optimization run and return the new plan summary."""
+    from packages.optimizer.main import run_optimization
+
+    await run_optimization()
+
+    # Return the latest plan as confirmation
+    async with get_session() as session:
+        plan_result = await session.execute(
+            select(PlanRecord)
+            .order_by(desc(PlanRecord.created_at))
+            .limit(1)
+        )
+        plan = plan_result.scalar_one_or_none()
+
+    if not plan:
+        return {"status": "no_plan", "message": "Optimization produced no plan"}
+
+    async with get_session() as session:
+        actions_result = await session.execute(
+            select(func.count())
+            .select_from(PlanActionRecord)
+            .where(PlanActionRecord.plan_id == plan.id)
+        )
+        action_count = actions_result.scalar() or 0
+
+    return {
+        "status": "ok",
+        "plan_id": plan.id,
+        "version": plan.optimizer_version,
+        "actions": action_count,
+        "horizon_start": plan.horizon_start.isoformat() if plan.horizon_start else None,
+        "horizon_end": plan.horizon_end.isoformat() if plan.horizon_end else None,
+        "cost_estimate_eur": plan.cost_estimate_eur,
+        "created_at": plan.created_at.isoformat() if plan.created_at else None,
+    }
+
+
 @app.get("/api/thermal/curve")
 async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     """
@@ -1504,6 +1543,83 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     # Assume current zone water temp persists (no plan data available here)
     zone_water_temps = [current_zone] * hours
 
+    # Fetch active plan actions to build plan-aware forecast
+    planned_actions = []
+    boost_offset = 0.0
+    plan_water_temps = list(zone_water_temps)  # copy — will be modified
+    async with get_session() as session:
+        plan_result = await session.execute(
+            select(PlanRecord)
+            .where(PlanRecord.horizon_end > now)
+            .order_by(desc(PlanRecord.created_at))
+            .limit(1)
+        )
+        active_plan = plan_result.scalar_one_or_none()
+
+        if active_plan:
+            actions_result = await session.execute(
+                select(PlanActionRecord)
+                .where(PlanActionRecord.plan_id == active_plan.id)
+                .order_by(PlanActionRecord.scheduled_ts)
+            )
+            plan_actions = actions_result.scalars().all()
+
+            # Build per-hour boost state from plan actions
+            hour_start = now.replace(minute=0, second=0, microsecond=0)
+            boost_active = False
+            boost_water_offset = 0
+            for action in plan_actions:
+                hour_offset = int((action.scheduled_ts - hour_start).total_seconds() / 3600)
+                if hour_offset < 0 or hour_offset >= hours:
+                    continue
+
+                if action.action_type in ("zone_temp_boost", "comfort_mode_on", "eco_mode_off"):
+                    payload = json.loads(action.payload_json) if action.payload_json else {}
+                    offset = payload.get("offset", 2)
+                    planned_actions.append({
+                        "hour": hour_offset,
+                        "action_type": action.action_type,
+                        "status": action.status,
+                        "payload": payload,
+                    })
+                    # Mark hours from this action until restore as boosted
+                    boost_active = True
+                    boost_water_offset = offset
+                    for h in range(hour_offset, hours):
+                        plan_water_temps[h] = current_zone + boost_water_offset
+
+                elif action.action_type in ("zone_temp_restore", "eco_mode_on"):
+                    payload = json.loads(action.payload_json) if action.payload_json else {}
+                    planned_actions.append({
+                        "hour": hour_offset,
+                        "action_type": action.action_type,
+                        "status": action.status,
+                        "payload": payload,
+                    })
+                    # Restore: undo boost from this hour onward
+                    boost_active = False
+                    for h in range(hour_offset, hours):
+                        plan_water_temps[h] = current_zone
+
+                elif action.action_type in ("force_dhw_on", "force_dhw_off",
+                                            "quiet_mode_on", "quiet_mode_off"):
+                    payload = json.loads(action.payload_json) if action.payload_json else {}
+                    planned_actions.append({
+                        "hour": hour_offset,
+                        "action_type": action.action_type,
+                        "status": action.status,
+                        "payload": payload,
+                    })
+
+    # Forecast with plan-aware water temps
+    forecast_with_plan = thermal_model.predict_indoor_curve(
+        current_indoor=current_indoor,
+        zone_water_temps=plan_water_temps,
+        weather_forecast=weather_forecast,
+        hours=hours,
+    )
+
+    # Baseline forecast (current state, no plan changes)
     forecast = thermal_model.predict_indoor_curve(
         current_indoor=current_indoor,
         zone_water_temps=zone_water_temps,
@@ -1539,8 +1655,10 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         "current_indoor": current_indoor,
         "outdoor_temp": outdoor,
         "forecast": forecast,
+        "forecast_with_plan": forecast_with_plan,
         "forecast_no_heating": forecast_no_heating,
         "target_schedule": target_schedule,
+        "planned_actions": planned_actions,
     }
 
 

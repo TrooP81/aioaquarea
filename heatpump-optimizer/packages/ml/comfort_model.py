@@ -332,10 +332,10 @@ class ComfortModel:
         Join indoor_temp_reading + device_status + weather on time, shifting
         by thermal lag so we correlate *past* water temp with *current* air temp.
 
-        Limits data to the last 30 days to bound memory usage.
+        Limits data to the last 90 days to maximise training signal.
         """
         lag = dt.timedelta(minutes=self._thermal_lag_minutes)
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
 
         async with get_session() as session:
             # Get indoor temp readings from the last 30 days

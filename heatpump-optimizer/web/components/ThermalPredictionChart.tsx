@@ -71,12 +71,21 @@ interface CurveData {
   };
 }
 
+interface PlannedAction {
+  hour: number;
+  action_type: string;
+  status: string;
+  payload: Record<string, unknown>;
+}
+
 interface IndoorForecastData {
   current_indoor: number;
   outdoor_temp: number;
   forecast: { hour: number; predicted_indoor_temp: number }[];
+  forecast_with_plan: { hour: number; predicted_indoor_temp: number }[];
   forecast_no_heating: { hour: number; predicted_indoor_temp: number }[];
   target_schedule: { hour: number; target: number; comfort_hour: boolean }[];
+  planned_actions: PlannedAction[];
 }
 
 interface IndoorTempReading {
@@ -89,6 +98,8 @@ export function ThermalPredictionChart() {
   const [curves, setCurves] = useState<CurveData | null>(null);
   const [indoorForecast, setIndoorForecast] = useState<IndoorForecastData | null>(null);
   const [indoorHistory, setIndoorHistory] = useState<IndoorTempReading[]>([]);
+  const [optimizing, setOptimizing] = useState(false);
+  const [optimizeResult, setOptimizeResult] = useState<string | null>(null);
   const [calibrating, setCalibrating] = useState(false);
   const [calibrateResult, setCalibrateResult] = useState<string | null>(null);
 
@@ -132,6 +143,27 @@ export function ThermalPredictionChart() {
     }
   };
 
+  const handleOptimize = async () => {
+    setOptimizing(true);
+    setOptimizeResult(null);
+    try {
+      const res = await fetch("/api/optimize-now", { method: "POST" });
+      const data = await res.json();
+      if (data.status === "ok") {
+        setOptimizeResult(
+          `Plan #${data.plan_id} created (${data.version}, ${data.actions} actions)`
+        );
+        await fetchData();
+      } else {
+        setOptimizeResult(data.message || "No plan generated");
+      }
+    } catch {
+      setOptimizeResult("Network error");
+    } finally {
+      setOptimizing(false);
+    }
+  };
+
   const chartData =
     curves?.curves.tank_standby.map((s, i) => ({
       hour: `+${s.hour}h`,
@@ -165,7 +197,7 @@ export function ThermalPredictionChart() {
         historyPoints.push({
           hour: `${h}h`,
           actualIndoor: parseFloat(avg.toFixed(1)),
-          indoorPredicted: undefined as number | undefined,
+          indoorWithPlan: undefined as number | undefined,
           indoorNoHeating: undefined as number | undefined,
           comfortTarget: undefined as number | undefined,
         });
@@ -176,7 +208,7 @@ export function ThermalPredictionChart() {
     const forecastPoints = indoorForecast.forecast.map((f, i) => ({
       hour: `+${f.hour}h`,
       actualIndoor: undefined as number | undefined,
-      indoorPredicted: f.predicted_indoor_temp,
+      indoorWithPlan: indoorForecast.forecast_with_plan[i]?.predicted_indoor_temp,
       indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
       comfortTarget: indoorForecast.target_schedule[i]?.target,
     }));
@@ -357,11 +389,11 @@ export function ThermalPredictionChart() {
               />
               <Line
                 type="monotone"
-                dataKey="indoorPredicted"
-                stroke="#ec4899"
+                dataKey="indoorWithPlan"
+                stroke="#f59e0b"
                 strokeWidth={2}
                 dot={false}
-                name="Predicted Indoor"
+                name="📈 Predicted Indoor"
               />
               <Line
                 type="monotone"
@@ -370,15 +402,56 @@ export function ThermalPredictionChart() {
                 strokeWidth={1.5}
                 strokeDasharray="5 5"
                 dot={false}
-                name="Indoor (no heating)"
+                name="❄️ No Heating"
               />
+              {indoorForecast?.planned_actions?.map((a, i) => {
+                const label =
+                  a.action_type === "zone_temp_boost"
+                    ? `🔥 +${(a.payload.offset as number) ?? 2}°C`
+                    : a.action_type === "zone_temp_restore"
+                    ? "⏹️ Restore"
+                    : a.action_type === "force_dhw_on"
+                    ? "🚰 DHW On"
+                    : a.action_type === "force_dhw_off"
+                    ? "🚰 DHW Off"
+                    : a.action_type === "comfort_mode_on"
+                    ? "☀️ Comfort"
+                    : a.action_type === "eco_mode_on"
+                    ? "🌿 Eco"
+                    : a.action_type === "quiet_mode_on"
+                    ? "🔇 Quiet"
+                    : a.action_type === "quiet_mode_off"
+                    ? "🔊 Loud"
+                    : a.action_type.replace(/_/g, " ");
+                const color =
+                  a.action_type === "zone_temp_boost" ? "#f59e0b"
+                    : a.action_type === "zone_temp_restore" ? "#94a3b8"
+                    : a.action_type.includes("dhw") ? "#3b82f6"
+                    : a.action_type.includes("comfort") ? "#10b981"
+                    : a.action_type.includes("eco") ? "#22c55e"
+                    : "#8b5cf6";
+                return (
+                  <ReferenceLine
+                    key={`action-${i}`}
+                    x={`+${a.hour}h`}
+                    stroke={color}
+                    strokeDasharray="3 3"
+                    label={{
+                      value: label,
+                      position: "top",
+                      fontSize: 10,
+                      fill: color,
+                    }}
+                  />
+                );
+              })}
             </LineChart>
           </ResponsiveContainer>
         </>
       )}
 
-      {/* Calibrate button */}
-      <div style={{ marginTop: "1rem", display: "flex", alignItems: "center", gap: "1rem" }}>
+      {/* Calibrate + Optimize buttons */}
+      <div style={{ marginTop: "1rem", display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
         <button
           className="btn"
           onClick={handleCalibrate}
@@ -390,6 +463,19 @@ export function ThermalPredictionChart() {
         {calibrateResult && (
           <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
             {calibrateResult}
+          </span>
+        )}
+        <button
+          className="btn"
+          onClick={handleOptimize}
+          disabled={optimizing}
+          style={{ fontSize: "0.8rem" }}
+        >
+          {optimizing ? "Optimizing..." : "Re-plan Now"}
+        </button>
+        {optimizeResult && (
+          <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+            {optimizeResult}
           </span>
         )}
       </div>
