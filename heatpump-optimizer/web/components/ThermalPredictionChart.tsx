@@ -74,14 +74,21 @@ interface CurveData {
 interface IndoorForecastData {
   current_indoor: number;
   outdoor_temp: number;
-  forecast: { hour: number; predicted_temp: number }[];
+  forecast: { hour: number; predicted_indoor_temp: number }[];
+  forecast_no_heating: { hour: number; predicted_indoor_temp: number }[];
   target_schedule: { hour: number; target: number; comfort_hour: boolean }[];
+}
+
+interface IndoorTempReading {
+  timestamp: string;
+  temperature: number;
 }
 
 export function ThermalPredictionChart() {
   const [status, setStatus] = useState<ThermalStatus | null>(null);
   const [curves, setCurves] = useState<CurveData | null>(null);
   const [indoorForecast, setIndoorForecast] = useState<IndoorForecastData | null>(null);
+  const [indoorHistory, setIndoorHistory] = useState<IndoorTempReading[]>([]);
   const [calibrating, setCalibrating] = useState(false);
   const [calibrateResult, setCalibrateResult] = useState<string | null>(null);
 
@@ -91,14 +98,16 @@ export function ThermalPredictionChart() {
 
   const fetchData = async () => {
     try {
-      const [statusRes, curveRes, indoorRes] = await Promise.all([
+      const [statusRes, curveRes, indoorRes, historyRes] = await Promise.all([
         fetch("/api/thermal/status"),
         fetch("/api/thermal/curve?hours=24"),
         fetch("/api/thermal/indoor-forecast?hours=24"),
+        fetch("/api/indoor-temp?hours=6"),
       ]);
       if (statusRes.ok) setStatus(await statusRes.json());
       if (curveRes.ok) setCurves(await curveRes.json());
       if (indoorRes.ok) setIndoorForecast(await indoorRes.json());
+      if (historyRes.ok) setIndoorHistory(await historyRes.json());
     } catch {}
   };
 
@@ -131,13 +140,49 @@ export function ThermalPredictionChart() {
       zoneStandby: curves.curves.zone_standby[i]?.predicted_temp,
     })) || [];
 
-  const indoorChartData =
-    indoorForecast?.forecast.map((f, i) => ({
+  const indoorChartData = (() => {
+    if (!indoorForecast) return [];
+
+    // Bucket actual readings into hourly averages relative to now
+    const now = Date.now();
+    const actualByHour: Record<number, number[]> = {};
+    for (const r of indoorHistory) {
+      const hoursAgo = (now - new Date(r.timestamp).getTime()) / 3_600_000;
+      // Map: -6h ago → hour -6, current → hour 0
+      const hourBucket = Math.round(-hoursAgo);
+      if (hourBucket >= -6 && hourBucket <= 0) {
+        if (!actualByHour[hourBucket]) actualByHour[hourBucket] = [];
+        actualByHour[hourBucket].push(r.temperature);
+      }
+    }
+
+    // Build history points (negative hours)
+    const historyPoints = [];
+    for (let h = -6; h <= 0; h++) {
+      const temps = actualByHour[h];
+      if (temps && temps.length > 0) {
+        const avg = temps.reduce((a, b) => a + b, 0) / temps.length;
+        historyPoints.push({
+          hour: `${h}h`,
+          actualIndoor: parseFloat(avg.toFixed(1)),
+          indoorPredicted: undefined as number | undefined,
+          indoorNoHeating: undefined as number | undefined,
+          comfortTarget: undefined as number | undefined,
+        });
+      }
+    }
+
+    // Build forecast points (positive hours)
+    const forecastPoints = indoorForecast.forecast.map((f, i) => ({
       hour: `+${f.hour}h`,
-      indoorPredicted: f.predicted_temp,
+      actualIndoor: undefined as number | undefined,
+      indoorPredicted: f.predicted_indoor_temp,
+      indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
       comfortTarget: indoorForecast.target_schedule[i]?.target,
-      comfortHour: indoorForecast.target_schedule[i]?.comfort_hour,
-    })) || [];
+    }));
+
+    return [...historyPoints, ...forecastPoints];
+  })();
 
   return (
     <div className="plan-section">
@@ -276,7 +321,7 @@ export function ThermalPredictionChart() {
           <h3 style={{ color: "var(--text-muted)", fontSize: "0.95rem", marginTop: "1.5rem", marginBottom: "0.5rem" }}>
             Indoor Temperature Forecast
           </h3>
-          <ResponsiveContainer width="100%" height={220}>
+          <ResponsiveContainer width="100%" height={250}>
             <LineChart data={indoorChartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
               <XAxis dataKey="hour" stroke="#94a3b8" fontSize={11} interval={3} />
@@ -287,9 +332,20 @@ export function ThermalPredictionChart() {
                   border: "1px solid #334155",
                   borderRadius: "8px",
                 }}
-                formatter={(value: number, name: string) => [`${value.toFixed(1)}°C`, name]}
+                formatter={(value: number, name: string) =>
+                  value != null ? [`${Number(value).toFixed(1)}°C`, name] : ["-", name]
+                }
               />
               <Legend />
+              <Line
+                type="monotone"
+                dataKey="actualIndoor"
+                stroke="#10b981"
+                strokeWidth={2}
+                dot={false}
+                name="Actual Indoor"
+                connectNulls
+              />
               <Line
                 type="monotone"
                 dataKey="comfortTarget"
@@ -306,6 +362,15 @@ export function ThermalPredictionChart() {
                 strokeWidth={2}
                 dot={false}
                 name="Predicted Indoor"
+              />
+              <Line
+                type="monotone"
+                dataKey="indoorNoHeating"
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                strokeDasharray="5 5"
+                dot={false}
+                name="Indoor (no heating)"
               />
             </LineChart>
           </ResponsiveContainer>

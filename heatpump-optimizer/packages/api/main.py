@@ -1511,6 +1511,15 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         hours=hours,
     )
 
+    # No-heating curve: simulate with water temp at outdoor (no active heating)
+    no_heat_water_temps = [outdoor] * hours
+    forecast_no_heating = thermal_model.predict_indoor_curve(
+        current_indoor=current_indoor,
+        zone_water_temps=no_heat_water_temps,
+        weather_forecast=weather_forecast,
+        hours=hours,
+    )
+
     # Build comfort target schedule overlay
     comfort_schedule = await get_comfort_schedule()
     comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
@@ -1530,6 +1539,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         "current_indoor": current_indoor,
         "outdoor_temp": outdoor,
         "forecast": forecast,
+        "forecast_no_heating": forecast_no_heating,
         "target_schedule": target_schedule,
     }
 
