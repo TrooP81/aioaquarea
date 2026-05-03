@@ -141,6 +141,19 @@ class RulesOptimizer:
         )
         actions.extend(eco_actions)
 
+        # --- Rule 6: Indoor temperature guardrails ---
+        comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
+        comfort_temp_min = float(
+            await get_setting("comfort_temp_min")
+            or getattr(settings, "comfort_temp_min", 18.0)
+        )
+        indoor_actions = self._plan_indoor_guardrails(
+            prices, weather, horizon_start,
+            current_indoor_temp, current_outdoor_temp, current_water_temp,
+            comfort_schedule, comfort_temp_target, comfort_temp_min,
+        )
+        actions.extend(indoor_actions)
+
         if not actions:
             return None
 
@@ -350,6 +363,118 @@ class RulesOptimizer:
                     "payload": {"reason": "preheat_complete"},
                 }
             )
+
+        return actions
+
+    def _plan_indoor_guardrails(
+        self,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        horizon_start: dt.datetime,
+        current_indoor_temp: float,
+        current_outdoor_temp: float,
+        current_water_temp: float,
+        comfort_schedule: dict[str, list[int]],
+        comfort_temp_target: float,
+        comfort_temp_min: float,
+    ) -> list[dict]:
+        """
+        Check predicted indoor trajectory and add zone heating if indoor temp
+        is forecast to drop below the comfort target during comfort hours.
+        Also triggers pre-heating when indoor cooling time to target is short.
+        """
+        actions: list[dict] = []
+
+        if not weather:
+            return actions
+
+        # Build a simple indoor trajectory using thermal model linear rates
+        hours = min(24, len(weather))
+        indoor = current_indoor_temp
+
+        for h in range(hours):
+            hour_ts = horizon_start + dt.timedelta(hours=h)
+            outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
+            in_comfort = is_comfort_hour(comfort_schedule, hour_ts)
+            target = comfort_temp_target if in_comfort else comfort_temp_min
+
+            if indoor < target and in_comfort:
+                # Indoor temp has dropped below comfort target — need zone heating
+                heating_pred = thermal_model.predict_indoor_heating_time(
+                    current_temp=indoor,
+                    target_temp=target,
+                    outdoor_temp=outdoor,
+                )
+                hours_needed = max(1, int(heating_pred.estimated_hours + 0.9))
+
+                # Find cheapest slot in the hours leading up to (and including) this hour
+                window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 2))
+                window_prices = [
+                    (ts, p) for ts, p in prices
+                    if window_start <= ts <= hour_ts
+                ]
+                best_slot = self._find_cheapest_slot(window_prices, hours_needed) if window_prices else None
+                slot_start = best_slot[0][0] if best_slot else hour_ts
+
+                actions.append({
+                    "ts": slot_start.isoformat(),
+                    "type": "zone_temp_boost",
+                    "payload": {
+                        "offset": +2,
+                        "reason": "indoor_guardrail",
+                        "predicted_indoor": round(indoor, 1),
+                        "target": target,
+                        "predicted_minutes": round(heating_pred.estimated_minutes),
+                    },
+                })
+                actions.append({
+                    "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
+                    "type": "zone_temp_restore",
+                    "payload": {"reason": "indoor_guardrail_complete"},
+                })
+                # After boosting, assume indoor reaches target
+                indoor = target
+                break  # Only one guardrail action per plan cycle
+
+            # Simulate indoor evolution for next hour
+            if current_water_temp > indoor + 5.0:
+                rate = thermal_model._indoor_heating_rate(outdoor)
+            else:
+                rate = thermal_model._indoor_cooling_rate(outdoor)
+                delta = max(indoor - outdoor, 0.0)
+                scale = delta / 15.0 if delta < 15.0 else 1.0
+                rate = rate * scale
+
+            indoor += rate
+            indoor = max(indoor, outdoor)
+
+        # Additional trigger: if indoor is predicted to cool below target soon
+        cooling_pred = thermal_model.predict_indoor_cooling_time(
+            current_temp=current_indoor_temp,
+            min_temp=comfort_temp_target - 1.0,
+            outdoor_temp=current_outdoor_temp,
+        )
+        if (
+            cooling_pred.estimated_minutes < 120
+            and cooling_pred.estimated_minutes > 0
+            and not actions  # Don't double up with the trajectory check
+        ):
+            actions.append({
+                "ts": horizon_start.isoformat(),
+                "type": "zone_temp_boost",
+                "payload": {
+                    "offset": +2,
+                    "reason": "indoor_cooling_imminent",
+                    "minutes_until_cold": round(cooling_pred.estimated_minutes),
+                    "current_indoor": round(current_indoor_temp, 1),
+                },
+            })
+            boost_hours = max(1, int(cooling_pred.estimated_minutes / 60))
+            actions.append({
+                "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
+                "type": "zone_temp_restore",
+                "payload": {"reason": "indoor_cooling_boost_complete"},
+            })
 
         return actions
 

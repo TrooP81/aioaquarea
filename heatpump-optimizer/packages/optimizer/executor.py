@@ -117,9 +117,9 @@ class PlanExecutor:
                 case "zone_temp_boost":
                     offset = payload.get("offset", 2)
                     device = await self._wrapper.get_device()
-                    if hasattr(device.status, "zones") and device.status.zones:
-                        zone = device.status.zones[0]
-                        new_temp = (zone.heat_set or 20) + offset
+                    if device.zones:
+                        zone = device.zones.get(0) or next(iter(device.zones.values()))
+                        new_temp = (zone.heat_target_temperature or 20) + offset
                         await self._wrapper.set_zone_heat_temperature(0, new_temp)
 
                 case "zone_temp_restore":

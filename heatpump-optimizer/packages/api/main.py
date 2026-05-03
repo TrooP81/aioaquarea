@@ -1291,12 +1291,34 @@ async def get_thermal_status():
     cooling_pred = thermal_model.predict_tank_cooling_time(current_tank, float(tank_target - 7), outdoor)
     zone_pred = thermal_model.predict_zone_heating_time(current_zone, current_zone + 2, outdoor)
 
+    # Indoor temperature predictions
+    latest_indoor: float | None = None
+    async with get_session() as session:
+        row = (
+            await session.execute(
+                select(IndoorTempReading.temperature)
+                .order_by(IndoorTempReading.timestamp.desc())
+                .limit(1)
+            )
+        ).scalar()
+        if row is not None:
+            latest_indoor = float(row)
+
+    current_indoor = latest_indoor or 20.0
+    indoor_cooling_pred = thermal_model.predict_indoor_cooling_time(
+        current_indoor, current_indoor - 2.0, outdoor
+    )
+    indoor_heating_pred = thermal_model.predict_indoor_heating_time(
+        current_indoor, current_indoor + 1.0, outdoor
+    )
+
     return {
         "current": {
             "tank_temp": current_tank,
             "tank_target": tank_target,
             "outdoor_temp": outdoor,
             "zone1_temp": current_zone,
+            "indoor_temp": latest_indoor,
             "timestamp": status.ts.isoformat(),
         },
         "predictions": {
@@ -1317,6 +1339,18 @@ async def get_thermal_status():
                 "heating_rate_per_hour": round(zone_pred.heating_rate_per_hour, 2),
                 "confidence": zone_pred.confidence,
             },
+            "indoor": {
+                "current_indoor_temp": latest_indoor,
+                "minutes_to_cool_2deg": round(indoor_cooling_pred.estimated_minutes, 1)
+                if indoor_cooling_pred.estimated_minutes != float("inf")
+                else None,
+                "minutes_to_heat_1deg": round(indoor_heating_pred.estimated_minutes, 1),
+                "indoor_heating_rate": round(thermal_model.params.indoor_heating_rate, 3),
+                "indoor_cooling_rate": round(thermal_model.params.indoor_cooling_rate, 3),
+                "indoor_heating_samples": thermal_model.params.indoor_heating_samples,
+                "indoor_cooling_samples": thermal_model.params.indoor_cooling_samples,
+                "confidence": indoor_heating_pred.confidence,
+            },
         },
         "model_params": {
             "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 3),
@@ -1324,6 +1358,8 @@ async def get_thermal_status():
             "tank_standby_loss": round(thermal_model.params.tank_standby_loss, 3),
             "zone_heating_rate": round(thermal_model.params.zone_heating_rate, 3),
             "zone_standby_loss": round(thermal_model.params.zone_standby_loss, 3),
+            "indoor_heating_rate": round(thermal_model.params.indoor_heating_rate, 3),
+            "indoor_cooling_rate": round(thermal_model.params.indoor_cooling_rate, 3),
             "last_calibrated": thermal_model.params.last_calibrated.isoformat()
             if thermal_model.params.last_calibrated
             else None,
@@ -1402,6 +1438,99 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
             "tank_heating": tank_heating_curve,
             "zone_standby": zone_standby_curve,
         },
+    }
+
+
+@app.get("/api/thermal/indoor-forecast")
+async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
+    """
+    Get 24h indoor air temperature forecast with comfort target overlay.
+
+    Uses ComfortModel (autoregressive multi-step) when trained, falls back
+    to learned linear indoor rates from the ThermalModel.
+    """
+    from packages.ml.thermal import thermal_model
+    from packages.core.settings_service import get_setting, get_comfort_schedule, is_comfort_hour
+
+    async with get_session() as session:
+        status_result = await session.execute(
+            select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
+        )
+        status = status_result.scalar_one_or_none()
+
+        indoor_row = (
+            await session.execute(
+                select(IndoorTempReading.temperature)
+                .order_by(IndoorTempReading.timestamp.desc())
+                .limit(1)
+            )
+        ).scalar()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        weather_result = await session.execute(
+            select(WeatherRecord)
+            .where(WeatherRecord.ts >= now)
+            .order_by(WeatherRecord.ts)
+            .limit(hours)
+        )
+        weather_records = weather_result.scalars().all()
+
+    if not status:
+        return {"error": "No device data available"}
+
+    current_indoor = float(indoor_row) if indoor_row is not None else 20.0
+    outdoor = status.outdoor_temp or 7.0
+    current_zone = status.zone1_temp or 35.0
+
+    # Build weather forecast and zone water temp arrays
+    weather_forecast = []
+    for i in range(hours):
+        if i < len(weather_records):
+            w = weather_records[i]
+            weather_forecast.append({
+                "outdoor_temp": w.temperature if w.temperature is not None else outdoor,
+                "wind_speed": w.wind_speed if w.wind_speed is not None else 3.0,
+                "irradiance": getattr(w, "irradiance", 0.0) or 0.0,
+                "hour": w.ts.hour,
+            })
+        else:
+            weather_forecast.append({
+                "outdoor_temp": outdoor,
+                "wind_speed": 3.0,
+                "irradiance": 0.0,
+                "hour": (now.hour + i) % 24,
+            })
+
+    # Assume current zone water temp persists (no plan data available here)
+    zone_water_temps = [current_zone] * hours
+
+    forecast = thermal_model.predict_indoor_curve(
+        current_indoor=current_indoor,
+        zone_water_temps=zone_water_temps,
+        weather_forecast=weather_forecast,
+        hours=hours,
+    )
+
+    # Build comfort target schedule overlay
+    comfort_schedule = await get_comfort_schedule()
+    comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
+    comfort_temp_min_val = float(await get_setting("comfort_temp_min") or 18.0)
+
+    target_schedule = []
+    for h in range(hours):
+        hour_ts = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=h)
+        in_comfort = is_comfort_hour(comfort_schedule, hour_ts)
+        target_schedule.append({
+            "hour": h + 1,
+            "target": comfort_temp_target if in_comfort else comfort_temp_min_val,
+            "comfort_hour": in_comfort,
+        })
+
+    return {
+        "current_indoor": current_indoor,
+        "outdoor_temp": outdoor,
+        "forecast": forecast,
+        "target_schedule": target_schedule,
     }
 
 

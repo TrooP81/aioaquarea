@@ -17,7 +17,7 @@ except ImportError:
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
-from packages.core.settings_service import get_setting, dhw_deadlines_from_schedule, get_comfort_schedule
+from packages.core.settings_service import get_setting, dhw_deadlines_from_schedule, get_comfort_schedule, is_comfort_hour
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
@@ -101,6 +101,19 @@ class MILPOptimizer:
         comfort_schedule = await get_comfort_schedule()
         dhw_deadlines = dhw_deadlines_from_schedule(comfort_schedule, horizon_start)
 
+        # Resolve per-hour indoor comfort targets from schedule
+        comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
+        comfort_temp_min = float(
+            await get_setting("comfort_temp_min") or getattr(settings, "comfort_temp_min", 18.0)
+        )
+        indoor_targets = []
+        for h in range(len(prices)):
+            hour_ts = horizon_start + dt.timedelta(hours=h)
+            if is_comfort_hour(comfort_schedule, hour_ts):
+                indoor_targets.append(comfort_temp_target)
+            else:
+                indoor_targets.append(comfort_temp_min)
+
         # Solve synchronously in a thread to avoid blocking the event loop
         plan = await asyncio.to_thread(
             self._solve,
@@ -111,6 +124,7 @@ class MILPOptimizer:
             current_tank_temp,
             latest_indoor_temp,
             dhw_deadlines,
+            indoor_targets,
         )
         return plan
 
@@ -160,6 +174,7 @@ class MILPOptimizer:
         current_tank_temp: float,
         current_indoor_temp: float | None = None,
         dhw_deadlines: list[int] | None = None,
+        indoor_targets: list[float] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -262,6 +277,28 @@ class MILPOptimizer:
                 if temps[h] < 0:
                     prob += x_sh[h] >= 0.5
 
+        # --- Indoor temperature state variable ---
+        # Track predicted indoor air temperature through the horizon.
+        # Uses learned indoor heating/cooling rates from the thermal model.
+        indoor_init = current_indoor_temp if current_indoor_temp is not None else 20.0
+        t_indoor = [
+            pulp.LpVariable(f"T_indoor_{h}", 10.0, 35.0) for h in range(H + 1)
+        ]
+        prob += t_indoor[0] == indoor_init
+
+        for h in range(H):
+            gain = thermal_model._indoor_heating_rate(temps[h])
+            loss = thermal_model._indoor_cooling_rate(temps[h])
+            # Linear evolution: T[h+1] = T[h] + loss + x_sh[h] * (gain - loss)
+            # When x_sh=0 → pure cooling; when x_sh=1 → full heating
+            prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
+
+        # Comfort floor: indoor temp must stay at/above the per-hour target
+        if indoor_targets:
+            for h in range(H):
+                if h < len(indoor_targets):
+                    prob += t_indoor[h] >= indoor_targets[h]
+
         # --- Solve ---
         solver = pulp.PULP_CBC_CMD(
             msg=0, timeLimit=self.SOLVER_TIMEOUT_SECONDS
@@ -320,6 +357,17 @@ class MILPOptimizer:
 
         total_cost = pulp.value(prob.objective)
 
+        # Extract indoor temperature forecast from LP solution
+        indoor_forecast = []
+        for h in range(H):
+            t_val = t_indoor[h].varValue
+            target_val = indoor_targets[h] if indoor_targets and h < len(indoor_targets) else None
+            indoor_forecast.append({
+                "hour": h,
+                "predicted_indoor_temp": round(t_val, 1) if t_val is not None else None,
+                "target": target_val,
+            })
+
         version = self.VERSION
         if self._cop_model and self._cop_model.is_trained:
             version += "+ml"
@@ -330,6 +378,7 @@ class MILPOptimizer:
             "actions": actions,
             "version": version,
             "cost_estimate": total_cost,
+            "indoor_forecast": indoor_forecast,
         }
 
     # --- Data fetching (delegates to shared data_access module) ---

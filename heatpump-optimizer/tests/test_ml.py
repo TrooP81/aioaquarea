@@ -103,7 +103,10 @@ class TestCOPModel:
         assert 0.5 < cop < 10.0
 
         # Save and reload
-        with patch("packages.ml.models.MODEL_DIR", tmp_path):
+        with patch("packages.ml.models.MODEL_DIR", tmp_path), \
+             patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(tmp_path)
+            mock_settings.secret_key = "test-secret-key"
             from packages.ml.safe_persistence import safe_dump
             model_path = tmp_path / "cop_model_test.pkl"
             safe_dump(pipeline, model_path)

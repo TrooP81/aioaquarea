@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy import select, and_, func
 
 from packages.core.database import get_session
-from packages.core.models import DeviceStatusRecord
+from packages.core.models import DeviceStatusRecord, IndoorTempReading
 
 logger = structlog.get_logger(__name__)
 
@@ -59,6 +59,13 @@ class ThermalParams:
     # Direction-aware stats
     dhw_heating_samples: int = 0
     zone_compressor_samples: int = 0
+    # Indoor air temperature rates (learned from SmartThings data)
+    indoor_heating_rate: float = 0.5  # °C/hour when zone heating active
+    indoor_heating_outdoor_factor: float = 0.01  # sensitivity to outdoor temp
+    indoor_cooling_rate: float = -0.3  # °C/hour standby (negative = cooling)
+    indoor_cooling_outdoor_factor: float = 0.01  # reduced loss per °C warmer outdoor
+    indoor_heating_samples: int = 0
+    indoor_cooling_samples: int = 0
 
 
 @dataclass
@@ -237,6 +244,11 @@ class ThermalModel:
             else:
                 self.params.zone_standby_loss = float(np.mean(deltas))
 
+        # --- Indoor air temperature rates (from SmartThings data) ---
+        indoor_heating_deltas, indoor_cooling_deltas = await self._calibrate_indoor_rates(
+            since, records
+        )
+
         self.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
         self.params.sample_count = len(records)
         self.params.defrost_intervals_filtered = defrost_filtered
@@ -247,6 +259,8 @@ class ThermalModel:
             f"Thermal model calibrated: tank_heating={self.params.tank_heating_rate:.2f}°C/h, "
             f"tank_loss={self.params.tank_standby_loss:.2f}°C/h, "
             f"zone_heating={self.params.zone_heating_rate:.2f}°C/h, "
+            f"indoor_heating={self.params.indoor_heating_rate:.2f}°C/h, "
+            f"indoor_cooling={self.params.indoor_cooling_rate:.2f}°C/h, "
             f"defrost_filtered={defrost_filtered}"
         )
 
@@ -257,6 +271,8 @@ class ThermalModel:
             "tank_cooling_samples": len(tank_cooling_deltas),
             "zone_heating_samples": len(zone_heating_deltas),
             "zone_cooling_samples": len(zone_cooling_deltas),
+            "indoor_heating_samples": len(indoor_heating_deltas),
+            "indoor_cooling_samples": len(indoor_cooling_deltas),
             "defrost_intervals_filtered": defrost_filtered,
             "params": {
                 "tank_heating_rate": self.params.tank_heating_rate,
@@ -266,8 +282,114 @@ class ThermalModel:
                 "zone_heating_rate": self.params.zone_heating_rate,
                 "zone_standby_loss": self.params.zone_standby_loss,
                 "zone_loss_outdoor_factor": self.params.zone_loss_outdoor_factor,
+                "indoor_heating_rate": self.params.indoor_heating_rate,
+                "indoor_heating_outdoor_factor": self.params.indoor_heating_outdoor_factor,
+                "indoor_cooling_rate": self.params.indoor_cooling_rate,
+                "indoor_cooling_outdoor_factor": self.params.indoor_cooling_outdoor_factor,
             },
         }
+
+    async def _calibrate_indoor_rates(
+        self,
+        since: dt.datetime,
+        device_records: list,
+    ) -> tuple[list, list]:
+        """
+        Learn indoor air temperature heating/cooling rates from SmartThings data.
+
+        Joins IndoorTempReading with the nearest DeviceStatusRecord to determine
+        whether the zone was actively heating (direction=PUMP/HEATING) or idle.
+
+        Returns (indoor_heating_deltas, indoor_cooling_deltas) for calibration stats.
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                select(IndoorTempReading)
+                .where(IndoorTempReading.timestamp >= since)
+                .order_by(IndoorTempReading.timestamp)
+            )
+            readings = result.scalars().all()
+
+        if len(readings) < 2:
+            return [], []
+
+        # Build lookup for device status → nearest-neighbor matching
+        status_times = np.array([
+            (r.ts - since).total_seconds() for r in device_records
+        ]) if device_records else np.array([])
+
+        indoor_heating_deltas: list[tuple[float, float]] = []  # (delta_per_hour, outdoor)
+        indoor_cooling_deltas: list[tuple[float, float]] = []
+
+        for i in range(1, len(readings)):
+            prev_reading = readings[i - 1]
+            curr_reading = readings[i]
+
+            dt_hours = (curr_reading.timestamp - prev_reading.timestamp).total_seconds() / 3600.0
+            if dt_hours <= 0 or dt_hours > 2.0:
+                continue
+
+            indoor_delta = (curr_reading.temperature - prev_reading.temperature) / dt_hours
+
+            # Find nearest device status to determine heating state
+            if len(status_times) == 0:
+                continue
+            t_sec = (curr_reading.timestamp - since).total_seconds()
+            idx = int(np.argmin(np.abs(status_times - t_sec)))
+            status = device_records[idx]
+            gap = abs((status.ts - curr_reading.timestamp).total_seconds())
+            if gap > 900:  # > 15 min gap — skip
+                continue
+
+            outdoor = status.outdoor_temp if status.outdoor_temp is not None else 10.0
+            direction = getattr(status, 'direction', None)
+            device_action = getattr(status, 'device_action', None)
+
+            zone_active = (
+                direction in ("PUMP", None)
+                and device_action in ("HEATING", None)
+            ) if direction is not None or device_action is not None else False
+
+            if indoor_delta > 0.1 and zone_active:
+                indoor_heating_deltas.append((indoor_delta, outdoor))
+            elif indoor_delta < -0.05:
+                indoor_cooling_deltas.append((indoor_delta, outdoor))
+
+        # Fit indoor heating rate
+        if len(indoor_heating_deltas) >= 5:
+            deltas = np.array([d[0] for d in indoor_heating_deltas])
+            outdoors = np.array([d[1] for d in indoor_heating_deltas])
+            if np.std(outdoors) > 0:
+                coeffs = np.polyfit(outdoors, deltas, 1)
+                self.params.indoor_heating_outdoor_factor = float(coeffs[0])
+                self.params.indoor_heating_rate = float(coeffs[1])
+            else:
+                self.params.indoor_heating_rate = float(np.mean(deltas))
+
+        # Fit indoor cooling rate
+        if len(indoor_cooling_deltas) >= 5:
+            deltas = np.array([d[0] for d in indoor_cooling_deltas])
+            outdoors = np.array([d[1] for d in indoor_cooling_deltas])
+            if np.std(outdoors) > 0:
+                coeffs = np.polyfit(outdoors, deltas, 1)
+                self.params.indoor_cooling_outdoor_factor = float(coeffs[0])
+                self.params.indoor_cooling_rate = float(coeffs[1])
+            else:
+                self.params.indoor_cooling_rate = float(np.mean(deltas))
+
+        self.params.indoor_heating_samples = len(indoor_heating_deltas)
+        self.params.indoor_cooling_samples = len(indoor_cooling_deltas)
+
+        if indoor_heating_deltas or indoor_cooling_deltas:
+            logger.info(
+                "indoor_rates_calibrated",
+                heating_samples=len(indoor_heating_deltas),
+                cooling_samples=len(indoor_cooling_deltas),
+                heating_rate=self.params.indoor_heating_rate,
+                cooling_rate=self.params.indoor_cooling_rate,
+            )
+
+        return indoor_heating_deltas, indoor_cooling_deltas
 
     def predict_tank_heating_time(
         self, current_temp: float, target_temp: float, outdoor_temp: float
@@ -379,6 +501,152 @@ class ThermalModel:
             heating_rate_per_hour=rate,
             confidence="learned" if self.params.last_calibrated else "default",
         )
+
+    def predict_indoor_heating_time(
+        self, current_temp: float, target_temp: float, outdoor_temp: float
+    ) -> ThermalPrediction:
+        """Predict how many minutes to raise indoor air temp from current to target."""
+        rate = self._indoor_heating_rate(outdoor_temp)
+
+        delta_needed = target_temp - current_temp
+        if delta_needed <= 0:
+            return ThermalPrediction(
+                current_temp=current_temp,
+                target_temp=target_temp,
+                outdoor_temp=outdoor_temp,
+                estimated_minutes=0.0,
+                heating_rate_per_hour=rate,
+                confidence="learned" if self.params.last_calibrated else "default",
+            )
+
+        hours_needed = delta_needed / rate
+        return ThermalPrediction(
+            current_temp=current_temp,
+            target_temp=target_temp,
+            outdoor_temp=outdoor_temp,
+            estimated_minutes=hours_needed * 60.0,
+            heating_rate_per_hour=rate,
+            confidence="learned" if self.params.last_calibrated else "default",
+        )
+
+    def predict_indoor_cooling_time(
+        self, current_temp: float, min_temp: float, outdoor_temp: float
+    ) -> ThermalPrediction:
+        """
+        Predict how many minutes until indoor air cools from current to min_temp.
+
+        Indoor air can't cool below outdoor temperature.
+        """
+        loss_rate = self._indoor_cooling_rate(outdoor_temp)
+
+        if loss_rate >= 0:
+            return ThermalPrediction(
+                current_temp=current_temp,
+                target_temp=min_temp,
+                outdoor_temp=outdoor_temp,
+                estimated_minutes=float("inf"),
+                heating_rate_per_hour=loss_rate,
+                confidence="learned" if self.params.last_calibrated else "default",
+            )
+
+        effective_min = max(min_temp, outdoor_temp)
+        delta_until_min = current_temp - effective_min
+        if delta_until_min <= 0:
+            return ThermalPrediction(
+                current_temp=current_temp,
+                target_temp=min_temp,
+                outdoor_temp=outdoor_temp,
+                estimated_minutes=0.0 if current_temp <= min_temp else float("inf"),
+                heating_rate_per_hour=loss_rate,
+                confidence="learned" if self.params.last_calibrated else "default",
+            )
+
+        hours_until_cold = delta_until_min / abs(loss_rate)
+        return ThermalPrediction(
+            current_temp=current_temp,
+            target_temp=min_temp,
+            outdoor_temp=outdoor_temp,
+            estimated_minutes=hours_until_cold * 60.0,
+            heating_rate_per_hour=loss_rate,
+            confidence="learned" if self.params.last_calibrated else "default",
+        )
+
+    def predict_indoor_curve(
+        self,
+        current_indoor: float,
+        zone_water_temps: list[float],
+        weather_forecast: list[dict],
+        hours: int = 24,
+    ) -> list[dict]:
+        """
+        Predict indoor air temperature evolution over the planning horizon.
+
+        When the ComfortModel is trained, uses autoregressive multi-step
+        predictions for higher accuracy. Falls back to learned linear
+        heating/cooling rates otherwise.
+
+        Args:
+            current_indoor: current indoor air temperature (°C)
+            zone_water_temps: planned water supply temp per hour (len >= hours)
+            weather_forecast: list of dicts with keys: outdoor_temp, wind_speed, irradiance
+            hours: number of hours to predict (default 24)
+
+        Returns:
+            list of {hour, predicted_indoor_temp, source} entries
+        """
+        from packages.ml.comfort_model import comfort_model
+
+        curve = []
+        indoor = current_indoor
+
+        for h in range(hours):
+            water_temp = zone_water_temps[h] if h < len(zone_water_temps) else zone_water_temps[-1]
+            wx = weather_forecast[h] if h < len(weather_forecast) else weather_forecast[-1]
+            outdoor = wx.get("outdoor_temp", 5.0)
+            wind = wx.get("wind_speed", 3.0)
+            irradiance = wx.get("irradiance", 0.0)
+            hour_of_day = wx.get("hour", (h % 24))
+
+            if comfort_model.is_trained:
+                predicted = comfort_model.predict_indoor_temp(
+                    zone_water_temp=water_temp,
+                    outdoor_temp=outdoor,
+                    wind_speed=wind,
+                    irradiance=irradiance,
+                    hour=hour_of_day,
+                    indoor_temp=indoor,
+                )
+                if predicted is not None:
+                    indoor = predicted
+                    curve.append({
+                        "hour": h + 1,
+                        "predicted_indoor_temp": round(indoor, 1),
+                        "source": "comfort_model",
+                    })
+                    continue
+
+            # Fallback: linear rates
+            # Heuristic: if water temp is significantly above indoor, assume active heating
+            if water_temp > indoor + 5.0:
+                rate = self._indoor_heating_rate(outdoor)
+            else:
+                rate = self._indoor_cooling_rate(outdoor)
+                # Scale cooling by delta-T (Newton's law): slows near outdoor
+                delta = max(indoor - outdoor, 0.0)
+                scale = delta / 15.0 if delta < 15.0 else 1.0
+                rate = rate * scale
+
+            indoor += rate
+            # Indoor temp physically bounded
+            indoor = max(indoor, outdoor)
+
+            curve.append({
+                "hour": h + 1,
+                "predicted_indoor_temp": round(indoor, 1),
+                "source": "linear_rates",
+            })
+
+        return curve
 
     def predict_temperature_curve(
         self,
@@ -495,6 +763,22 @@ class ThermalModel:
             + self.params.zone_loss_outdoor_factor * outdoor_temp
         )
         return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
+
+    def _indoor_heating_rate(self, outdoor_temp: float) -> float:
+        """Indoor air heating rate (°C/hour) when zone is actively heating."""
+        rate = (
+            self.params.indoor_heating_rate
+            + self.params.indoor_heating_outdoor_factor * outdoor_temp
+        )
+        return max(0.1, min(3.0, rate))
+
+    def _indoor_cooling_rate(self, outdoor_temp: float) -> float:
+        """Indoor air cooling rate (°C/hour, negative) during standby."""
+        loss = (
+            self.params.indoor_cooling_rate
+            + self.params.indoor_cooling_outdoor_factor * outdoor_temp
+        )
+        return max(-2.0, min(0.0, loss))
 
 
 # Singleton instance

@@ -212,8 +212,17 @@ class TestCalibrate:
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = records
 
+        # Second session (indoor readings) returns empty
+        mock_indoor_result = MagicMock()
+        mock_indoor_result.scalars.return_value.all.return_value = []
+
+        call_count = [0]
+        async def _mock_execute(stmt):
+            call_count[0] += 1
+            return mock_result if call_count[0] <= 1 else mock_indoor_result
+
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=_mock_execute)
 
         with patch("packages.ml.thermal.get_session") as mock_ctx:
             mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
@@ -245,8 +254,16 @@ class TestCalibrate:
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = records
 
+        mock_indoor_result = MagicMock()
+        mock_indoor_result.scalars.return_value.all.return_value = []
+
+        call_count = [0]
+        async def _mock_execute(stmt):
+            call_count[0] += 1
+            return mock_result if call_count[0] <= 1 else mock_indoor_result
+
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=_mock_execute)
 
         with patch("packages.ml.thermal.get_session") as mock_ctx:
             mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
@@ -264,8 +281,16 @@ class TestCalibrate:
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = records
 
+        mock_indoor_result = MagicMock()
+        mock_indoor_result.scalars.return_value.all.return_value = []
+
+        call_count = [0]
+        async def _mock_execute(stmt):
+            call_count[0] += 1
+            return mock_result if call_count[0] <= 1 else mock_indoor_result
+
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=_mock_execute)
 
         with patch("packages.ml.thermal.get_session") as mock_ctx:
             mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
@@ -306,3 +331,199 @@ class TestInternalRates:
     def test_zone_loss_rate_never_positive(self):
         model = ThermalModel()
         assert model._zone_loss_rate(30.0) <= 0.0
+
+
+# --- Indoor temperature prediction tests ---
+
+
+class TestIndoorPredictions:
+    """Test indoor air temperature prediction methods."""
+
+    def test_indoor_heating_time_basic(self):
+        model = ThermalModel()
+        pred = model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0)
+        assert isinstance(pred, ThermalPrediction)
+        assert pred.estimated_minutes > 0
+        assert pred.confidence == "default"
+
+    def test_indoor_heating_already_at_target(self):
+        model = ThermalModel()
+        pred = model.predict_indoor_heating_time(21.0, 21.0, outdoor_temp=5.0)
+        assert pred.estimated_minutes == 0.0
+
+    def test_indoor_heating_above_target(self):
+        model = ThermalModel()
+        pred = model.predict_indoor_heating_time(22.0, 21.0, outdoor_temp=5.0)
+        assert pred.estimated_minutes == 0.0
+
+    def test_indoor_cooling_time_basic(self):
+        model = ThermalModel()
+        pred = model.predict_indoor_cooling_time(21.0, 18.0, outdoor_temp=5.0)
+        assert pred.estimated_minutes > 0
+        assert pred.heating_rate_per_hour < 0
+
+    def test_indoor_cooling_already_below_min(self):
+        model = ThermalModel()
+        pred = model.predict_indoor_cooling_time(17.0, 18.0, outdoor_temp=5.0)
+        assert pred.estimated_minutes == 0.0
+
+    def test_indoor_cooling_never_below_outdoor(self):
+        """Indoor temp can't cool below outdoor temperature."""
+        model = ThermalModel()
+        pred = model.predict_indoor_cooling_time(21.0, 10.0, outdoor_temp=15.0)
+        # min_temp=10 but outdoor=15, so effective_min=15
+        # 21 → 15 at cooling rate
+        assert pred.estimated_minutes > 0
+
+    def test_indoor_warmer_outdoor_heats_faster(self):
+        """Warmer outdoor should allow slightly faster indoor heating."""
+        model = ThermalModel()
+        cold = model.predict_indoor_heating_time(18.0, 21.0, outdoor_temp=-5.0)
+        warm = model.predict_indoor_heating_time(18.0, 21.0, outdoor_temp=15.0)
+        assert warm.estimated_minutes <= cold.estimated_minutes
+
+
+class TestIndoorRates:
+    """Test indoor heating/cooling rate helper methods."""
+
+    def test_indoor_heating_rate_minimum(self):
+        model = ThermalModel()
+        model.params.indoor_heating_rate = 0.01
+        model.params.indoor_heating_outdoor_factor = 0.0
+        assert model._indoor_heating_rate(-20.0) == 0.1
+
+    def test_indoor_heating_rate_maximum(self):
+        model = ThermalModel()
+        model.params.indoor_heating_rate = 5.0
+        assert model._indoor_heating_rate(10.0) == 3.0
+
+    def test_indoor_cooling_rate_never_positive(self):
+        model = ThermalModel()
+        assert model._indoor_cooling_rate(30.0) <= 0.0
+
+    def test_indoor_cooling_rate_capped(self):
+        model = ThermalModel()
+        model.params.indoor_cooling_rate = -5.0
+        assert model._indoor_cooling_rate(0.0) == -2.0
+
+
+class TestIndoorCurve:
+    """Test predict_indoor_curve method."""
+
+    def test_indoor_curve_length(self):
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+                   for h in range(12)]
+        water_temps = [35.0] * 12
+        curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=12)
+        assert len(curve) == 12
+
+    def test_indoor_curve_keys(self):
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": 10}]
+        water_temps = [35.0]
+        curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=1)
+        assert "predicted_indoor_temp" in curve[0]
+        assert "source" in curve[0]
+        assert "hour" in curve[0]
+
+    def test_indoor_curve_fallback_source(self):
+        """Without trained comfort model, source should be linear_rates."""
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+                   for h in range(6)]
+        water_temps = [35.0] * 6
+        curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=6)
+        assert all(entry["source"] == "linear_rates" for entry in curve)
+
+    def test_indoor_curve_cooling_without_heating(self):
+        """With low water temp, indoor should cool toward outdoor."""
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+                   for h in range(24)]
+        water_temps = [15.0] * 24  # Water temp below indoor → no heating effect
+        curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=24)
+        # Should be cooling over time
+        assert curve[-1]["predicted_indoor_temp"] < curve[0]["predicted_indoor_temp"]
+
+    def test_indoor_curve_never_below_outdoor(self):
+        """Indoor temp should never go below outdoor temperature."""
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 10.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+                   for h in range(48)]
+        water_temps = [10.0] * 48
+        curve = model.predict_indoor_curve(15.0, water_temps, weather, hours=48)
+        for entry in curve:
+            assert entry["predicted_indoor_temp"] >= 10.0
+
+
+class TestCalibrateIndoorRates:
+    """Test indoor rate calibration with mocked DB data."""
+
+    async def test_calibrate_includes_indoor_rates_in_result(self):
+        """Calibration result should include indoor rate keys."""
+        model = ThermalModel()
+        records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
+
+        # Mock device status records
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = records
+
+        # Mock empty indoor readings (no SmartThings data)
+        mock_indoor_result = MagicMock()
+        mock_indoor_result.scalars.return_value.all.return_value = []
+
+        call_count = [0]
+
+        async def mock_execute(stmt):
+            call_count[0] += 1
+            if call_count[0] <= 1:
+                return mock_result  # Device status query
+            return mock_indoor_result  # Indoor temp query
+
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(side_effect=mock_execute)
+
+        with patch("packages.ml.thermal.get_session") as mock_ctx:
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await model.calibrate()
+
+        assert result["status"] == "calibrated"
+        assert "indoor_heating_samples" in result
+        assert "indoor_cooling_samples" in result
+        assert "indoor_heating_rate" in result["params"]
+        assert "indoor_cooling_rate" in result["params"]
+
+    async def test_calibrate_no_smartthings_uses_defaults(self):
+        """Without SmartThings data, indoor rates stay at defaults."""
+        model = ThermalModel()
+        records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = records
+
+        mock_indoor_result = MagicMock()
+        mock_indoor_result.scalars.return_value.all.return_value = []
+
+        call_count = [0]
+
+        async def mock_execute(stmt):
+            call_count[0] += 1
+            if call_count[0] <= 1:
+                return mock_result
+            return mock_indoor_result
+
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(side_effect=mock_execute)
+
+        with patch("packages.ml.thermal.get_session") as mock_ctx:
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            await model.calibrate()
+
+        # Should keep defaults
+        assert model.params.indoor_heating_rate == 0.5
+        assert model.params.indoor_cooling_rate == -0.3
+        assert model.params.indoor_heating_samples == 0
+        assert model.params.indoor_cooling_samples == 0
