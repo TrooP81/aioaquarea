@@ -47,6 +47,7 @@ function StatusDot({ ok }: { ok: boolean }) {
 function formatDate(iso: string | null): string {
   if (!iso) return "never";
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return "unknown";
   return d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 }
 

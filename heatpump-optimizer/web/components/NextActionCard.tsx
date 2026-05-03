@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
-import { ACTION_LABELS, formatRelativeTime, formatTime } from "@/lib/constants";
+import { useTimeFormat } from "./useTimeFormat";
+import { ACTION_LABELS, LAYER_LABELS, LAYER_TOOLTIPS, formatRelativeTime, formatTime } from "@/lib/constants";
 
 interface NextActionCardProps {
   plan: {
@@ -27,6 +28,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
   const [nextAction, setNextAction] = useState<PlanAction | null>(null);
   const [relTime, setRelTime] = useState("");
   const currency = useCurrency();
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     if (!plan?.id) {
@@ -91,7 +93,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
             </span>
           </div>
           <div className="card-subtitle">
-            at {formatTime(nextAction.scheduled_ts)} · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
+            at {formatTime(nextAction.scheduled_ts, timeFormat.hour12)} · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
           </div>
         </>
       ) : (
@@ -104,6 +106,14 @@ export function NextActionCard({ plan }: NextActionCardProps) {
           </div>
         </>
       )}
+      <div className="next-action-layer">
+        <span
+          title={LAYER_TOOLTIPS[plan.optimizer_version] || plan.optimizer_version}
+          className={`opt-layer-badge ${plan.optimizer_version.includes("ml") ? "opt-layer-badge--ml" : plan.optimizer_version.includes("milp") ? "opt-layer-badge--milp" : ""}`}
+        >
+          {LAYER_LABELS[plan.optimizer_version] || plan.optimizer_version}
+        </span>
+      </div>
     </div>
   );
 }

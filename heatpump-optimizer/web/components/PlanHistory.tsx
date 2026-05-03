@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
+import { useTimeFormat } from "./useTimeFormat";
 import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
 
 interface PlanSummary {
@@ -160,6 +161,7 @@ export function PlanHistory() {
   const [expandedActions, setExpandedActions] = useState<PlanAction[]>([]);
   const [loadingActions, setLoadingActions] = useState(false);
   const currency = useCurrency();
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     fetch("/api/plans?limit=20")
@@ -236,7 +238,7 @@ export function PlanHistory() {
               >
                 <span className="plan-history-date">{formatDate(plan.created_at)}</span>
                 <span className="plan-history-horizon">
-                  {formatTime(plan.horizon_start)} – {formatTime(plan.horizon_end)}
+                  {formatTime(plan.horizon_start, timeFormat.hour12)} – {formatTime(plan.horizon_end, timeFormat.hour12)}
                 </span>
                 <span className="plan-history-layer">{layerLabel}</span>
                 <span className="plan-history-cost">{formatCost(plan.cost_estimate_eur, currency)}</span>
@@ -292,7 +294,7 @@ export function PlanHistory() {
                             style={{ opacity: isDone || isExpired ? 0.5 : 1 }}
                           >
                             <div className="plan-action-main-row">
-                              <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
+                              <span className="plan-action-time">{formatTime(action.scheduled_ts, timeFormat.hour12)}</span>
                               <span className="plan-action-type">
                                 {info ? (
                                   <>
@@ -303,7 +305,7 @@ export function PlanHistory() {
                               </span>
                               {action.executed_at && (
                                 <span className="plan-history-executed-at">
-                                  ran {formatTime(action.executed_at)}
+                                  ran {formatTime(action.executed_at, timeFormat.hour12)}
                                 </span>
                               )}
                               <span className={`plan-action-status ${status.className}`}>{status.text}</span>

@@ -13,6 +13,7 @@ import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
 import { SECTIONS, SectionId } from "@/lib/constants";
+import { useTimeFormat, formatTime } from "@/components/useTimeFormat";
 
 interface DashboardData {
   current_status: {
@@ -55,14 +56,11 @@ interface IndoorTempData {
   sensor_count: number;
 }
 
-function formatLastUpdated(date: Date): string {
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-}
-
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
   const [loading, setLoading] = useState(true);
+  const timeFormat = useTimeFormat();
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
   const [pollResult, setPollResult] = useState<PollResult | null>(null);
@@ -188,7 +186,7 @@ export default function Home() {
         <div className="header-actions">
           {lastUpdated && (
             <span className="last-updated">
-              Updated {formatLastUpdated(lastUpdated)}
+              Updated {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
             </span>
           )}
           <button className="btn btn-primary" onClick={pollNow} disabled={polling}>

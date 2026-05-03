@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useTimeFormat, formatHourLabel } from "./useTimeFormat";
 
 interface SettingEntry {
   value: string;
@@ -92,12 +93,10 @@ const UNIT_SUFFIXES: Record<string, string> = {
   manual_price_eur_per_kwh: " /kWh",
   price_comfort_override_pct: "th pctl",
   price_eco_upgrade_pct: "th pctl",
-  quiet_mode_start: ":00",
-  quiet_mode_end: ":00",
   poll_interval_seconds: "s",
 };
 
-function formatValue(key: string, entry: SettingEntry): string {
+function formatValue(key: string, entry: SettingEntry, hour12: boolean): string {
   const val = entry.value;
   if (val === "" || val === undefined || val === null) return "—";
 
@@ -116,6 +115,12 @@ function formatValue(key: string, entry: SettingEntry): string {
     "open-meteo": "Open-Meteo",
   };
   if (optionLabels[val]) return optionLabels[val];
+
+  // Quiet mode hours — format as time
+  if (key === "quiet_mode_start" || key === "quiet_mode_end") {
+    const h = parseInt(val, 10);
+    if (!isNaN(h)) return formatHourLabel(h, hour12) + ":00";
+  }
 
   const suffix = UNIT_SUFFIXES[key] || "";
   return `${val}${suffix}`;
@@ -249,6 +254,7 @@ export function SettingsPanel() {
   const [device, setDevice] = useState<DeviceSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     Promise.all([
@@ -341,7 +347,7 @@ export function SettingsPanel() {
                       {DISPLAY_LABELS[key] || key}
                     </span>
                     <span className="settings-value">
-                      {formatValue(key, entry)}
+                      {formatValue(key, entry, timeFormat.hour12)}
                     </span>
                   </div>
                 );

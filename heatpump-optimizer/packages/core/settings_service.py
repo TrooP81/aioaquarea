@@ -137,6 +137,12 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "description": "Display currency",
         "options": ["EUR", "GBP", "USD", "SEK", "NOK", "DKK", "CHF", "PLN", "CZK", "HUF"],
     },
+    "time_format": {
+        "type": "str",
+        "default": "24h",
+        "description": "Time display format",
+        "options": ["24h", "12h"],
+    },
     # --- Manual static values ---
     "manual_price_eur_per_kwh": {
         "type": "float",

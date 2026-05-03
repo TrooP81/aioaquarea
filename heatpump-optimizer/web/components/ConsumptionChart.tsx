@@ -11,6 +11,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { useTimeFormat, formatTime } from "./useTimeFormat";
 
 interface ConsumptionPoint {
   ts: string;
@@ -23,6 +24,7 @@ interface ConsumptionPoint {
 
 export function ConsumptionChart() {
   const [data, setData] = useState<ConsumptionPoint[]>([]);
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     fetch("/api/consumption/history?hours=24")
@@ -32,10 +34,7 @@ export function ConsumptionChart() {
   }, []);
 
   const chartData = data.map((d) => ({
-    time: new Date(d.ts).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
+    time: formatTime(new Date(d.ts), timeFormat.hour12),
     heat: d.heat_kwh || 0,
     cool: d.cool_kwh || 0,
     tank: d.tank_kwh || 0,

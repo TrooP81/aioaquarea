@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { useTimeFormat, formatHourLabel } from "./useTimeFormat";
 
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 const DAY_TYPES = ["weekday", "weekend"] as const;
@@ -16,16 +17,13 @@ interface LearnedSchedule {
   weekend: Record<string, number>;
 }
 
-function formatHour(h: number): string {
-  return `${h.toString().padStart(2, "0")}`;
-}
-
 export function ComfortSchedule() {
   const [schedule, setSchedule] = useState<Schedule>({ weekday: [], weekend: [] });
   const [learned, setLearned] = useState<LearnedSchedule | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const [dragging, setDragging] = useState<{ dayType: DayType; adding: boolean } | null>(null);
+  const timeFormat = useTimeFormat();
 
   const fetchSchedule = useCallback(async () => {
     try {
@@ -171,7 +169,7 @@ export function ComfortSchedule() {
                     fontWeight: 400,
                   }}
                 >
-                  {formatHour(h)}
+                  {formatHourLabel(h, timeFormat.hour12)}
                 </th>
               ))}
             </tr>
@@ -206,7 +204,7 @@ export function ComfortSchedule() {
                       <div
                         role="checkbox"
                         aria-checked={active}
-                        aria-label={`${dayType} ${formatHour(h)}:00 — ${active ? "comfort" : "eco"}`}
+                        aria-label={`${dayType} ${formatHourLabel(h, timeFormat.hour12)} — ${active ? "comfort" : "eco"}`}
                         tabIndex={0}
                         onKeyDown={(e) => {
                           if (e.key === " " || e.key === "Enter") {

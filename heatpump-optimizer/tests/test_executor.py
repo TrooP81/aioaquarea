@@ -44,23 +44,45 @@ class TestExecuteAction:
     @pytest.mark.asyncio
     async def test_force_dhw_on_dispatches(self, executor, mock_wrapper):
         action = _make_action("force_dhw_on")
-        with patch("packages.optimizer.executor.asyncio.create_task"):
+        with patch("packages.optimizer.executor.asyncio.create_task"), \
+             patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
             await executor._execute_action(action)
         mock_wrapper.force_dhw.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_quiet_mode_on_dispatches(self, executor, mock_wrapper):
         action = _make_action("quiet_mode_on")
-        with patch("packages.optimizer.executor.asyncio.create_task"):
+        with patch("packages.optimizer.executor.asyncio.create_task"), \
+             patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
             await executor._execute_action(action)
         mock_wrapper.set_quiet_mode.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_set_tank_temp_dispatches(self, executor, mock_wrapper):
         action = _make_action("set_tank_temp", {"temperature": 52})
-        with patch("packages.optimizer.executor.asyncio.create_task"):
+        with patch("packages.optimizer.executor.asyncio.create_task"), \
+             patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
             await executor._execute_action(action)
         mock_wrapper.set_tank_temperature.assert_awaited_once_with(52)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_marks_executed_unverified_immediately(self, executor, mock_wrapper):
+        """After successful dispatch, action is immediately marked executed_unverified."""
+        action = _make_action("force_dhw_on")
+        with patch("packages.optimizer.executor.asyncio.create_task"), \
+             patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await executor._execute_action(action)
+        # The session.execute should have been called to update status
+        mock_session.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_unknown_action_type_does_not_crash(self, executor, mock_wrapper):
@@ -261,3 +283,45 @@ class TestExpireStaleActions:
             await executor.expire_stale_actions()
 
         assert mock_session.execute.call_count == 1  # only the initial query
+
+    @pytest.mark.asyncio
+    async def test_optimization_overlap_detected(self, executor):
+        """When a plan was generated near the action's scheduled time, report overlap."""
+        stale = _make_action(
+            "comfort_mode_on",
+            scheduled_ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+        )
+        stale.plan_id = 20
+
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = [stale]
+
+            latest_plan_result = MagicMock()
+            latest_plan_result.scalar_one_or_none.return_value = 20  # same plan
+
+            override_result = MagicMock()
+            override_result.scalar_one_or_none.return_value = None  # no override
+
+            # Concurrent plan found
+            concurrent_plan_result = MagicMock()
+            concurrent_plan_result.one_or_none.return_value = (
+                21,
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=4),
+            )
+
+            mock_session.execute = AsyncMock(
+                side_effect=[
+                    stale_result, latest_plan_result, override_result,
+                    concurrent_plan_result, None,
+                ]
+            )
+
+            await executor.expire_stale_actions()
+
+        # stale + latest plan + override + plan check + update = 5 calls
+        assert mock_session.execute.call_count == 5

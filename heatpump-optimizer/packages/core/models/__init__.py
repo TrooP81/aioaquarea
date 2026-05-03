@@ -131,7 +131,7 @@ class PlanActionRecord(Base):
     scheduled_ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
     action_type: Mapped[str] = mapped_column(String(64))
     payload_json: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
+    status: Mapped[str] = mapped_column(String(24), default="pending")
     executed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     result_json: Mapped[str | None] = mapped_column(Text)
 

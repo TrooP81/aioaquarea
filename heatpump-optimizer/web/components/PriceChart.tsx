@@ -11,6 +11,7 @@ import {
   ComposedChart,
 } from "recharts";
 import { useCurrency, priceAxisLabel } from "./useCurrency";
+import { useTimeFormat, formatTime } from "./useTimeFormat";
 
 interface PricePoint {
   ts: string;
@@ -20,6 +21,7 @@ interface PricePoint {
 export function PriceChart() {
   const [prices, setPrices] = useState<PricePoint[]>([]);
   const currency = useCurrency();
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     fetch("/api/prices?hours=48")
@@ -30,10 +32,7 @@ export function PriceChart() {
 
   const chartData = currency.loaded
     ? prices.map((p) => {
-        const hour = new Date(p.ts).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        });
+        const hour = formatTime(new Date(p.ts), timeFormat.hour12);
         const now = new Date();
         const priceTime = new Date(p.ts);
         const isFuture = priceTime > now;

@@ -5,6 +5,7 @@ import { TestConnection } from "../../components/TestConnection";
 import { ComfortSchedule } from "../../components/ComfortSchedule";
 import { SmartThingsOAuth } from "../../components/SmartThingsOAuth";
 import { useCurrency } from "../../components/useCurrency";
+import { OPTIMIZER_LAYER_OPTIONS } from "@/lib/constants";
 
 interface SettingMeta {
   value: string;
@@ -79,7 +80,7 @@ const SETTING_GROUPS = [
   {
     title: "Display",
     description: "Currency and display preferences",
-    keys: ["currency"],
+    keys: ["currency", "time_format"],
   },
 ];
 
@@ -242,20 +243,27 @@ export default function SettingsPage() {
                     </label>
 
                     {meta.options ? (
-                      <select
-                        id={`setting-${key}`}
-                        value={editValues[key] || ""}
-                        onChange={(e) =>
-                          setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
-                        }
-                        className="form-select"
-                      >
-                        {meta.options.map((opt) => (
-                          <option key={opt} value={opt}>
-                            {opt}
-                          </option>
-                        ))}
-                      </select>
+                      <>
+                        <select
+                          id={`setting-${key}`}
+                          value={editValues[key] || ""}
+                          onChange={(e) =>
+                            setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
+                          }
+                          className="form-select"
+                        >
+                          {meta.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {key === "optimizer_layer" ? (OPTIMIZER_LAYER_OPTIONS[opt]?.label || opt) : opt}
+                            </option>
+                          ))}
+                        </select>
+                        {key === "optimizer_layer" && OPTIMIZER_LAYER_OPTIONS[editValues[key]] && (
+                          <span className="settings-form-hint">
+                            {OPTIMIZER_LAYER_OPTIONS[editValues[key]].description}
+                          </span>
+                        )}
+                      </>
                     ) : (
                       <input
                         id={`setting-${key}`}

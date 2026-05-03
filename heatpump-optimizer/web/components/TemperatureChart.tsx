@@ -11,6 +11,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { useTimeFormat, formatTime } from "./useTimeFormat";
 
 interface StatusPoint {
   ts: string;
@@ -29,6 +30,7 @@ interface IndoorTempPoint {
 export function TemperatureChart() {
   const [data, setData] = useState<StatusPoint[]>([]);
   const [indoorData, setIndoorData] = useState<IndoorTempPoint[]>([]);
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     fetch("/api/status/history?hours=24")
@@ -48,10 +50,7 @@ export function TemperatureChart() {
     const d = new Date(p.timestamp);
     // Round to nearest 5 minutes
     d.setMinutes(Math.round(d.getMinutes() / 5) * 5, 0, 0);
-    const key = d.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const key = formatTime(d, timeFormat.hour12);
     indoorByBucket.set(key, p.temperature);
   });
 
@@ -59,10 +58,7 @@ export function TemperatureChart() {
     const raw = new Date(d.ts);
     // Round status timestamps to same 5-minute bucket
     raw.setMinutes(Math.round(raw.getMinutes() / 5) * 5, 0, 0);
-    const time = raw.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const time = formatTime(raw, timeFormat.hour12);
     return {
       time,
       tank: d.tank_temp,

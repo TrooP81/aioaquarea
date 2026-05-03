@@ -843,6 +843,13 @@ async def get_currency():
     }
 
 
+@app.get("/api/time-format")
+async def get_time_format():
+    """Get the configured time display format (24h or 12h)."""
+    fmt = await get_setting("time_format") or "24h"
+    return {"format": fmt, "hour12": fmt == "12h"}
+
+
 # --- SmartThings indoor temperature ---
 
 
@@ -1184,18 +1191,30 @@ async def get_optimizer_status():
         cop_samples = max(0, total_consumption - estimated_days)
         demand_samples = total_consumption
 
+    def _version_to_iso(prefix: str, models: list) -> str | None:
+        """Convert model filename version (YYYYMMDD_HHMM) to ISO 8601."""
+        if not models:
+            return None
+        version = models[-1].stem.replace(prefix, "")
+        try:
+            return dt.datetime.strptime(version, "%Y%m%d_%H%M").replace(
+                tzinfo=dt.timezone.utc
+            ).isoformat()
+        except ValueError:
+            return version  # fallback: return raw string
+
     return {
         "configured_layer": layer,
         "active_layer": active_layer,
         "fallback_layer": "rules_v3",
         "cop_model": {
             "trained": cop.is_trained,
-            "last_trained": cop_models[-1].stem.replace("cop_model_", "") if cop_models else None,
+            "last_trained": _version_to_iso("cop_model_", cop_models),
             "samples": cop_samples,
         },
         "demand_model": {
             "trained": demand.is_trained,
-            "last_trained": demand_models[-1].stem.replace("demand_model_", "") if demand_models else None,
+            "last_trained": _version_to_iso("demand_model_", demand_models),
             "samples": demand_samples,
         },
         "thermal_model": {

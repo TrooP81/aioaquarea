@@ -145,6 +145,21 @@ class PlanExecutor:
                     logger.warning("executor_unknown_action", action_type=action.action_type)
                     return
 
+            # Mark as dispatched immediately — verify task may upgrade to
+            # "executed" later, but we must not leave the action as "pending"
+            # in case the async verification fails.
+            now = dt.datetime.now(dt.timezone.utc)
+            async with get_session() as session:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="executed_unverified",
+                        executed_at=now,
+                        result_json=json.dumps({"dispatched": True}),
+                    )
+                )
+
             # --- Action Verification (non-blocking) ---
             asyncio.create_task(self._deferred_verify(action))
 
@@ -234,6 +249,8 @@ class PlanExecutor:
             )
         except Exception as e:
             logger.error("deferred_verify_failed", action_id=action.id, error=str(e))
+            # Status already set to executed_unverified by _execute_action,
+            # so the action won't be stuck as "pending".
 
     async def expire_stale_actions(self) -> None:
         """Mark stale pending actions as expired with a diagnostic reason.
@@ -296,20 +313,24 @@ class PlanExecutor:
     ) -> dict:
         """Determine why a pending action was never executed."""
         scheduled = action.scheduled_ts
+        gap_minutes = round((now - scheduled).total_seconds() / 60, 1)
 
         # 1. Superseded by a newer plan?
         if latest_plan_id and action.plan_id != latest_plan_id:
             return {
                 "reason": "superseded",
+                "gap_minutes": gap_minutes,
                 "detail": f"Replaced by plan #{latest_plan_id}",
             }
 
-        # 2. Was an override active during the action's scheduled window?
-        #    Check overrides that overlapped the scheduled time.
+        # 2. Was an override active in the execution window?
+        #    The executor checks every 60s, so look for overrides covering
+        #    a window from scheduled_ts to scheduled_ts + 2 min.
+        window_end = scheduled + dt.timedelta(minutes=2)
         override_result = await session.execute(
             select(OverrideRecord).where(
                 and_(
-                    OverrideRecord.ts_from <= scheduled,
+                    OverrideRecord.ts_from <= window_end,
                     OverrideRecord.ts_to >= scheduled,
                 )
             ).limit(1)
@@ -319,21 +340,49 @@ class PlanExecutor:
             return {
                 "reason": "override_active",
                 "override": blocking_override.reason or "manual override",
+                "gap_minutes": gap_minutes,
                 "detail": f"Override '{blocking_override.reason}' was active at scheduled time",
             }
 
-        # 3. Large gap since scheduled time → executor likely wasn't running
-        gap_minutes = (now - scheduled).total_seconds() / 60
+        # 3. Was a new plan generated around the action's scheduled time?
+        #    Re-optimization can delay the executor in the same event loop.
+        plan_window_start = scheduled - dt.timedelta(minutes=1)
+        plan_window_end = scheduled + dt.timedelta(minutes=3)
+        plan_result = await session.execute(
+            select(PlanRecord.id, PlanRecord.created_at).where(
+                and_(
+                    PlanRecord.created_at >= plan_window_start,
+                    PlanRecord.created_at <= plan_window_end,
+                )
+            ).order_by(PlanRecord.created_at.desc()).limit(1)
+        )
+        concurrent_plan = plan_result.one_or_none()
+        if concurrent_plan:
+            return {
+                "reason": "optimization_overlap",
+                "concurrent_plan_id": concurrent_plan[0],
+                "gap_minutes": gap_minutes,
+                "detail": (
+                    f"Plan #{concurrent_plan[0]} was being generated at "
+                    f"{concurrent_plan[1].strftime('%H:%M:%S')} "
+                    f"— may have blocked the executor"
+                ),
+            }
+
+        # 4. Large gap since scheduled time → executor likely wasn't running
         if gap_minutes > 10:
             return {
                 "reason": "executor_gap",
-                "gap_minutes": round(gap_minutes),
+                "gap_minutes": gap_minutes,
                 "detail": f"Executor did not run for ~{round(gap_minutes)} min after scheduled time",
             }
 
-        # 4. Fallback: small gap, likely a timing edge case
+        # 5. Fallback
         return {
             "reason": "timing",
-            "gap_minutes": round(gap_minutes, 1),
-            "detail": "Scheduled time passed between executor cycles",
+            "gap_minutes": gap_minutes,
+            "detail": (
+                f"Action was due {gap_minutes} min ago but was never picked up "
+                f"— possible event-loop delay or transient DB error"
+            ),
         }

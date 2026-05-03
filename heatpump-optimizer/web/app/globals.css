@@ -1070,3 +1070,38 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Optimizer layer on NextActionCard ── */
+.next-action-layer {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* ── ML status dots (compact) ── */
+.ml-status-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.ml-status-dots .status-dot {
+  width: 8px;
+  height: 8px;
+  margin-right: 0.125rem;
+}
+
+.ml-status-label {
+  margin-left: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+/* ── Settings form hint ── */
+.settings-form-hint {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
