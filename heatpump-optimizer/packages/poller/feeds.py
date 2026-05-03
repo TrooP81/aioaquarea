@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
-from xml.etree import ElementTree
 
+import defusedxml.ElementTree as ElementTree
 import httpx
 
 from packages.core.config import settings

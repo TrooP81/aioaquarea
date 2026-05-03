@@ -20,15 +20,23 @@ def _get_signing_key() -> bytes:
     return hashlib.sha256(settings.secret_key.encode()).digest()
 
 
+def _validate_path(path: Path) -> Path:
+    """Resolve path and ensure it stays within the configured model directory."""
+    model_dir = Path(settings.model_dir).resolve()
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(model_dir)):
+        raise ValueError(f"Path {path} resolves outside model directory {model_dir}")
+    return resolved
+
+
 def safe_dump(obj: Any, path: Path) -> None:
     """Serialize object to file with HMAC integrity tag."""
+    resolved = _validate_path(path)
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     mac = hmac.new(_get_signing_key(), data, hashlib.sha256).digest()
 
-    with open(path, "wb") as f:
-        # Write 32-byte HMAC prefix then pickled data
-        f.write(mac)
-        f.write(data)
+    # Write 32-byte HMAC prefix then pickled data
+    resolved.write_bytes(mac + data)
 
 
 def safe_load(path: Path) -> Any:
@@ -38,7 +46,8 @@ def safe_load(path: Path) -> Any:
     Raises ValueError if the file has been tampered with or was not
     created by safe_dump.
     """
-    raw = path.read_bytes()
+    resolved = _validate_path(path)
+    raw = resolved.read_bytes()
 
     if len(raw) < 32:
         raise ValueError(f"Model file too small to contain HMAC: {path}")
