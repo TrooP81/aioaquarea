@@ -894,22 +894,31 @@ async def get_indoor_temp(
 async def get_latest_indoor_temp():
     """Get the most recent indoor temperature reading (average across all sensors)."""
     async with get_session() as session:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
+
+        # Latest readings (including stale carry-forwards)
         result = await session.execute(
             select(
                 func.avg(IndoorTempReading.temperature),
                 func.max(IndoorTempReading.timestamp),
                 func.count(IndoorTempReading.id),
-            ).where(
-                IndoorTempReading.timestamp
-                >= dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
-            )
+            ).where(IndoorTempReading.timestamp >= cutoff)
         )
         row = result.one()
+
+        # Last fresh (non-stale) reading across all time
+        fresh_result = await session.execute(
+            select(func.max(IndoorTempReading.timestamp)).where(
+                IndoorTempReading.is_stale == False  # noqa: E712
+            )
+        )
+        last_fresh = fresh_result.scalar()
 
     return {
         "avg_temperature": round(row[0], 1) if row[0] is not None else None,
         "latest_reading": row[1].isoformat() if row[1] else None,
         "sensor_count": row[2] or 0,
+        "last_fresh_reading": last_fresh.isoformat() if last_fresh else None,
     }
 
 

@@ -27,6 +27,7 @@ interface IndoorTempLatest {
   avg_temperature: number | null;
   latest_reading: string | null;
   sensor_count: number;
+  last_fresh_reading: string | null;
 }
 
 interface OptimizerStatusData {
@@ -264,6 +265,16 @@ export function OptimizerStatus() {
             <div className="model-card-details">
               <div>Average across {indoorTemp.sensor_count} sensor{indoorTemp.sensor_count !== 1 ? "s" : ""}</div>
               <div>Last reading: {formatDate(indoorTemp.latest_reading)}</div>
+              {indoorTemp.last_fresh_reading && indoorTemp.last_fresh_reading !== indoorTemp.latest_reading && (
+                <div className="text-warning text-sm">
+                  ⚠ Sensor data stale — last fresh reading: {formatDate(indoorTemp.last_fresh_reading)}
+                </div>
+              )}
+              {!indoorTemp.last_fresh_reading && (
+                <div className="text-warning text-sm">
+                  ⚠ No fresh sensor data received yet
+                </div>
+              )}
             </div>
           </div>
         </>

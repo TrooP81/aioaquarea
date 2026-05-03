@@ -54,6 +54,7 @@ interface IndoorTempData {
   avg_temperature: number | null;
   latest_reading: string | null;
   sensor_count: number;
+  last_fresh_reading: string | null;
 }
 
 export default function Home() {
@@ -228,7 +229,7 @@ export default function Home() {
 
       {/* ── Overview section ── */}
       <section id="overview">
-        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} />
+        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
         <NextActionCard plan={data?.active_plan ?? null} />
       </section>
 

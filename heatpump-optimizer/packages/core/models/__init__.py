@@ -229,6 +229,8 @@ class IndoorTempReading(Base):
     device_label: Mapped[str | None] = mapped_column(String(200))
     room: Mapped[str | None] = mapped_column(String(200))
     temperature: Mapped[float] = mapped_column(Float, nullable=False)
+    device_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    is_stale: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
 
 
 class SmartThingsToken(Base):

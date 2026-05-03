@@ -286,10 +286,10 @@ class TestRetryBehavior:
 # ------------------------------------------------------------------
 
 
-class TestStaleReadingExclusion:
+class TestStaleReadingHandling:
     @pytest.mark.asyncio
-    async def test_stale_reading_is_skipped(self):
-        """Readings older than STALE_READING_THRESHOLD are not written."""
+    async def test_stale_reading_is_written_with_flag(self):
+        """Readings older than STALE_READING_THRESHOLD are written with is_stale=True."""
         from packages.poller.smartthings import poll_smartthings_temps, invalidate_device_cache
 
         invalidate_device_cache()
@@ -323,8 +323,12 @@ class TestStaleReadingExclusion:
                 ):
                     count = await poll_smartthings_temps(mock_session)
 
-        assert count == 0
-        mock_session.add.assert_not_called()
+        assert count == 1
+        mock_session.add.assert_called_once()
+        reading = mock_session.add.call_args[0][0]
+        assert reading.is_stale is True
+        assert reading.temperature == 21.0
+        assert reading.device_timestamp is not None
 
     @pytest.mark.asyncio
     async def test_fresh_reading_is_written(self):
@@ -364,3 +368,6 @@ class TestStaleReadingExclusion:
 
         assert count == 1
         mock_session.add.assert_called_once()
+        reading = mock_session.add.call_args[0][0]
+        assert reading.is_stale is False
+        assert reading.temperature == 21.0

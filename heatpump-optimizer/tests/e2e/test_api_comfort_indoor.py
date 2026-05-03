@@ -84,6 +84,7 @@ class TestIndoorTemp:
         # Average of 21.5 and 20.0
         assert data["avg_temperature"] == 20.8
         assert data["latest_reading"] is not None
+        assert data["last_fresh_reading"] is not None
 
     async def test_indoor_temp_latest_empty(self, client: AsyncClient):
         resp = await client.get("/api/indoor-temp/latest")
@@ -91,6 +92,7 @@ class TestIndoorTemp:
         data = resp.json()
         assert data["avg_temperature"] is None
         assert data["sensor_count"] == 0
+        assert data["last_fresh_reading"] is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

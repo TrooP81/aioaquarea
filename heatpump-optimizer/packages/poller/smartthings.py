@@ -197,20 +197,22 @@ async def poll_smartthings_temps(session) -> int:
 
     count = 0
     for r in readings:
-        # Exclude stale readings (SmartThings reports old timestamps when
-        # a sensor hasn't reported recently)
+        is_stale = False
+        device_ts: dt.datetime | None = None
+
+        # Parse the device-reported timestamp and check staleness
         if r.get("timestamp"):
             try:
-                reading_ts = dt.datetime.fromisoformat(
+                device_ts = dt.datetime.fromisoformat(
                     r["timestamp"].replace("+0000", "+00:00")
                 )
-                if (now - reading_ts) > STALE_READING_THRESHOLD:
+                if (now - device_ts) > STALE_READING_THRESHOLD:
                     logger.warning(
                         "smartthings_stale_reading",
                         device_id=r["device_id"],
-                        age_minutes=round((now - reading_ts).total_seconds() / 60),
+                        age_minutes=round((now - device_ts).total_seconds() / 60),
                     )
-                    continue
+                    is_stale = True
             except (ValueError, TypeError):
                 pass  # If timestamp parsing fails, accept the reading
 
@@ -220,6 +222,8 @@ async def poll_smartthings_temps(session) -> int:
                 device_id=r["device_id"],
                 device_label=device_labels.get(r["device_id"]),
                 temperature=r["value"],
+                device_timestamp=device_ts,
+                is_stale=is_stale,
             )
         )
         count += 1

@@ -20,6 +20,8 @@ interface DashboardProps {
   } | null;
   indoorTemp: number | null;
   indoorSensorCount: number;
+  lastFreshReading: string | null;
+  latestReading: string | null;
 }
 
 interface OptimizerBrief {
@@ -29,7 +31,20 @@ interface OptimizerBrief {
   thermal_calibrated: boolean;
 }
 
-export function Dashboard({ data, indoorTemp, indoorSensorCount }: DashboardProps) {
+function formatRelativeTime(iso: string | null): string {
+  if (!iso) return "never";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "unknown";
+  const diffMs = Date.now() - d.getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReading, latestReading }: DashboardProps) {
   const currency = useCurrency();
   const status = data?.current_status;
   const [optBrief, setOptBrief] = useState<OptimizerBrief | null>(null);
@@ -96,6 +111,11 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount }: DashboardProp
             ? `${indoorSensorCount} sensor${indoorSensorCount !== 1 ? "s" : ""}`
             : "No sensors connected"}
         </div>
+        {lastFreshReading && lastFreshReading !== latestReading && (
+          <div className="card-subtitle text-warning text-sm">
+            ⚠ Stale — fresh data {formatRelativeTime(lastFreshReading)}
+          </div>
+        )}
       </div>
 
       <div className="card">
