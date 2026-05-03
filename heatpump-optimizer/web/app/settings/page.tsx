@@ -78,6 +78,11 @@ const SETTING_GROUPS = [
     keys: ["use_comfort_model", "comfort_temp_target", "thermal_lag_minutes"],
   },
   {
+    title: "Shower Mode",
+    description: "Reactive DHW boost when a rapid tank temperature drop is detected (e.g. during a shower)",
+    keys: ["shower_mode_enabled", "shower_drop_threshold", "shower_max_duration_minutes"],
+  },
+  {
     title: "Display",
     description: "Currency and display preferences",
     keys: ["currency", "time_format"],

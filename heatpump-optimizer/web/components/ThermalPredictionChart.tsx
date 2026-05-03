@@ -37,6 +37,16 @@ interface ThermalStatus {
       heating_rate_per_hour: number;
       confidence: string;
     };
+    indoor?: {
+      current_indoor_temp: number | null;
+      minutes_to_cool_2deg: number | null;
+      minutes_to_heat_1deg: number;
+      indoor_heating_rate: number;
+      indoor_cooling_rate: number;
+      indoor_heating_samples: number;
+      indoor_cooling_samples: number;
+      confidence: string;
+    };
   };
   model_params: {
     tank_heating_rate: number;
@@ -61,9 +71,17 @@ interface CurveData {
   };
 }
 
+interface IndoorForecastData {
+  current_indoor: number;
+  outdoor_temp: number;
+  forecast: { hour: number; predicted_temp: number }[];
+  target_schedule: { hour: number; target: number; comfort_hour: boolean }[];
+}
+
 export function ThermalPredictionChart() {
   const [status, setStatus] = useState<ThermalStatus | null>(null);
   const [curves, setCurves] = useState<CurveData | null>(null);
+  const [indoorForecast, setIndoorForecast] = useState<IndoorForecastData | null>(null);
   const [calibrating, setCalibrating] = useState(false);
   const [calibrateResult, setCalibrateResult] = useState<string | null>(null);
 
@@ -73,12 +91,14 @@ export function ThermalPredictionChart() {
 
   const fetchData = async () => {
     try {
-      const [statusRes, curveRes] = await Promise.all([
+      const [statusRes, curveRes, indoorRes] = await Promise.all([
         fetch("/api/thermal/status"),
         fetch("/api/thermal/curve?hours=24"),
+        fetch("/api/thermal/indoor-forecast?hours=24"),
       ]);
       if (statusRes.ok) setStatus(await statusRes.json());
       if (curveRes.ok) setCurves(await curveRes.json());
+      if (indoorRes.ok) setIndoorForecast(await indoorRes.json());
     } catch {}
   };
 
@@ -109,6 +129,14 @@ export function ThermalPredictionChart() {
       tankStandby: s.predicted_temp,
       tankHeating: curves.curves.tank_heating[i]?.predicted_temp,
       zoneStandby: curves.curves.zone_standby[i]?.predicted_temp,
+    })) || [];
+
+  const indoorChartData =
+    indoorForecast?.forecast.map((f, i) => ({
+      hour: `+${f.hour}h`,
+      indoorPredicted: f.predicted_temp,
+      comfortTarget: indoorForecast.target_schedule[i]?.target,
+      comfortHour: indoorForecast.target_schedule[i]?.comfort_hour,
     })) || [];
 
   return (
@@ -166,6 +194,25 @@ export function ThermalPredictionChart() {
               ({status.predictions.zone_boost.confidence})
             </div>
           </div>
+
+          {status.predictions.indoor && (
+            <div className="metric-card">
+              <div className="metric-label">Indoor Temperature</div>
+              <div className="metric-value">
+                {status.predictions.indoor.current_indoor_temp != null
+                  ? `${status.predictions.indoor.current_indoor_temp.toFixed(1)}°C`
+                  : "No sensor"}
+              </div>
+              <div className="metric-sub">
+                {status.predictions.indoor.indoor_heating_rate}°C/h heat
+                {" / "}
+                {status.predictions.indoor.indoor_cooling_rate}°C/h cool
+                {status.predictions.indoor.indoor_heating_samples > 0
+                  ? ` (${status.predictions.indoor.indoor_heating_samples} samples)`
+                  : " (defaults)"}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -221,6 +268,48 @@ export function ThermalPredictionChart() {
             />
           </LineChart>
         </ResponsiveContainer>
+      )}
+
+      {/* Indoor temperature forecast chart */}
+      {indoorChartData.length > 0 && (
+        <>
+          <h3 style={{ color: "var(--text-muted)", fontSize: "0.95rem", marginTop: "1.5rem", marginBottom: "0.5rem" }}>
+            Indoor Temperature Forecast
+          </h3>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={indoorChartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+              <XAxis dataKey="hour" stroke="#94a3b8" fontSize={11} interval={3} />
+              <YAxis stroke="#94a3b8" fontSize={11} unit="°C" domain={["auto", "auto"]} />
+              <Tooltip
+                contentStyle={{
+                  background: "#1e293b",
+                  border: "1px solid #334155",
+                  borderRadius: "8px",
+                }}
+                formatter={(value: number, name: string) => [`${value.toFixed(1)}°C`, name]}
+              />
+              <Legend />
+              <Line
+                type="monotone"
+                dataKey="comfortTarget"
+                stroke="#6366f1"
+                strokeWidth={1.5}
+                strokeDasharray="4 4"
+                dot={false}
+                name="Comfort Target"
+              />
+              <Line
+                type="monotone"
+                dataKey="indoorPredicted"
+                stroke="#ec4899"
+                strokeWidth={2}
+                dot={false}
+                name="Predicted Indoor"
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </>
       )}
 
       {/* Calibrate button */}
