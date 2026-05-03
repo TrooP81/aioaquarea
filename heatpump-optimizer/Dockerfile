@@ -15,7 +15,9 @@ COPY . .
 # Install the project itself
 RUN pip install --no-cache-dir -e .
 
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --create-home --shell /bin/bash appuser \
+ && mkdir -p /app/models \
+ && chown -R appuser:appuser /app/models
 USER appuser
 
 CMD ["python", "-m", "packages.poller.main"]
