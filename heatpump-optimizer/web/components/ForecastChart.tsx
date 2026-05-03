@@ -12,6 +12,7 @@ import {
   Legend,
   ReferenceLine,
 } from "recharts";
+import { useTimeFormat } from "./useTimeFormat";
 
 interface WeatherPoint {
   ts: string;
@@ -22,6 +23,7 @@ interface WeatherPoint {
 
 export function ForecastChart() {
   const [data, setData] = useState<WeatherPoint[]>([]);
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     fetch("/api/weather?hours=48")
@@ -39,6 +41,7 @@ export function ForecastChart() {
         weekday: "short",
         hour: "2-digit",
         minute: "2-digit",
+        hour12: timeFormat.hour12,
       }),
       temperature: d.temperature,
       windSpeed: d.wind_speed,
