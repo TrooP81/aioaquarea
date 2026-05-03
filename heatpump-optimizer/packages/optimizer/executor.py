@@ -135,7 +135,7 @@ class PlanExecutor:
                 case "eco_mode_on":
                     await self._wrapper.set_special_status("ECO")
 
-                case "eco_mode_off":
+                case "eco_mode_off" | "normal_mode_on":
                     await self._wrapper.clear_special_status()
 
                 case "comfort_mode_on":
@@ -208,7 +208,7 @@ class PlanExecutor:
                     return device.special_status is not None and device.special_status.name == "ECO"
                 case "comfort_mode_on":
                     return device.special_status is not None and device.special_status.name == "COMFORT"
-                case "eco_mode_off":
+                case "eco_mode_off" | "normal_mode_on":
                     return device.special_status is None
                 case _:
                     # For actions we can't easily verify, assume success

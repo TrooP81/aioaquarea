@@ -113,16 +113,16 @@ class TestFlatPriceOptimizer:
         # With identical prices there are no peaks — should produce no actions
         assert actions == []
 
-    def test_eco_comfort_follows_schedule_for_flat_price(self, flat_prices):
+    def test_eco_comfort_follows_schedule_for_flat_price(self, flat_prices, sample_weather):
         optimizer = RulesOptimizer()
         comfort_schedule = {"weekday": [7, 8, 9, 17, 18, 19, 20, 21], "weekend": [8, 9, 10, 11, 17, 18, 19, 20, 21]}
         actions = optimizer._plan_eco_comfort(
-            flat_prices, flat_prices[0][0], comfort_schedule,
+            flat_prices, sample_weather, flat_prices[0][0], comfort_schedule,
         )
-        # All comfort hours should produce comfort_mode_on, not "normal" overrides
+        # With flat prices, no price-based overrides should occur
         for a in actions:
             if a["type"] == "comfort_mode_on":
                 assert "peak_price" not in a["payload"].get("reason", "")
             # No eco hours should be "upgraded" due to cheap price
-            if a["type"] == "eco_mode_off":
+            if a["type"] == "normal_mode_on":
                 assert "cheap_price" not in a["payload"].get("reason", "")

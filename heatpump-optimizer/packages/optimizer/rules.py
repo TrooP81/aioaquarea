@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading, ShowerEventRecord
-from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour, dhw_deadlines_from_schedule, get_comfort_schedule
+from packages.core.settings_service import get_effective_schedule, get_setting, get_user_tz, is_comfort_hour, dhw_deadlines_from_schedule, get_comfort_schedule
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 
@@ -97,6 +97,7 @@ class RulesOptimizer:
         # Fetch comfort schedule early — used by DHW shifting and eco/comfort rules
         learned_threshold = float(await get_setting("learned_schedule_threshold") or 0.3)
         comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
+        tz_name = await get_user_tz()
 
         # Check for active shower event (skip force_dhw_off to avoid conflict)
         shower_active = False
@@ -112,6 +113,7 @@ class RulesOptimizer:
             current_tank_temp, tank_target, current_outdoor_temp,
             comfort_schedule,
             suppress_dhw_off=shower_active,
+            tz_name=tz_name,
         )
         actions.extend(dhw_actions)
 
@@ -129,15 +131,16 @@ class RulesOptimizer:
         # --- Rule 4: Quiet mode scheduling (night hours) ---
         quiet_start = int(await get_setting("quiet_mode_start") or 22)
         quiet_end = int(await get_setting("quiet_mode_end") or 6)
-        quiet_actions = self._plan_quiet_mode(horizon_start, quiet_start, quiet_end)
+        quiet_actions = self._plan_quiet_mode(horizon_start, quiet_start, quiet_end, tz_name=tz_name)
         actions.extend(quiet_actions)
 
         # --- Rule 5: Eco/Comfort mode based on schedule + price ---
         comfort_override_pct = int(await get_setting("price_comfort_override_pct") or 90)
         eco_upgrade_pct = int(await get_setting("price_eco_upgrade_pct") or 25)
         eco_actions = self._plan_eco_comfort(
-            prices, horizon_start, comfort_schedule,
+            prices, weather, horizon_start, comfort_schedule,
             comfort_override_pct, eco_upgrade_pct,
+            tz_name=tz_name,
         )
         actions.extend(eco_actions)
 
@@ -151,6 +154,7 @@ class RulesOptimizer:
             prices, weather, horizon_start,
             current_indoor_temp, current_outdoor_temp, current_water_temp,
             comfort_schedule, comfort_temp_target, comfort_temp_min,
+            tz_name=tz_name,
         )
         actions.extend(indoor_actions)
 
@@ -181,6 +185,7 @@ class RulesOptimizer:
         current_outdoor_temp: float,
         comfort_schedule: dict[str, list[int]],
         suppress_dhw_off: bool = False,
+        tz_name: str | None = None,
     ) -> list[dict]:
         """
         Schedule DHW heating using thermal model predictions.
@@ -210,7 +215,7 @@ class RulesOptimizer:
         )
 
         # Derive deadlines from the comfort schedule
-        ready_hours = dhw_deadlines_from_schedule(comfort_schedule, horizon_start)
+        ready_hours = dhw_deadlines_from_schedule(comfort_schedule, horizon_start, tz_name=tz_name)
 
         for ready_hour in ready_hours:
             deadline = horizon_start.replace(hour=ready_hour, minute=0)
@@ -377,42 +382,66 @@ class RulesOptimizer:
         comfort_schedule: dict[str, list[int]],
         comfort_temp_target: float,
         comfort_temp_min: float,
+        tz_name: str | None = None,
     ) -> list[dict]:
         """
         Check predicted indoor trajectory and add zone heating if indoor temp
         is forecast to drop below the comfort target during comfort hours.
-        Also triggers pre-heating when indoor cooling time to target is short.
+
+        Uses the same predict_indoor_curve() that the chart displays so the
+        guardrail decisions are consistent with what the user sees.
         """
         actions: list[dict] = []
 
         if not weather:
             return actions
 
-        # Build a simple indoor trajectory using thermal model linear rates
         hours = min(24, len(weather))
-        indoor = current_indoor_temp
+
+        # Build weather forecast dicts for predict_indoor_curve
+        weather_forecast = []
+        for h in range(hours):
+            w_ts, w_temp = weather[h] if h < len(weather) else (None, current_outdoor_temp)
+            outdoor = w_temp if w_temp is not None else current_outdoor_temp
+            weather_forecast.append({
+                "outdoor_temp": outdoor,
+                "wind_speed": 3.0,
+                "irradiance": 0.0,
+                "hour": (horizon_start + dt.timedelta(hours=h)).hour,
+            })
+
+        # Use the same curve the chart shows (current water temp held constant)
+        zone_water_temps = [current_water_temp] * hours
+        curve = thermal_model.predict_indoor_curve(
+            current_indoor=current_indoor_temp,
+            zone_water_temps=zone_water_temps,
+            weather_forecast=weather_forecast,
+            hours=hours,
+        )
 
         for h in range(hours):
             hour_ts = horizon_start + dt.timedelta(hours=h)
-            outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
-            in_comfort = is_comfort_hour(comfort_schedule, hour_ts)
-            target = comfort_temp_target if in_comfort else comfort_temp_min
+            in_comfort = is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name)
+            if not in_comfort:
+                continue
 
-            if indoor < target and in_comfort:
+            predicted_indoor = curve[h]["predicted_indoor_temp"] if h < len(curve) else current_indoor_temp
+            target = comfort_temp_target
+
+            if predicted_indoor < target:
                 # Only trigger if the drop is meaningful (not just rounding)
-                if target - indoor < 0.3:
-                    indoor = target
+                if target - predicted_indoor < 0.3:
                     continue
 
-                # Indoor temp has dropped below comfort target — need zone heating
+                # Indoor temp is forecast to drop below comfort target
                 heating_pred = thermal_model.predict_indoor_heating_time(
-                    current_temp=indoor,
+                    current_temp=predicted_indoor,
                     target_temp=target,
-                    outdoor_temp=outdoor,
+                    outdoor_temp=weather_forecast[h]["outdoor_temp"],
                 )
                 hours_needed = max(1, int(heating_pred.estimated_hours + 0.9))
 
-                # Find cheapest slot in the hours leading up to (and including) this hour
+                # Find cheapest slot in the hours leading up to this hour
                 window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 2))
                 window_prices = [
                     (ts, p) for ts, p in prices
@@ -427,7 +456,7 @@ class RulesOptimizer:
                     "payload": {
                         "offset": +2,
                         "reason": "indoor_guardrail",
-                        "predicted_indoor": round(indoor, 1),
+                        "predicted_indoor": round(predicted_indoor, 1),
                         "target": target,
                         "predicted_minutes": round(heating_pred.estimated_minutes),
                     },
@@ -437,33 +466,11 @@ class RulesOptimizer:
                     "type": "zone_temp_restore",
                     "payload": {"reason": "indoor_guardrail_complete"},
                 })
-                # After boosting, assume indoor reaches target
-                indoor = target
                 break  # Only one guardrail action per plan cycle
-
-            # Simulate indoor evolution for next hour
-            # During comfort hours, the heat pump is normally active (eco/comfort
-            # mode), so use the heating rate. Only simulate cooling during non-comfort
-            # hours or when water temp is too low to meaningfully heat.
-            next_hour_ts = horizon_start + dt.timedelta(hours=h + 1)
-            next_in_comfort = is_comfort_hour(comfort_schedule, next_hour_ts)
-            if next_in_comfort and current_water_temp > indoor:
-                # Heat pump is running in comfort/eco mode — indoor holds or rises slowly
-                rate = thermal_model._indoor_heating_rate(outdoor) * 0.5  # partial: eco isn't full power
-            elif current_water_temp > indoor + 5.0:
-                rate = thermal_model._indoor_heating_rate(outdoor)
-            else:
-                rate = thermal_model._indoor_cooling_rate(outdoor)
-                delta = max(indoor - outdoor, 0.0)
-                scale = delta / 15.0 if delta < 15.0 else 1.0
-                rate = rate * scale
-
-            indoor += rate
-            indoor = max(indoor, outdoor)
 
         # Additional trigger: if indoor is predicted to cool below target soon
         # Only check if we're currently in a comfort hour and temp is already marginal
-        current_is_comfort = is_comfort_hour(comfort_schedule, horizon_start)
+        current_is_comfort = is_comfort_hour(comfort_schedule, horizon_start, tz_name=tz_name)
         if current_is_comfort and current_indoor_temp < comfort_temp_target + 1.0:
             cooling_pred = thermal_model.predict_indoor_cooling_time(
                 current_temp=current_indoor_temp,
@@ -592,6 +599,7 @@ class RulesOptimizer:
     def _plan_quiet_mode(
         self, horizon_start: dt.datetime,
         start_hour: int = 22, end_hour: int = 6,
+        tz_name: str | None = None,
     ) -> list[dict]:
         """
         Schedule quiet mode during night hours.
@@ -599,19 +607,21 @@ class RulesOptimizer:
         Quiet mode reduces compressor noise by limiting speed.
         No significant efficiency loss but improves neighbor relations.
         """
+        from packages.core.settings_service import _to_local
+
         actions = []
 
         for offset_hours in range(24):
             ts = horizon_start + dt.timedelta(hours=offset_hours)
-            hour = ts.hour
+            local_hour = _to_local(ts, tz_name).hour
 
-            if hour == start_hour:
+            if local_hour == start_hour:
                 actions.append({
                     "ts": ts.isoformat(),
                     "type": "quiet_mode_on",
                     "payload": {"reason": "night_quiet_schedule", "level": 2},
                 })
-            elif hour == end_hour:
+            elif local_hour == end_hour:
                 actions.append({
                     "ts": ts.isoformat(),
                     "type": "quiet_mode_off",
@@ -623,20 +633,30 @@ class RulesOptimizer:
     def _plan_eco_comfort(
         self,
         prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
         horizon_start: dt.datetime,
         comfort_schedule: dict[str, list[int]],
         comfort_override_pct: int = 90,
         eco_upgrade_pct: int = 25,
+        tz_name: str | None = None,
     ) -> list[dict]:
         """
-        Toggle eco/comfort mode based on the user's comfort schedule
-        with price as a secondary modifier.
+        Toggle eco/normal/comfort mode based on the user's comfort schedule
+        with price and outdoor temperature as secondary modifiers.
+
+        The heat pump has three water-temperature modes:
+        - ECO:     curve − 5 °C  (saves energy, lower comfort)
+        - NORMAL:  curve ± 0 °C  (balanced)
+        - COMFORT: curve + 5 °C  (max comfort, higher cost)
 
         Strategy:
-        - Hours marked as comfort in schedule → COMFORT mode
-          (unless price is above comfort_override_pct — then stay normal)
-        - Hours NOT in comfort schedule → ECO mode
-          (unless price is below eco_upgrade_pct — then upgrade to normal)
+        - Hours marked as comfort in schedule:
+          → COMFORT if outdoor temp is cold (< 5 °C) and price isn't extreme
+          → NORMAL if outdoor temp is mild (≥ 5 °C) — comfort offset unnecessary
+          → NORMAL if price is above comfort_override_pct
+        - Hours NOT in comfort schedule:
+          → ECO by default
+          → NORMAL if price is below eco_upgrade_pct (cheap, might as well run normally)
         - Transitions only emitted on mode change to avoid command spam.
         """
         actions = []
@@ -652,18 +672,34 @@ class RulesOptimizer:
         # are meaningless — just follow the comfort schedule directly.
         flat_price = len(set(price_values)) <= 1
 
+        # Build a lookup of outdoor temp per hour for weather-based decisions
+        temp_by_ts: dict[str, float] = {}
+        for w_ts, w_temp in weather:
+            temp_by_ts[w_ts.isoformat()] = w_temp
+
+        # Threshold: above this outdoor temp, normal mode is sufficient
+        # during comfort hours (comfort's +5°C offset is unnecessary in mild weather)
+        MILD_OUTDOOR_THRESHOLD = 5.0
+
         current_mode = None  # Track mode to avoid redundant switches
 
         for ts, price in prices:
-            scheduled_comfort = is_comfort_hour(comfort_schedule, ts)
+            scheduled_comfort = is_comfort_hour(comfort_schedule, ts, tz_name=tz_name)
+            outdoor_temp = temp_by_ts.get(ts.isoformat())
 
             if scheduled_comfort:
-                # Comfort hour — but override to normal if price is extreme
-                # (skip override when prices are flat)
+                # Comfort hour — decide between comfort and normal based on
+                # outdoor temperature and electricity price.
                 if not flat_price and price >= p_comfort:
+                    # Price is extreme → don't pay for the +5°C boost
                     target_mode = "normal"
                     reason = f"comfort_hour_but_peak_price_{price:.4f}"
+                elif outdoor_temp is not None and outdoor_temp >= MILD_OUTDOOR_THRESHOLD:
+                    # Mild weather → the curve alone is enough, no +5°C needed
+                    target_mode = "normal"
+                    reason = f"comfort_hour_but_mild_outdoor_{outdoor_temp:.1f}C"
                 else:
+                    # Cold weather, reasonable price → full comfort
                     target_mode = "comfort"
                     reason = "comfort_schedule"
             else:
@@ -694,7 +730,7 @@ class RulesOptimizer:
             else:  # normal
                 actions.append({
                     "ts": ts.isoformat(),
-                    "type": "eco_mode_off",
+                    "type": "normal_mode_on",
                     "payload": {"reason": reason},
                 })
 

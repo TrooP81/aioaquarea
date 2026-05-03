@@ -75,6 +75,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "longitude",
         "description": "Location longitude",
     },
+    "timezone": {
+        "type": "str",
+        "default": "Europe/Amsterdam",
+        "description": "IANA timezone (e.g. Europe/Amsterdam, Europe/Stockholm)",
+    },
     # --- Optimizer constraints ---
     "tank_min_temp": {
         "type": "int",
@@ -344,21 +349,38 @@ async def get_comfort_schedule() -> dict[str, list[int]]:
     return schedule
 
 
-def is_comfort_hour(schedule: dict[str, list[int]], ts: "dt.datetime") -> bool:
-    """Check if a given timestamp falls within a comfort hour."""
-    # Monday=0 ... Sunday=6; weekday = Mon-Fri
-    day_type = "weekday" if ts.weekday() < 5 else "weekend"
-    return ts.hour in schedule.get(day_type, [])
+def _to_local(ts: "dt.datetime", tz_name: str | None = None) -> "dt.datetime":
+    """Convert a (possibly UTC) timestamp to the user's local timezone."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("Europe/Amsterdam")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    return ts.astimezone(tz)
 
 
-def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: "dt.datetime") -> list[int]:
+async def get_user_tz() -> str:
+    """Return the user's configured IANA timezone string."""
+    return await get_setting("timezone") or "Europe/Amsterdam"
+
+
+def is_comfort_hour(schedule: dict[str, list[int]], ts: "dt.datetime", tz_name: str | None = None) -> bool:
+    """Check if a given timestamp falls within a comfort hour (in local time)."""
+    local = _to_local(ts, tz_name)
+    day_type = "weekday" if local.weekday() < 5 else "weekend"
+    return local.hour in schedule.get(day_type, [])
+
+
+def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: "dt.datetime", tz_name: str | None = None) -> list[int]:
     """
     Derive DHW ready-by hours from the comfort schedule.
 
     Returns the first hour of each contiguous comfort block for the day type
-    of `ts`. The tank must be at temperature by the start of each comfort block.
+    of `ts` (in local time). The tank must be at temperature by the start of each comfort block.
     """
-    day_type = "weekday" if ts.weekday() < 5 else "weekend"
+    local = _to_local(ts, tz_name)
+    day_type = "weekday" if local.weekday() < 5 else "weekend"
     hours = sorted(set(schedule.get(day_type, [])))
     if not hours:
         return []
@@ -391,8 +413,9 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
     total_counts: dict[str, dict[int, int]] = {"weekday": defaultdict(int), "weekend": defaultdict(int)}
 
     for ts, action in rows:
-        day_type = "weekday" if ts.weekday() < 5 else "weekend"
-        hour = ts.hour
+        local = _to_local(ts)
+        day_type = "weekday" if local.weekday() < 5 else "weekend"
+        hour = local.hour
         total_counts[day_type][hour] += 1
         if action and action.upper() in ("HEATING", "HEATING_WATER"):
             heating_counts[day_type][hour] += 1

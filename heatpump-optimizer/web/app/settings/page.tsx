@@ -40,7 +40,7 @@ const SETTING_GROUPS = [
   {
     title: "Location",
     description: "Coordinates for weather and price area lookup",
-    keys: ["latitude", "longitude"],
+    keys: ["latitude", "longitude", "timezone"],
   },
   {
     title: "Optimizer Constraints",

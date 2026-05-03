@@ -17,7 +17,7 @@ except ImportError:
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
-from packages.core.settings_service import get_setting, dhw_deadlines_from_schedule, get_comfort_schedule, is_comfort_hour
+from packages.core.settings_service import get_setting, get_user_tz, dhw_deadlines_from_schedule, get_comfort_schedule, is_comfort_hour
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
@@ -99,7 +99,8 @@ class MILPOptimizer:
 
         # Get comfort schedule to derive DHW deadlines
         comfort_schedule = await get_comfort_schedule()
-        dhw_deadlines = dhw_deadlines_from_schedule(comfort_schedule, horizon_start)
+        tz_name = await get_user_tz()
+        dhw_deadlines = dhw_deadlines_from_schedule(comfort_schedule, horizon_start, tz_name=tz_name)
 
         # Resolve per-hour indoor comfort targets from schedule
         comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
@@ -109,10 +110,15 @@ class MILPOptimizer:
         indoor_targets = []
         for h in range(len(prices)):
             hour_ts = horizon_start + dt.timedelta(hours=h)
-            if is_comfort_hour(comfort_schedule, hour_ts):
+            if is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name):
                 indoor_targets.append(comfort_temp_target)
             else:
                 indoor_targets.append(comfort_temp_min)
+
+        # Current heat curve baseline water temp (what the pump targets in NORMAL mode)
+        heat_curve_water_temp = (
+            last_status.zone1_target_temp if last_status and last_status.zone1_target_temp else 35.0
+        )
 
         # Solve synchronously in a thread to avoid blocking the event loop
         plan = await asyncio.to_thread(
@@ -125,6 +131,7 @@ class MILPOptimizer:
             latest_indoor_temp,
             dhw_deadlines,
             indoor_targets,
+            heat_curve_water_temp,
         )
         return plan
 
@@ -175,6 +182,7 @@ class MILPOptimizer:
         current_indoor_temp: float | None = None,
         dhw_deadlines: list[int] | None = None,
         indoor_targets: list[float] | None = None,
+        heat_curve_water_temp: float = 35.0,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -354,6 +362,69 @@ class MILPOptimizer:
                         },
                     }
                 )
+
+        # --- Eco/Normal/Comfort mode selection based on solved indoor curve ---
+        # Use the comfort model (if trained) to find the required water supply
+        # temperature for the MILP's target indoor temp each hour, then compare
+        # to the heat curve baseline to pick the best mode offset:
+        #   ECO     = curve − 5 °C
+        #   NORMAL  = curve ± 0 °C
+        #   COMFORT = curve + 5 °C
+        current_mode = None
+        if comfort_model.is_trained:
+            for h in range(H):
+                ts = start_ts + dt.timedelta(hours=h)
+                target_indoor = indoor_targets[h] if indoor_targets and h < len(indoor_targets) else 20.0
+                indoor_now = current_indoor_temp if h == 0 else None
+
+                required_water = comfort_model.required_zone_temp(
+                    target_indoor=target_indoor,
+                    outdoor_temp=temps[h],
+                    hour=hours[h],
+                    indoor_temp=indoor_now,
+                )
+                if required_water is None:
+                    continue
+
+                # How much offset from the heat curve baseline do we need?
+                offset_needed = required_water - heat_curve_water_temp
+
+                # Pick the mode whose offset is closest to what's needed
+                # ECO = −5, NORMAL = 0, COMFORT = +5
+                eco_dist = abs(offset_needed - (-5.0))
+                normal_dist = abs(offset_needed - 0.0)
+                comfort_dist = abs(offset_needed - 5.0)
+
+                best = min(eco_dist, normal_dist, comfort_dist)
+                if best == eco_dist:
+                    target_mode = "eco"
+                elif best == comfort_dist:
+                    target_mode = "comfort"
+                else:
+                    target_mode = "normal"
+
+                if target_mode == current_mode:
+                    continue
+
+                if target_mode == "eco":
+                    action_type = "eco_mode_on"
+                elif target_mode == "comfort":
+                    action_type = "comfort_mode_on"
+                else:
+                    action_type = "normal_mode_on"
+
+                actions.append({
+                    "ts": ts.isoformat(),
+                    "type": action_type,
+                    "payload": {
+                        "reason": f"milp_water_offset_{offset_needed:+.1f}C",
+                        "required_water_temp": round(required_water, 1),
+                        "heat_curve_baseline": round(heat_curve_water_temp, 1),
+                        "outdoor_temp": round(temps[h], 1),
+                        "target_indoor": target_indoor,
+                    },
+                })
+                current_mode = target_mode
 
         total_cost = pulp.value(prob.objective)
 

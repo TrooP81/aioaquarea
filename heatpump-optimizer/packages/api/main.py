@@ -1489,7 +1489,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     to learned linear indoor rates from the ThermalModel.
     """
     from packages.ml.thermal import thermal_model
-    from packages.core.settings_service import get_setting, get_comfort_schedule, is_comfort_hour
+    from packages.core.settings_service import get_setting, get_comfort_schedule, is_comfort_hour, get_user_tz
 
     async with get_session() as session:
         status_result = await session.execute(
@@ -1573,7 +1573,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                 if hour_offset < 0 or hour_offset >= hours:
                     continue
 
-                if action.action_type in ("zone_temp_boost", "comfort_mode_on", "eco_mode_off"):
+                if action.action_type in ("zone_temp_boost", "comfort_mode_on"):
                     payload = json.loads(action.payload_json) if action.payload_json else {}
                     offset = payload.get("offset", 2)
                     planned_actions.append({
@@ -1597,6 +1597,19 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                         "payload": payload,
                     })
                     # Restore: undo boost from this hour onward
+                    boost_active = False
+                    for h in range(hour_offset, hours):
+                        plan_water_temps[h] = current_zone
+
+                elif action.action_type in ("eco_mode_off", "normal_mode_on"):
+                    payload = json.loads(action.payload_json) if action.payload_json else {}
+                    planned_actions.append({
+                        "hour": hour_offset,
+                        "action_type": action.action_type,
+                        "status": action.status,
+                        "payload": payload,
+                    })
+                    # Normal mode: clear any boost/eco offset
                     boost_active = False
                     for h in range(hour_offset, hours):
                         plan_water_temps[h] = current_zone
@@ -1640,11 +1653,12 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     comfort_schedule = await get_comfort_schedule()
     comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
     comfort_temp_min_val = float(await get_setting("comfort_temp_min") or 18.0)
+    tz_name = await get_user_tz()
 
     target_schedule = []
     for h in range(hours):
         hour_ts = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=h)
-        in_comfort = is_comfort_hour(comfort_schedule, hour_ts)
+        in_comfort = is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name)
         target_schedule.append({
             "hour": h + 1,
             "target": comfort_temp_target if in_comfort else comfort_temp_min_val,
