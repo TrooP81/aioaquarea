@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
+import { useTimeFormat } from "./useTimeFormat";
 import {
   ACTION_LABELS,
   LAYER_LABELS,
@@ -123,9 +124,11 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
 function ActionRow({
   action,
   isNext,
+  hour12,
 }: {
   action: PlanAction;
   isNext: boolean;
+  hour12: boolean;
 }) {
   const info = ACTION_LABELS[action.action_type];
   const isPastDuePending = action.status === "pending" && new Date(action.scheduled_ts) < new Date();
@@ -147,7 +150,7 @@ function ActionRow({
       className={`plan-action ${isNext ? "plan-action--next" : ""}`}
       style={{ opacity: isFaded ? 0.6 : 1 }}
     >
-      <span className="plan-action-time">{formatTime(action.scheduled_ts)}</span>
+      <span className="plan-action-time">{formatTime(action.scheduled_ts, hour12)}</span>
       <span className="plan-action-type">
         {info ? (
           <>
@@ -190,6 +193,7 @@ export function PlanView({ plan }: PlanProps) {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const currency = useCurrency();
+  const timeFormat = useTimeFormat();
 
   useEffect(() => {
     if (!plan?.id) {
@@ -258,7 +262,7 @@ export function PlanView({ plan }: PlanProps) {
               {/* Meta row */}
               <div className="plan-meta-row">
                 <span>
-                  {formatTime(plan.horizon_start)} – {formatTime(plan.horizon_end)}
+                  {formatTime(plan.horizon_start, timeFormat.hour12)} – {formatTime(plan.horizon_end, timeFormat.hour12)}
                 </span>
                 <span className="plan-meta-sep" aria-hidden="true">·</span>
                 <span>
@@ -288,7 +292,7 @@ export function PlanView({ plan }: PlanProps) {
             {ACTION_LABELS[nextAction.action_type]?.label || nextAction.action_type}
           </span>
           <span className="plan-next-time">
-            {formatTime(nextAction.scheduled_ts)}
+            {formatTime(nextAction.scheduled_ts, timeFormat.hour12)}
             <span className="plan-next-relative"> ({formatRelativeTime(nextAction.scheduled_ts)})</span>
           </span>
         </div>
@@ -321,6 +325,7 @@ export function PlanView({ plan }: PlanProps) {
                   key={action.id}
                   action={action}
                   isNext={action.id === nextAction?.id}
+                  hour12={timeFormat.hour12}
                 />
               ))}
             </div>
