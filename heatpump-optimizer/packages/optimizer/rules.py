@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
+from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading, ShowerEventRecord
 from packages.core.settings_service import get_effective_schedule, get_setting, is_comfort_hour, dhw_deadlines_from_schedule, get_comfort_schedule
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
@@ -98,11 +98,20 @@ class RulesOptimizer:
         learned_threshold = float(await get_setting("learned_schedule_threshold") or 0.3)
         comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
 
+        # Check for active shower event (skip force_dhw_off to avoid conflict)
+        shower_active = False
+        async with get_session() as session:
+            shower_row = await session.execute(
+                select(ShowerEventRecord).where(ShowerEventRecord.status == "active").limit(1)
+            )
+            shower_active = shower_row.scalar_one_or_none() is not None
+
         # --- Rule 1: DHW shifting (thermal-model-aware) ---
         dhw_actions = self._plan_dhw(
             prices, weather, horizon_start,
             current_tank_temp, tank_target, current_outdoor_temp,
             comfort_schedule,
+            suppress_dhw_off=shower_active,
         )
         actions.extend(dhw_actions)
 
@@ -158,12 +167,16 @@ class RulesOptimizer:
         tank_target: int,
         current_outdoor_temp: float,
         comfort_schedule: dict[str, list[int]],
+        suppress_dhw_off: bool = False,
     ) -> list[dict]:
         """
         Schedule DHW heating using thermal model predictions.
 
         Deadlines are derived from the comfort schedule: the tank must be
         at temperature by the start of each contiguous comfort block.
+
+        When suppress_dhw_off is True (active shower event), force_dhw_off
+        actions are omitted to let shower mode control DHW termination.
         """
         actions = []
 
@@ -228,13 +241,14 @@ class RulesOptimizer:
                 )
                 # Turn off after predicted heating duration (rounded to hours)
                 off_time = slot_start + dt.timedelta(hours=hours_needed)
-                actions.append(
-                    {
-                        "ts": off_time.isoformat(),
-                        "type": "force_dhw_off",
-                        "payload": {"reason": "dhw_target_reached"},
-                    }
-                )
+                if not suppress_dhw_off:
+                    actions.append(
+                        {
+                            "ts": off_time.isoformat(),
+                            "type": "force_dhw_off",
+                            "payload": {"reason": "dhw_target_reached"},
+                        }
+                    )
 
         return actions
 

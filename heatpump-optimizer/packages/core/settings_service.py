@@ -234,6 +234,23 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": '{"weekday":[7,8,9,17,18,19,20,21],"weekend":[8,9,10,11,12,13,14,15,16,17,18,19,20,21]}',
         "description": "Hours (0-23) when comfort mode is preferred, by day type (JSON)",
     },
+    # --- Shower mode (reactive DHW boost) ---
+    "shower_mode_enabled": {
+        "type": "str",
+        "default": "false",
+        "description": "Enable reactive DHW boost on rapid tank temperature drop (shower detection)",
+        "options": ["true", "false"],
+    },
+    "shower_drop_threshold": {
+        "type": "int",
+        "default": "10",
+        "description": "Tank temp drop (°C) between polls to trigger shower mode",
+    },
+    "shower_max_duration_minutes": {
+        "type": "int",
+        "default": "60",
+        "description": "Max shower boost duration before timeout (minutes)",
+    },
 }
 
 

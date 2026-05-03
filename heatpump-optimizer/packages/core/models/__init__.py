@@ -233,6 +233,24 @@ class IndoorTempReading(Base):
     is_stale: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
 
 
+class ShowerEventRecord(Base):
+    """Reactive shower detection events — tracks DHW boost triggered by rapid tank temp drop."""
+
+    __tablename__ = "shower_events"
+    __table_args__ = (Index("ix_shower_events_status", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    pre_shower_temp: Mapped[float] = mapped_column(Float, nullable=False)
+    recovered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(
+        String(24), default="active"
+    )  # active / recovered / timeout / skipped_peak
+    peak_price_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class SmartThingsToken(Base):
     """Persisted SmartThings OAuth 2.0 tokens (single-row, id=1)."""
 

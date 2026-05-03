@@ -22,8 +22,12 @@ from packages.core.services import AquareaWrapper
 from packages.poller.feeds import fetch_prices, fetch_weather
 from packages.poller.smartthings import poll_smartthings_temps
 from packages.core.settings_service import get_setting
+from packages.optimizer.shower_mode import ShowerDetector
 
 logger = structlog.get_logger()
+
+# Module-level shower detector instance (reused across polls)
+_shower_detector = ShowerDetector()
 
 
 async def poll_device_status(wrapper: AquareaWrapper) -> None:
@@ -82,6 +86,12 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
             action=device_action,
             direction=direction,
         )
+
+        # --- Shower mode detection ---
+        try:
+            await _shower_detector.check(record)
+        except Exception as shower_err:
+            logger.error("shower_detection_failed", error=str(shower_err))
 
         # --- Fault detection ---
         if device.is_on_error and device.current_error:
