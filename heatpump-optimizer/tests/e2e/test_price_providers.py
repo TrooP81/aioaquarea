@@ -169,6 +169,45 @@ class TestTibberIntegration:
 
         assert len(prices) == 2
 
+    @respx.mock
+    async def test_fetch_tibber_skips_unsubscribed_home(self):
+        """Uses the first home that actually has subscription price data."""
+        response = {
+            "data": {
+                "viewer": {
+                    "homes": [
+                        {"currentSubscription": None},
+                        {
+                            "currentSubscription": {
+                                "priceInfo": {
+                                    "today": [
+                                        {"total": 0.31, "startsAt": "2026-05-04T00:00:00+02:00"},
+                                        {"total": 0.28, "startsAt": "2026-05-04T01:00:00+02:00"},
+                                    ],
+                                    "tomorrow": [
+                                        {"total": 0.22, "startsAt": "2026-05-05T00:00:00+02:00"},
+                                    ],
+                                }
+                            }
+                        },
+                    ]
+                }
+            }
+        }
+        respx.post("https://api.tibber.com/v1-beta/gql").mock(
+            return_value=Response(200, json=response)
+        )
+
+        async def mock_get_setting(key):
+            return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
+
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+            prices = await _fetch_prices_tibber()
+
+        assert len(prices) == 3
+        assert prices[0][1] == 0.31
+        assert prices[2][1] == 0.22
+
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestProviderRouting:

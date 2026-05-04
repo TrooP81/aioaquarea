@@ -111,12 +111,7 @@ def _parse_entsoe_xml(xml_text: str, period_start: dt.datetime) -> list[tuple[dt
 
     return results
 
-
 async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
-    """
-    Fetch electricity prices from Tibber GraphQL API.
-    Returns today's and tomorrow's prices as (timestamp_utc, EUR/kWh).
-    """
     token = await get_setting("tibber_api_token")
     if not token:
         return []
@@ -152,25 +147,37 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
         resp.raise_for_status()
         data = resp.json()
 
-    results = []
-    try:
-        homes = data["data"]["viewer"]["homes"]
-        if not homes:
-            return results
-        price_info = homes[0]["currentSubscription"]["priceInfo"]
+    if data.get("errors"):
+        return []
 
-        for price_entry in (price_info.get("today") or []) + (price_info.get("tomorrow") or []):
-            ts = dt.datetime.fromisoformat(price_entry["startsAt"])
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=dt.timezone.utc)
-            else:
-                ts = ts.astimezone(dt.timezone.utc)
-            # Tibber returns total price in the home's currency per kWh (inc. tax/fees)
-            price_kwh = float(price_entry["total"])
-            results.append((ts, price_kwh))
-    except (KeyError, IndexError, TypeError):
-        return results
+    homes = (((data.get("data") or {}).get("viewer") or {}).get("homes") or [])
+    if not homes:
+        return []
 
+    price_entries: list[dict] = []
+    for home in homes:
+        current_subscription = home.get("currentSubscription") or {}
+        price_info = current_subscription.get("priceInfo") or {}
+        price_entries = (price_info.get("today") or []) + (price_info.get("tomorrow") or [])
+        if price_entries:
+            break
+
+    results: list[tuple[dt.datetime, float]] = []
+    for price_entry in price_entries:
+        starts_at = price_entry.get("startsAt")
+        total = price_entry.get("total")
+        if starts_at is None or total is None:
+            continue
+
+        ts = dt.datetime.fromisoformat(starts_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+        else:
+            ts = ts.astimezone(dt.timezone.utc)
+
+        results.append((ts, float(total)))
+
+    results.sort(key=lambda x: x[0])
     return results
 
 
