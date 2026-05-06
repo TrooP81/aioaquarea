@@ -339,32 +339,16 @@ class MILPOptimizer:
         max_changes = 20
         prob += pulp.lpSum(x_dhw) <= max_changes
 
-        # Space heating: ensure minimum comfort when freezing
-        # When comfort model is trained, derive a minimum SH fraction from
-        # the required water supply temperature to maintain the target indoor temp.
-        comfort_target = float(settings.comfort_temp_min) if hasattr(settings, 'comfort_temp_min') else 20.0
-        use_comfort = comfort_model.is_trained
-
+        # Space heating: safety net for extreme cold.
+        # The indoor temperature LP constraints (t_indoor >= target) below are
+        # the primary mechanism — the solver schedules x_sh to keep indoor
+        # temp above the per-hour target at minimum cost.  This hard floor
+        # only kicks in during severe frost as a fail-safe.
         for h in range(H):
-            if use_comfort:
-                # Use actual indoor temp for hour 0, None for future hours
-                indoor_now = current_indoor_temp if h == 0 else None
-                required_water = comfort_model.required_zone_temp(
-                    target_indoor=comfort_target,
-                    outdoor_temp=temps[h],
-                    hour=hours[h],
-                    indoor_temp=indoor_now,
-                )
-                if required_water is not None and required_water > 25:
-                    # Higher required water temp → higher SH fraction needed
-                    # Scale linearly: water=25 → 0.0, water=55 → 1.0
-                    min_sh = max(0.0, min(1.0, (required_water - 25.0) / 30.0))
-                    prob += x_sh[h] >= min_sh
-                elif temps[h] < 0:
-                    prob += x_sh[h] >= 0.5
-            else:
-                if temps[h] < 0:
-                    prob += x_sh[h] >= 0.5
+            if temps[h] < -10:
+                prob += x_sh[h] >= 0.5
+            elif temps[h] < 0:
+                prob += x_sh[h] >= 0.2
 
         # --- Indoor temperature state variable ---
         # Track predicted indoor air temperature through the horizon.
