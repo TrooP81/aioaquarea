@@ -514,45 +514,52 @@ class MILPOptimizer:
                     }
                 )
 
-        # --- Eco/Normal/Comfort mode selection based on solved indoor curve ---
-        # Use the comfort model (if trained) to find the required water supply
-        # temperature for the MILP's target indoor temp each hour, then compare
-        # to the heat curve baseline to pick the best mode offset:
-        #   ECO     = curve − 5 °C
-        #   NORMAL  = curve ± 0 °C
-        #   COMFORT = curve + 5 °C
+        # --- Eco/Normal/Comfort mode selection based on solved LP state ---
+        # Use the MILP's solved x_sh fraction and t_indoor trajectory to pick
+        # the best heat-pump mode.  When the solver says little/no SH is needed,
+        # use ECO (curve − 5 °C) to minimize background heating.  When x_sh is
+        # high, use the comfort model to find the required water temperature
+        # and pick the mode offset closest to it.
         current_mode = None
         if comfort_model.is_trained:
             for h in range(H):
                 ts = start_ts + dt.timedelta(hours=h)
+                sh_val = x_sh[h].varValue or 0
+                solved_indoor = t_indoor[h].varValue if t_indoor[h].varValue is not None else indoor_init
                 target_indoor = indoor_targets[h] if indoor_targets and h < len(indoor_targets) else 20.0
-                indoor_now = current_indoor_temp if h == 0 else None
 
-                required_water = comfort_model.required_zone_temp(
-                    target_indoor=target_indoor,
-                    outdoor_temp=temps[h],
-                    hour=hours[h],
-                    indoor_temp=indoor_now,
-                )
-                if required_water is None:
-                    continue
-
-                # How much offset from the heat curve baseline do we need?
-                offset_needed = required_water - heat_curve_water_temp
-
-                # Pick the mode whose offset is closest to what's needed
-                # ECO = −5, NORMAL = 0, COMFORT = +5
-                eco_dist = abs(offset_needed - (-5.0))
-                normal_dist = abs(offset_needed - 0.0)
-                comfort_dist = abs(offset_needed - 5.0)
-
-                best = min(eco_dist, normal_dist, comfort_dist)
-                if best == eco_dist:
+                # When MILP says little SH is needed, use ECO to avoid
+                # unnecessary background heating from the heat curve.
+                if sh_val < 0.3:
                     target_mode = "eco"
-                elif best == comfort_dist:
-                    target_mode = "comfort"
+                elif solved_indoor > target_indoor + 1.0:
+                    # Indoor is well above target even with SH scheduled —
+                    # use ECO to reduce overshoot
+                    target_mode = "eco"
                 else:
-                    target_mode = "normal"
+                    # SH is needed — use comfort model with the solved indoor
+                    # temp as anchor to find required water temperature
+                    required_water = comfort_model.required_zone_temp(
+                        target_indoor=target_indoor,
+                        outdoor_temp=temps[h],
+                        hour=hours[h],
+                        indoor_temp=solved_indoor,
+                    )
+                    if required_water is None:
+                        target_mode = "normal"
+                    else:
+                        offset_needed = required_water - heat_curve_water_temp
+                        eco_dist = abs(offset_needed - (-5.0))
+                        normal_dist = abs(offset_needed - 0.0)
+                        comfort_dist = abs(offset_needed - 5.0)
+
+                        best = min(eco_dist, normal_dist, comfort_dist)
+                        if best == eco_dist:
+                            target_mode = "eco"
+                        elif best == comfort_dist:
+                            target_mode = "comfort"
+                        else:
+                            target_mode = "normal"
 
                 if target_mode == current_mode:
                     continue
@@ -568,11 +575,11 @@ class MILPOptimizer:
                     "ts": ts.isoformat(),
                     "type": action_type,
                     "payload": {
-                        "reason": f"milp_water_offset_{offset_needed:+.1f}C",
-                        "required_water_temp": round(required_water, 1),
-                        "heat_curve_baseline": round(heat_curve_water_temp, 1),
-                        "outdoor_temp": round(temps[h], 1),
+                        "reason": f"milp_sh_{sh_val:.2f}_indoor_{solved_indoor:.1f}",
                         "target_indoor": target_indoor,
+                        "solved_indoor": round(solved_indoor, 1),
+                        "sh_fraction": round(sh_val, 2),
+                        "outdoor_temp": round(temps[h], 1),
                     },
                 })
                 current_mode = target_mode
