@@ -15,6 +15,7 @@ from sqlalchemy import select, and_, func, desc
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import (
+    AppLogRecord,
     AuditLogRecord,
     COPRecord,
     ConsumptionRecord,
@@ -795,6 +796,42 @@ async def get_audit_log(limit: int = Query(50, ge=1, le=200)):
             "target_device": r.target_device,
             "payload": json.loads(r.payload_json) if r.payload_json else None,
             "result": r.result,
+        }
+        for r in rows
+    ]
+
+
+# --- Application Logs ---
+
+
+@app.get("/api/logs")
+async def get_app_logs(
+    minutes: int = Query(30, ge=1, le=1440),
+    level: str | None = Query(None),
+    service: str | None = Query(None),
+):
+    """Get application log entries from the last N minutes."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+
+    stmt = select(AppLogRecord).where(AppLogRecord.ts >= cutoff)
+    if level:
+        stmt = stmt.where(AppLogRecord.level == level.upper())
+    if service:
+        stmt = stmt.where(AppLogRecord.service == service)
+    stmt = stmt.order_by(desc(AppLogRecord.ts)).limit(500)
+
+    async with get_session() as session:
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+
+    return [
+        {
+            "ts": r.ts.isoformat(),
+            "level": r.level,
+            "logger": r.logger_name,
+            "event": r.event,
+            "details": json.loads(r.details_json) if r.details_json else None,
+            "service": r.service,
         }
         for r in rows
     ]

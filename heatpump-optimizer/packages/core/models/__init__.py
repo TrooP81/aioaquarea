@@ -251,6 +251,23 @@ class ShowerEventRecord(Base):
     peak_price_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class AppLogRecord(Base):
+    """Application log entries captured from structlog for dashboard display."""
+
+    __tablename__ = "app_logs"
+    __table_args__ = (Index("ix_app_logs_ts", "ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    level: Mapped[str] = mapped_column(String(16))
+    logger_name: Mapped[str | None] = mapped_column(String(128))
+    event: Mapped[str] = mapped_column(String(256))
+    details_json: Mapped[str | None] = mapped_column(Text)
+    service: Mapped[str] = mapped_column(String(32))
+
+
 class SmartThingsToken(Base):
     """Persisted SmartThings OAuth 2.0 tokens (single-row, id=1)."""
 

@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-import logging
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PlanActionRecord, PlanRecord, COPRecord, ConsumptionRecord
 from packages.core.services import AquareaWrapper
@@ -198,11 +196,8 @@ async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
 
 async def main() -> None:
     """Main entry point for the optimizer service."""
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelName(settings.log_level)
-        ),
-    )
+    from packages.core.log_sink import configure_structlog_with_db
+    configure_structlog_with_db("optimizer")
 
     logger.info("optimizer_starting")
 

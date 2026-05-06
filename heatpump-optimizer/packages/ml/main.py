@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from packages.core.config import settings
 from packages.ml.models import COPModel, DemandModel
 
 logger = structlog.get_logger()
@@ -31,11 +29,8 @@ async def retrain_models() -> None:
 
 async def main() -> None:
     """ML service main loop — retrains weekly, serves predictions via the API."""
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelName(settings.log_level)
-        ),
-    )
+    from packages.core.log_sink import configure_structlog_with_db
+    configure_structlog_with_db("ml")
 
     # Load latest models on startup
     cop_model.load_latest()

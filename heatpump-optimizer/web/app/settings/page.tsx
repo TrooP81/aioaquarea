@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { TestConnection } from "../../components/TestConnection";
 import { ComfortSchedule } from "../../components/ComfortSchedule";
 import { SmartThingsOAuth } from "../../components/SmartThingsOAuth";
+import { LogViewer } from "../../components/LogViewer";
 import { useCurrency } from "../../components/useCurrency";
 import { OPTIMIZER_LAYER_OPTIONS } from "@/lib/constants";
 
@@ -45,7 +46,7 @@ const SETTING_GROUPS = [
   {
     title: "Optimizer Constraints",
     description: "Temperature and scheduling boundaries",
-    keys: ["tank_min_temp", "tank_max_temp", "comfort_temp_min", "comfort_temp_max"],
+    keys: ["tank_min_temp", "tank_min_temp_offpeak", "tank_max_temp", "comfort_temp_min", "comfort_temp_max"],
   },
   {
     title: "Quiet Mode",
@@ -291,6 +292,8 @@ export default function SettingsPage() {
       <ComfortSchedule />
 
       <TestConnection editValues={editValues} />
+
+      <LogViewer />
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
         <button className="btn btn-primary" onClick={handleSave} disabled={saving}>

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import logging
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -262,11 +261,8 @@ async def retrain_comfort_model() -> None:
 
 async def main() -> None:
     """Main entry point for the poller service."""
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelName(settings.log_level)
-        ),
-    )
+    from packages.core.log_sink import configure_structlog_with_db
+    configure_structlog_with_db("poller")
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
