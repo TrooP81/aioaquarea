@@ -39,6 +39,9 @@ from packages.core.settings_service import (
     set_setting,
 )
 from packages.api.auth import require_auth
+from packages.core.log_sink import configure_structlog_with_db
+
+configure_structlog_with_db("api")
 
 app = FastAPI(
     title="Heat Pump Optimizer API",
