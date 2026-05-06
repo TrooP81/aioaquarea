@@ -87,6 +87,34 @@ export function LogViewer() {
       )
     : logs;
 
+  const allExpanded = filtered.length > 0 && filtered.every((_, idx) => expandedRows.has(idx));
+
+  const toggleExpandAll = () => {
+    if (allExpanded) {
+      setExpandedRows(new Set());
+    } else {
+      setExpandedRows(new Set(filtered.map((_, idx) => idx)));
+    }
+  };
+
+  const [copied, setCopied] = useState(false);
+
+  const copyAllToClipboard = () => {
+    const text = filtered
+      .map((log) => {
+        const time = formatTime(log.ts);
+        const details = log.details && Object.keys(log.details).length > 0
+          ? "\n" + JSON.stringify(log.details, null, 2)
+          : "";
+        return `${time} ${log.level} [${log.service}] ${log.event}${details}`;
+      })
+      .join("\n");
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
   return (
     <div className="plan-section">
       <h2 className="chart-title">Application Logs</h2>
@@ -163,6 +191,22 @@ export function LogViewer() {
 
         <button className="btn" onClick={fetchLogs} disabled={loading} style={{ padding: "0.4rem 0.75rem" }}>
           {loading ? "⟳" : "Refresh"}
+        </button>
+        <button
+          className="btn"
+          onClick={toggleExpandAll}
+          disabled={filtered.length === 0}
+          style={{ padding: "0.4rem 0.75rem" }}
+        >
+          {allExpanded ? "Collapse All" : "Expand All"}
+        </button>
+        <button
+          className="btn"
+          onClick={copyAllToClipboard}
+          disabled={filtered.length === 0}
+          style={{ padding: "0.4rem 0.75rem" }}
+        >
+          {copied ? "✓ Copied" : "Copy All"}
         </button>
       </div>
 
