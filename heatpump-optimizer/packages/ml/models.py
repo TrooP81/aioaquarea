@@ -205,24 +205,26 @@ class COPModel:
         X_list = []
         y_list = []
 
+        # Diagnostic counters
+        skip_no_delta = 0
+        skip_no_status = 0
+        skip_thermal_zero = 0
+        skip_cop_low = 0
+        skip_cop_high = 0
+        used_status_path = 0
+        used_fallback_path = 0
+
         prev_row = None
         for row in consumption_rows:
             if prev_row is None or row.ts.date() != prev_row.ts.date():
                 prev_row = row
                 continue
 
-            # Electrical consumption delta
-            delta_elec = (
-                ((row.heat_kwh or 0) + (row.tank_kwh or 0))
-                - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
-            )
             elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
-
-            if delta_elec <= 0.01 or not (0.2 <= elapsed_hours <= 2.0):
+            if not (0.2 <= elapsed_hours <= 2.0):
+                skip_no_delta += 1
                 prev_row = row
                 continue
-
-            elec_kw = delta_elec / elapsed_hours
 
             # Get tank ΔT from device status around this time window
             prev_key = (prev_row.ts.date(), prev_row.ts.hour)
@@ -235,35 +237,58 @@ class COPModel:
                 and prev_status.get("tank_temp") is not None
                 and curr_status.get("tank_temp") is not None
             ):
+                used_status_path += 1
                 tank_delta_t = curr_status["tank_temp"] - prev_status["tank_temp"]
+
+                if tank_delta_t <= 0:
+                    # Tank not heating — skip
+                    skip_thermal_zero += 1
+                    prev_row = row
+                    continue
+
+                # Use only DHW electrical consumption (not total)
+                delta_tank_elec = (row.tank_kwh or 0) - (prev_row.tank_kwh or 0)
+                if delta_tank_elec <= 0.01:
+                    skip_no_delta += 1
+                    prev_row = row
+                    continue
+
+                elec_kw = delta_tank_elec / elapsed_hours
                 kwh_per_deg = self._tank_kwh_per_degree()
 
-                # Total thermal output = (observed ΔT + standby losses) × capacity
-                # The observed ΔT is net: heating minus losses. We add back
-                # the estimated standby losses to get gross thermal output.
-                # During active heating the effective loss is lower than idle
-                # loss because the tank spends part of the interval at a lower
-                # temp; use 50% of calibrated idle loss as a reasonable estimate.
-                from packages.ml.thermal import thermal_model
-                calibrated_loss = abs(thermal_model.params.tank_standby_loss)
-                standby_rate = (calibrated_loss if calibrated_loss > 0 else 0.5) * 0.5
-                gross_delta_t = max(0, tank_delta_t + standby_rate * elapsed_hours)
-                thermal_kwh = gross_delta_t * kwh_per_deg / elapsed_hours
+                # Thermal output = net tank ΔT × tank capacity
+                thermal_kwh = tank_delta_t * kwh_per_deg / elapsed_hours
             else:
-                # No status pairing — estimate thermal from electrical using
-                # physics-based default COP
+                # No status pairing — use total electrical with default COP
+                delta_elec = (
+                    ((row.heat_kwh or 0) + (row.tank_kwh or 0))
+                    - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
+                )
+                if delta_elec <= 0.01:
+                    skip_no_delta += 1
+                    prev_row = row
+                    continue
+
+                used_fallback_path += 1
+                elec_kw = delta_elec / elapsed_hours
                 outdoor = row.outdoor_temp or 5.0
                 default_cop = self._default_cop_curve(outdoor)
                 thermal_kwh = elec_kw * default_cop * 0.7  # conservative
 
             if thermal_kwh <= 0:
+                skip_thermal_zero += 1
                 prev_row = row
                 continue
 
             cop = thermal_kwh / elec_kw
 
             # Only keep physically plausible COP values for training
-            if not (self.COP_MIN <= cop <= self.COP_MAX):
+            if cop < self.COP_MIN:
+                skip_cop_low += 1
+                prev_row = row
+                continue
+            if cop > self.COP_MAX:
+                skip_cop_high += 1
                 prev_row = row
                 continue
 
@@ -282,7 +307,16 @@ class COPModel:
         _logger.info(
             "cop_training_data_prepared",
             total_consumption_rows=len(consumption_rows),
+            status_rows=len(status_rows),
             paired_samples=len(y_list),
+            skip_no_delta=skip_no_delta,
+            skip_no_status=skip_no_status,
+            skip_thermal_zero=skip_thermal_zero,
+            skip_cop_low=skip_cop_low,
+            skip_cop_high=skip_cop_high,
+            used_status_path=used_status_path,
+            used_fallback_path=used_fallback_path,
+            kwh_per_degree=round(self._tank_kwh_per_degree(), 4),
         )
         return np.array(X_list), np.array(y_list)
 
