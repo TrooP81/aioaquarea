@@ -24,6 +24,10 @@ logger = structlog.get_logger()
 # Minimum data history (days) before trusting ML models in auto mode
 ML_MIN_DATA_DAYS = 14
 
+# Cooldown: skip scheduled optimization if a plan was generated recently
+_OPTIMIZATION_COOLDOWN_S = 300  # 5 minutes
+_last_plan_generated_at: float = 0.0
+
 # Global ML model instances (loaded once, reused across optimization cycles)
 _cop_model = COPModel()
 _demand_model = DemandModel()
@@ -124,8 +128,30 @@ async def _has_sufficient_ml_data() -> bool:
         return False
 
 
-async def run_optimization() -> None:
-    """Run the optimizer and store the plan, with layer selection and fallback."""
+async def run_optimization(*, scheduled: bool = False) -> None:
+    """Run the optimizer and store the plan, with layer selection and fallback.
+
+    Args:
+        scheduled: True when called by the hourly scheduler.  If a plan was
+            generated recently (within _OPTIMIZATION_COOLDOWN_S), the
+            scheduled run is skipped so a manual "Optimize Now" plan isn't
+            immediately overwritten.
+    """
+    import time as _time
+
+    global _last_plan_generated_at
+
+    if scheduled:
+        elapsed = _time.monotonic() - _last_plan_generated_at
+        if elapsed < _OPTIMIZATION_COOLDOWN_S:
+            logger.info(
+                "scheduled_optimization_skipped",
+                reason="recent plan exists",
+                seconds_since_last=round(elapsed),
+                cooldown=_OPTIMIZATION_COOLDOWN_S,
+            )
+            return
+
     try:
         layer = await get_setting("optimizer_layer") or "rules_only"
         layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
@@ -177,6 +203,8 @@ async def run_optimization() -> None:
                 )
                 session.add(action_record)
 
+        _last_plan_generated_at = _time.monotonic()
+
         logger.info(
             "plan_generated",
             plan_id=plan_record.id,
@@ -210,9 +238,12 @@ async def main() -> None:
 
     scheduler = AsyncIOScheduler()
 
+    async def _scheduled_optimization():
+        await run_optimization(scheduled=True)
+
     # Re-optimize every hour
     scheduler.add_job(
-        run_optimization,
+        _scheduled_optimization,
         "interval",
         hours=1,
         id="optimize",
