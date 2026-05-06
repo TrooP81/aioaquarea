@@ -167,6 +167,7 @@ class ThermalModel:
 
             outdoor = curr.outdoor_temp if curr.outdoor_temp is not None else 10.0
             curr_direction = getattr(curr, 'direction', None)
+            prev_direction = getattr(prev, 'direction', None)
 
             # Tank temperature delta
             if (
@@ -177,13 +178,16 @@ class ThermalModel:
             ):
                 tank_delta = (curr.tank_temp - prev.tank_temp) / dt_hours
 
+                # With sliding-window gaps, direction may change mid-interval.
+                # Accept heating samples when EITHER endpoint was in WATER mode.
+                either_water = "WATER" in (curr_direction, prev_direction)
+                either_idle = curr_direction in (None, "IDLE", "PUMP") and prev_direction in (None, "IDLE", "PUMP")
+
                 if tank_delta > 0.5:
-                    # Tank is being actively heated
-                    if curr_direction is None or curr_direction == "WATER":
+                    if curr_direction is None or either_water:
                         tank_heating_deltas.append((tank_delta, outdoor))
                 elif tank_delta < -0.1:
-                    # Tank is cooling (standby loss) — only when NOT actively heating
-                    if curr_direction is None or curr_direction in ("IDLE", "PUMP"):
+                    if curr_direction is None or either_idle:
                         tank_cooling_deltas.append((tank_delta, outdoor))
 
             # Zone 1 temperature delta
@@ -195,13 +199,15 @@ class ThermalModel:
             ):
                 zone_delta = (curr.zone1_temp - prev.zone1_temp) / dt_hours
 
+                # Accept zone heating when EITHER endpoint was in PUMP mode
+                either_pump = "PUMP" in (curr_direction, prev_direction)
+                either_not_pump = curr_direction in (None, "IDLE", "WATER") and prev_direction in (None, "IDLE", "WATER")
+
                 if zone_delta > 0.2:
-                    # Zone heating — only count when compressor is on PUMP
-                    if curr_direction is None or curr_direction == "PUMP":
+                    if curr_direction is None or either_pump:
                         zone_heating_deltas.append((zone_delta, outdoor))
                 elif zone_delta < -0.1:
-                    # Zone cooling — only when NOT actively heating zone
-                    if curr_direction is None or curr_direction in ("IDLE", "WATER"):
+                    if curr_direction is None or either_not_pump:
                         zone_cooling_deltas.append((zone_delta, outdoor))
 
         # --- Fit linear relationships ---
@@ -266,12 +272,17 @@ class ThermalModel:
         self.params.zone_compressor_samples = len(zone_heating_deltas)
 
         logger.info(
-            f"Thermal model calibrated: tank_heating={self.params.tank_heating_rate:.2f}°C/h, "
-            f"tank_loss={self.params.tank_standby_loss:.2f}°C/h, "
-            f"zone_heating={self.params.zone_heating_rate:.2f}°C/h, "
-            f"indoor_heating={self.params.indoor_heating_rate:.2f}°C/h, "
-            f"indoor_cooling={self.params.indoor_cooling_rate:.2f}°C/h, "
-            f"defrost_filtered={defrost_filtered}"
+            "thermal_model_calibrated",
+            tank_heating=round(self.params.tank_heating_rate, 2),
+            tank_heating_outdoor_factor=round(self.params.tank_heating_outdoor_factor, 3),
+            tank_heating_samples=len(tank_heating_deltas),
+            tank_loss=round(self.params.tank_standby_loss, 2),
+            tank_loss_samples=len(tank_cooling_deltas),
+            zone_heating=round(self.params.zone_heating_rate, 2),
+            zone_heating_samples=len(zone_heating_deltas),
+            indoor_heating=round(self.params.indoor_heating_rate, 2),
+            indoor_cooling=round(self.params.indoor_cooling_rate, 2),
+            defrost_filtered=defrost_filtered,
         )
 
         return {
