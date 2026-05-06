@@ -404,7 +404,7 @@ class TestIndoorRates:
     def test_indoor_cooling_rate_capped(self):
         model = ThermalModel()
         model.params.indoor_cooling_rate = -5.0
-        assert model._indoor_cooling_rate(0.0) == -2.0
+        assert model._indoor_cooling_rate(0.0) == -1.0
 
 
 class TestIndoorCurve:

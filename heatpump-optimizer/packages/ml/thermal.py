@@ -366,16 +366,16 @@ class ThermalModel:
             else:
                 self.params.indoor_heating_rate = float(np.mean(deltas))
 
-        # Fit indoor cooling rate
+        # Fit indoor cooling rate (clamped: a house rarely cools faster than 1°C/h)
         if len(indoor_cooling_deltas) >= 5:
             deltas = np.array([d[0] for d in indoor_cooling_deltas])
             outdoors = np.array([d[1] for d in indoor_cooling_deltas])
             if np.std(outdoors) > 0:
                 coeffs = np.polyfit(outdoors, deltas, 1)
                 self.params.indoor_cooling_outdoor_factor = float(coeffs[0])
-                self.params.indoor_cooling_rate = float(coeffs[1])
+                self.params.indoor_cooling_rate = max(-1.0, float(coeffs[1]))
             else:
-                self.params.indoor_cooling_rate = float(np.mean(deltas))
+                self.params.indoor_cooling_rate = max(-1.0, float(np.mean(deltas)))
 
         self.params.indoor_heating_samples = len(indoor_heating_deltas)
         self.params.indoor_cooling_samples = len(indoor_cooling_deltas)
@@ -773,12 +773,17 @@ class ThermalModel:
         return max(0.1, min(3.0, rate))
 
     def _indoor_cooling_rate(self, outdoor_temp: float) -> float:
-        """Indoor air cooling rate (°C/hour, negative) during standby."""
+        """Indoor air cooling rate (°C/hour, negative) during standby.
+
+        Clamped to [-1.0, 0.0]: a well-insulated house loses ~0.3°C/h,
+        a poorly insulated one up to ~0.8°C/h.  Values beyond -1.0 are
+        usually calibration noise, not real thermal behaviour.
+        """
         loss = (
             self.params.indoor_cooling_rate
             + self.params.indoor_cooling_outdoor_factor * outdoor_temp
         )
-        return max(-2.0, min(0.0, loss))
+        return max(-1.0, min(0.0, loss))
 
 
 # Singleton instance
