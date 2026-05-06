@@ -306,6 +306,7 @@ class ThermalModel:
             result = await session.execute(
                 select(IndoorTempReading)
                 .where(IndoorTempReading.timestamp >= since)
+                .where(IndoorTempReading.is_stale == False)  # noqa: E712
                 .order_by(IndoorTempReading.timestamp)
             )
             readings = result.scalars().all()
@@ -321,12 +322,30 @@ class ThermalModel:
         indoor_heating_deltas: list[tuple[float, float]] = []  # (delta_per_hour, outdoor)
         indoor_cooling_deltas: list[tuple[float, float]] = []
 
+        # Build a time-indexed list for sliding-window pairing.
+        # We pair each reading with the one ~15-30 min earlier rather than
+        # the immediate predecessor.  This avoids amplifying sensor
+        # quantisation noise (e.g. 0.1°C / 5 min → spurious -1.2°C/h).
+        MIN_GAP_S = 900   # 15 min minimum between paired readings
+        MAX_GAP_S = 7200  # 2 h maximum
+
+        j = 0  # trailing pointer
         for i in range(1, len(readings)):
-            prev_reading = readings[i - 1]
             curr_reading = readings[i]
 
-            dt_hours = (curr_reading.timestamp - prev_reading.timestamp).total_seconds() / 3600.0
-            if dt_hours <= 0 or dt_hours > 2.0:
+            # Advance j until the gap is at least MIN_GAP_S
+            while j < i and (curr_reading.timestamp - readings[j].timestamp).total_seconds() > MAX_GAP_S:
+                j += 1
+
+            prev_reading = readings[j]
+            gap_s = (curr_reading.timestamp - prev_reading.timestamp).total_seconds()
+            if gap_s < MIN_GAP_S or gap_s > MAX_GAP_S:
+                continue
+
+            dt_hours = gap_s / 3600.0
+            abs_delta = abs(curr_reading.temperature - prev_reading.temperature)
+            # Skip deltas within sensor noise (±0.15°C)
+            if abs_delta < 0.15:
                 continue
 
             indoor_delta = (curr_reading.temperature - prev_reading.temperature) / dt_hours
