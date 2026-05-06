@@ -113,13 +113,20 @@ class COPModel:
         return float(self._model.predict(features.reshape(1, -1))[0])
 
     def predict_cop(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
-        """Predict COP given conditions."""
+        """Predict COP given conditions.
+
+        Uses predicted electrical consumption to derive COP.  Clamped to
+        [1.5, 6.0] — real air-to-water heat pumps cannot exceed ~6 COP
+        even in ideal conditions.  Values outside this range indicate the
+        ML model is extrapolating into unrealistic territory.
+        """
         kwh_electrical = self.predict(outdoor_temp, tank_target, hour)
         if kwh_electrical <= 0:
             return 3.0  # fallback
         # Assume ~3kW thermal output typical
         thermal_output = 3.0  # This would come from a thermal model
-        return thermal_output / kwh_electrical
+        raw_cop = thermal_output / kwh_electrical
+        return max(1.5, min(6.0, raw_cop))
 
     @staticmethod
     def _fallback_predict(outdoor_temp: float) -> float:
