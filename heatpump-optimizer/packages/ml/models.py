@@ -184,6 +184,7 @@ class COPModel:
                     DeviceStatusRecord.tank_temp,
                     DeviceStatusRecord.outdoor_temp,
                     DeviceStatusRecord.direction,
+                    DeviceStatusRecord.zone1_temp,
                 ).order_by(DeviceStatusRecord.ts)
             )
             status_rows = status_result.all()
