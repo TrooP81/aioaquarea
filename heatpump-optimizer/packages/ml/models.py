@@ -237,14 +237,18 @@ class COPModel:
             ):
                 tank_delta_t = curr_status["tank_temp"] - prev_status["tank_temp"]
                 kwh_per_deg = self._tank_kwh_per_degree()
-                # Thermal energy from tank ΔT (can be negative if cooling)
-                thermal_tank_kwh = max(0, tank_delta_t) * kwh_per_deg
-                # Account for standby losses: use calibrated value if available
+
+                # Total thermal output = (observed ΔT + standby losses) × capacity
+                # The observed ΔT is net: heating minus losses. We add back
+                # the estimated standby losses to get gross thermal output.
+                # During active heating the effective loss is lower than idle
+                # loss because the tank spends part of the interval at a lower
+                # temp; use 50% of calibrated idle loss as a reasonable estimate.
                 from packages.ml.thermal import thermal_model
                 calibrated_loss = abs(thermal_model.params.tank_standby_loss)
-                standby_rate = calibrated_loss if calibrated_loss > 0 else 0.5
-                standby_loss_kwh = standby_rate * elapsed_hours * kwh_per_deg
-                thermal_kwh = (thermal_tank_kwh + standby_loss_kwh) / elapsed_hours
+                standby_rate = (calibrated_loss if calibrated_loss > 0 else 0.5) * 0.5
+                gross_delta_t = max(0, tank_delta_t + standby_rate * elapsed_hours)
+                thermal_kwh = gross_delta_t * kwh_per_deg / elapsed_hours
             else:
                 # No status pairing — estimate thermal from electrical using
                 # physics-based default COP
