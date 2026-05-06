@@ -180,6 +180,7 @@ async def run_optimization() -> None:
         logger.info(
             "plan_generated",
             plan_id=plan_record.id,
+            version=plan["version"],
             actions=len(plan["actions"]),
             cost_eur=plan.get("cost_estimate"),
         )

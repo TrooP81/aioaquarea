@@ -139,15 +139,26 @@ class ThermalModel:
         zone_cooling_deltas = []
         defrost_filtered = 0
 
+        # Build sliding-window pairs with a minimum 10-min gap to avoid
+        # amplifying short-interval temperature noise into extreme hourly
+        # rates (e.g. 1°C / 5 min → 12°C/h when it's really ~2°C/h).
+        MIN_GAP_S_DEVICE = 600   # 10 min
+        MAX_GAP_S_DEVICE = 7200  # 2 h
+
+        j = 0  # trailing pointer
         for i in range(1, len(records)):
-            prev = records[i - 1]
             curr = records[i]
 
-            # Time gap in hours
-            dt_hours = (curr.ts - prev.ts).total_seconds() / 3600.0
-            if dt_hours <= 0 or dt_hours > 2.0:
-                # Skip gaps larger than 2 hours (data gap)
+            # Advance j past records that are too old
+            while j < i and (curr.ts - records[j].ts).total_seconds() > MAX_GAP_S_DEVICE:
+                j += 1
+
+            prev = records[j]
+            gap_s = (curr.ts - prev.ts).total_seconds()
+            if gap_s < MIN_GAP_S_DEVICE or gap_s > MAX_GAP_S_DEVICE:
                 continue
+
+            dt_hours = gap_s / 3600.0
 
             # FILTER: Skip defrost intervals — temperature readings are unreliable
             if getattr(curr, 'defrost_active', None) or getattr(prev, 'defrost_active', None):
@@ -168,7 +179,6 @@ class ThermalModel:
 
                 if tank_delta > 0.5:
                     # Tank is being actively heated
-                    # If direction data is available, only count when compressor is on WATER
                     if curr_direction is None or curr_direction == "WATER":
                         tank_heating_deltas.append((tank_delta, outdoor))
                 elif tank_delta < -0.1:
@@ -209,7 +219,7 @@ class ThermalModel:
             else:
                 self.params.tank_heating_rate = float(np.mean(deltas))
 
-        # Tank standby loss
+        # Tank standby loss (clamped: a 200L tank rarely loses more than 3°C/h)
         if len(tank_cooling_deltas) >= 5:
             deltas = np.array([d[0] for d in tank_cooling_deltas])
             outdoors = np.array([d[1] for d in tank_cooling_deltas])
@@ -217,20 +227,20 @@ class ThermalModel:
             if np.std(outdoors) > 0:
                 coeffs = np.polyfit(outdoors, deltas, 1)
                 self.params.tank_loss_outdoor_factor = float(coeffs[0])
-                self.params.tank_standby_loss = float(coeffs[1])
+                self.params.tank_standby_loss = max(-3.0, float(coeffs[1]))
             else:
-                self.params.tank_standby_loss = float(np.mean(deltas))
+                self.params.tank_standby_loss = max(-3.0, float(np.mean(deltas)))
 
-        # Zone heating rate
+        # Zone heating rate (clamped: water supply typically heats at 2-15°C/h)
         if len(zone_heating_deltas) >= 5:
             deltas = np.array([d[0] for d in zone_heating_deltas])
             outdoors = np.array([d[1] for d in zone_heating_deltas])
 
             if np.std(outdoors) > 0:
                 coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.zone_heating_rate = float(coeffs[1])
+                self.params.zone_heating_rate = min(15.0, float(coeffs[1]))
             else:
-                self.params.zone_heating_rate = float(np.mean(deltas))
+                self.params.zone_heating_rate = min(15.0, float(np.mean(deltas)))
 
         # Zone standby loss
         if len(zone_cooling_deltas) >= 5:
@@ -759,7 +769,7 @@ class ThermalModel:
             self.params.tank_heating_rate
             + self.params.tank_heating_outdoor_factor * outdoor_temp
         )
-        return max(1.0, rate)  # At least 1°C/hour
+        return max(1.0, min(30.0, rate))
 
     def _tank_loss_rate(self, outdoor_temp: float) -> float:
         """Tank standby loss rate (°C/hour, negative)."""
@@ -773,7 +783,7 @@ class ThermalModel:
         """Zone heating rate (°C/hour)."""
         # Zones heat slower when it's very cold outside
         rate = self.params.zone_heating_rate + 0.03 * outdoor_temp
-        return max(0.5, rate)
+        return max(0.5, min(15.0, rate))
 
     def _zone_loss_rate(self, outdoor_temp: float) -> float:
         """Zone standby loss rate (°C/hour, negative)."""
