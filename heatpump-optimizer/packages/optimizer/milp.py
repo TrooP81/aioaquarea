@@ -226,15 +226,29 @@ class MILPOptimizer:
         kwh_per_degree = 0.23
         avg_cop = sum(cops) / len(cops) if cops else 3.5
 
-        # --- Use thermal model parameters if calibrated ---
+        # --- Use thermal model's outdoor-adjusted rates per hour ---
+        # The thermal model fits: rate = base + factor * outdoor_temp
+        # Using the raw base (intercept at outdoor=0) can vastly understate
+        # actual rates.  Call the model's methods with the per-hour outdoor
+        # temperature so every hour uses a physically accurate rate.
         if thermal_model.params.last_calibrated:
-            tank_loss_kwh_per_h = abs(thermal_model.params.tank_standby_loss) * kwh_per_degree
-            dhw_thermal_kw = thermal_model.params.tank_heating_rate * kwh_per_degree
-            dhw_power_kw = dhw_thermal_kw / avg_cop if avg_cop > 0 else 0.27
+            tank_heat_rates = [
+                thermal_model._tank_heating_rate(temps[h]) for h in range(H)
+            ]
+            tank_loss_rates = [
+                thermal_model._tank_loss_rate(temps[h]) for h in range(H)
+            ]
         else:
-            # Default: ~5 °C/h heating rate, ~0.5 °C/h standby loss
-            dhw_power_kw = (5.0 * kwh_per_degree) / avg_cop if avg_cop > 0 else 0.27
-            tank_loss_kwh_per_h = 0.5 * kwh_per_degree
+            tank_heat_rates = [5.0] * H   # default 5 °C/h
+            tank_loss_rates = [-0.5] * H  # default -0.5 °C/h
+
+        # Convert per-hour °C rates to kWh quantities
+        dhw_thermal_kw_per_h = [r * kwh_per_degree for r in tank_heat_rates]
+        dhw_power_kw_per_h = [
+            (dhw_thermal_kw_per_h[h] / cops[h]) if cops[h] > 0 else 0.27
+            for h in range(H)
+        ]
+        tank_loss_kwh_per_h = [abs(r) * kwh_per_degree for r in tank_loss_rates]
 
         sh_max_power_kw = 3.0  # Max electrical input for space heating
 
@@ -255,19 +269,24 @@ class MILPOptimizer:
         # Fast-heating tanks (e.g. 20°C/h) reach target in minutes; the solver
         # needs the ability to run DHW for only a fraction of the hour.
         tank_range = _tank_max - tank_min_abs
-        max_thermal_per_h = [dhw_power_kw * cops[h] for h in range(H)]
+        max_thermal_per_h = [dhw_power_kw_per_h[h] * cops[h] for h in range(H)]
         # If any hour's thermal gain exceeds the tank range, use continuous DHW
         needs_continuous_dhw = any(g > tank_range * 1.1 for g in max_thermal_per_h)
 
-        logger.debug(
+        # Representative values for logging
+        avg_dhw_power = sum(dhw_power_kw_per_h) / H
+        avg_tank_loss = sum(tank_loss_kwh_per_h) / H
+
+        logger.info(
             "milp_tank_parameters",
             tank_min_abs_kwh=round(tank_min_abs, 2),
             tank_min_comfort_kwh=round(tank_min_comfort, 2),
             tank_max_kwh=round(_tank_max, 2),
             tank_range_kwh=round(tank_range, 2),
             tank_init_kwh=round(tank_init, 2),
-            dhw_power_kw=round(dhw_power_kw, 3),
-            tank_loss_kwh_per_h=round(tank_loss_kwh_per_h, 3),
+            avg_dhw_power_kw=round(avg_dhw_power, 3),
+            avg_tank_loss_kwh_per_h=round(avg_tank_loss, 3),
+            avg_tank_heat_rate=round(sum(tank_heat_rates) / H, 2),
             max_thermal_gain=round(max(max_thermal_per_h), 2),
             continuous_dhw=needs_continuous_dhw,
         )
@@ -287,7 +306,7 @@ class MILPOptimizer:
         # --- Objective: minimize cost ---
         prob += pulp.lpSum(
             [
-                price_vals[h] * (x_dhw[h] * dhw_power_kw + x_sh[h] * sh_max_power_kw)
+                price_vals[h] * (x_dhw[h] * dhw_power_kw_per_h[h] + x_sh[h] * sh_max_power_kw)
                 for h in range(H)
             ]
         )
@@ -303,8 +322,8 @@ class MILPOptimizer:
         prob += tank_state[0] == tank_init
 
         for h in range(H):
-            heat_added = x_dhw[h] * dhw_power_kw * cops[h]
-            prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h
+            heat_added = x_dhw[h] * dhw_power_kw_per_h[h] * cops[h]
+            prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h[h]
 
         # Per-hour tank floor: comfort hours use normal min, off-peak uses lower min
         for h in range(H + 1):
