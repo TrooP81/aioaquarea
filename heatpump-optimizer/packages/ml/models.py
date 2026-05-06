@@ -463,45 +463,56 @@ class DemandModel:
     async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
         """Prepare training data from consumption + weather history.
 
-        Joins consumption records with WeatherRecord to get real wind/irradiance
-        instead of placeholder constants.
+        Fetches consumption and weather separately, then pairs by closest
+        hour to get real wind/irradiance instead of placeholder constants.
         """
         async with get_session() as session:
-            # Join consumption with closest weather record (same hour)
-            result = await session.execute(
+            cons_result = await session.execute(
                 select(
                     ConsumptionRecord.ts,
                     ConsumptionRecord.heat_kwh,
                     ConsumptionRecord.cool_kwh,
                     ConsumptionRecord.tank_kwh,
                     ConsumptionRecord.outdoor_temp,
+                ).order_by(ConsumptionRecord.ts)
+            )
+            consumption_rows = cons_result.all()
+
+            weather_result = await session.execute(
+                select(
+                    WeatherRecord.ts,
                     WeatherRecord.wind_speed,
                     WeatherRecord.irradiance,
-                )
-                .outerjoin(
-                    WeatherRecord,
-                    and_(
-                        func.date_trunc("hour", WeatherRecord.ts)
-                        == func.date_trunc("hour", ConsumptionRecord.ts),
-                    ),
-                )
-                .order_by(ConsumptionRecord.ts)
+                ).order_by(WeatherRecord.ts)
             )
-            rows = result.all()
+            weather_rows = weather_result.all()
 
-        if not rows:
+        if not consumption_rows:
             return np.array([]), np.array([])
+
+        # Index weather by truncated hour for fast lookup
+        weather_by_hour: dict[tuple, dict] = {}
+        for w in weather_rows:
+            key = (w.ts.date(), w.ts.hour)
+            weather_by_hour[key] = {
+                "wind_speed": w.wind_speed,
+                "irradiance": w.irradiance,
+            }
 
         X_list = []
         y_list = []
 
-        for row in rows:
+        for row in consumption_rows:
             total = (row.heat_kwh or 0) + (row.cool_kwh or 0) + (row.tank_kwh or 0)
             temp = row.outdoor_temp or 5.0
-            wind = row.wind_speed if row.wind_speed is not None else 3.0
-            irradiance = row.irradiance if row.irradiance is not None else 0.0
             hour = row.ts.hour
             dow = row.ts.weekday()
+
+            # Look up weather for this hour
+            w_key = (row.ts.date(), hour)
+            w = weather_by_hour.get(w_key, {})
+            wind = w.get("wind_speed") or 3.0
+            irradiance = w.get("irradiance") or 0.0
 
             features = np.array(
                 [

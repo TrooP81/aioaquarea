@@ -749,17 +749,15 @@ class RulesOptimizer:
         # Use real consumption data: average daily kWh over the last 7 days
         estimated_kwh_per_day = 15.0  # fallback
         try:
+            from sqlalchemy import func as sa_func, case
             since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
+            heat = sa_func.coalesce(ConsumptionRecord.heat_kwh, 0)
+            cool = sa_func.coalesce(ConsumptionRecord.cool_kwh, 0)
+            tank = sa_func.coalesce(ConsumptionRecord.tank_kwh, 0)
             async with get_session() as session:
-                from sqlalchemy import func as sa_func
                 result = await session.execute(
-                    select(
-                        sa_func.avg(
-                            (ConsumptionRecord.heat_kwh or 0)
-                            + (ConsumptionRecord.cool_kwh or 0)
-                            + (ConsumptionRecord.tank_kwh or 0)
-                        )
-                    ).where(ConsumptionRecord.ts >= since)
+                    select(sa_func.avg(heat + cool + tank))
+                    .where(ConsumptionRecord.ts >= since)
                 )
                 avg_kwh = result.scalar()
                 if avg_kwh and avg_kwh > 0:
