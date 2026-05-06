@@ -749,7 +749,7 @@ class RulesOptimizer:
         # Use real consumption data: average daily kWh over the last 7 days
         estimated_kwh_per_day = 15.0  # fallback
         try:
-            from sqlalchemy import func as sa_func, case
+            from sqlalchemy import func as sa_func
             since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
             heat = sa_func.coalesce(ConsumptionRecord.heat_kwh, 0)
             cool = sa_func.coalesce(ConsumptionRecord.cool_kwh, 0)

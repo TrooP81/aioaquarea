@@ -1125,12 +1125,20 @@ async def get_comfort_model_status():
 @app.post("/api/comfort-model/train")
 async def trigger_comfort_model_training():
     """Manually trigger comfort model training."""
+    import traceback
+    import structlog
+    _log = structlog.get_logger()
+
     from packages.ml.comfort_model import comfort_model
 
     lag_str = await get_setting("thermal_lag_minutes")
     lag = int(lag_str) if lag_str else None
 
-    result = await comfort_model.train(thermal_lag_minutes=lag)
+    try:
+        result = await comfort_model.train(thermal_lag_minutes=lag)
+    except Exception as exc:
+        _log.error("comfort_train_error", error=str(exc), traceback=traceback.format_exc())
+        result = {"error": f"Training failed: {exc}"}
 
     async with get_session() as session:
         session.add(
@@ -1264,13 +1272,26 @@ async def get_optimizer_status():
 @app.post("/api/ml/train")
 async def trigger_ml_training():
     """Manually trigger COP and demand model training."""
+    import traceback
+    import structlog
+    _log = structlog.get_logger()
+
     from packages.ml.models import COPModel, DemandModel
 
     cop = COPModel()
     demand = DemandModel()
 
-    cop_result = await cop.train()
-    demand_result = await demand.train()
+    try:
+        cop_result = await cop.train()
+    except Exception as exc:
+        _log.error("cop_train_error", error=str(exc), traceback=traceback.format_exc())
+        cop_result = {"error": f"Training failed: {exc}"}
+
+    try:
+        demand_result = await demand.train()
+    except Exception as exc:
+        _log.error("demand_train_error", error=str(exc), traceback=traceback.format_exc())
+        demand_result = {"error": f"Training failed: {exc}"}
 
     async with get_session() as session:
         session.add(
