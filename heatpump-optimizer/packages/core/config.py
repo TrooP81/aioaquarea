@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     # Optimizer constraints
     tank_min_temp: int = 45
+    tank_min_temp_offpeak: int = 41
     tank_max_temp: int = 55
     comfort_temp_min: float = 20.0
     comfort_temp_max: float = 22.0

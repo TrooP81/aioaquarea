@@ -84,7 +84,12 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     "tank_min_temp": {
         "type": "int",
         "default_env": "tank_min_temp",
-        "description": "Minimum tank temperature (°C)",
+        "description": "Minimum tank temperature during comfort hours (°C)",
+    },
+    "tank_min_temp_offpeak": {
+        "type": "int",
+        "default_env": "tank_min_temp_offpeak",
+        "description": "Minimum tank temperature during off-peak/sleep hours (°C)",
     },
     "tank_max_temp": {
         "type": "int",

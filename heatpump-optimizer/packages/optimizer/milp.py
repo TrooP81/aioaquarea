@@ -115,6 +115,22 @@ class MILPOptimizer:
             else:
                 indoor_targets.append(comfort_temp_min)
 
+        # Tank temperature bounds (DB-first, env fallback)
+        tank_min_temp = int(await get_setting("tank_min_temp") or settings.tank_min_temp)
+        tank_min_temp_offpeak = int(
+            await get_setting("tank_min_temp_offpeak") or settings.tank_min_temp_offpeak
+        )
+        tank_max_temp = int(await get_setting("tank_max_temp") or settings.tank_max_temp)
+
+        # Per-hour tank floor: lower minimum during off-peak (sleep/away) hours
+        tank_min_per_hour = []
+        for h in range(len(prices)):
+            hour_ts = horizon_start + dt.timedelta(hours=h)
+            if is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name):
+                tank_min_per_hour.append(tank_min_temp)
+            else:
+                tank_min_per_hour.append(tank_min_temp_offpeak)
+
         # Current heat curve baseline water temp (what the pump targets in NORMAL mode)
         heat_curve_water_temp = (
             last_status.zone1_target_temp if last_status and last_status.zone1_target_temp else 35.0
@@ -132,6 +148,8 @@ class MILPOptimizer:
             dhw_deadlines,
             indoor_targets,
             heat_curve_water_temp,
+            tank_min_per_hour,
+            tank_max_temp,
         )
         return plan
 
@@ -183,6 +201,8 @@ class MILPOptimizer:
         dhw_deadlines: list[int] | None = None,
         indoor_targets: list[float] | None = None,
         heat_curve_water_temp: float = 35.0,
+        tank_min_per_hour: list[int] | None = None,
+        tank_max_temp_setting: int | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -219,22 +239,31 @@ class MILPOptimizer:
         sh_max_power_kw = 3.0  # Max electrical input for space heating
 
         # Tank state (thermal kWh stored, using same kwh_per_degree factor)
-        tank_min = settings.tank_min_temp * kwh_per_degree
-        tank_max = settings.tank_max_temp * kwh_per_degree
-        tank_init = max(tank_min, min(tank_max, current_tank_temp * kwh_per_degree))
+        # Per-hour tank floor: lower bound during off-peak hours
+        _tank_max = (tank_max_temp_setting or settings.tank_max_temp) * kwh_per_degree
+        if tank_min_per_hour:
+            tank_min_floors = [t * kwh_per_degree for t in tank_min_per_hour]
+            tank_min_abs = min(tank_min_floors)  # lowest possible floor (for LP bounds)
+            tank_min_comfort = max(tank_min_floors)  # comfort-hour floor (for deadlines)
+        else:
+            tank_min_abs = settings.tank_min_temp * kwh_per_degree
+            tank_min_comfort = tank_min_abs
+            tank_min_floors = [tank_min_abs] * H
+        tank_init = max(tank_min_abs, min(_tank_max, current_tank_temp * kwh_per_degree))
 
         # Cap DHW thermal gain so it can't exceed the tank range in one hour.
         # Fast-heating tanks (e.g. 20°C/h) reach target in minutes; the solver
         # needs the ability to run DHW for only a fraction of the hour.
-        tank_range = tank_max - tank_min
+        tank_range = _tank_max - tank_min_abs
         max_thermal_per_h = [dhw_power_kw * cops[h] for h in range(H)]
         # If any hour's thermal gain exceeds the tank range, use continuous DHW
         needs_continuous_dhw = any(g > tank_range * 1.1 for g in max_thermal_per_h)
 
         logger.debug(
             "milp_tank_parameters",
-            tank_min_kwh=round(tank_min, 2),
-            tank_max_kwh=round(tank_max, 2),
+            tank_min_abs_kwh=round(tank_min_abs, 2),
+            tank_min_comfort_kwh=round(tank_min_comfort, 2),
+            tank_max_kwh=round(_tank_max, 2),
             tank_range_kwh=round(tank_range, 2),
             tank_init_kwh=round(tank_init, 2),
             dhw_power_kw=round(dhw_power_kw, 3),
@@ -265,9 +294,11 @@ class MILPOptimizer:
 
         # --- Constraints ---
 
-        # Tank state evolution
+        # Tank state evolution — LP variable bounds use the absolute (offpeak)
+        # minimum so the solver has full range; per-hour floors are added as
+        # explicit constraints below.
         tank_state = [
-            pulp.LpVariable(f"tank_{h}", tank_min, tank_max) for h in range(H + 1)
+            pulp.LpVariable(f"tank_{h}", tank_min_abs, _tank_max) for h in range(H + 1)
         ]
         prob += tank_state[0] == tank_init
 
@@ -275,10 +306,15 @@ class MILPOptimizer:
             heat_added = x_dhw[h] * dhw_power_kw * cops[h]
             prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h
 
-        # Tank must be above minimum at comfort-schedule deadline hours
+        # Per-hour tank floor: comfort hours use normal min, off-peak uses lower min
+        for h in range(H + 1):
+            floor = tank_min_floors[min(h, H - 1)]
+            prob += tank_state[h] >= floor
+
+        # Tank must be above comfort minimum at comfort-schedule deadline hours
         for ready_hour in (dhw_deadlines or []):
             if ready_hour < H:
-                prob += tank_state[ready_hour] >= tank_min * 1.2
+                prob += tank_state[ready_hour] >= tank_min_comfort * 1.2
 
         # Limit DHW activations (API rate limit proxy)
         max_changes = 20

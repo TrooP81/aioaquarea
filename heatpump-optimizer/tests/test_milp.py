@@ -326,6 +326,80 @@ class TestMILPSolver:
             thermal_model.params = orig_params
 
 
+    def test_milp_offpeak_lower_tank_floor(self):
+        """Off-peak hours should allow tank to drop below normal min."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        # Hours 0-6 and 22-23 are off-peak (41°C), rest comfort (45°C)
+        tank_min_per_hour = [
+            41, 41, 41, 41, 41, 41, 41,  # 0-6: off-peak
+            45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,  # 7-21: comfort
+            41, 41,  # 22-23: off-peak
+        ]
+
+        plan = milp._solve(
+            prices, weather,
+            cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+            demand_per_hour=[3.0] * 24,
+            current_tank_temp=42.0,  # Between offpeak min (41) and comfort min (45)
+            tank_min_per_hour=tank_min_per_hour,
+            tank_max_temp_setting=55,
+        )
+
+        # Should be feasible — the tank starts at 42°C which is above the
+        # off-peak floor of 41°C, even though it's below the comfort floor of 45°C
+        assert plan is not None
+        assert plan["version"] == "milp_v1"
+
+    def test_milp_comfort_hours_use_normal_floor(self):
+        """During comfort hours the normal tank_min_temp should be enforced."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        # All hours are comfort hours (45°C floor)
+        tank_min_per_hour = [45] * 24
+
+        plan = milp._solve(
+            prices, weather,
+            cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+            demand_per_hour=[3.0] * 24,
+            current_tank_temp=48.0,
+            tank_min_per_hour=tank_min_per_hour,
+            tank_max_temp_setting=55,
+        )
+
+        assert plan is not None
+        # DHW should still be scheduled to maintain the 45°C floor
+        dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
+        assert len(dhw_on) > 0
+
+    def test_milp_offpeak_backward_compat_no_per_hour(self):
+        """When tank_min_per_hour is None, falls back to settings constants."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        # No per-hour list — should use settings.tank_min_temp as constant
+        plan = milp._solve(
+            prices, weather,
+            cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+            demand_per_hour=[3.0] * 24,
+            current_tank_temp=48.0,
+        )
+
+        assert plan is not None
+        assert plan["version"] == "milp_v1"
+
+
 class TestMILPGeneratePlan:
     """Tests for the async generate_plan interface."""
 
