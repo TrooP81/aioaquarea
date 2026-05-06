@@ -42,8 +42,36 @@ def _load_ml_models() -> None:
     )
 
 
-async def _select_optimizer(layer: str) -> tuple[str, object]:
+def _selected_layer_version(layer_name: str) -> str:
+    """Map an optimizer selection to the user-facing layer version string."""
+    if layer_name == "milp":
+        if _cop_model.is_trained or _demand_model.is_trained:
+            return f"{MILPOptimizer.VERSION}+ml"
+        return MILPOptimizer.VERSION
+    return RulesOptimizer.VERSION
+
+
+async def get_optimizer_status_snapshot(
+    layer: str,
+    reload_models: bool = False,
+) -> dict[str, str | bool]:
+    """Return the selected layer and loaded model state for the given configuration."""
+    layer_name, _ = await _select_optimizer(layer, reload_models=reload_models)
+    return {
+        "active_layer": _selected_layer_version(layer_name),
+        "cop_trained": _cop_model.is_trained,
+        "demand_trained": _demand_model.is_trained,
+    }
+
+
+async def _select_optimizer(
+    layer: str,
+    reload_models: bool = False,
+) -> tuple[str, object]:
     """Return (layer_name, optimizer_instance) based on the configured layer setting."""
+    if reload_models:
+        _load_ml_models()
+
     if layer == "rules_only":
         return "rules", RulesOptimizer()
 
@@ -102,7 +130,7 @@ async def run_optimization() -> None:
     """Run the optimizer and store the plan, with layer selection and fallback."""
     try:
         layer = await get_setting("optimizer_layer") or "rules_only"
-        layer_name, optimizer = await _select_optimizer(layer)
+        layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
 
         logger.info("optimization_starting", configured_layer=layer, selected=layer_name)
 

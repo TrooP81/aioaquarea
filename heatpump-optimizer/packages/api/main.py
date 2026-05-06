@@ -1157,29 +1157,13 @@ async def health():
 @app.get("/api/optimizer/status")
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
-    from packages.ml.models import COPModel, DemandModel, MODEL_DIR
+    from packages.ml.models import MODEL_DIR
     from packages.ml.thermal import thermal_model
     from packages.core.settings_service import get_setting
+    from packages.optimizer.main import get_optimizer_status_snapshot
 
     layer = await get_setting("optimizer_layer") or "rules_only"
-
-    # Determine active layer
-    cop = COPModel()
-    cop.load_latest()
-    demand = DemandModel()
-    demand.load_latest()
-
-    if layer == "rules_only":
-        active_layer = "rules_v3"
-    elif layer == "milp_preferred":
-        active_layer = "milp_v1+ml" if cop.is_trained else "milp_v1"
-    elif layer == "auto":
-        if cop.is_trained and demand.is_trained:
-            active_layer = "milp_v1+ml"
-        else:
-            active_layer = "rules_v3"
-    else:
-        active_layer = "rules_v3"
+    optimizer_status = await get_optimizer_status_snapshot(layer, reload_models=True)
 
     # Find latest model timestamps
     cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
@@ -1214,15 +1198,15 @@ async def get_optimizer_status():
 
     return {
         "configured_layer": layer,
-        "active_layer": active_layer,
+        "active_layer": optimizer_status["active_layer"],
         "fallback_layer": "rules_v3",
         "cop_model": {
-            "trained": cop.is_trained,
+            "trained": optimizer_status["cop_trained"],
             "last_trained": _version_to_iso("cop_model_", cop_models),
             "samples": cop_samples,
         },
         "demand_model": {
-            "trained": demand.is_trained,
+            "trained": optimizer_status["demand_trained"],
             "last_trained": _version_to_iso("demand_model_", demand_models),
             "samples": demand_samples,
         },

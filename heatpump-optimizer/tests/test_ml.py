@@ -248,6 +248,18 @@ class TestOrchestratorFallback:
     """Tests for the orchestrator layer selection and fallback logic."""
 
     @pytest.mark.asyncio
+    async def test_select_optimizer_can_reload_models(self):
+        """reload_models=True should refresh checkpoints before selecting a layer."""
+        from packages.optimizer.main import _select_optimizer
+
+        with patch("packages.optimizer.main._load_ml_models") as mock_load:
+            layer_name, optimizer = await _select_optimizer("rules_only", reload_models=True)
+
+        mock_load.assert_called_once_with()
+        assert layer_name == "rules"
+        assert type(optimizer).__name__ == "RulesOptimizer"
+
+    @pytest.mark.asyncio
     async def test_rules_only_never_uses_milp(self):
         """With rules_only setting, MILP should never be invoked."""
         from packages.optimizer.main import _select_optimizer
@@ -298,6 +310,40 @@ class TestOrchestratorFallback:
                 assert layer_name == "milp"
         finally:
             # Restore untrained state
+            _cop_model._model = None
+            _demand_model._model = None
+
+    @pytest.mark.asyncio
+    async def test_optimizer_status_snapshot_uses_same_auto_gate(self):
+        """Status snapshot should report the same layer the runtime selector would use."""
+        from packages.optimizer.main import (
+            _cop_model,
+            _demand_model,
+            get_optimizer_status_snapshot,
+        )
+
+        _cop_model._model = MagicMock()
+        _demand_model._model = MagicMock()
+
+        try:
+            with patch(
+                "packages.optimizer.main._has_sufficient_ml_data",
+                new_callable=AsyncMock,
+                return_value=False,
+            ):
+                status = await get_optimizer_status_snapshot("auto")
+                assert status["active_layer"] == "rules_v3"
+
+            with patch(
+                "packages.optimizer.main._has_sufficient_ml_data",
+                new_callable=AsyncMock,
+                return_value=True,
+            ):
+                status = await get_optimizer_status_snapshot("auto")
+                assert status["active_layer"] == "milp_v1+ml"
+                assert status["cop_trained"] is True
+                assert status["demand_trained"] is True
+        finally:
             _cop_model._model = None
             _demand_model._model = None
 
