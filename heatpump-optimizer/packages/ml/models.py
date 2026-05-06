@@ -191,16 +191,26 @@ class COPModel:
         if not consumption_rows or not status_rows:
             return np.array([]), np.array([])
 
-        # Index device status by (date, hour) for tank temp and direction
-        status_by_hour: dict[tuple, dict] = {}
-        for s in status_rows:
-            key = (s.ts.date(), s.ts.hour)
-            status_by_hour[key] = {
-                "tank_target": s.tank_target_temp or 50,
-                "tank_temp": s.tank_temp,
-                "outdoor": s.outdoor_temp,
-                "direction": s.direction,
-            }
+        # Sort status records by timestamp for binary-search pairing
+        status_sorted = sorted(status_rows, key=lambda s: s.ts)
+        status_ts = [s.ts for s in status_sorted]
+
+        def _find_closest_status(ts):
+            """Find the device status record closest to the given timestamp."""
+            import bisect
+            idx = bisect.bisect_left(status_ts, ts)
+            best = None
+            best_gap = float("inf")
+            for candidate_idx in (idx - 1, idx):
+                if 0 <= candidate_idx < len(status_sorted):
+                    gap = abs((status_sorted[candidate_idx].ts - ts).total_seconds())
+                    if gap < best_gap:
+                        best_gap = gap
+                        best = status_sorted[candidate_idx]
+            # Only return if within 20 minutes
+            if best and best_gap <= 1200:
+                return best
+            return None
 
         X_list = []
         y_list = []
@@ -226,51 +236,65 @@ class COPModel:
                 prev_row = row
                 continue
 
-            # Get tank ΔT from device status around this time window
-            prev_key = (prev_row.ts.date(), prev_row.ts.hour)
-            curr_key = (row.ts.date(), row.ts.hour)
-            prev_status = status_by_hour.get(prev_key)
-            curr_status = status_by_hour.get(curr_key)
+            # Pair each consumption timestamp with nearest device status
+            prev_status_rec = _find_closest_status(prev_row.ts)
+            curr_status_rec = _find_closest_status(row.ts)
+
+            # Total electrical delta for this interval
+            delta_elec = (
+                ((row.heat_kwh or 0) + (row.tank_kwh or 0))
+                - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
+            )
+            if delta_elec <= 0.01:
+                skip_no_delta += 1
+                prev_row = row
+                continue
+
+            elec_kw = delta_elec / elapsed_hours
+            thermal_kwh = 0.0
+            curr_status = None
 
             if (
-                prev_status and curr_status
-                and prev_status.get("tank_temp") is not None
-                and curr_status.get("tank_temp") is not None
+                prev_status_rec and curr_status_rec
+                and prev_status_rec.ts != curr_status_rec.ts
             ):
                 used_status_path += 1
-                tank_delta_t = curr_status["tank_temp"] - prev_status["tank_temp"]
-
-                if tank_delta_t <= 0:
-                    # Tank not heating — skip
-                    skip_thermal_zero += 1
-                    prev_row = row
-                    continue
-
-                # Use only DHW electrical consumption (not total)
-                delta_tank_elec = (row.tank_kwh or 0) - (prev_row.tank_kwh or 0)
-                if delta_tank_elec <= 0.01:
-                    skip_no_delta += 1
-                    prev_row = row
-                    continue
-
-                elec_kw = delta_tank_elec / elapsed_hours
                 kwh_per_deg = self._tank_kwh_per_degree()
 
-                # Thermal output = net tank ΔT × tank capacity
-                thermal_kwh = tank_delta_t * kwh_per_deg / elapsed_hours
-            else:
-                # No status pairing — use total electrical with default COP
-                delta_elec = (
-                    ((row.heat_kwh or 0) + (row.tank_kwh or 0))
-                    - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
-                )
-                if delta_elec <= 0.01:
-                    skip_no_delta += 1
-                    prev_row = row
-                    continue
+                # Tank thermal contribution
+                tank_thermal = 0.0
+                if (
+                    prev_status_rec.tank_temp is not None
+                    and curr_status_rec.tank_temp is not None
+                ):
+                    tank_delta = curr_status_rec.tank_temp - prev_status_rec.tank_temp
+                    if tank_delta > 0:
+                        tank_thermal = tank_delta * kwh_per_deg
 
+                # Zone (space heating) thermal contribution
+                zone_thermal = 0.0
+                if (
+                    prev_status_rec.zone1_temp is not None
+                    and curr_status_rec.zone1_temp is not None
+                ):
+                    zone_delta = curr_status_rec.zone1_temp - prev_status_rec.zone1_temp
+                    if zone_delta > 0:
+                        # Water circuit thermal mass for zone heating
+                        zone_thermal = zone_delta * 0.5  # kWh per °C water circuit
+
+                total_thermal = tank_thermal + zone_thermal
+                if total_thermal > 0:
+                    thermal_kwh = total_thermal / elapsed_hours
+
+                curr_status = {
+                    "tank_target": curr_status_rec.tank_target_temp or 50,
+                }
+            else:
+                skip_no_status += 1
+
+            # If no thermal from status pairing, use default COP estimate
+            if thermal_kwh <= 0:
                 used_fallback_path += 1
-                elec_kw = delta_elec / elapsed_hours
                 outdoor = row.outdoor_temp or 5.0
                 default_cop = self._default_cop_curve(outdoor)
                 thermal_kwh = elec_kw * default_cop * 0.7  # conservative
