@@ -421,13 +421,14 @@ class TestOrchestratorFallback:
 class TestDirectionAwareCOP:
     """Tests for direction-based COP computation."""
 
-    def test_tank_thermal_mass_constant(self):
-        """Verify the tank thermal mass constant is physically reasonable."""
+    def test_tank_thermal_mass_from_config(self):
+        """Verify tank thermal mass is computed from configured volume."""
         from packages.ml.models import DirectionAwareCOP
 
         dac = DirectionAwareCOP()
-        # ~50L tank ≈ 58 Wh per °C → 0.058 kWh/°C
-        assert 0.01 < dac.TANK_THERMAL_MASS_KWH_PER_DEG < 0.5
+        # 300L tank → 0.349 kWh/°C (configurable via tank_volume_liters)
+        tank_kwh = dac._tank_kwh_per_degree()
+        assert 0.1 < tank_kwh < 1.0
 
     def test_water_circuit_thermal_mass_constant(self):
         """Verify the renamed water circuit thermal mass constant."""
@@ -467,9 +468,9 @@ class TestDirectionAwareCOP:
         record_curr.defrost_active = False
         record_curr.device_id = "test"
 
-        # For HEATING_WATER: thermal = 5 * 0.058 = 0.29 kWh (from tank temp)
+        # For HEATING_WATER: thermal = 5 * tank_kwh_per_degree (from tank temp)
         # NOT from zone1_temp which didn't change
-        expected_thermal = 5.0 * dac.TANK_THERMAL_MASS_KWH_PER_DEG
+        expected_thermal = 5.0 * dac._tank_kwh_per_degree()
         assert expected_thermal > 0
 
     def test_idle_and_off_intervals_are_skipped(self):
@@ -480,9 +481,8 @@ class TestDirectionAwareCOP:
 
         dac = DirectionAwareCOP()
 
-        # Verify the filter condition exists in the code logic
-        # (structural assertion — the actual filtering is in compute_cop_intervals)
-        assert dac.TANK_THERMAL_MASS_KWH_PER_DEG > 0
+        # Verify the tank thermal capacity is available and positive
+        assert dac._tank_kwh_per_degree() > 0
 
     def test_defrost_intervals_are_skipped(self):
         """Defrost intervals should not contribute to COP calculation."""

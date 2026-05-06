@@ -5,13 +5,13 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading, ShowerEventRecord
-from packages.core.settings_service import get_effective_schedule, get_setting, get_user_tz, is_comfort_hour, dhw_deadlines_from_schedule, get_comfort_schedule
+from packages.core.models import IndoorTempReading, ShowerEventRecord, ConsumptionRecord
+from packages.core.settings_service import get_effective_schedule, get_setting, get_user_tz, is_comfort_hour, dhw_deadlines_from_schedule
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 
@@ -165,7 +165,7 @@ class RulesOptimizer:
         actions.sort(key=lambda a: a["ts"])
 
         # Estimate cost
-        cost_estimate = self._estimate_cost(actions, prices)
+        cost_estimate = await self._estimate_cost(actions, prices)
 
         return {
             "horizon_start": horizon_start,
@@ -738,15 +738,35 @@ class RulesOptimizer:
 
         return actions
 
-    def _estimate_cost(
+    async def _estimate_cost(
         self, actions: list[dict], prices: list[tuple[dt.datetime, float]]
     ) -> float:
-        """Rough cost estimate (simplified)."""
-        # Average price * estimated kWh (very rough)
+        """Cost estimate using rolling average daily consumption from DB."""
         if not prices:
             return 0.0
         avg_price = sum(p for _, p in prices) / len(prices)
-        estimated_kwh_per_day = 15.0  # Typical for a mid-size heat pump
+
+        # Use real consumption data: average daily kWh over the last 7 days
+        estimated_kwh_per_day = 15.0  # fallback
+        try:
+            since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
+            async with get_session() as session:
+                from sqlalchemy import func as sa_func
+                result = await session.execute(
+                    select(
+                        sa_func.avg(
+                            (ConsumptionRecord.heat_kwh or 0)
+                            + (ConsumptionRecord.cool_kwh or 0)
+                            + (ConsumptionRecord.tank_kwh or 0)
+                        )
+                    ).where(ConsumptionRecord.ts >= since)
+                )
+                avg_kwh = result.scalar()
+                if avg_kwh and avg_kwh > 0:
+                    estimated_kwh_per_day = float(avg_kwh)
+        except Exception:
+            pass
+
         return avg_price * estimated_kwh_per_day
 
     async def _get_prices(

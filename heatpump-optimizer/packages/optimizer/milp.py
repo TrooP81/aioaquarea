@@ -6,8 +6,7 @@ import asyncio
 import datetime as dt
 from typing import Any
 
-import numpy as np
-from sqlalchemy import select, and_
+from sqlalchemy import select
 
 try:
     import pulp
@@ -16,7 +15,7 @@ except ImportError:
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.models import PriceRecord, WeatherRecord, DeviceStatusRecord, IndoorTempReading
+from packages.core.models import IndoorTempReading
 from packages.core.settings_service import get_setting, get_user_tz, dhw_deadlines_from_schedule, get_comfort_schedule, is_comfort_hour
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
@@ -63,6 +62,7 @@ class MILPOptimizer:
         async with get_session() as session:
             prices = await self._get_prices(session, horizon_start, horizon_end)
             weather = await self._get_weather(session, horizon_start, horizon_end)
+            weather_full = await self._get_weather_full(session, horizon_start, horizon_end)
             last_status = await self._get_last_status(session)
 
             # Latest indoor temp from SmartThings (if available)
@@ -95,7 +95,7 @@ class MILPOptimizer:
         cop_fn = self._build_cop_function(last_status)
 
         # Build demand estimates: prefer ML model, fall back to constant
-        demand_per_hour = self._build_demand_estimates(weather)
+        demand_per_hour = self._build_demand_estimates(weather, weather_full)
 
         # Get comfort schedule to derive DHW deadlines
         comfort_schedule = await get_comfort_schedule()
@@ -189,18 +189,28 @@ class MILPOptimizer:
         logger.info("milp_using_default_cop_curve")
         return lambda outdoor_temp, hour=12: self._default_cop_curve(outdoor_temp)
 
-    def _build_demand_estimates(self, weather) -> list[float]:
+    def _build_demand_estimates(self, weather, weather_full=None) -> list[float]:
         """Return hourly demand estimates (kW) for the horizon."""
         if self._demand_model and self._demand_model.is_trained:
             logger.info("milp_using_ml_demand_model")
-            weather_dicts = [
-                {"temperature": t, "wind_speed": 3.0, "irradiance": 0.0}
-                for _, t in weather
-            ]
+            if weather_full:
+                weather_dicts = [
+                    {
+                        "temperature": w.get("temperature", 5.0),
+                        "wind_speed": w.get("wind_speed") or 3.0,
+                        "irradiance": w.get("irradiance") or 0.0,
+                    }
+                    for w in weather_full
+                ]
+            else:
+                weather_dicts = [
+                    {"temperature": t, "wind_speed": 3.0, "irradiance": 0.0}
+                    for _, t in weather
+                ]
             return self._demand_model.predict_hourly(weather_dicts, len(weather))
 
-        # Fallback: constant estimate
-        return [3.0] * len(weather)
+        # Fallback: use SH power from config as a rough estimate
+        return [settings.sh_max_power_kw * 0.25] * len(weather)
 
     @staticmethod
     def _precompute_indoor_rates(
@@ -263,8 +273,8 @@ class MILPOptimizer:
     @staticmethod
     def _default_cop_curve(outdoor_temp: float) -> float:
         """Simple linear COP approximation for air-to-water heat pump."""
-        cop = 3.5 + 0.1 * outdoor_temp
-        return max(1.5, min(6.0, cop))
+        from packages.ml.models import COPModel
+        return COPModel._default_cop_curve(outdoor_temp)
 
     def _solve(
         self,
@@ -298,10 +308,8 @@ class MILPOptimizer:
         hours = [(prices[h][0]).hour for h in range(H)]
         cops = [cop_fn(temps[h], hours[h]) for h in range(H)]
 
-        # Consistent conversion factor: 200L tank ≈ 0.23 kWh per °C
-        # (water specific heat × mass: 200 kg × 4186 J/(kg·°C) / 3.6e6)
-        kwh_per_degree = 0.23
-        avg_cop = sum(cops) / len(cops) if cops else 3.5
+        # Tank thermal capacity from configured volume
+        kwh_per_degree = settings.tank_kwh_per_degree
 
         # --- Use thermal model's outdoor-adjusted rates per hour ---
         # The thermal model fits: rate = base + factor * outdoor_temp
@@ -327,7 +335,7 @@ class MILPOptimizer:
         ]
         tank_loss_kwh_per_h = [abs(r) * kwh_per_degree for r in tank_loss_rates]
 
-        sh_max_power_kw = 3.0  # Max electrical input for space heating
+        sh_max_power_kw = settings.sh_max_power_kw
 
         # Tank state (thermal kWh stored, using same kwh_per_degree factor)
         # Per-hour tank floor: lower bound during off-peak hours
@@ -623,6 +631,12 @@ class MILPOptimizer:
     ) -> list[tuple[dt.datetime, float]]:
         from packages.optimizer.data_access import get_weather
         return await get_weather(session, start, end)
+
+    async def _get_weather_full(
+        self, session, start: dt.datetime, end: dt.datetime
+    ) -> list[dict]:
+        from packages.optimizer.data_access import get_weather_full
+        return await get_weather_full(session, start, end)
 
     async def _get_last_status(self, session):
         from packages.optimizer.data_access import get_last_status

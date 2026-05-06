@@ -40,13 +40,38 @@ async def get_prices(
 async def get_weather(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[tuple[dt.datetime, float]]:
-    """Fetch weather forecast (temperature) from DB."""
+    """Fetch weather forecast (temperature only) from DB."""
     result = await session.execute(
         select(WeatherRecord.ts, WeatherRecord.temperature)
         .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
         .order_by(WeatherRecord.ts)
     )
     return [(row.ts, row.temperature) for row in result.all()]
+
+
+async def get_weather_full(
+    session: AsyncSession, start: dt.datetime, end: dt.datetime
+) -> list[dict]:
+    """Fetch full weather data (temp, wind, irradiance) from DB."""
+    result = await session.execute(
+        select(
+            WeatherRecord.ts,
+            WeatherRecord.temperature,
+            WeatherRecord.wind_speed,
+            WeatherRecord.irradiance,
+        )
+        .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
+        .order_by(WeatherRecord.ts)
+    )
+    return [
+        {
+            "ts": row.ts,
+            "temperature": row.temperature,
+            "wind_speed": row.wind_speed,
+            "irradiance": row.irradiance,
+        }
+        for row in result.all()
+    ]
 
 
 async def get_last_status(session: AsyncSession):

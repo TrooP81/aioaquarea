@@ -96,6 +96,16 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "tank_max_temp",
         "description": "Maximum tank temperature (°C)",
     },
+    "tank_volume_liters": {
+        "type": "int",
+        "default_env": "tank_volume_liters",
+        "description": "DHW tank volume (liters)",
+    },
+    "sh_max_power_kw": {
+        "type": "float",
+        "default_env": "sh_max_power_kw",
+        "description": "Heat pump max electrical input for space heating (kW)",
+    },
     "comfort_temp_min": {
         "type": "float",
         "default_env": "comfort_temp_min",

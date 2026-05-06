@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +22,6 @@ except ImportError:
     HAS_SKLEARN = False
 
 from sqlalchemy import select, and_, func
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord, COPRecord
@@ -47,8 +45,12 @@ class COPModel:
     # Physical COP bounds for air-to-water heat pumps
     COP_MIN = 1.5
     COP_MAX = 6.0
-    # Tank thermal capacity: 200L × 4186 J/(kg·°C) / 3.6e6 = 0.233 kWh/°C
-    TANK_KWH_PER_DEGREE = 0.23
+
+    @staticmethod
+    def _tank_kwh_per_degree() -> float:
+        """Tank thermal capacity from configured volume."""
+        from packages.core.config import settings
+        return settings.tank_kwh_per_degree
 
     def __init__(self):
         self._model: Pipeline | None = None
@@ -234,17 +236,20 @@ class COPModel:
                 and curr_status.get("tank_temp") is not None
             ):
                 tank_delta_t = curr_status["tank_temp"] - prev_status["tank_temp"]
+                kwh_per_deg = self._tank_kwh_per_degree()
                 # Thermal energy from tank ΔT (can be negative if cooling)
-                thermal_tank_kwh = max(0, tank_delta_t) * self.TANK_KWH_PER_DEGREE
-                # Also account for standby losses: if tank stayed warm, there's
-                # hidden thermal output maintaining it. Add ~0.5°C/h standby loss.
-                standby_loss_kwh = 0.5 * elapsed_hours * self.TANK_KWH_PER_DEGREE
+                thermal_tank_kwh = max(0, tank_delta_t) * kwh_per_deg
+                # Account for standby losses: use calibrated value if available
+                from packages.ml.thermal import thermal_model
+                calibrated_loss = abs(thermal_model.params.tank_standby_loss)
+                standby_rate = calibrated_loss if calibrated_loss > 0 else 0.5
+                standby_loss_kwh = standby_rate * elapsed_hours * kwh_per_deg
                 thermal_kwh = (thermal_tank_kwh + standby_loss_kwh) / elapsed_hours
             else:
                 # No status pairing — estimate thermal from electrical using
                 # physics-based default COP
                 outdoor = row.outdoor_temp or 5.0
-                default_cop = max(1.5, min(6.0, 3.5 + 0.1 * outdoor))
+                default_cop = self._default_cop_curve(outdoor)
                 thermal_kwh = elec_kw * default_cop * 0.7  # conservative
 
             if thermal_kwh <= 0:
@@ -394,8 +399,13 @@ class DemandModel:
         return predictions
 
     async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """Prepare training data from consumption + weather history."""
+        """Prepare training data from consumption + weather history.
+
+        Joins consumption records with WeatherRecord to get real wind/irradiance
+        instead of placeholder constants.
+        """
         async with get_session() as session:
+            # Join consumption with closest weather record (same hour)
             result = await session.execute(
                 select(
                     ConsumptionRecord.ts,
@@ -403,7 +413,17 @@ class DemandModel:
                     ConsumptionRecord.cool_kwh,
                     ConsumptionRecord.tank_kwh,
                     ConsumptionRecord.outdoor_temp,
-                ).order_by(ConsumptionRecord.ts)
+                    WeatherRecord.wind_speed,
+                    WeatherRecord.irradiance,
+                )
+                .outerjoin(
+                    WeatherRecord,
+                    and_(
+                        func.date_trunc("hour", WeatherRecord.ts)
+                        == func.date_trunc("hour", ConsumptionRecord.ts),
+                    ),
+                )
+                .order_by(ConsumptionRecord.ts)
             )
             rows = result.all()
 
@@ -416,14 +436,16 @@ class DemandModel:
         for row in rows:
             total = (row.heat_kwh or 0) + (row.cool_kwh or 0) + (row.tank_kwh or 0)
             temp = row.outdoor_temp or 5.0
+            wind = row.wind_speed if row.wind_speed is not None else 3.0
+            irradiance = row.irradiance if row.irradiance is not None else 0.0
             hour = row.ts.hour
             dow = row.ts.weekday()
 
             features = np.array(
                 [
                     temp,
-                    3.0,  # wind placeholder
-                    0.0,  # irradiance placeholder
+                    wind,
+                    irradiance,
                     np.sin(2 * np.pi * hour / 24),
                     np.cos(2 * np.pi * hour / 24),
                     np.sin(2 * np.pi * dow / 7),
@@ -468,10 +490,14 @@ class DirectionAwareCOP:
     This replaces the old black-box COP model with measured COP values.
     """
 
-    # Estimated thermal capacity (kW) per °C/hour of temperature change
-    # These are rough estimates — calibrated over time from consumption data
-    TANK_THERMAL_MASS_KWH_PER_DEG = 0.058  # ~50L tank ≈ 58 Wh per °C
-    WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG = 0.5  # Water circuit thermal mass estimate (zone1_temp is water supply temp)
+    # Water circuit thermal mass estimate (zone1_temp is water supply temp)
+    WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG = 0.5
+
+    @staticmethod
+    def _tank_kwh_per_degree() -> float:
+        """Tank thermal capacity from configured volume."""
+        from packages.core.config import settings
+        return settings.tank_kwh_per_degree
 
     async def compute_cop_intervals(self, hours: int = 24) -> list[dict]:
         """
@@ -479,7 +505,6 @@ class DirectionAwareCOP:
 
         Returns list of {ts, mode, cop, outdoor_temp, electrical_kwh, thermal_kwh}
         """
-        from packages.core.models import COPRecord
 
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
 
@@ -500,6 +525,10 @@ class DirectionAwareCOP:
 
         if len(records) < 2:
             return []
+
+        # Count active hours by mode from status records to estimate
+        # how many hours/day each mode runs (for daily→hourly conversion)
+        active_hours_by_mode = self._count_active_hours(records)
 
         cop_intervals = []
 
@@ -523,10 +552,10 @@ class DirectionAwareCOP:
             thermal_kwh = 0.0
 
             if action == "HEATING_WATER":
-                # Tank heating: thermal = mass × ΔT
+                # Tank heating: thermal = tank_mass × ΔT
                 if prev.tank_temp and curr.tank_temp and curr.tank_temp > prev.tank_temp:
                     delta_t = curr.tank_temp - prev.tank_temp
-                    thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
+                    thermal_kwh = delta_t * self._tank_kwh_per_degree()
             elif action == "HEATING":
                 # Zone heating: thermal output from water circuit ΔT
                 # (zone1_temp is water supply temperature, not indoor air)
@@ -544,7 +573,7 @@ class DirectionAwareCOP:
 
             # Estimate electrical consumption for this interval
             electrical_kwh = self._estimate_electrical(
-                curr.ts, dt_hours, consumption_records, action
+                curr.ts, dt_hours, consumption_records, action, active_hours_by_mode
             )
 
             if electrical_kwh <= 0:
@@ -594,16 +623,44 @@ class DirectionAwareCOP:
         return cop_intervals
 
     @staticmethod
+    def _count_active_hours(records: list) -> dict[str, float]:
+        """Count total active hours per mode from status records.
+
+        Returns dict mapping mode category → total hours active.
+        Categories: 'dhw', 'sh', 'total'.
+        """
+        dhw_hours = 0.0
+        sh_hours = 0.0
+        for i in range(1, len(records)):
+            prev_r = records[i - 1]
+            curr_r = records[i]
+            gap = (curr_r.ts - prev_r.ts).total_seconds() / 3600.0
+            if gap <= 0 or gap > 2.0:
+                continue
+            action = getattr(curr_r, "device_action", None)
+            if action == "HEATING_WATER":
+                dhw_hours += gap
+            elif action in ("HEATING", "COOLING"):
+                sh_hours += gap
+        return {
+            "dhw": max(dhw_hours, 1.0),
+            "sh": max(sh_hours, 1.0),
+            "total": max(dhw_hours + sh_hours, 1.0),
+        }
+
+    @staticmethod
     def _estimate_electrical(
         ts: dt.datetime,
         dt_hours: float,
         consumption_records: list,
         action: str,
+        active_hours: dict[str, float] | None = None,
     ) -> float:
         """
         Estimate electrical kWh consumed during an interval.
 
-        Uses the closest consumption record and proportions by action type.
+        Uses the closest consumption record, divides daily kWh by actual
+        compressor-on hours for the relevant mode.
         """
         if not consumption_records:
             return 0.0
@@ -618,21 +675,22 @@ class DirectionAwareCOP:
         if abs((closest.ts - ts).total_seconds()) > 1800:
             return 0.0
 
-        # Estimate hourly rate from daily consumption
+        # Estimate hourly rate from daily consumption ÷ real active hours
         if action == "HEATING_WATER":
             daily_kwh = closest.tank_kwh or 0
+            divisor = active_hours["dhw"] if active_hours else 10.0
         elif action in ("HEATING", "COOLING"):
             daily_kwh = (closest.heat_kwh or 0) + (closest.cool_kwh or 0)
+            divisor = active_hours["sh"] if active_hours else 10.0
         else:
             daily_kwh = (closest.heat_kwh or 0) + (closest.tank_kwh or 0) + (closest.cool_kwh or 0)
+            divisor = active_hours["total"] if active_hours else 10.0
 
-        # Rough: assume consumption is spread across 10 active hours/day
-        hourly_rate = daily_kwh / 10.0 if daily_kwh > 0 else 0
+        hourly_rate = daily_kwh / divisor if daily_kwh > 0 else 0
         return hourly_rate * dt_hours
 
     async def get_average_cop(self, hours: int = 24, mode: str | None = None) -> dict:
         """Get average COP statistics for a time period."""
-        from packages.core.models import COPRecord
 
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
 

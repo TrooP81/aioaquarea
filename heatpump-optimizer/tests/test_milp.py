@@ -147,6 +147,8 @@ class TestMILPSolver:
                 mock_settings.tank_min_temp = 45
                 mock_settings.tank_max_temp = 55
                 mock_settings.comfort_temp_min = 20.0
+                mock_settings.tank_kwh_per_degree = 0.349
+                mock_settings.sh_max_power_kw = 12.0
 
                 with pytest.raises(InfeasibleError):
                     milp._solve(
@@ -161,7 +163,6 @@ class TestMILPSolver:
     def test_milp_solver_timeout_raises(self):
         """MILP should raise SolverTimeoutError when solver doesn't converge."""
         from packages.optimizer.milp import MILPOptimizer
-        import pulp
 
         milp = MILPOptimizer()
         milp.SOLVER_TIMEOUT_SECONDS = 0  # Instant timeout
