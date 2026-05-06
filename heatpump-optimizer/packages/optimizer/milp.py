@@ -223,10 +223,36 @@ class MILPOptimizer:
         tank_max = settings.tank_max_temp * kwh_per_degree
         tank_init = max(tank_min, min(tank_max, current_tank_temp * kwh_per_degree))
 
+        # Cap DHW thermal gain so it can't exceed the tank range in one hour.
+        # Fast-heating tanks (e.g. 20°C/h) reach target in minutes; the solver
+        # needs the ability to run DHW for only a fraction of the hour.
+        tank_range = tank_max - tank_min
+        max_thermal_per_h = [dhw_power_kw * cops[h] for h in range(H)]
+        # If any hour's thermal gain exceeds the tank range, use continuous DHW
+        needs_continuous_dhw = any(g > tank_range * 1.1 for g in max_thermal_per_h)
+
+        logger.debug(
+            "milp_tank_parameters",
+            tank_min_kwh=round(tank_min, 2),
+            tank_max_kwh=round(tank_max, 2),
+            tank_range_kwh=round(tank_range, 2),
+            tank_init_kwh=round(tank_init, 2),
+            dhw_power_kw=round(dhw_power_kw, 3),
+            tank_loss_kwh_per_h=round(tank_loss_kwh_per_h, 3),
+            max_thermal_gain=round(max(max_thermal_per_h), 2),
+            continuous_dhw=needs_continuous_dhw,
+        )
+
         # --- Problem setup ---
         prob = pulp.LpProblem("HeatPumpCostMin", pulp.LpMinimize)
 
-        x_dhw = [pulp.LpVariable(f"x_dhw_{h}", cat="Binary") for h in range(H)]
+        # DHW decision: continuous [0,1] fraction of the hour when the thermal
+        # gain per hour would exceed the tank range (fast-heating tanks),
+        # binary otherwise (traditional slower tanks).
+        if needs_continuous_dhw:
+            x_dhw = [pulp.LpVariable(f"x_dhw_{h}", 0, 1, cat="Continuous") for h in range(H)]
+        else:
+            x_dhw = [pulp.LpVariable(f"x_dhw_{h}", cat="Binary") for h in range(H)]
         x_sh = [pulp.LpVariable(f"x_sh_{h}", 0, 1, cat="Continuous") for h in range(H)]
 
         # --- Objective: minimize cost ---
@@ -330,7 +356,10 @@ class MILPOptimizer:
         for h in range(H):
             ts = start_ts + dt.timedelta(hours=h)
 
-            if x_dhw[h].varValue and x_dhw[h].varValue > 0.5:
+            dhw_frac = x_dhw[h].varValue or 0
+            if dhw_frac > 0.05:
+                # Duration proportional to fraction (minimum 5 minutes)
+                dhw_minutes = max(5, int(round(dhw_frac * 60)))
                 actions.append(
                     {
                         "ts": ts.isoformat(),
@@ -339,12 +368,14 @@ class MILPOptimizer:
                             "reason": "milp_optimal",
                             "price": price_vals[h],
                             "cop": cops[h],
+                            "dhw_fraction": round(dhw_frac, 2),
+                            "dhw_minutes": dhw_minutes,
                         },
                     }
                 )
                 actions.append(
                     {
-                        "ts": (ts + dt.timedelta(minutes=55)).isoformat(),
+                        "ts": (ts + dt.timedelta(minutes=dhw_minutes)).isoformat(),
                         "type": "force_dhw_off",
                         "payload": {"reason": "milp_slot_end"},
                     }

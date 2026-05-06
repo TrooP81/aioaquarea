@@ -128,28 +128,35 @@ class TestMILPSolver:
     def test_milp_infeasible_raises(self):
         """MILP should raise InfeasibleError when constraints are impossible."""
         from packages.optimizer.milp import MILPOptimizer
-        import pulp
+        from packages.ml.thermal import thermal_model, ThermalParams
 
         milp = MILPOptimizer()
         prices = _make_prices(hours=2)
         weather = _make_weather(hours=2)
 
-        # Force an infeasible scenario: tank_init far below tank_min with
-        # heavy loss and no DHW power → tank state can never stay in bounds.
-        # We'll monkey-patch settings to create an impossible scenario.
-        with patch("packages.optimizer.milp.settings") as mock_settings:
-            mock_settings.tank_min_temp = 80   # absurdly high min
-            mock_settings.tank_max_temp = 82   # very tight range
-            mock_settings.dhw_ready_hours = [1]
-            mock_settings.comfort_temp_min = 20.0
+        # Force an infeasible scenario: huge standby loss that exceeds
+        # maximum possible thermal gain even at full DHW duty cycle.
+        orig_params = thermal_model.params
+        thermal_model.params = ThermalParams(
+            tank_heating_rate=1.0,      # slow heater
+            tank_standby_loss=-50.0,    # absurd loss: 50 °C/h
+            last_calibrated=dt.datetime.now(dt.timezone.utc),
+        )
+        try:
+            with patch("packages.optimizer.milp.settings") as mock_settings:
+                mock_settings.tank_min_temp = 45
+                mock_settings.tank_max_temp = 55
+                mock_settings.comfort_temp_min = 20.0
 
-            with pytest.raises(InfeasibleError):
-                milp._solve(
-                    prices, weather,
-                    cop_fn=lambda t, h=12: 0.01,  # nearly zero COP
-                    demand_per_hour=[3.0] * 2,
-                    current_tank_temp=10.0,  # way below min
-                )
+                with pytest.raises(InfeasibleError):
+                    milp._solve(
+                        prices, weather,
+                        cop_fn=lambda t, h=12: 0.5,  # low COP
+                        demand_per_hour=[3.0] * 2,
+                        current_tank_temp=48.0,
+                    )
+        finally:
+            thermal_model.params = orig_params
 
     def test_milp_solver_timeout_raises(self):
         """MILP should raise SolverTimeoutError when solver doesn't converge."""
@@ -245,6 +252,78 @@ class TestMILPSolver:
 
         assert plan is not None
         assert plan["version"] == "milp_v1"
+
+    def test_milp_fast_heating_tank_feasible(self):
+        """MILP should remain feasible with fast-heating tanks (20+ °C/h)."""
+        from packages.optimizer.milp import MILPOptimizer
+        from packages.ml.thermal import thermal_model, ThermalParams
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        # Simulate learned parameters from a fast-heating system:
+        # 20.59 °C/h heating, -3 °C/h standby loss (real-world values)
+        orig_params = thermal_model.params
+        thermal_model.params = ThermalParams(
+            tank_heating_rate=20.59,
+            tank_standby_loss=-3.0,
+            last_calibrated=dt.datetime.now(dt.timezone.utc),
+            sample_count=1591,
+        )
+        try:
+            plan = milp._solve(
+                prices, weather,
+                cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+                demand_per_hour=[3.0] * 24,
+                current_tank_temp=48.0,
+            )
+
+            assert plan is not None
+            assert plan["cost_estimate"] is not None
+
+            dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
+            assert len(dhw_on) > 0
+
+            # Continuous DHW should produce fractional durations (< 60 min)
+            for action in dhw_on:
+                assert "dhw_minutes" in action["payload"]
+                assert action["payload"]["dhw_minutes"] <= 60
+        finally:
+            thermal_model.params = orig_params
+
+    def test_milp_fast_tank_dhw_fraction_payload(self):
+        """DHW actions from fast-tank MILP should include fraction and duration."""
+        from packages.optimizer.milp import MILPOptimizer
+        from packages.ml.thermal import thermal_model, ThermalParams
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        orig_params = thermal_model.params
+        thermal_model.params = ThermalParams(
+            tank_heating_rate=20.59,
+            tank_standby_loss=-3.0,
+            last_calibrated=dt.datetime.now(dt.timezone.utc),
+            sample_count=1591,
+        )
+        try:
+            plan = milp._solve(
+                prices, weather,
+                cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+                demand_per_hour=[3.0] * 24,
+                current_tank_temp=48.0,
+            )
+
+            dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
+            for action in dhw_on:
+                assert "dhw_fraction" in action["payload"]
+                assert 0 < action["payload"]["dhw_fraction"] <= 1.0
+                assert "dhw_minutes" in action["payload"]
+                assert 5 <= action["payload"]["dhw_minutes"] <= 60
+        finally:
+            thermal_model.params = orig_params
 
 
 class TestMILPGeneratePlan:
