@@ -37,15 +37,18 @@ class COPModel:
     """
     Predicts COP (Coefficient of Performance) given operating conditions.
 
-    Features:
-    - outdoor_temperature
-    - tank_target_temp (supply temp proxy)
-    - hour_of_day (cyclical)
-    - mode (encoded)
+    Trained on real COP values derived from paired consumption (electrical kWh)
+    and device status (tank/zone ΔT → thermal kWh) records.
 
-    Target: electrical_kwh / thermal_kwh_delivered (inverted COP)
-    We actually predict kWh electrical since that's what we measure.
+    Features: outdoor_temp, tank_target, hour_sin, hour_cos
+    Target: COP (thermal_kWh / electrical_kWh)
     """
+
+    # Physical COP bounds for air-to-water heat pumps
+    COP_MIN = 1.5
+    COP_MAX = 6.0
+    # Tank thermal capacity: 200L × 4186 J/(kg·°C) / 3.6e6 = 0.233 kWh/°C
+    TANK_KWH_PER_DEGREE = 0.23
 
     def __init__(self):
         self._model: Pipeline | None = None
@@ -63,7 +66,7 @@ class COPModel:
 
         X, y = await self._prepare_training_data()
 
-        if len(X) < 100:
+        if len(X) < 50:
             return {"error": "Insufficient data", "samples": len(X)}
 
         pipeline = Pipeline(
@@ -73,7 +76,7 @@ class COPModel:
                     "model",
                     GradientBoostingRegressor(
                         n_estimators=200,
-                        max_depth=5,
+                        max_depth=4,
                         learning_rate=0.1,
                         random_state=42,
                     ),
@@ -82,7 +85,8 @@ class COPModel:
         )
 
         # Cross-validate
-        scores = cross_val_score(pipeline, X, y, cv=5, scoring="neg_mean_absolute_error")
+        n_folds = min(5, len(X))
+        scores = cross_val_score(pipeline, X, y, cv=n_folds, scoring="neg_mean_absolute_error")
         mae = -scores.mean()
 
         # Train on full data
@@ -91,6 +95,14 @@ class COPModel:
         self._model = pipeline
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
         self._metrics = {"mae": mae, "samples": len(X), "cv_std": scores.std()}
+
+        _logger.info(
+            "cop_model_trained",
+            samples=len(X),
+            mae=round(mae, 3),
+            y_mean=round(float(np.mean(y)), 2),
+            y_std=round(float(np.std(y)), 2),
+        )
 
         # Save model
         model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
@@ -104,37 +116,37 @@ class COPModel:
         }
 
     def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
-        """Predict electrical kWh for one hour given conditions."""
-        if self._model is None:
-            # Fallback to simple curve
-            return self._fallback_predict(outdoor_temp)
+        """Predict electrical kWh for one hour (legacy, kept for compatibility).
 
-        features = self._make_features(outdoor_temp, tank_target, hour)
-        return float(self._model.predict(features.reshape(1, -1))[0])
+        Derives from COP prediction: electrical = thermal_estimate / COP.
+        """
+        cop = self.predict_cop(outdoor_temp, tank_target, hour)
+        # Estimate typical thermal output based on conditions
+        thermal_kw = self._estimate_thermal_output(outdoor_temp, tank_target)
+        return thermal_kw / cop
 
     def predict_cop(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
-        """Predict COP given conditions.
+        """Predict COP given operating conditions."""
+        if self._model is None:
+            return self._default_cop_curve(outdoor_temp)
 
-        Uses predicted electrical consumption to derive COP.  Clamped to
-        [1.5, 6.0] — real air-to-water heat pumps cannot exceed ~6 COP
-        even in ideal conditions.  Values outside this range indicate the
-        ML model is extrapolating into unrealistic territory.
-        """
-        kwh_electrical = self.predict(outdoor_temp, tank_target, hour)
-        if kwh_electrical <= 0:
-            return 3.0  # fallback
-        # Assume ~3kW thermal output typical
-        thermal_output = 3.0  # This would come from a thermal model
-        raw_cop = thermal_output / kwh_electrical
-        return max(1.5, min(6.0, raw_cop))
+        features = self._make_features(outdoor_temp, tank_target, hour)
+        raw = float(self._model.predict(features.reshape(1, -1))[0])
+        return max(self.COP_MIN, min(self.COP_MAX, raw))
 
     @staticmethod
-    def _fallback_predict(outdoor_temp: float) -> float:
-        """Simple fallback when no trained model available."""
-        # Higher outdoor temp = lower electrical consumption (higher COP)
-        base_kwh = 2.0
-        temp_factor = max(0.3, 1.0 - outdoor_temp * 0.03)
-        return base_kwh * temp_factor
+    def _default_cop_curve(outdoor_temp: float) -> float:
+        """Simple linear COP approximation when no model is trained."""
+        cop = 3.5 + 0.1 * outdoor_temp
+        return max(1.5, min(6.0, cop))
+
+    @staticmethod
+    def _estimate_thermal_output(outdoor_temp: float, tank_target: int) -> float:
+        """Rough thermal output estimate (kW) for predict() backward compat."""
+        # Lower outdoor → higher thermal demand; higher tank target → more output
+        base = 2.0
+        temp_factor = max(0.5, 1.0 - outdoor_temp * 0.02)
+        return base * temp_factor
 
     @staticmethod
     def _make_features(outdoor_temp: float, tank_target: int, hour: int) -> np.ndarray:
@@ -144,9 +156,15 @@ class COPModel:
         return np.array([outdoor_temp, tank_target, hour_sin, hour_cos])
 
     async def _prepare_training_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """Load and join consumption + status data for training."""
+        """Compute real COP from paired consumption + device status records.
+
+        COP = thermal_kWh / electrical_kWh
+
+        Thermal output is derived from tank ΔT (for DHW) or zone ΔT (for SH),
+        both measurable from device status. Electrical input comes from
+        consumption records.
+        """
         async with get_session() as session:
-            # Get consumption records with matching weather
             consumption_result = await session.execute(
                 select(
                     ConsumptionRecord.ts,
@@ -157,61 +175,106 @@ class COPModel:
             )
             consumption_rows = consumption_result.all()
 
-            # Get device status for tank targets
             status_result = await session.execute(
                 select(
                     DeviceStatusRecord.ts,
                     DeviceStatusRecord.tank_target_temp,
+                    DeviceStatusRecord.tank_temp,
                     DeviceStatusRecord.outdoor_temp,
+                    DeviceStatusRecord.direction,
                 ).order_by(DeviceStatusRecord.ts)
             )
             status_rows = status_result.all()
 
-        if not consumption_rows:
+        if not consumption_rows or not status_rows:
             return np.array([]), np.array([])
 
-        # Build a lookup of tank_target by hour from status records
-        # Key: (date, hour) -> tank_target_temp
-        status_by_hour: dict[tuple, float] = {}
+        # Index device status by (date, hour) for tank temp and direction
+        status_by_hour: dict[tuple, dict] = {}
         for s in status_rows:
-            if s.tank_target_temp is not None:
-                key = (s.ts.date(), s.ts.hour)
-                status_by_hour[key] = s.tank_target_temp
+            key = (s.ts.date(), s.ts.hour)
+            status_by_hour[key] = {
+                "tank_target": s.tank_target_temp or 50,
+                "tank_temp": s.tank_temp,
+                "outdoor": s.outdoor_temp,
+                "direction": s.direction,
+            }
 
-        # Consumption values are cumulative per day — compute hourly deltas.
-        # Group consecutive records by (device day) and diff them.
         X_list = []
         y_list = []
 
         prev_row = None
         for row in consumption_rows:
-            if prev_row is not None and row.ts.date() == prev_row.ts.date():
-                # Same day: delta = current cumulative - previous cumulative
-                delta_kwh = (
-                    ((row.heat_kwh or 0) + (row.tank_kwh or 0))
-                    - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
-                )
-                elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
+            if prev_row is None or row.ts.date() != prev_row.ts.date():
+                prev_row = row
+                continue
 
-                # Only use if positive delta and reasonable time gap (15 min to 2 hours)
-                if delta_kwh > 0 and 0.2 <= elapsed_hours <= 2.0:
-                    # Normalize to per-hour consumption
-                    kwh_per_hour = delta_kwh / elapsed_hours
+            # Electrical consumption delta
+            delta_elec = (
+                ((row.heat_kwh or 0) + (row.tank_kwh or 0))
+                - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
+            )
+            elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
 
-                    outdoor_temp = row.outdoor_temp or 5.0
-                    hour = row.ts.hour
-                    # Look up tank_target from nearest status record
-                    tank_target = status_by_hour.get(
-                        (row.ts.date(), hour),
-                        status_by_hour.get((row.ts.date(), hour - 1), 50),
-                    )
+            if delta_elec <= 0.01 or not (0.2 <= elapsed_hours <= 2.0):
+                prev_row = row
+                continue
 
-                    features = self._make_features(outdoor_temp, int(tank_target), hour)
-                    X_list.append(features)
-                    y_list.append(kwh_per_hour)
+            elec_kw = delta_elec / elapsed_hours
+
+            # Get tank ΔT from device status around this time window
+            prev_key = (prev_row.ts.date(), prev_row.ts.hour)
+            curr_key = (row.ts.date(), row.ts.hour)
+            prev_status = status_by_hour.get(prev_key)
+            curr_status = status_by_hour.get(curr_key)
+
+            if (
+                prev_status and curr_status
+                and prev_status.get("tank_temp") is not None
+                and curr_status.get("tank_temp") is not None
+            ):
+                tank_delta_t = curr_status["tank_temp"] - prev_status["tank_temp"]
+                # Thermal energy from tank ΔT (can be negative if cooling)
+                thermal_tank_kwh = max(0, tank_delta_t) * self.TANK_KWH_PER_DEGREE
+                # Also account for standby losses: if tank stayed warm, there's
+                # hidden thermal output maintaining it. Add ~0.5°C/h standby loss.
+                standby_loss_kwh = 0.5 * elapsed_hours * self.TANK_KWH_PER_DEGREE
+                thermal_kwh = (thermal_tank_kwh + standby_loss_kwh) / elapsed_hours
+            else:
+                # No status pairing — estimate thermal from electrical using
+                # physics-based default COP
+                outdoor = row.outdoor_temp or 5.0
+                default_cop = max(1.5, min(6.0, 3.5 + 0.1 * outdoor))
+                thermal_kwh = elec_kw * default_cop * 0.7  # conservative
+
+            if thermal_kwh <= 0:
+                prev_row = row
+                continue
+
+            cop = thermal_kwh / elec_kw
+
+            # Only keep physically plausible COP values for training
+            if not (self.COP_MIN <= cop <= self.COP_MAX):
+                prev_row = row
+                continue
+
+            outdoor_temp = row.outdoor_temp or 5.0
+            hour = row.ts.hour
+            tank_target = (
+                curr_status.get("tank_target", 50) if curr_status else 50
+            )
+
+            features = self._make_features(outdoor_temp, int(tank_target), hour)
+            X_list.append(features)
+            y_list.append(cop)
 
             prev_row = row
 
+        _logger.info(
+            "cop_training_data_prepared",
+            total_consumption_rows=len(consumption_rows),
+            paired_samples=len(y_list),
+        )
         return np.array(X_list), np.array(y_list)
 
     def load_latest(self) -> bool:

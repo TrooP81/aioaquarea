@@ -9,24 +9,32 @@ import pytest
 
 class TestCOPModel:
     def test_untrained_uses_fallback(self):
-        """Untrained model should use fallback prediction."""
+        """Untrained model should use default COP curve."""
         from packages.ml.models import COPModel
 
         model = COPModel()
         assert not model.is_trained
 
-        # Fallback should return reasonable values
+        # Fallback COP should be in reasonable range
+        cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
+        assert 1.5 <= cop <= 6.0
+
+        # predict() should still return reasonable electrical kWh
         pred = model.predict(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 0.5 < pred < 5.0
+        assert 0.1 < pred < 5.0
 
     def test_fallback_higher_at_cold(self):
-        """Colder outdoor temp → higher electrical consumption (lower COP)."""
+        """Colder outdoor temp → lower COP → higher electrical consumption."""
         from packages.ml.models import COPModel
 
         model = COPModel()
+        cold_cop = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
+        warm_cop = model.predict_cop(outdoor_temp=15.0, tank_target=50, hour=12)
+        assert cold_cop < warm_cop  # COP increases with outdoor temp
+
         cold_pred = model.predict(outdoor_temp=-5.0, tank_target=50, hour=12)
         warm_pred = model.predict(outdoor_temp=15.0, tank_target=50, hour=12)
-        assert cold_pred > warm_pred
+        assert cold_pred > warm_pred  # Electrical consumption higher in cold
 
     def test_predict_cop_fallback(self):
         """predict_cop should return a reasonable COP range."""
@@ -34,7 +42,7 @@ class TestCOPModel:
 
         model = COPModel()
         cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 1.0 < cop < 8.0
+        assert 1.5 <= cop <= 6.0
 
     def test_make_features_shape(self):
         """Feature vector should have correct shape."""
@@ -52,7 +60,7 @@ class TestCOPModel:
             assert not model.load_latest()
 
     def test_train_and_predict_with_synthetic_data(self, tmp_path):
-        """Train COP model on synthetic data and verify predictions."""
+        """Train COP model on synthetic COP data and verify predictions."""
         from packages.ml.models import COPModel, HAS_SKLEARN
         if not HAS_SKLEARN:
             pytest.skip("scikit-learn not installed")
@@ -63,7 +71,7 @@ class TestCOPModel:
 
         model = COPModel()
 
-        # Simulate training: outdoor_temp + tank_target + hour → electrical_kwh
+        # Simulate training: outdoor_temp + tank_target + hour → COP
         rng = np.random.RandomState(42)
         n = 300
 
@@ -77,9 +85,9 @@ class TestCOPModel:
             np.sin(2 * np.pi * hours / 24),
             np.cos(2 * np.pi * hours / 24),
         ])
-        # Higher outdoor → lower consumption (higher COP)
-        y = 2.0 - 0.04 * outdoor_temps + 0.01 * tank_targets + rng.normal(0, 0.1, n)
-        y = np.clip(y, 0.3, 5.0)
+        # Higher outdoor → higher COP (physically correct)
+        y = 3.0 + 0.08 * outdoor_temps - 0.02 * tank_targets + rng.normal(0, 0.15, n)
+        y = np.clip(y, 1.5, 6.0)
 
         pipeline = Pipeline([
             ("scaler", StandardScaler()),
@@ -93,14 +101,18 @@ class TestCOPModel:
 
         assert model.is_trained
 
-        # Cold → more consumption than warm
-        cold_pred = model.predict(outdoor_temp=-5.0, tank_target=50, hour=12)
-        warm_pred = model.predict(outdoor_temp=20.0, tank_target=50, hour=12)
-        assert cold_pred > warm_pred
+        # Warm → higher COP than cold
+        cold_cop = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
+        warm_cop = model.predict_cop(outdoor_temp=20.0, tank_target=50, hour=12)
+        assert warm_cop > cold_cop
 
         # COP should be in physical range
         cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 0.5 < cop < 10.0
+        assert 1.5 <= cop <= 6.0
+
+        # predict() (electrical kWh) should still be reasonable
+        pred = model.predict(outdoor_temp=5.0, tank_target=50, hour=12)
+        assert 0.1 < pred < 5.0
 
         # Save and reload
         with patch("packages.ml.models.MODEL_DIR", tmp_path), \
@@ -114,8 +126,8 @@ class TestCOPModel:
             model2 = COPModel()
             assert model2.load_latest()
             assert model2.is_trained
-            pred2 = model2.predict(outdoor_temp=5.0, tank_target=50, hour=12)
-            assert abs(pred2 - model.predict(outdoor_temp=5.0, tank_target=50, hour=12)) < 0.01
+            cop2 = model2.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
+            assert abs(cop2 - cop) < 0.01
 
 
 class TestDemandModel:
