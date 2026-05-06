@@ -48,6 +48,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - modeldata:/app/models
     depends_on:
       db:
         condition: service_healthy
@@ -66,6 +68,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - modeldata:/app/models
     depends_on:
       db:
         condition: service_healthy
@@ -84,6 +88,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - modeldata:/app/models
     ports:
       - "${API_PORT}:8500"
     depends_on:
@@ -108,3 +114,4 @@ services:
 volumes:
   pgdata:
   redisdata:
+  modeldata:

@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import structlog
+
+_logger = structlog.get_logger()
 
 try:
     from sklearn.ensemble import GradientBoostingRegressor
@@ -210,12 +213,15 @@ class COPModel:
 
         models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
         if not models:
+            _logger.info("cop_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
         try:
             self._model = safe_load(models[-1])
-        except ValueError:
+        except ValueError as exc:
+            _logger.warning("cop_model_load_failed", path=str(models[-1]), error=str(exc))
             return False
         self._version = models[-1].stem.replace("cop_model_", "")
+        _logger.info("cop_model_loaded", version=self._version, path=str(models[-1]))
         return True
 
 
@@ -365,12 +371,15 @@ class DemandModel:
 
         models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
         if not models:
+            _logger.info("demand_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
         try:
             self._model = safe_load(models[-1])
-        except ValueError:
+        except ValueError as exc:
+            _logger.warning("demand_model_load_failed", path=str(models[-1]), error=str(exc))
             return False
         self._version = models[-1].stem.replace("demand_model_", "")
+        _logger.info("demand_model_loaded", version=self._version, path=str(models[-1]))
         return True
 
 
