@@ -136,6 +136,23 @@ class MILPOptimizer:
             last_status.zone1_target_temp if last_status and last_status.zone1_target_temp else 35.0
         )
 
+        # Pre-compute per-hour indoor rates using comfort model when trained.
+        # The comfort model (GradientBoosting, trained on real sensor data) is
+        # far more accurate than the simple linear thermal model rates.  We
+        # simulate one step of heating and one step of no-heating for each hour
+        # to derive per-hour (gain, loss) pairs that the LP can use directly.
+        indoor_rates: list[tuple[float, float]] | None = None
+        if comfort_model.is_trained and latest_indoor_temp is not None:
+            indoor_rates = self._precompute_indoor_rates(
+                prices, weather, latest_indoor_temp, heat_curve_water_temp
+            )
+            if indoor_rates:
+                logger.info(
+                    "milp_using_comfort_model_indoor_rates",
+                    sample_h0_gain=round(indoor_rates[0][0], 3),
+                    sample_h0_loss=round(indoor_rates[0][1], 3),
+                )
+
         # Solve synchronously in a thread to avoid blocking the event loop
         plan = await asyncio.to_thread(
             self._solve,
@@ -150,6 +167,7 @@ class MILPOptimizer:
             heat_curve_water_temp,
             tank_min_per_hour,
             tank_max_temp,
+            indoor_rates,
         )
         return plan
 
@@ -185,6 +203,64 @@ class MILPOptimizer:
         return [3.0] * len(weather)
 
     @staticmethod
+    def _precompute_indoor_rates(
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        current_indoor: float,
+        heat_curve_water_temp: float,
+    ) -> list[tuple[float, float]]:
+        """Pre-compute per-hour (gain, loss) indoor rate pairs using comfort model.
+
+        For each hour, runs one comfort-model prediction with active heating
+        (zone_water_temp = heat_curve baseline) and one without heating
+        (zone_water_temp = outdoor) to derive the effective rate the LP sees.
+
+        Returns list of (gain, loss) per hour where:
+          gain = delta indoor per hour with SH on
+          loss = delta indoor per hour with SH off (negative)
+        """
+        rates = []
+        indoor = current_indoor
+
+        for h in range(len(prices)):
+            hour_ts = prices[h][0]
+            outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
+            hour_of_day = hour_ts.hour
+
+            # No-heating: water at outdoor temp (radiators not contributing)
+            pred_no_heat = comfort_model.predict_indoor_temp(
+                zone_water_temp=outdoor,
+                outdoor_temp=outdoor,
+                hour=hour_of_day,
+                indoor_temp=indoor,
+            )
+            # Full heating: water at heat curve temp
+            pred_heat = comfort_model.predict_indoor_temp(
+                zone_water_temp=heat_curve_water_temp,
+                outdoor_temp=outdoor,
+                hour=hour_of_day,
+                indoor_temp=indoor,
+            )
+
+            if pred_no_heat is None or pred_heat is None:
+                return []  # Comfort model failed — fall back to thermal model
+
+            loss = pred_no_heat - indoor
+            gain = pred_heat - indoor
+
+            # Clamp to physical bounds
+            loss = max(-1.0, min(0.0, loss))
+            gain = max(0.0, min(3.0, gain))
+
+            rates.append((gain, loss))
+
+            # Step indoor forward along the no-heating path for autoregressive
+            # prediction (so future hours see a realistic indoor trajectory)
+            indoor = pred_no_heat
+
+        return rates
+
+    @staticmethod
     def _default_cop_curve(outdoor_temp: float) -> float:
         """Simple linear COP approximation for air-to-water heat pump."""
         cop = 3.5 + 0.1 * outdoor_temp
@@ -203,6 +279,7 @@ class MILPOptimizer:
         heat_curve_water_temp: float = 35.0,
         tank_min_per_hour: list[int] | None = None,
         tank_max_temp_setting: int | None = None,
+        indoor_rates: list[tuple[float, float]] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -352,7 +429,8 @@ class MILPOptimizer:
 
         # --- Indoor temperature state variable ---
         # Track predicted indoor air temperature through the horizon.
-        # Uses learned indoor heating/cooling rates from the thermal model.
+        # Prefers comfort-model-derived rates (accurate, learned from real
+        # sensor data) over the simple thermal model linear rates.
         indoor_init = current_indoor_temp if current_indoor_temp is not None else 20.0
         t_indoor = [
             pulp.LpVariable(f"T_indoor_{h}", 10.0, 35.0) for h in range(H + 1)
@@ -360,8 +438,11 @@ class MILPOptimizer:
         prob += t_indoor[0] == indoor_init
 
         for h in range(H):
-            gain = thermal_model._indoor_heating_rate(temps[h])
-            loss = thermal_model._indoor_cooling_rate(temps[h])
+            if indoor_rates and h < len(indoor_rates):
+                gain, loss = indoor_rates[h]
+            else:
+                gain = thermal_model._indoor_heating_rate(temps[h])
+                loss = thermal_model._indoor_cooling_rate(temps[h])
             # Linear evolution: T[h+1] = T[h] + loss + x_sh[h] * (gain - loss)
             # When x_sh=0 → pure cooling; when x_sh=1 → full heating
             prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
