@@ -211,7 +211,8 @@ class TestMILPSolver:
             dt.datetime.fromisoformat(action["ts"])
             # type must be a known action
             assert action["type"] in (
-                "force_dhw_on", "force_dhw_off", "quiet_mode_on",
+                "force_dhw_on", "force_dhw_off",
+                "quiet_mode_on", "quiet_mode_off",
             ), f"Unknown action type: {action['type']}"
 
     def test_milp_with_ml_cop_model(self):

@@ -510,13 +510,28 @@ class MILPOptimizer:
                 )
 
             sh_val = x_sh[h].varValue or 0
-            if sh_val < 0.3 and temps[h] > 5:
+            want_quiet = sh_val < 0.3 and temps[h] > 5
+            prev_sh = x_sh[h - 1].varValue or 0 if h > 0 else 1.0
+            was_quiet = (prev_sh < 0.3 and temps[h - 1] > 5) if h > 0 else False
+
+            if want_quiet and not was_quiet:
                 actions.append(
                     {
                         "ts": ts.isoformat(),
                         "type": "quiet_mode_on",
                         "payload": {
                             "reason": "milp_low_demand",
+                            "sh_fraction": sh_val,
+                        },
+                    }
+                )
+            elif not want_quiet and was_quiet:
+                actions.append(
+                    {
+                        "ts": ts.isoformat(),
+                        "type": "quiet_mode_off",
+                        "payload": {
+                            "reason": "milp_demand_increase",
                             "sh_fraction": sh_val,
                         },
                     }
