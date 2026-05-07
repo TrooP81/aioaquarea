@@ -236,6 +236,30 @@ async def get_dashboard():
         )
         consumption_row = consumption_result.one_or_none()
 
+        # Per-record consumption since midnight (for hourly cost calculation)
+        consumption_records_result = await session.execute(
+            select(ConsumptionRecord)
+            .where(ConsumptionRecord.ts >= today_start)
+            .order_by(ConsumptionRecord.ts)
+        )
+        consumption_records = consumption_records_result.scalars().all()
+
+        # Hourly prices since midnight, keyed by hour-truncated timestamp
+        prices_result = await session.execute(
+            select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
+            .where(
+                and_(
+                    PriceRecord.ts >= today_start,
+                    PriceRecord.ts <= now,
+                    PriceRecord.area == area,
+                )
+            )
+        )
+        price_by_hour: dict[dt.datetime, float] = {
+            ts.replace(minute=0, second=0, microsecond=0): price
+            for ts, price in prices_result.all()
+        }
+
         # Active plan
         plan_result = await session.execute(
             select(PlanRecord)
@@ -263,8 +287,23 @@ async def get_dashboard():
     if consumption_row and consumption_row[0] is not None:
         today_kwh = (consumption_row[0] or 0) + (consumption_row[1] or 0) + (consumption_row[2] or 0)
 
-    avg_price = current_price_row or 0.10  # Default fallback
-    today_cost = today_kwh * avg_price
+    # Compute today's cost as Σ(per-interval delta_kWh × price for that interval's hour).
+    # Falls back to current price for hours without a recorded spot price; if no prices
+    # are available at all, falls back to a flat 0.10 estimate to preserve prior behavior.
+    fallback_price = current_price_row if current_price_row is not None else 0.10
+    today_cost = 0.0
+    prev_record = None
+    for record in consumption_records:
+        if prev_record is not None and record.ts.date() == prev_record.ts.date():
+            heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
+            cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
+            tank_delta = max(0.0, (record.tank_kwh or 0) - (prev_record.tank_kwh or 0))
+            delta_kwh = heat_delta + cool_delta + tank_delta
+            if delta_kwh > 0:
+                hour_key = record.ts.replace(minute=0, second=0, microsecond=0)
+                price = price_by_hour.get(hour_key, fallback_price)
+                today_cost += delta_kwh * price
+        prev_record = record
 
     return DashboardResponse(
         current_status=DeviceStatusResponse(
