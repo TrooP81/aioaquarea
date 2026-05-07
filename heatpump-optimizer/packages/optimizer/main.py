@@ -18,6 +18,7 @@ from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
 from packages.optimizer.executor import PlanExecutor
 from packages.ml.models import COPModel, DemandModel
+from packages.ml.comfort_model import comfort_model
 
 logger = structlog.get_logger()
 
@@ -37,10 +38,12 @@ def _load_ml_models() -> None:
     """Load the latest ML model checkpoints from disk."""
     _cop_model.load_latest()
     _demand_model.load_latest()
+    comfort_model.load_latest()
     logger.info(
         "ml_models_loaded",
         cop_trained=_cop_model.is_trained,
         demand_trained=_demand_model.is_trained,
+        comfort_trained=comfort_model.is_trained,
     )
 
 
