@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-from sqlalchemy import select, and_, func
+from sqlalchemy import and_, select
 
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading

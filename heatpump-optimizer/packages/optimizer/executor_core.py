@@ -1,0 +1,416 @@
+"""Plan executor: dispatches actions and verifies the device applied them.
+
+Verification consumes Panasonic API read budget. The executor therefore keeps batches small
+(`MAX_ACTIONS_PER_CYCLE`) and polls at a bounded cadence (`VERIFY_POLL_INTERVAL_S`) so a single
+cycle stays within the wrapper's rate limiter while still marking mismatches as failures instead
+of silently succeeding.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+
+import structlog
+from sqlalchemy import and_, select, update
+
+from packages.core.database import get_session
+from packages.core.models import AuditLogRecord, OverrideRecord, PlanActionRecord, PlanRecord
+from packages.core.services import AquareaWrapper
+from packages.optimizer.actions import ActionType, VerifyResult, get_action_handler
+
+logger = structlog.get_logger()
+
+MAX_ACTIONS_PER_CYCLE = 3
+VERIFY_POLL_INTERVAL_S = 10
+VERIFY_TIMEOUT_S = 60
+VERIFY_REDISPATCH_ATTEMPTS = 1
+
+
+class PlanExecutor:
+    """Executes pending plan actions respecting overrides and rate limits."""
+
+    def __init__(self, wrapper: AquareaWrapper):
+        self._wrapper = wrapper
+
+    async def execute_due_actions(self) -> None:
+        """Find and execute all actions whose scheduled time has passed."""
+        now = dt.datetime.now(dt.timezone.utc)
+
+        async with get_session() as session:
+            override_result = await session.execute(
+                select(OverrideRecord).where(
+                    and_(
+                        OverrideRecord.active,
+                        OverrideRecord.ts_from <= now,
+                        OverrideRecord.ts_to >= now,
+                    )
+                )
+            )
+            active_overrides = override_result.scalars().all()
+
+            result = await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    and_(
+                        PlanActionRecord.status == "pending",
+                        PlanActionRecord.scheduled_ts <= now,
+                    )
+                )
+                .order_by(PlanActionRecord.scheduled_ts)
+                .limit(MAX_ACTIONS_PER_CYCLE)
+            )
+            actions = result.scalars().all()
+
+            if active_overrides and actions:
+                override_reason = active_overrides[0].reason or "manual override"
+                logger.info(
+                    "executor_overrides_active",
+                    count=len(active_overrides),
+                    reason=override_reason,
+                    skipping=len(actions),
+                )
+                for action in actions:
+                    await session.execute(
+                        update(PlanActionRecord)
+                        .where(PlanActionRecord.id == action.id)
+                        .values(
+                            status="skipped",
+                            executed_at=now,
+                            result_json=json.dumps(
+                                {"reason": "override_active", "override": override_reason}
+                            ),
+                        )
+                    )
+                return
+
+            if active_overrides:
+                logger.info(
+                    "executor_overrides_active",
+                    count=len(active_overrides),
+                    reason=active_overrides[0].reason,
+                )
+                return
+
+        for action in actions:
+            await self._execute_action(action)
+
+    async def _execute_action(self, action: PlanActionRecord) -> None:
+        """Execute a single action, then synchronously verify it."""
+        try:
+            payload = json.loads(action.payload_json) if action.payload_json else {}
+            action_type = ActionType(action.action_type)
+            handler = get_action_handler(action_type)
+
+            expected_state = await handler.dispatch(self._wrapper, payload) or {}
+            now = dt.datetime.now(dt.timezone.utc)
+            async with get_session() as session:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="dispatched",
+                        executed_at=now,
+                        expected_state_json=json.dumps(expected_state),
+                        verify_attempts=0,
+                        last_observed_json=None,
+                        result_json=json.dumps({"dispatched": True}),
+                    )
+                )
+
+            logger.info(
+                "action_dispatched",
+                action_type=action.action_type,
+                action_id=action.id,
+                expected_state=expected_state,
+            )
+
+            await self._verify_with_retry(action, payload, expected_state)
+
+        except ValueError:
+            logger.warning("executor_unknown_action", action_type=action.action_type)
+        except Exception as exc:
+            logger.error(
+                "action_failed", action_type=action.action_type, action_id=action.id, error=str(exc)
+            )
+            async with get_session() as session:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="failed",
+                        executed_at=dt.datetime.now(dt.timezone.utc),
+                        result_json=json.dumps({"error": str(exc)}),
+                    )
+                )
+
+    async def _verify_with_retry(
+        self,
+        action: PlanActionRecord,
+        payload: dict,
+        expected_state: dict[str, object],
+    ) -> None:
+        action_type = ActionType(action.action_type)
+        handler = get_action_handler(action_type)
+        attempts = 0
+        last_result = VerifyResult(ok=False, expected_value=expected_state, reason="not_verified")
+
+        for dispatch_attempt in range(VERIFY_REDISPATCH_ATTEMPTS + 1):
+            last_result, attempts = await self._poll_until_verified(
+                action_id=action.id,
+                handler=handler,
+                payload=payload,
+                expected_state=expected_state,
+                attempts=attempts,
+            )
+            if last_result.ok:
+                await self._mark_verified(action, attempts, last_result)
+                return
+
+            if dispatch_attempt < VERIFY_REDISPATCH_ATTEMPTS:
+                logger.warning(
+                    "action_verification_retrying",
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    observed=last_result.observed_value,
+                    expected=last_result.expected_value,
+                    reason=last_result.reason,
+                )
+                expected_state = await handler.dispatch(self._wrapper, payload) or expected_state
+
+        await self._mark_failed(action, attempts, last_result)
+
+    async def _poll_until_verified(
+        self,
+        *,
+        action_id: int,
+        handler,
+        payload: dict,
+        expected_state: dict[str, object],
+        attempts: int,
+    ) -> tuple[VerifyResult, int]:
+        deadline = asyncio.get_running_loop().time() + VERIFY_TIMEOUT_S
+        while True:
+            device = await self._wrapper.refresh_device()
+            result = handler.verify(device, payload, expected_state)
+            attempts += 1
+            await self._store_verification_progress(action_id, attempts, result)
+            if result.ok:
+                return result, attempts
+            if asyncio.get_running_loop().time() >= deadline:
+                return result, attempts
+            await asyncio.sleep(VERIFY_POLL_INTERVAL_S)
+
+    async def _store_verification_progress(
+        self, action_id: int, attempts: int, result: VerifyResult
+    ) -> None:
+        async with get_session() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action_id)
+                .values(
+                    verify_attempts=attempts,
+                    last_observed_json=json.dumps(result.as_dict()),
+                )
+            )
+
+    async def _mark_verified(
+        self, action: PlanActionRecord, attempts: int, result: VerifyResult
+    ) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        audit_record = AuditLogRecord(
+            actor="optimizer",
+            action=action.action_type,
+            payload_json=action.payload_json,
+            result="success",
+        )
+        async with get_session() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="executed",
+                    executed_at=now,
+                    verify_attempts=attempts,
+                    last_observed_json=json.dumps(result.as_dict()),
+                    result_json=json.dumps({"success": True, "verified": True}),
+                )
+            )
+            add_result = session.add(audit_record)
+            if asyncio.iscoroutine(add_result):
+                await add_result
+        logger.info(
+            "action_verified",
+            action_type=action.action_type,
+            action_id=action.id,
+            verify_attempts=attempts,
+        )
+
+    async def _mark_failed(
+        self, action: PlanActionRecord, attempts: int, result: VerifyResult
+    ) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        audit_record = AuditLogRecord(
+            actor="optimizer",
+            action=action.action_type,
+            payload_json=action.payload_json,
+            result="failed",
+        )
+        async with get_session() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="failed",
+                    executed_at=now,
+                    verify_attempts=attempts,
+                    last_observed_json=json.dumps(result.as_dict()),
+                    result_json=json.dumps(
+                        {
+                            "success": False,
+                            "verified": False,
+                            "reason": result.reason,
+                            "observed": result.observed_value,
+                            "expected": result.expected_value,
+                        }
+                    ),
+                )
+            )
+            add_result = session.add(audit_record)
+            if asyncio.iscoroutine(add_result):
+                await add_result
+        logger.error(
+            "action_verification_failed",
+            action_type=action.action_type,
+            action_id=action.id,
+            verify_attempts=attempts,
+            observed=result.observed_value,
+            expected=result.expected_value,
+            reason=result.reason,
+        )
+
+    async def expire_stale_actions(self) -> None:
+        """Mark stale pending actions as expired with a diagnostic reason.
+
+        Runs periodically to catch actions that the executor never picked up
+        (e.g. scheduled during an override window, or from a superseded plan).
+        Only expires actions older than 2 minutes to avoid racing with
+        execute_due_actions.
+        """
+        now = dt.datetime.now(dt.timezone.utc)
+        cutoff = now - dt.timedelta(minutes=2)
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    and_(
+                        PlanActionRecord.status == "pending",
+                        PlanActionRecord.scheduled_ts <= cutoff,
+                    )
+                )
+                .order_by(PlanActionRecord.scheduled_ts)
+                .limit(20)
+            )
+            stale = result.scalars().all()
+
+            if not stale:
+                return
+
+            latest_plan_result = await session.execute(
+                select(PlanRecord.id).order_by(PlanRecord.created_at.desc()).limit(1)
+            )
+            latest_plan_id = latest_plan_result.scalar_one_or_none()
+
+            for action in stale:
+                reason = await self._diagnose_missed(session, action, latest_plan_id, now)
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="expired",
+                        executed_at=now,
+                        result_json=json.dumps(reason),
+                    )
+                )
+                logger.info(
+                    "action_expired",
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    diagnosis=reason.get("reason"),
+                )
+
+    @staticmethod
+    async def _diagnose_missed(session, action: PlanActionRecord, latest_plan_id: int | None, now) -> dict:
+        """Determine why a pending action was never executed."""
+        scheduled = action.scheduled_ts
+        gap_minutes = round((now - scheduled).total_seconds() / 60, 1)
+
+        if latest_plan_id and action.plan_id != latest_plan_id:
+            return {
+                "reason": "superseded",
+                "gap_minutes": gap_minutes,
+                "detail": f"Replaced by plan #{latest_plan_id}",
+            }
+
+        window_end = scheduled + dt.timedelta(minutes=2)
+        override_result = await session.execute(
+            select(OverrideRecord)
+            .where(
+                and_(
+                    OverrideRecord.ts_from <= window_end,
+                    OverrideRecord.ts_to >= scheduled,
+                )
+            )
+            .limit(1)
+        )
+        blocking_override = override_result.scalar_one_or_none()
+        if blocking_override:
+            return {
+                "reason": "override_active",
+                "override": blocking_override.reason or "manual override",
+                "gap_minutes": gap_minutes,
+                "detail": f"Override '{blocking_override.reason}' was active at scheduled time",
+            }
+
+        plan_window_start = scheduled - dt.timedelta(minutes=1)
+        plan_window_end = scheduled + dt.timedelta(minutes=3)
+        plan_result = await session.execute(
+            select(PlanRecord.id, PlanRecord.created_at)
+            .where(
+                and_(
+                    PlanRecord.created_at >= plan_window_start,
+                    PlanRecord.created_at <= plan_window_end,
+                )
+            )
+            .order_by(PlanRecord.created_at.desc())
+            .limit(1)
+        )
+        concurrent_plan = plan_result.one_or_none()
+        if concurrent_plan:
+            return {
+                "reason": "optimization_overlap",
+                "concurrent_plan_id": concurrent_plan[0],
+                "gap_minutes": gap_minutes,
+                "detail": (
+                    f"Plan #{concurrent_plan[0]} was being generated at "
+                    f"{concurrent_plan[1].strftime('%H:%M:%S')} - may have blocked the executor"
+                ),
+            }
+
+        if gap_minutes > 10:
+            return {
+                "reason": "executor_gap",
+                "gap_minutes": gap_minutes,
+                "detail": f"Executor did not run for ~{round(gap_minutes)} min after scheduled time",
+            }
+
+        return {
+            "reason": "timing",
+            "gap_minutes": gap_minutes,
+            "detail": (
+                f"Action was due {gap_minutes} min ago but was never picked up "
+                f"- possible event-loop delay or transient DB error"
+            ),
+        }

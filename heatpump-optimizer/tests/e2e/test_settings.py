@@ -2,6 +2,7 @@
 
 import pytest
 from httpx import AsyncClient
+from unittest.mock import AsyncMock, patch
 
 from packages.core.models import SettingRecord
 
@@ -93,7 +94,7 @@ class TestSettingsUpdate:
         assert resp.status_code == 200
         logs = resp.json()
 
-        settings_logs = [l for l in logs if l["action"] == "update_settings"]
+        settings_logs = [entry for entry in logs if entry["action"] == "update_settings"]
         assert len(settings_logs) > 0
         assert settings_logs[0]["actor"] == "user"
 
@@ -107,7 +108,7 @@ class TestSettingsUpdate:
         resp = await client.get("/api/audit")
         logs = resp.json()
 
-        settings_logs = [l for l in logs if l["action"] == "update_settings"]
+        settings_logs = [entry for entry in logs if entry["action"] == "update_settings"]
         # The payload should have masked the secret
         payload = settings_logs[0]["payload"]
         assert "super-secret-token" not in str(payload)
@@ -150,3 +151,30 @@ class TestManualMode:
         assert data["weather_provider"]["value"] == "manual"
         assert data["manual_outdoor_temp"]["value"] == "12.5"
         assert data["manual_wind_speed"]["value"] == "3.0"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestTypedSettingsAccessors:
+    async def test_typed_getters_parse_defaults(self):
+        from packages.core.settings_service import get_bool_setting, get_float_setting, get_int_setting
+
+        with patch("packages.core.settings_service.get_setting", new=AsyncMock(side_effect=lambda key: "")):
+            assert await get_int_setting("smartthings_poll_interval") == 300
+            assert await get_float_setting("comfort_temp_target") == 20.5
+            assert await get_bool_setting("smartthings_enabled") is False
+
+    async def test_typed_getters_parse_stored_values(self):
+        from packages.core.settings_service import get_bool_setting, get_float_setting, get_int_setting
+
+        values = {
+            "smartthings_poll_interval": "450",
+            "comfort_temp_target": "21.25",
+            "smartthings_enabled": "true",
+        }
+        with patch(
+            "packages.core.settings_service.get_setting",
+            new=AsyncMock(side_effect=lambda key: values[key]),
+        ):
+            assert await get_int_setting("smartthings_poll_interval") == 450
+            assert await get_float_setting("comfort_temp_target") == 21.25
+            assert await get_bool_setting("smartthings_enabled") is True

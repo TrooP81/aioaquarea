@@ -30,6 +30,7 @@ _LOG_BUFFER: list[dict[str, Any]] = []
 _BUFFER_LOCK = asyncio.Lock()
 _FLUSH_INTERVAL = 2  # seconds
 _SERVICE_NAME: str = "unknown"
+_FLUSH_TASK: asyncio.Task[None] | None = None
 
 # Retention: keep only the last 24 h of logs
 _RETENTION_HOURS = 24
@@ -106,6 +107,19 @@ async def _flush_loop() -> None:
             pass
 
 
+def _ensure_flush_loop() -> None:
+    """Start the flush task only when an event loop is available."""
+    global _FLUSH_TASK
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    if _FLUSH_TASK is None or _FLUSH_TASK.done():
+        _FLUSH_TASK = loop.create_task(_flush_loop())
+
+
 def configure_structlog_with_db(service_name: str) -> None:
     """Configure structlog with the DB-persistence processor.
 
@@ -126,6 +140,4 @@ def configure_structlog_with_db(service_name: str) -> None:
         ),
     )
 
-    # Start the flush loop in the current event loop
-    loop = asyncio.get_event_loop()
-    loop.create_task(_flush_loop())
+    _ensure_flush_loop()

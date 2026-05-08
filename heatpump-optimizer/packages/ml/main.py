@@ -29,8 +29,9 @@ async def retrain_models() -> None:
 
 async def main() -> None:
     """ML service main loop — retrains weekly, serves predictions via the API."""
-    from packages.core.log_sink import configure_structlog_with_db
-    configure_structlog_with_db("ml")
+    from packages.core.logging import configure_logging
+
+    configure_logging("ml")
 
     # Load latest models on startup
     cop_model.load_latest()

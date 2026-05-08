@@ -14,6 +14,7 @@ from packages.core.models import PlanActionRecord, PlanRecord, COPRecord, Consum
 from packages.core.services import AquareaWrapper
 from packages.core.settings_service import get_setting
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
+from packages.optimizer.actions import ActionType
 from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
 from packages.optimizer.executor import PlanExecutor
@@ -193,18 +194,22 @@ async def run_optimization(*, scheduled: bool = False) -> None:
                 optimizer_version=plan["version"],
                 cost_estimate_eur=plan.get("cost_estimate"),
             )
-            session.add(plan_record)
+            add_result = session.add(plan_record)
+            if asyncio.iscoroutine(add_result):
+                await add_result
             await session.flush()
 
             for action in plan["actions"]:
                 action_record = PlanActionRecord(
                     plan_id=plan_record.id,
                     scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
-                    action_type=action["type"],
+                    action_type=str(ActionType(action["type"])),
                     payload_json=json.dumps(action.get("payload", {})),
                     status="pending",
                 )
-                session.add(action_record)
+                add_result = session.add(action_record)
+                if asyncio.iscoroutine(add_result):
+                    await add_result
 
         _last_plan_generated_at = _time.monotonic()
 
@@ -228,8 +233,9 @@ async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
 
 async def main() -> None:
     """Main entry point for the optimizer service."""
-    from packages.core.log_sink import configure_structlog_with_db
-    configure_structlog_with_db("optimizer")
+    from packages.core.logging import configure_logging
+
+    configure_logging("optimizer")
 
     logger.info("optimizer_starting")
 

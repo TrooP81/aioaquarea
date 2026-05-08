@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Final
 
 from .const import AquareaEnvironment
 from .core import AquareaClient as Client  # Import AquareaClient and alias it as Client
@@ -35,7 +35,7 @@ from .errors import (
 )
 from .statistics import Consumption, ConsumptionType, DateType
 
-__all__: Tuple[str, ...] = (
+__all__: Final[tuple[str, ...]] = (
     "Client",  # Keep "Client" in __all__ as it's aliased
     "Device",
     "ClientError",

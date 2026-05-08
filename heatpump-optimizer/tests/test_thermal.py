@@ -3,10 +3,7 @@
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
-import pytest
-
-from packages.ml.thermal import ThermalModel, ThermalParams, ThermalPrediction
+from packages.ml.thermal import ThermalModel, ThermalPrediction
 
 
 def _make_status_record(ts, tank_temp, outdoor_temp, zone1_temp=20.0, direction=None, defrost_active=False):

@@ -9,7 +9,6 @@ import pytest
 from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
-    PlanRecord,
     ShowerEventRecord,
 )
 from packages.optimizer.shower_mode import ShowerDetector

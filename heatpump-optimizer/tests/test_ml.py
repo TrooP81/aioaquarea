@@ -486,10 +486,6 @@ class TestDirectionAwareCOP:
 
     def test_defrost_intervals_are_skipped(self):
         """Defrost intervals should not contribute to COP calculation."""
-        from packages.ml.models import DirectionAwareCOP
-
-        dac = DirectionAwareCOP()
-
         base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
 
         record_prev = MagicMock()

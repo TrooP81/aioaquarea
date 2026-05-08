@@ -1,7 +1,6 @@
 """Tests for the comfort model (indoor air temperature prediction)."""
 
 import datetime as dt
-from unittest.mock import AsyncMock, patch, MagicMock
 
 import numpy as np
 import pytest

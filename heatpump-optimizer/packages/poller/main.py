@@ -20,7 +20,7 @@ from packages.core.models import (
 from packages.core.services import AquareaWrapper
 from packages.poller.feeds import fetch_prices, fetch_weather
 from packages.poller.smartthings import poll_smartthings_temps
-from packages.core.settings_service import get_setting
+from packages.core.settings_service import get_bool_setting, get_int_setting, get_string_setting
 from packages.optimizer.shower_mode import ShowerDetector
 
 logger = structlog.get_logger()
@@ -167,9 +167,9 @@ async def poll_prices() -> None:
 
     try:
         prices = await fetch_prices()
-        provider = await get_setting("price_provider")
+        provider = await get_string_setting("price_provider")
         if provider == "entsoe":
-            area = (await get_setting("entsoe_area")) or settings.entsoe_area
+            area = (await get_string_setting("entsoe_area")) or settings.entsoe_area
         elif provider == "manual":
             area = "manual"
         else:
@@ -228,8 +228,8 @@ async def poll_weather() -> None:
 async def poll_indoor_temp() -> None:
     """Fetch indoor air temperatures from SmartThings sensors."""
     try:
-        enabled = await get_setting("smartthings_enabled")
-        if enabled != "true":
+        enabled = await get_bool_setting("smartthings_enabled")
+        if not enabled:
             return
 
         async with get_session() as session:
@@ -244,13 +244,13 @@ async def poll_indoor_temp() -> None:
 async def retrain_comfort_model() -> None:
     """Periodically retrain the comfort model from accumulated SmartThings data."""
     try:
-        enabled = await get_setting("use_comfort_model")
-        if enabled != "true":
+        enabled = await get_bool_setting("use_comfort_model")
+        if not enabled:
             return
 
         from packages.ml.comfort_model import comfort_model
 
-        lag_str = await get_setting("thermal_lag_minutes")
+        lag_str = await get_string_setting("thermal_lag_minutes")
         lag = int(lag_str) if lag_str else None
 
         result = await comfort_model.train(thermal_lag_minutes=lag)
@@ -261,8 +261,9 @@ async def retrain_comfort_model() -> None:
 
 async def main() -> None:
     """Main entry point for the poller service."""
-    from packages.core.log_sink import configure_structlog_with_db
-    configure_structlog_with_db("poller")
+    from packages.core.logging import configure_logging
+
+    configure_logging("poller")
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
@@ -310,8 +311,7 @@ async def main() -> None:
     )
 
     # SmartThings indoor temp (uses smartthings_poll_interval setting, default 300s)
-    st_interval_str = await get_setting("smartthings_poll_interval")
-    st_interval = int(st_interval_str) if st_interval_str else 300
+    st_interval = await get_int_setting("smartthings_poll_interval")
     scheduler.add_job(
         poll_indoor_temp,
         "interval",

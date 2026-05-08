@@ -133,6 +133,9 @@ class PlanActionRecord(Base):
     payload_json: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(24), default="pending")
     executed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    expected_state_json: Mapped[str | None] = mapped_column(Text)
+    verify_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_observed_json: Mapped[str | None] = mapped_column(Text)
     result_json: Mapped[str | None] = mapped_column(Text)
 
 

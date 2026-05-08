@@ -15,11 +15,11 @@ from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
     PlanRecord,
-    PriceRecord,
     ShowerEventRecord,
 )
 from packages.core.settings_service import get_setting
 from packages.optimizer.data_access import get_prices
+from packages.optimizer.actions import ActionType
 
 logger = structlog.get_logger()
 
@@ -129,7 +129,7 @@ class ShowerDetector:
         action = PlanActionRecord(
             plan_id=plan.id,
             scheduled_ts=now,
-            action_type="force_dhw_on",
+            action_type=str(ActionType.FORCE_DHW_ON),
             payload_json=json.dumps(
                 {
                     "trigger": "shower_mode",
@@ -213,7 +213,7 @@ class ShowerDetector:
         action = PlanActionRecord(
             plan_id=plan.id,
             scheduled_ts=now,
-            action_type="force_dhw_off",
+            action_type=str(ActionType.FORCE_DHW_OFF),
             payload_json=json.dumps(
                 {"trigger": "shower_mode", "reason": reason}
             ),

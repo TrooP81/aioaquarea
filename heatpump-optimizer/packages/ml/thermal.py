@@ -17,12 +17,12 @@ Phase 3 improvements:
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import structlog
-from sqlalchemy import select, and_, func
+from sqlalchemy import select
 
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, IndoorTempReading

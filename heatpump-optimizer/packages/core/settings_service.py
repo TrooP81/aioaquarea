@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -13,6 +15,39 @@ from packages.core.database import get_session
 from packages.core.models import SettingRecord
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SettingSpec:
+    key: str
+    value_type: str
+    description: str
+    default: str = ""
+    default_env: str | None = None
+    options: tuple[str, ...] | None = None
+
+    def serialize_default(self) -> str:
+        return self.default
+
+    def parse(self, value: str) -> Any:
+        if self.value_type in {"str", "secret", "json"}:
+            return value
+        if self.value_type == "int":
+            return int(value)
+        if self.value_type == "float":
+            return float(value)
+        if self.value_type == "bool":
+            return _parse_bool(value)
+        raise ValueError(f"Unsupported setting type: {self.value_type}")
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off", ""}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
 
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
@@ -273,20 +308,39 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
 }
 
+SETTING_SPECS: dict[str, SettingSpec] = {
+    key: SettingSpec(
+        key=key,
+        value_type=str(schema["type"]),
+        description=str(schema.get("description", "")),
+        default=str(schema.get("default", "")),
+        default_env=schema.get("default_env"),
+        options=tuple(schema["options"]) if schema.get("options") else None,
+    )
+    for key, schema in SETTINGS_SCHEMA.items()
+}
+
+
+def get_setting_spec(key: str) -> SettingSpec:
+    try:
+        return SETTING_SPECS[key]
+    except KeyError as exc:
+        raise KeyError(f"Unknown setting: {key}") from exc
+
+
+def _default_setting_value(spec: SettingSpec) -> str:
+    if spec.default_env and hasattr(env_settings, spec.default_env):
+        return str(getattr(env_settings, spec.default_env))
+    return spec.serialize_default()
+
 
 async def get_all_settings() -> dict[str, str]:
     """Load all settings from DB, falling back to env vars."""
     result: dict[str, str] = {}
 
     # Start with env fallbacks / defaults
-    for key, schema in SETTINGS_SCHEMA.items():
-        env_attr = schema.get("default_env")
-        if env_attr and hasattr(env_settings, env_attr):
-            result[key] = str(getattr(env_settings, env_attr))
-        elif "default" in schema:
-            result[key] = str(schema["default"])
-        else:
-            result[key] = ""
+    for key, spec in SETTING_SPECS.items():
+        result[key] = _default_setting_value(spec)
 
     # Override with DB values
     async with get_session() as session:
@@ -309,11 +363,32 @@ async def get_setting(key: str) -> str:
             return record.value
 
     # Fallback to env
-    schema = SETTINGS_SCHEMA.get(key, {})
-    env_attr = schema.get("default_env")
-    if env_attr and hasattr(env_settings, env_attr):
-        return str(getattr(env_settings, env_attr))
-    return str(schema.get("default", ""))
+    spec = get_setting_spec(key)
+    return _default_setting_value(spec)
+
+
+async def get_typed_setting(key: str) -> Any:
+    spec = get_setting_spec(key)
+    raw_value = await get_setting(key)
+    if raw_value == "" and spec.value_type not in {"str", "secret", "json"}:
+        return spec.parse(spec.serialize_default()) if spec.serialize_default() else None
+    return spec.parse(raw_value)
+
+
+async def get_int_setting(key: str) -> int:
+    return int(await get_typed_setting(key))
+
+
+async def get_float_setting(key: str) -> float:
+    return float(await get_typed_setting(key))
+
+
+async def get_bool_setting(key: str) -> bool:
+    return bool(await get_typed_setting(key))
+
+
+async def get_string_setting(key: str) -> str:
+    return str(await get_setting(key))
 
 
 async def set_setting(key: str, value: str) -> None:
@@ -364,9 +439,8 @@ async def get_comfort_schedule() -> dict[str, list[int]]:
     return schedule
 
 
-def _to_local(ts: "dt.datetime", tz_name: str | None = None) -> "dt.datetime":
+def _to_local(ts: dt.datetime, tz_name: str | None = None) -> dt.datetime:
     """Convert a (possibly UTC) timestamp to the user's local timezone."""
-    import datetime as dt
     from zoneinfo import ZoneInfo
 
     tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("Europe/Amsterdam")
@@ -380,14 +454,14 @@ async def get_user_tz() -> str:
     return await get_setting("timezone") or "Europe/Amsterdam"
 
 
-def is_comfort_hour(schedule: dict[str, list[int]], ts: "dt.datetime", tz_name: str | None = None) -> bool:
+def is_comfort_hour(schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None) -> bool:
     """Check if a given timestamp falls within a comfort hour (in local time)."""
     local = _to_local(ts, tz_name)
     day_type = "weekday" if local.weekday() < 5 else "weekend"
     return local.hour in schedule.get(day_type, [])
 
 
-def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: "dt.datetime", tz_name: str | None = None) -> list[int]:
+def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None) -> list[int]:
     """
     Derive DHW ready-by hours from the comfort schedule.
 

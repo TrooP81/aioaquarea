@@ -1,7 +1,6 @@
 """Tests for the rules optimizer."""
 
 import datetime as dt
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
