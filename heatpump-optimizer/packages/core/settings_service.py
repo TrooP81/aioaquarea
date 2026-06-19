@@ -58,6 +58,21 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "description": "Which optimizer layer to use",
         "options": ["rules_only", "milp_preferred", "auto"],
     },
+    # --- Learning mode ---
+    "learning_mode_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": (
+            "Observe-only training mode: the optimizer still plans but the executor "
+            "dispatches no device commands, so the heat pump runs naturally while data "
+            "is collected for ML training. Toggle off to let the optimizer act."
+        ),
+    },
+    "learning_mode_since": {
+        "type": "str",
+        "default": "",
+        "description": "ISO timestamp when learning mode was last enabled (internal)",
+    },
     # --- Service modes ---
     "price_provider": {
         "type": "str",

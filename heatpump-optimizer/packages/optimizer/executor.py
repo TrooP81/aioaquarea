@@ -12,6 +12,7 @@ from .executor_core import (
     VERIFY_REDISPATCH_ATTEMPTS,
     VERIFY_TIMEOUT_S,
     PlanExecutor as _CorePlanExecutor,
+    is_learning_mode_active,
 )
 
 
@@ -19,12 +20,16 @@ class PlanExecutor(_CorePlanExecutor):
     """Compatibility subclass that preserves module-level patch points for tests."""
 
     async def execute_due_actions(self) -> None:
-        original_get_session = self.__class__.__mro__[1].execute_due_actions.__globals__["get_session"]
-        self.__class__.__mro__[1].execute_due_actions.__globals__["get_session"] = get_session
+        core_globals = self.__class__.__mro__[1].execute_due_actions.__globals__
+        original_get_session = core_globals["get_session"]
+        original_learning = core_globals["is_learning_mode_active"]
+        core_globals["get_session"] = get_session
+        core_globals["is_learning_mode_active"] = is_learning_mode_active
         try:
             await super().execute_due_actions()
         finally:
-            self.__class__.__mro__[1].execute_due_actions.__globals__["get_session"] = original_get_session
+            core_globals["get_session"] = original_get_session
+            core_globals["is_learning_mode_active"] = original_learning
 
     async def _execute_action(self, action) -> None:
         core_method = self.__class__.__mro__[1]._execute_action
@@ -110,4 +115,5 @@ __all__ = [
     "PlanExecutor",
     "asyncio",
     "get_session",
+    "is_learning_mode_active",
 ]

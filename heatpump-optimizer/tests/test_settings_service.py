@@ -4,7 +4,12 @@ import datetime as dt
 
 import pytest
 
-from packages.core.settings_service import is_comfort_hour, dhw_deadlines_from_schedule
+from packages.core.settings_service import (
+    SETTINGS_SCHEMA,
+    SETTING_SPECS,
+    is_comfort_hour,
+    dhw_deadlines_from_schedule,
+)
 
 TZ = "UTC"  # Tests use UTC timestamps with UTC-aligned schedule hours
 
@@ -81,3 +86,17 @@ class TestDhwDeadlines:
         schedule = {"weekday": [7, 7, 8, 8, 9], "weekend": []}
         ts = dt.datetime(2026, 4, 29, 0, 0, tzinfo=dt.timezone.utc)
         assert dhw_deadlines_from_schedule(schedule, ts, tz_name=TZ) == [7]
+
+
+class TestLearningModeSettings:
+    def test_learning_mode_settings_registered(self):
+        assert "learning_mode_enabled" in SETTINGS_SCHEMA
+        assert "learning_mode_since" in SETTINGS_SCHEMA
+
+    def test_learning_mode_enabled_is_bool_default_false(self):
+        spec = SETTING_SPECS["learning_mode_enabled"]
+        assert spec.value_type == "bool"
+        assert spec.parse(spec.default) is False
+
+    def test_learning_mode_since_defaults_empty(self):
+        assert SETTING_SPECS["learning_mode_since"].default == ""

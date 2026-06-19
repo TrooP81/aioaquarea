@@ -34,6 +34,7 @@ def test_expected_route_paths_present():
         "/api/comfort-model/train",
         "/api/comfort-model/predict",
         "/api/optimizer/status",
+        "/api/learning-mode",
         "/api/ml/train",
         "/api/thermal/status",
         "/api/thermal/calibrate",

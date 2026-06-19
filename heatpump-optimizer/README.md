@@ -31,6 +31,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **ML models**: COP prediction, demand forecasting, and indoor comfort model (train on your own data)
 - **Action verification**: Confirms commands took effect by polling device after execution
 - **Manual overrides**: Always-wins pause button for the optimizer; survives optimizer reruns
+- **Learning mode**: Manually toggleable observe-only mode — the optimizer keeps planning but sends no device commands, so the heat pump runs naturally while clean training data is collected over a long period
 - **On-demand actions**: "Optimize now" and "Poll now" buttons trigger an immediate plan or device refresh
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
@@ -127,7 +128,8 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 
 **Optimizer & overrides**
 - `GET /api/plans` / `GET /api/plans/{id}` — Plans and plan details with actions
-- `GET /api/optimizer/status` — Current optimizer mode and ML model readiness
+- `GET /api/optimizer/status` — Current optimizer mode, ML model readiness, and learning-mode state
+- `GET /api/learning-mode` / `POST /api/learning-mode` — Read or toggle observe-only learning mode (`{"enabled": true|false}`)
 - `POST /api/optimize-now` — Force an immediate optimizer run
 - `POST /api/poll-now` — Force an immediate device poll
 - `POST /api/overrides` / `DELETE /api/overrides/{id}` — Create or cancel a manual override
@@ -201,6 +203,7 @@ python -m packages.poller.main
 ## Safety
 
 - Manual override **always wins** over the optimizer
+- **Learning mode** suppresses all device commands while enabled (optimizer observes only) — useful for safely collecting training data
 - Rate limiter prevents API abuse (30 reads/h, 20 writes/h)
 - Circuit breaker disables auth for 15 min after 3 failures
 - All actions are audit-logged

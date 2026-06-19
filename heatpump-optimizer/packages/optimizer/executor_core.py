@@ -28,6 +28,24 @@ VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
 
 
+async def is_learning_mode_active() -> bool:
+    """Return True when observe-only learning mode is enabled.
+
+    In learning mode the executor dispatches no device commands so the heat pump
+    runs on its own native schedule, letting the poller collect clean, natural-
+    behaviour data for ML training over a long period. Defensive: any lookup error
+    is treated as "not active" so a transient settings failure never blocks control.
+    """
+    from packages.core.settings_service import get_bool_setting
+
+    try:
+        return await get_bool_setting("learning_mode_enabled")
+    except Exception as exc:  # noqa: BLE001 - never let a settings error pause control
+        logger.warning("learning_mode_check_failed", error=str(exc))
+        return False
+
+
+
 class PlanExecutor:
     """Executes pending plan actions respecting overrides and rate limits."""
 
@@ -62,6 +80,24 @@ class PlanExecutor:
                 .limit(MAX_ACTIONS_PER_CYCLE)
             )
             actions = result.scalars().all()
+
+            if await is_learning_mode_active():
+                logger.info(
+                    "executor_learning_mode_active",
+                    reason="observe-only training mode",
+                    skipping=len(actions),
+                )
+                for action in actions:
+                    await session.execute(
+                        update(PlanActionRecord)
+                        .where(PlanActionRecord.id == action.id)
+                        .values(
+                            status="skipped",
+                            executed_at=now,
+                            result_json=json.dumps({"reason": "learning_mode"}),
+                        )
+                    )
+                return
 
             if active_overrides and actions:
                 override_reason = active_overrides[0].reason or "manual override"

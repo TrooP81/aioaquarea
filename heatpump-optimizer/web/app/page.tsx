@@ -11,6 +11,7 @@ import { PlanView } from "@/components/PlanView";
 import { PlanHistory } from "@/components/PlanHistory";
 import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
+import { LearningModeCard } from "@/components/LearningModeCard";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
 import { SECTIONS, SectionId } from "@/lib/constants";
 import { useTimeFormat, formatTime } from "@/components/useTimeFormat";
@@ -57,9 +58,16 @@ interface IndoorTempData {
   last_fresh_reading: string | null;
 }
 
+interface LearningModeData {
+  enabled: boolean;
+  since: string | null;
+  days_elapsed: number | null;
+}
+
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
+  const [learningMode, setLearningMode] = useState<LearningModeData | null>(null);
   const [loading, setLoading] = useState(true);
   const timeFormat = useTimeFormat();
   const [error, setError] = useState<string | null>(null);
@@ -88,9 +96,22 @@ export default function Home() {
     }
   };
 
+  const fetchLearningMode = async () => {
+    try {
+      const res = await fetch("/api/learning-mode");
+      setLearningMode(res.ok ? await res.json() : null);
+    } catch {
+      /* non-critical: banner just won't show */
+    }
+  };
+
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 30000);
+    fetchLearningMode();
+    const interval = setInterval(() => {
+      fetchData();
+      fetchLearningMode();
+    }, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -227,6 +248,24 @@ export default function Home() {
         </div>
       )}
 
+      {learningMode?.enabled && (
+        <div
+          className="override-banner"
+          style={{ borderColor: "var(--success)", background: "rgba(34,197,94,0.1)" }}
+        >
+          <p style={{ color: "var(--success)" }}>
+            🎓 Learning mode active — optimizer is observing only (no device commands)
+            {learningMode.days_elapsed != null
+              ? ` · collecting data for ${
+                  learningMode.days_elapsed < 1
+                    ? `${Math.round(learningMode.days_elapsed * 24)}h`
+                    : `${Math.floor(learningMode.days_elapsed)}d`
+                }`
+              : ""}
+          </p>
+        </div>
+      )}
+
       {/* ── Overview section ── */}
       <section id="overview">
         <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
@@ -236,6 +275,7 @@ export default function Home() {
       {/* ── Controls (moved up — emergency actions should be accessible) ── */}
       <section id="controls">
         <Controls />
+        <LearningModeCard onChange={fetchLearningMode} />
       </section>
 
       {/* ── Plan section ── */}

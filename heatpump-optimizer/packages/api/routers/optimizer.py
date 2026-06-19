@@ -4,6 +4,7 @@ import datetime as dt
 import json
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
 from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
@@ -11,6 +12,10 @@ from packages.core.database import get_session
 from packages.core.models import AuditLogRecord, OverrideRecord, PlanActionRecord, PlanRecord
 
 router = APIRouter()
+
+
+class LearningModeUpdate(BaseModel):
+    enabled: bool
 
 
 @router.get("/api/plans", response_model=list[PlanResponse])
@@ -135,6 +140,68 @@ async def cancel_override(override_id: int):
     return {"status": "cancelled"}
 
 
+async def _learning_mode_status() -> dict[str, object]:
+    """Return learning-mode state plus how long it has been collecting data."""
+    from packages.core.settings_service import get_bool_setting, get_setting
+
+    enabled = await get_bool_setting("learning_mode_enabled")
+    since_raw = await get_setting("learning_mode_since")
+    since_iso: str | None = since_raw or None
+    days_elapsed: float | None = None
+    if enabled and since_iso:
+        try:
+            started = dt.datetime.fromisoformat(since_iso)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=dt.timezone.utc)
+            days_elapsed = round(
+                (dt.datetime.now(dt.timezone.utc) - started).total_seconds() / 86400, 2
+            )
+        except ValueError:
+            since_iso = None
+
+    return {"enabled": enabled, "since": since_iso, "days_elapsed": days_elapsed}
+
+
+@router.get("/api/learning-mode")
+async def get_learning_mode():
+    """Get the current learning-mode state."""
+    return await _learning_mode_status()
+
+
+@router.post("/api/learning-mode")
+async def set_learning_mode(body: LearningModeUpdate):
+    """Enable or disable observe-only learning mode.
+
+    While enabled the optimizer keeps generating plans but the executor dispatches
+    no device commands, so the heat pump runs naturally and clean training data is
+    collected over a long period.
+    """
+    from packages.core.settings_service import get_bool_setting, set_settings_bulk
+
+    was_enabled = await get_bool_setting("learning_mode_enabled")
+    now = dt.datetime.now(dt.timezone.utc)
+
+    updates = {"learning_mode_enabled": "true" if body.enabled else "false"}
+    if body.enabled and not was_enabled:
+        updates["learning_mode_since"] = now.isoformat()
+    elif not body.enabled:
+        updates["learning_mode_since"] = ""
+
+    await set_settings_bulk(updates)
+
+    async with get_session() as session:
+        session.add(
+            AuditLogRecord(
+                actor="user",
+                action="set_learning_mode",
+                payload_json=json.dumps({"enabled": body.enabled}),
+                result="enabled" if body.enabled else "disabled",
+            )
+        )
+
+    return await _learning_mode_status()
+
+
 @router.get("/api/optimizer/status")
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
@@ -145,6 +212,7 @@ async def get_optimizer_status():
 
     layer = await get_setting("optimizer_layer") or "rules_only"
     optimizer_status = await get_optimizer_status_snapshot(layer, reload_models=True)
+    learning_mode = await _learning_mode_status()
 
     cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
     demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
@@ -172,6 +240,7 @@ async def get_optimizer_status():
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
         "fallback_layer": "rules_v3",
+        "learning_mode": learning_mode,
         "cop_model": {
             "trained": optimizer_status["cop_trained"],
             "last_trained": _version_to_iso("cop_model_", cop_models),

@@ -181,7 +181,10 @@ class TestExecuteDueActions:
         override_mock = MagicMock()
         override_mock.reason = "Manual test"
 
-        with patch("packages.optimizer.executor.get_session") as mock_gs:
+        with patch("packages.optimizer.executor.get_session") as mock_gs, patch(
+            "packages.optimizer.executor.is_learning_mode_active",
+            new=AsyncMock(return_value=False),
+        ):
             mock_session = AsyncMock()
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -202,7 +205,10 @@ class TestExecuteDueActions:
         override_mock.reason = "comfort_schedule"
         action_mock = _make_action(str(ActionType.COMFORT_MODE_ON))
 
-        with patch("packages.optimizer.executor.get_session") as mock_gs:
+        with patch("packages.optimizer.executor.get_session") as mock_gs, patch(
+            "packages.optimizer.executor.is_learning_mode_active",
+            new=AsyncMock(return_value=False),
+        ):
             mock_session = AsyncMock()
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -217,6 +223,54 @@ class TestExecuteDueActions:
 
         executor._wrapper.set_special_status.assert_not_awaited()
         assert mock_session.execute.call_count == 3
+
+
+class TestLearningMode:
+    @pytest.mark.asyncio
+    async def test_learning_mode_skips_due_actions_without_touching_device(self, executor):
+        action_mock = _make_action(str(ActionType.FORCE_DHW_ON))
+
+        with patch("packages.optimizer.executor.get_session") as mock_gs, patch(
+            "packages.optimizer.executor.is_learning_mode_active",
+            new=AsyncMock(return_value=True),
+        ):
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            override_result = MagicMock()
+            override_result.scalars.return_value.all.return_value = []
+            actions_result = MagicMock()
+            actions_result.scalars.return_value.all.return_value = [action_mock]
+            # override query, actions query, then the skip-update for the one action
+            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result, None])
+
+            await executor.execute_due_actions()
+
+        executor._wrapper.force_dhw.assert_not_awaited()
+        assert mock_session.execute.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_learning_mode_off_does_not_skip(self, executor):
+        with patch("packages.optimizer.executor.get_session") as mock_gs, patch(
+            "packages.optimizer.executor.is_learning_mode_active",
+            new=AsyncMock(return_value=False),
+        ):
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            override_result = MagicMock()
+            override_result.scalars.return_value.all.return_value = []
+            actions_result = MagicMock()
+            actions_result.scalars.return_value.all.return_value = []
+            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result])
+
+            await executor.execute_due_actions()
+
+        # No overrides, no learning mode, no due actions → only the two queries ran.
+        executor._wrapper.force_dhw.assert_not_awaited()
+        assert mock_session.execute.call_count == 2
 
 
 class TestConstants:
