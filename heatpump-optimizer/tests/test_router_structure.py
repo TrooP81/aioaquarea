@@ -49,5 +49,6 @@ def test_expected_route_paths_present():
         "/api/cop/stats",
         "/api/cop/compute",
         "/api/compressor/activity",
+        "/api/admin/reset",
     }
     assert expected.issubset(paths)

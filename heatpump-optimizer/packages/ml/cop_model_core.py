@@ -26,6 +26,12 @@ class COPModel:
         self._version: str = "untrained"
         self._metrics: dict[str, float] = {}
 
+    def reset(self) -> None:
+        """Discard the trained model and return to the untrained fallback state."""
+        self._model = None
+        self._version = "untrained"
+        self._metrics = {}
+
     @property
     def is_trained(self) -> bool:
         return self._model is not None

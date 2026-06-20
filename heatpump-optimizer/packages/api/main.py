@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from packages.api.auth import require_auth
+from packages.api.routers.admin import router as admin_router
 from packages.api.routers.dashboard import router as dashboard_router
 from packages.api.routers.feeds import router as feeds_router
 from packages.api.routers.models_router import router as models_router
@@ -54,5 +55,6 @@ for router in (
     smartthings_router,
     models_router,
     polling_router,
+    admin_router,
 ):
     app.include_router(router)

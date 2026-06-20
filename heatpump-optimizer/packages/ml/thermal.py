@@ -101,6 +101,10 @@ class ThermalModel:
     def __init__(self):
         self.params = ThermalParams()
 
+    def reset(self) -> None:
+        """Discard learned calibration and return to default thermal parameters."""
+        self.params = ThermalParams()
+
     async def calibrate(self) -> dict:
         """
         Learn thermal parameters from historical device status data.

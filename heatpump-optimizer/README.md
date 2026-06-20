@@ -162,6 +162,11 @@ The Settings page → **SmartThings Integration** section includes a sensor sele
 - `GET /api/settings` / `PUT /api/settings`
 - `POST /api/test-connection` — Probe Panasonic/price/weather/SmartThings connectivity
 
+**Admin / data reset**
+- `POST /api/admin/reset` — Permanently delete selected data scopes so models can train from scratch (`{"scopes": ["indoor_temp", "energy", ...], "reset_models": true}`). Available scopes: `indoor_temp`, `energy`, `device_status`, `weather`, `prices`, `plans`, `logs`. Settings, credentials, and the SmartThings connection are always preserved. Clearing any model-feeding scope (`indoor_temp`, `energy`, `device_status`, `weather`) also resets the trained ML models (COP, demand, comfort, thermal) so predictions don't drift from deleted data.
+
+The Settings page → **Danger Zone — Reset Data** card exposes this: tick the data categories to wipe (or *Start everything fresh* to select all), confirm, and the collected time-series data — plus the affected trained models — is cleared. Use it to recover after training on bad data (e.g. a misconfigured indoor-temperature sensor).
+
 ## How the Optimizer Works
 
 ### Rules Engine (v3)

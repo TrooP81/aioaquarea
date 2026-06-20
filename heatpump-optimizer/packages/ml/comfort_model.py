@@ -72,6 +72,14 @@ class ComfortModel:
         self._training_samples: int = 0
         self._thermal_lag_minutes: int = DEFAULT_THERMAL_LAG_MINUTES
 
+    def reset(self) -> None:
+        """Discard the trained model and learned metadata."""
+        self._model = None
+        self._metrics = {}
+        self._last_trained = None
+        self._training_samples = 0
+        self._thermal_lag_minutes = DEFAULT_THERMAL_LAG_MINUTES
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

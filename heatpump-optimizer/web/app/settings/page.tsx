@@ -6,6 +6,7 @@ import { ComfortSchedule } from "../../components/ComfortSchedule";
 import { SmartThingsOAuth } from "../../components/SmartThingsOAuth";
 import { SmartThingsSensorSelector } from "../../components/SmartThingsSensorSelector";
 import { LogViewer } from "../../components/LogViewer";
+import { ResetDataCard } from "../../components/ResetDataCard";
 import { useCurrency } from "../../components/useCurrency";
 import { OPTIMIZER_LAYER_OPTIONS } from "@/lib/constants";
 
@@ -302,6 +303,8 @@ export default function SettingsPage() {
       <TestConnection editValues={editValues} />
 
       <LogViewer />
+
+      <ResetDataCard />
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
         <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
