@@ -164,6 +164,21 @@ def invalidate_device_cache() -> None:
 # ------------------------------------------------------------------
 
 
+async def get_selected_device_ids() -> list[str]:
+    """Return the user-selected SmartThings device IDs to poll.
+
+    Reads the ``smartthings_device_ids`` setting. An empty value means "no
+    explicit selection" — callers should treat that as "use all discovered
+    sensors". Readers of indoor-temperature data should filter to this set so
+    that lingering readings from previously-polled sensors do not leak into
+    aggregations after the user narrows their selection.
+    """
+    raw = await get_setting("smartthings_device_ids")
+    if not raw:
+        return []
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
 async def poll_smartthings_temps(session) -> int:
     """
     Fetch temperatures from all configured SmartThings sensors and
@@ -179,9 +194,8 @@ async def poll_smartthings_temps(session) -> int:
     client = SmartThingsClient(access_token)
 
     # Resolve which devices to poll
-    device_ids_str = await get_setting("smartthings_device_ids")
-    if device_ids_str:
-        device_ids = [d.strip() for d in device_ids_str.split(",") if d.strip()]
+    device_ids = await get_selected_device_ids()
+    if device_ids:
         device_labels: dict[str, str] = {}
     else:
         # Auto-discover (cached for 1 hour)

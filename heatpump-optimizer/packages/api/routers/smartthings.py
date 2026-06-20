@@ -20,11 +20,16 @@ async def get_indoor_temp(
     hours: int = Query(24, ge=1, le=720),
     device_id: Optional[str] = Query(None),
 ):
+    from packages.poller.smartthings import get_selected_device_ids
+
+    selected = await get_selected_device_ids()
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
     async with get_session() as session:
         stmt = select(IndoorTempReading).where(IndoorTempReading.timestamp >= since)
         if device_id:
             stmt = stmt.where(IndoorTempReading.device_id == device_id)
+        elif selected:
+            stmt = stmt.where(IndoorTempReading.device_id.in_(selected))
         stmt = stmt.order_by(IndoorTempReading.timestamp)
         result = await session.execute(stmt)
         rows = result.scalars().all()
@@ -44,20 +49,29 @@ async def get_indoor_temp(
 
 @router.get("/api/indoor-temp/latest")
 async def get_latest_indoor_temp():
+    from packages.poller.smartthings import get_selected_device_ids
+
+    selected = await get_selected_device_ids()
     async with get_session() as session:
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
-        result = await session.execute(
-            select(
-                func.avg(IndoorTempReading.temperature),
-                func.max(IndoorTempReading.timestamp),
-                func.count(IndoorTempReading.id),
-            ).where(IndoorTempReading.timestamp >= cutoff)
+        agg_stmt = select(
+            func.avg(IndoorTempReading.temperature),
+            func.max(IndoorTempReading.timestamp),
+            func.count(IndoorTempReading.id),
+        ).where(IndoorTempReading.timestamp >= cutoff)
+
+        fresh_stmt = select(func.max(IndoorTempReading.timestamp)).where(
+            not_(IndoorTempReading.is_stale)
         )
+
+        if selected:
+            agg_stmt = agg_stmt.where(IndoorTempReading.device_id.in_(selected))
+            fresh_stmt = fresh_stmt.where(IndoorTempReading.device_id.in_(selected))
+
+        result = await session.execute(agg_stmt)
         row = result.one()
 
-        fresh_result = await session.execute(
-            select(func.max(IndoorTempReading.timestamp)).where(not_(IndoorTempReading.is_stale))
-        )
+        fresh_result = await session.execute(fresh_stmt)
         last_fresh = fresh_result.scalar()
 
     return {

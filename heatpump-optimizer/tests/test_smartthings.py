@@ -371,3 +371,134 @@ class TestStaleReadingHandling:
         reading = mock_session.add.call_args[0][0]
         assert reading.is_stale is False
         assert reading.temperature == 21.0
+
+
+# ------------------------------------------------------------------
+# Selected device IDs helper
+# ------------------------------------------------------------------
+
+
+class TestGetSelectedDeviceIds:
+    @pytest.mark.asyncio
+    async def test_empty_setting_returns_empty_list(self):
+        from packages.poller.smartthings import get_selected_device_ids
+
+        with patch(
+            "packages.poller.smartthings.get_setting",
+            new_callable=AsyncMock,
+            return_value="",
+        ):
+            assert await get_selected_device_ids() == []
+
+    @pytest.mark.asyncio
+    async def test_none_setting_returns_empty_list(self):
+        from packages.poller.smartthings import get_selected_device_ids
+
+        with patch(
+            "packages.poller.smartthings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            assert await get_selected_device_ids() == []
+
+    @pytest.mark.asyncio
+    async def test_parses_and_trims_csv(self):
+        from packages.poller.smartthings import get_selected_device_ids
+
+        with patch(
+            "packages.poller.smartthings.get_setting",
+            new_callable=AsyncMock,
+            return_value=" dev-a , dev-b ,,dev-c,",
+        ):
+            assert await get_selected_device_ids() == ["dev-a", "dev-b", "dev-c"]
+
+
+# ------------------------------------------------------------------
+# Indoor-temp endpoints respect the selected sensor set
+# ------------------------------------------------------------------
+
+
+class _RecordingResult:
+    def __init__(self, *, one=None, scalar=None):
+        self._one = one
+        self._scalar = scalar
+
+    def one(self):
+        return self._one
+
+    def scalar(self):
+        return self._scalar
+
+
+class _RecordingSession:
+    """Captures executed statements and returns canned aggregate results."""
+
+    def __init__(self, agg_row, fresh_scalar):
+        self.statements = []
+        self._results = [
+            _RecordingResult(one=agg_row),
+            _RecordingResult(scalar=fresh_scalar),
+        ]
+
+    async def execute(self, stmt):
+        self.statements.append(stmt)
+        return self._results.pop(0)
+
+
+class _RecordingSessionCtx:
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class TestLatestIndoorTempFiltering:
+    @pytest.mark.asyncio
+    async def test_filters_by_selected_devices(self):
+        from packages.api.routers.smartthings import get_latest_indoor_temp
+
+        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
+        session = _RecordingSession(agg_row=(26.7, now, 1), fresh_scalar=now)
+
+        with patch(
+            "packages.poller.smartthings.get_selected_device_ids",
+            new_callable=AsyncMock,
+            return_value=["dev-living"],
+        ):
+            with patch(
+                "packages.api.routers.smartthings.get_session",
+                return_value=_RecordingSessionCtx(session),
+            ):
+                result = await get_latest_indoor_temp()
+
+        assert result["avg_temperature"] == 26.7
+        assert result["sensor_count"] == 1
+        # Both the aggregate and the freshness query must constrain device_id.
+        assert len(session.statements) == 2
+        assert all("device_id" in str(stmt) for stmt in session.statements)
+
+    @pytest.mark.asyncio
+    async def test_no_selection_does_not_filter_devices(self):
+        from packages.api.routers.smartthings import get_latest_indoor_temp
+
+        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
+        session = _RecordingSession(agg_row=(22.0, now, 3), fresh_scalar=now)
+
+        with patch(
+            "packages.poller.smartthings.get_selected_device_ids",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            with patch(
+                "packages.api.routers.smartthings.get_session",
+                return_value=_RecordingSessionCtx(session),
+            ):
+                result = await get_latest_indoor_temp()
+
+        assert result["sensor_count"] == 3
+        # With no explicit selection the aggregate must not reference device_id.
+        assert "device_id" not in str(session.statements[0])
