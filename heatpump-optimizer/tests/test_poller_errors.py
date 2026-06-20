@@ -37,7 +37,7 @@ class TestPollPricesErrors:
     async def test_fetch_prices_empty_result(self):
         with patch("packages.poller.main.fetch_prices", new_callable=AsyncMock) as mock_fp:
             mock_fp.return_value = []
-            with patch("packages.poller.main.get_setting", new_callable=AsyncMock) as mock_gs:
+            with patch("packages.poller.main.get_string_setting", new_callable=AsyncMock) as mock_gs:
                 mock_gs.return_value = "entsoe"
                 with patch("packages.poller.main.get_session") as mock_session:
                     mock_ctx = AsyncMock()
@@ -58,14 +58,14 @@ class TestPollWeatherErrors:
 class TestPollIndoorTempErrors:
     @pytest.mark.asyncio
     async def test_smartthings_disabled(self):
-        with patch("packages.poller.main.get_setting", new_callable=AsyncMock) as mock_gs:
-            mock_gs.return_value = "false"
+        with patch("packages.poller.main.get_bool_setting", new_callable=AsyncMock) as mock_gs:
+            mock_gs.return_value = False
             await poll_indoor_temp()
 
     @pytest.mark.asyncio
     async def test_smartthings_error_caught(self):
-        with patch("packages.poller.main.get_setting", new_callable=AsyncMock) as mock_gs:
-            mock_gs.return_value = "true"
+        with patch("packages.poller.main.get_bool_setting", new_callable=AsyncMock) as mock_gs:
+            mock_gs.return_value = True
             with patch("packages.poller.main.get_session") as mock_session:
                 mock_session.side_effect = Exception("DB down")
                 await poll_indoor_temp()
