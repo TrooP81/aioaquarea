@@ -1,10 +1,45 @@
 """Tests for ML models (COP, Demand) and ThermalModel."""
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _FakeSession:
+    def __init__(self, results):
+        self._results = list(results)
+
+    async def execute(self, *args, **kwargs):
+        return self._results.pop(0)
+
+
+class _FakeSessionCtx:
+    def __init__(self, results):
+        self._session = _FakeSession(results)
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _mock_get_session(results):
+    def factory():
+        return _FakeSessionCtx(results)
+
+    return factory
 
 
 class TestCOPModel:
@@ -157,6 +192,114 @@ class TestDemandModel:
         warm_demand = model.predict_hourly(warm_weather, hours=24)
 
         assert sum(cold_demand) > sum(warm_demand)
+
+    def test_make_features_shape_and_order(self):
+        """Shared feature builder must return the fixed 7-feature schema."""
+        from packages.ml.models import DemandModel
+
+        features = DemandModel._make_features(5.0, 3.0, 100.0, 12, 2)
+        assert features.shape == (7,)
+        assert features[0] == 5.0  # temperature
+        assert features[1] == 3.0  # wind
+        assert features[2] == 100.0  # irradiance
+
+    @pytest.mark.asyncio
+    async def test_prepare_data_uses_interval_rate_not_cumulative(self):
+        """Target must be per-interval hourly RATE, never the cumulative counter."""
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        results = [_FakeResult(consumption), _FakeResult(weather)]
+
+        model = DemandModel()
+        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_data()
+
+        # 0.5 kWh / 0.25h = 2.0 kW; 1.0 kWh / 0.25h = 4.0 kW
+        assert len(y) == 2
+        assert sorted(round(float(v), 6) for v in y) == [2.0, 4.0]
+        # The cumulative reading (1.5) must NOT leak through as a target.
+        assert max(y) == pytest.approx(4.0)
+        # Consumption's own outdoor_temp is preferred when present.
+        assert X[0][0] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_prepare_data_falls_back_to_weather_temp(self):
+        """When consumption lacks outdoor_temp, use nearest weather temperature."""
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.25, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
+        ]
+        weather = [SimpleNamespace(ts=base + dt.timedelta(minutes=20), temperature=-3.0, wind_speed=5.0, irradiance=0.0)]
+        results = [_FakeResult(consumption), _FakeResult(weather)]
+
+        model = DemandModel()
+        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_data()
+
+        assert len(y) == 1
+        assert X[0][0] == -3.0  # weather temperature filled in
+        assert X[0][1] == 5.0  # weather wind
+
+
+class TestConsumptionIntervals:
+    def test_basic_delta_within_day(self):
+        from packages.ml.models_common import iter_consumption_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.5, outdoor_temp=3.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=1.4, cool_kwh=0.0, tank_kwh=0.6, outdoor_temp=3.0),
+        ]
+        intervals = list(iter_consumption_intervals(rows))
+        assert len(intervals) == 1
+        iv = intervals[0]
+        assert iv.elapsed_hours == pytest.approx(0.25)
+        assert iv.heat_kwh == pytest.approx(0.4)
+        assert iv.tank_kwh == pytest.approx(0.1)
+        assert iv.total_kwh == pytest.approx(0.5)
+        assert iv.total_rate_kw == pytest.approx(2.0)
+
+    def test_day_boundary_reset_skipped(self):
+        from packages.ml.models_common import iter_consumption_intervals
+
+        rows = [
+            SimpleNamespace(ts=dt.datetime(2026, 1, 5, 23, 55, tzinfo=dt.timezone.utc), heat_kwh=10.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(ts=dt.datetime(2026, 1, 6, 0, 10, tzinfo=dt.timezone.utc), heat_kwh=0.3, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+        ]
+        assert list(iter_consumption_intervals(rows)) == []
+
+    def test_out_of_window_elapsed_skipped(self):
+        from packages.ml.models_common import iter_consumption_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(ts=base + dt.timedelta(hours=3), heat_kwh=2.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+        ]
+        assert list(iter_consumption_intervals(rows)) == []
+
+    def test_negative_field_delta_clamped(self):
+        from packages.ml.models_common import iter_consumption_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(ts=base, heat_kwh=2.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.5, cool_kwh=0.0, tank_kwh=1.0, outdoor_temp=3.0),
+        ]
+        intervals = list(iter_consumption_intervals(rows))
+        assert len(intervals) == 1
+        assert intervals[0].heat_kwh == 0.0  # negative delta clamped to zero
+        assert intervals[0].tank_kwh == pytest.approx(1.0)
 
 
 class TestThermalModel:
