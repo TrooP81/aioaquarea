@@ -269,7 +269,7 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     "smartthings_device_ids": {
         "type": "str",
         "default": "",
-        "description": "Comma-separated SmartThings device IDs (empty = auto-discover)",
+        "description": "Indoor temperature sensors to poll (none selected = poll all discovered)",
     },
     "smartthings_poll_interval": {
         "type": "int",

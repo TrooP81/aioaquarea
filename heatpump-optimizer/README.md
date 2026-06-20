@@ -23,7 +23,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Fault detection**: Automatic detection and logging of device faults
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
 - **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
-- **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging)
+- **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
 - **Rules-based optimizer (v3)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
 - **MILP optimizer**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
 - **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
@@ -141,10 +141,12 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 - `GET /api/indoor-temp?hours=24` / `GET /api/indoor-temp/latest` — Indoor sensor history/latest
 
 **SmartThings integration**
-- `GET /api/smartthings/devices` — List discoverable temperature sensors
+- `GET /api/smartthings/devices` — List discoverable temperature sensors (powers the Settings sensor selector)
 - `GET /api/smartthings/oauth/authorize` / `GET /api/smartthings/oauth/callback` — OAuth flow
 - `GET /api/smartthings/oauth/status` — Current connection status
 - `DELETE /api/smartthings/oauth/disconnect` — Revoke stored OAuth tokens
+
+The Settings page → **SmartThings Integration** section includes a sensor selector: it discovers your temperature sensors and lets you tick which ones to poll for indoor temperature. Selecting none falls back to polling all discovered sensors. The choice is saved as `smartthings_device_ids`.
 
 **Faults, COP & compressor**
 - `GET /api/faults` / `POST /api/faults/{id}/resolve`

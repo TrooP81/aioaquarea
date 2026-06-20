@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { TestConnection } from "../../components/TestConnection";
 import { ComfortSchedule } from "../../components/ComfortSchedule";
 import { SmartThingsOAuth } from "../../components/SmartThingsOAuth";
+import { SmartThingsSensorSelector } from "../../components/SmartThingsSensorSelector";
 import { LogViewer } from "../../components/LogViewer";
 import { useCurrency } from "../../components/useCurrency";
 import { OPTIMIZER_LAYER_OPTIONS } from "@/lib/constants";
@@ -248,7 +249,14 @@ export default function SettingsPage() {
                       {description}
                     </label>
 
-                    {meta.options ? (
+                    {key === "smartthings_device_ids" ? (
+                      <SmartThingsSensorSelector
+                        value={editValues[key] || ""}
+                        onChange={(next) =>
+                          setEditValues((prev) => ({ ...prev, [key]: next }))
+                        }
+                      />
+                    ) : meta.options ? (
                       <>
                         <select
                           id={`setting-${key}`}
