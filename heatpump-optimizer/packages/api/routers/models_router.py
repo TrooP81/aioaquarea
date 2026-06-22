@@ -19,6 +19,30 @@ from packages.core.models import (
 router = APIRouter()
 
 
+def _enforce_physical_ordering(
+    forecast: list[dict],
+    forecast_with_plan: list[dict],
+    forecast_no_heating: list[dict],
+) -> None:
+    """Clamp indoor-temperature curves in place to a physically valid ordering.
+
+    Active heating can never leave the house cooler than the no-heating
+    baseline, and a boosted plan can never be cooler than the base heating
+    forecast. The monotonic comfort model already guarantees this, but the
+    clamp is a cheap safety net so the chart can never show the nonsensical
+    "predicted indoor below no-heating" case (e.g. when the model is untrained
+    and the linear fallback is used).
+    """
+    key = "predicted_indoor_temp"
+    n = min(len(forecast), len(forecast_with_plan), len(forecast_no_heating))
+    for h in range(n):
+        floor = forecast_no_heating[h][key]
+        base = max(forecast[h][key], floor)
+        plan = max(forecast_with_plan[h][key], base)
+        forecast[h][key] = round(base, 1)
+        forecast_with_plan[h][key] = round(plan, 1)
+
+
 @router.get("/api/comfort-model/status")
 async def get_comfort_model_status():
     from packages.ml.comfort_model import comfort_model
@@ -434,6 +458,8 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         weather_forecast=weather_forecast,
         hours=hours,
     )
+
+    _enforce_physical_ordering(forecast, forecast_with_plan, forecast_no_heating)
 
     comfort_schedule = await get_comfort_schedule()
     comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)

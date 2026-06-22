@@ -10,7 +10,11 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord
-from packages.ml.models_common import GradientBoostingRegressor, HAS_SKLEARN, MODEL_DIR, Pipeline, StandardScaler, _logger, cross_val_score
+from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor
+
+# Physical monotonicity for COP features [outdoor_temp, tank_target, hour_sin, hour_cos]:
+# COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
+_COP_MONOTONIC_CST = [1, -1, 0, 0]
 
 
 class COPModel:
@@ -22,7 +26,7 @@ class COPModel:
         return app_settings.tank_kwh_per_degree
 
     def __init__(self):
-        self._model: Pipeline | None = None
+        self._model = None
         self._version: str = "untrained"
         self._metrics: dict[str, float] = {}
 
@@ -44,15 +48,12 @@ class COPModel:
         if len(X) < 50:
             return {"error": "Insufficient data", "samples": len(X)}
 
-        pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42)),
-        ])
-        scores = cross_val_score(pipeline, X, y, cv=min(5, len(X)), scoring="neg_mean_absolute_error")
+        model = make_monotonic_regressor(_COP_MONOTONIC_CST, max_iter=300)
+        scores = cross_val_score(model, X, y, cv=min(5, len(X)), scoring="neg_mean_absolute_error")
         mae = -scores.mean()
-        pipeline.fit(X, y)
+        model.fit(X, y)
 
-        self._model = pipeline
+        self._model = model
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
         self._metrics = {"mae": mae, "samples": len(X), "cv_std": scores.std()}
 
@@ -61,7 +62,7 @@ class COPModel:
         model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump(pipeline, model_path)
+        safe_dump(model, model_path)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
     def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:

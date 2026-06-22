@@ -11,24 +11,28 @@ from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, WeatherRecord
 from packages.ml.models_common import (
-    GradientBoostingRegressor,
     HAS_SKLEARN,
     MODEL_DIR,
-    Pipeline,
-    StandardScaler,
     _logger,
     cross_val_score,
     iter_consumption_intervals,
+    make_monotonic_regressor,
 )
 
 # Weather samples are typically hourly; only join a consumption interval to a
 # weather observation within this gap, otherwise fall back to defaults.
 MAX_WEATHER_GAP_SECONDS = 2 * 3600
 
+# Physical monotonicity for demand features
+# [outdoor_temp, wind_speed, irradiance, hour_sin, hour_cos, dow_sin, dow_cos]:
+# heating demand falls as it warms up outside (-1) and as solar gain rises (-1),
+# and rises with wind-driven heat loss (+1). Time-of-day/week are unconstrained.
+_DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0]
+
 
 class DemandModel:
     def __init__(self):
-        self._model: Pipeline | None = None
+        self._model = None
         self._version: str = "untrained"
 
     def reset(self) -> None:
@@ -69,19 +73,16 @@ class DemandModel:
         if len(X) < 168:
             return {"error": "Insufficient data", "samples": len(X)}
 
-        pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", GradientBoostingRegressor(n_estimators=150, max_depth=4, learning_rate=0.1, random_state=42)),
-        ])
-        scores = cross_val_score(pipeline, X, y, cv=5, scoring="neg_mean_absolute_error")
-        pipeline.fit(X, y)
+        model = make_monotonic_regressor(_DEMAND_MONOTONIC_CST, max_iter=250)
+        scores = cross_val_score(model, X, y, cv=5, scoring="neg_mean_absolute_error")
+        model.fit(X, y)
 
-        self._model = pipeline
+        self._model = model
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
         model_path = MODEL_DIR / f"demand_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump(pipeline, model_path)
+        safe_dump(model, model_path)
         return {"version": self._version, "mae": -scores.mean(), "samples": len(X)}
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:

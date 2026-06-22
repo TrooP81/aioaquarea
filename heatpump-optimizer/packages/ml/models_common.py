@@ -82,7 +82,10 @@ def iter_consumption_intervals(
         prev = row
 
 try:
-    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.ensemble import (
+        GradientBoostingRegressor,
+        HistGradientBoostingRegressor,
+    )
     from sklearn.model_selection import cross_val_score
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
@@ -91,9 +94,36 @@ try:
 except ImportError:
     HAS_SKLEARN = False
     GradientBoostingRegressor = None
+    HistGradientBoostingRegressor = None
     cross_val_score = None
     Pipeline = None
     StandardScaler = None
 
 MODEL_DIR = Path(app_settings.model_dir)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def make_monotonic_regressor(monotonic_cst, **overrides):
+    """Build a gradient-boosting regressor with physical monotonicity constraints.
+
+    ``monotonic_cst`` is a per-feature list of ``+1`` (output must be
+    non-decreasing in the feature), ``-1`` (non-increasing), or ``0`` (no
+    constraint). Enforcing these relationships keeps predictions physically
+    sensible — e.g. more heat input can never lower the predicted indoor
+    temperature — even when the training data is noisy or sparse.
+
+    ``HistGradientBoostingRegressor`` is used because it natively supports
+    monotonic constraints and needs no feature scaling (it is tree-based), so
+    the previous ``StandardScaler`` pipeline is unnecessary.
+    """
+    if not HAS_SKLEARN:
+        raise ImportError("scikit-learn required: pip install scikit-learn")
+    params = dict(
+        max_iter=300,
+        max_depth=4,
+        learning_rate=0.05,
+        l2_regularization=1.0,
+        random_state=42,
+    )
+    params.update(overrides)
+    return HistGradientBoostingRegressor(monotonic_cst=list(monotonic_cst), **params)

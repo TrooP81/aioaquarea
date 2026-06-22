@@ -183,3 +183,88 @@ class TestThermalLag:
         features_a = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
         features_b = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
         np.testing.assert_array_equal(features_a, features_b)
+
+
+def _inverted_dataset(n=300, seed=0):
+    """Synthetic data where MORE water heat correlates with LOWER indoor temp.
+
+    This reproduces the failure mode reported from the field (the comfort model
+    trained on a mis-selected sensor) where a naive regressor learns that
+    heating *lowers* indoor temperature.
+    """
+    rng = np.random.RandomState(seed)
+    water = rng.uniform(25, 55, n)
+    outdoor = rng.uniform(-5, 20, n)
+    wind = rng.uniform(0, 8, n)
+    irradiance = rng.uniform(0, 400, n)
+    hours = rng.randint(0, 24, n)
+    prev_indoor = rng.uniform(19, 27, n)
+    X = np.column_stack([
+        water,
+        outdoor,
+        wind,
+        irradiance,
+        np.sin(2.0 * np.pi * hours / 24.0),
+        np.cos(2.0 * np.pi * hours / 24.0),
+        prev_indoor,
+    ])
+    # Inverted relationship: higher water temp -> lower indoor temp.
+    y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n)
+    return X, y, n
+
+
+class TestComfortModelMonotonicity:
+    """The trained model must stay physically sensible even on bad data."""
+
+    @pytest.mark.asyncio
+    async def test_higher_water_never_lowers_indoor_on_inverted_data(self):
+        X, y, n = _inverted_dataset()
+        model = ComfortModel()
+
+        async def fake_build():
+            return X, y, n
+
+        model._build_dataset = fake_build
+        model._save = lambda: None
+
+        result = await model.train(thermal_lag_minutes=30)
+        assert result["status"] == "trained"
+
+        # Despite the inverted training signal, the monotonic constraint must
+        # guarantee predicted indoor is non-decreasing in water supply temp.
+        prev = None
+        for water in range(25, 56, 5):
+            pred = model.predict_indoor_temp(float(water), 5.0, indoor_temp=22.0)
+            if prev is not None:
+                assert pred >= prev - 1e-6
+            prev = pred
+
+    @pytest.mark.asyncio
+    async def test_higher_current_indoor_never_lowers_prediction(self):
+        X, y, n = _inverted_dataset(seed=1)
+        model = ComfortModel()
+
+        async def fake_build():
+            return X, y, n
+
+        model._build_dataset = fake_build
+        model._save = lambda: None
+        await model.train(thermal_lag_minutes=30)
+
+        low = model.predict_indoor_temp(40.0, 5.0, indoor_temp=20.0)
+        high = model.predict_indoor_temp(40.0, 5.0, indoor_temp=26.0)
+        assert high >= low - 1e-6
+
+    @pytest.mark.asyncio
+    async def test_metrics_report_out_of_sample_validation(self):
+        X, y, n = _inverted_dataset(seed=2)
+        model = ComfortModel()
+
+        async def fake_build():
+            return X, y, n
+
+        model._build_dataset = fake_build
+        model._save = lambda: None
+        result = await model.train(thermal_lag_minutes=30)
+        assert result["validated"] is True
+        assert "mae" in result and "r2" in result

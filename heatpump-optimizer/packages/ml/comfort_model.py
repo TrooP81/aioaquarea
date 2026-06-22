@@ -13,9 +13,7 @@ from typing import Any
 import numpy as np
 
 try:
-    from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
+    import sklearn.ensemble  # noqa: F401  (availability probe)
 
     HAS_SKLEARN = True
 except ImportError:
@@ -26,6 +24,7 @@ from sqlalchemy import and_, select
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading
 from packages.core.config import settings as app_settings
+from packages.ml.models_common import make_monotonic_regressor
 
 import structlog
 
@@ -43,6 +42,22 @@ _LAG_CANDIDATES = [10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
 # Reasonable bounds for bisection search
 MIN_ZONE_WATER_TEMP = 20.0
 MAX_ZONE_WATER_TEMP = 65.0
+
+# Physical monotonicity constraints for the 7 model features, in order:
+# [zone_water_temp, outdoor_temp, wind_speed, irradiance, hour_sin, hour_cos, indoor_temp]
+#   +1 = predicted indoor must not decrease as the feature increases
+#   -1 = predicted indoor must not increase as the feature increases
+#    0 = unconstrained
+# More heat input (water temp), warmer outside, more sun, and a warmer current
+# indoor temperature can only raise (or hold) the predicted indoor temperature;
+# stronger wind can only lower (or hold) it. This guarantees, for example, that a
+# heating forecast is never below the no-heating baseline — even when training
+# data is noisy.
+_MONOTONIC_CST = [1, 1, -1, 1, 0, 0, 1]
+
+# Fraction of (time-ordered) samples held out at the end for honest validation.
+_VALIDATION_FRACTION = 0.2
+_MIN_VALIDATION_ROWS = 10
 
 
 class ComfortModel:
@@ -66,7 +81,7 @@ class ComfortModel:
     """
 
     def __init__(self) -> None:
-        self._model: Pipeline | None = None
+        self._model: Any | None = None
         self._metrics: dict[str, float] = {}
         self._last_trained: dt.datetime | None = None
         self._training_samples: int = 0
@@ -156,7 +171,14 @@ class ComfortModel:
         return best_result
 
     async def _train_with_current_lag(self) -> dict[str, Any]:
-        """Train once using the currently set ``_thermal_lag_minutes``."""
+        """Train once using the currently set ``_thermal_lag_minutes``.
+
+        Metrics are computed on a chronological hold-out (the most recent
+        ``_VALIDATION_FRACTION`` of samples) so the reported MAE/R² reflect
+        out-of-sample accuracy rather than how well the model memorised the
+        training set. The deployed model is then refit on *all* available
+        samples for the best possible predictions.
+        """
         X, y, n_rows = await self._build_dataset()
 
         if n_rows < MIN_TRAINING_ROWS:
@@ -166,36 +188,37 @@ class ComfortModel:
                 "required": MIN_TRAINING_ROWS,
             }
 
-        pipeline = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "gbr",
-                    GradientBoostingRegressor(
-                        n_estimators=200,
-                        max_depth=4,
-                        learning_rate=0.05,
-                        subsample=0.8,
-                        random_state=42,
-                    ),
-                ),
-            ]
-        )
-
-        pipeline.fit(X, y)
-
-        # Metrics
         from sklearn.metrics import mean_absolute_error, r2_score
 
-        y_pred = pipeline.predict(X)
-        mae = mean_absolute_error(y, y_pred)
-        r2 = r2_score(y, y_pred)
+        # Honest, out-of-sample metrics on the most recent slice of data.
+        split = int(n_rows * (1.0 - _VALIDATION_FRACTION))
+        n_val = n_rows - split
+        if n_val >= _MIN_VALIDATION_ROWS:
+            eval_model = self._build_regressor()
+            eval_model.fit(X[:split], y[:split])
+            y_val_pred = eval_model.predict(X[split:])
+            mae = mean_absolute_error(y[split:], y_val_pred)
+            r2 = r2_score(y[split:], y_val_pred)
+            validated = True
+        else:
+            # Too few rows to hold out — fall back to in-sample metrics.
+            tmp = self._build_regressor()
+            tmp.fit(X, y)
+            y_pred = tmp.predict(X)
+            mae = mean_absolute_error(y, y_pred)
+            r2 = r2_score(y, y_pred)
+            validated = False
 
-        self._model = pipeline
+        # Deploy a model trained on every available sample.
+        model = self._build_regressor()
+        model.fit(X, y)
+
+        self._model = model
         self._metrics = {
-            "mae": round(mae, 3),
-            "r2": round(r2, 3),
+            "mae": round(float(mae), 3),
+            "r2": round(float(r2), 3),
             "thermal_lag_min": self._thermal_lag_minutes,
+            "validated": validated,
         }
         self._last_trained = dt.datetime.now(dt.timezone.utc)
         self._training_samples = n_rows
@@ -208,9 +231,15 @@ class ComfortModel:
             samples=n_rows,
             mae=mae,
             r2=r2,
+            validated=validated,
             thermal_lag_min=self._thermal_lag_minutes,
         )
         return {"status": "trained", "samples": n_rows, **self._metrics}
+
+    @staticmethod
+    def _build_regressor():
+        """Build the monotonic gradient-boosting regressor for indoor-temp prediction."""
+        return make_monotonic_regressor(_MONOTONIC_CST)
 
     def predict_indoor_temp(
         self,

@@ -399,6 +399,114 @@ class TestThermalModel:
         assert curve[-1]["predicted_temp"] < 52.0
 
 
+class TestMonotonicCOPModel:
+    """COP must rise with outdoor temperature even when trained on bad data."""
+
+    @pytest.mark.asyncio
+    async def test_cop_non_decreasing_in_outdoor_on_inverted_data(self):
+        from packages.ml.cop_model_core import COPModel
+
+        rng = np.random.RandomState(0)
+        n = 200
+        outdoor = rng.uniform(-10, 20, n)
+        tank = rng.uniform(45, 55, n)
+        hours = rng.randint(0, 24, n)
+        X = np.column_stack([
+            outdoor,
+            tank,
+            np.sin(2 * np.pi * hours / 24),
+            np.cos(2 * np.pi * hours / 24),
+        ])
+        # Physically wrong: colder outside -> higher COP.
+        y = np.clip(3.0 - 0.05 * outdoor + rng.normal(0, 0.1, n), 1.5, 6.0)
+
+        model = COPModel()
+
+        async def fake_prep():
+            return X, y
+
+        model._prepare_training_data = fake_prep
+        with patch("packages.ml.safe_persistence.safe_dump"):
+            result = await model.train()
+        assert "version" in result
+
+        cold = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
+        warm = model.predict_cop(outdoor_temp=15.0, tank_target=50, hour=12)
+        assert warm >= cold - 1e-6
+
+
+class TestMonotonicDemandModel:
+    """Demand must rise as it gets colder even when trained on bad data."""
+
+    @pytest.mark.asyncio
+    async def test_demand_non_increasing_in_outdoor_on_inverted_data(self):
+        from packages.ml.demand_model_core import DemandModel
+
+        rng = np.random.RandomState(0)
+        n = 300
+        outdoor = rng.uniform(-10, 20, n)
+        wind = rng.uniform(0, 10, n)
+        irradiance = rng.uniform(0, 500, n)
+        hours = rng.randint(0, 24, n)
+        dow = rng.randint(0, 7, n)
+        X = np.column_stack([
+            outdoor,
+            wind,
+            irradiance,
+            np.sin(2 * np.pi * hours / 24),
+            np.cos(2 * np.pi * hours / 24),
+            np.sin(2 * np.pi * dow / 7),
+            np.cos(2 * np.pi * dow / 7),
+        ])
+        # Physically wrong: warmer outside -> higher demand.
+        y = np.clip(1.0 + 0.1 * outdoor + rng.normal(0, 0.1, n), 0.1, None)
+
+        model = DemandModel()
+
+        async def fake_prep():
+            return X, y
+
+        model._prepare_data = fake_prep
+        with patch("packages.ml.safe_persistence.safe_dump"):
+            result = await model.train()
+        assert "version" in result
+
+        f_warm = DemandModel._make_features(15.0, 3.0, 0.0, 12, 2).reshape(1, -1)
+        f_cold = DemandModel._make_features(-5.0, 3.0, 0.0, 12, 2).reshape(1, -1)
+        warm = float(model._model.predict(f_warm)[0])
+        cold = float(model._model.predict(f_cold)[0])
+        assert cold >= warm - 1e-6
+
+
+class TestPhysicalCurveOrdering:
+    """The indoor-forecast endpoint must never show heating below no-heating."""
+
+    def test_predicted_clamped_to_no_heating_floor(self):
+        from packages.api.routers.models_router import _enforce_physical_ordering
+
+        # Reproduces the reported inversion: predicted 25.9 < no-heating 26.2.
+        forecast = [{"predicted_indoor_temp": 25.9}]
+        forecast_with_plan = [{"predicted_indoor_temp": 25.0}]
+        forecast_no_heating = [{"predicted_indoor_temp": 26.2}]
+
+        _enforce_physical_ordering(forecast, forecast_with_plan, forecast_no_heating)
+
+        assert forecast[0]["predicted_indoor_temp"] == 26.2
+        assert forecast_with_plan[0]["predicted_indoor_temp"] >= 26.2
+
+    def test_valid_ordering_left_untouched(self):
+        from packages.api.routers.models_router import _enforce_physical_ordering
+
+        forecast = [{"predicted_indoor_temp": 22.0}]
+        forecast_with_plan = [{"predicted_indoor_temp": 23.0}]
+        forecast_no_heating = [{"predicted_indoor_temp": 20.0}]
+
+        _enforce_physical_ordering(forecast, forecast_with_plan, forecast_no_heating)
+
+        assert forecast[0]["predicted_indoor_temp"] == 22.0
+        assert forecast_with_plan[0]["predicted_indoor_temp"] == 23.0
+
+
 class TestOrchestratorFallback:
     """Tests for the orchestrator layer selection and fallback logic."""
 
