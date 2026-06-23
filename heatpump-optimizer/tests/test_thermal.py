@@ -454,6 +454,75 @@ class TestIndoorCurve:
             assert entry["predicted_indoor_temp"] >= 10.0
 
 
+class TestManagedTankCurve:
+    """Test predict_managed_tank_curve — schedule-aware deadband control."""
+
+    def test_curve_length_and_keys(self):
+        model = ThermalModel()
+        floors = [45.0] * 24
+        curve = model.predict_managed_tank_curve(
+            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=floors, hours=24,
+        )
+        assert len(curve) == 24
+        assert {"hour", "predicted_temp", "state", "floor"} <= set(curve[0])
+
+    def test_not_pinned_at_target(self):
+        """Regression: the tank must coast down, not hold flat at the target."""
+        model = ThermalModel()
+        floors = [45.0] * 24
+        curve = model.predict_managed_tank_curve(
+            current_temp=52.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=floors, hours=24,
+        )
+        temps = [c["predicted_temp"] for c in curve]
+        assert min(temps) < 52.0  # it cools between reheats
+
+    def test_overnight_floor_allows_deeper_drop(self):
+        """Lower overnight floor should let the tank dip toward the off-peak min."""
+        model = ThermalModel()
+        # Daytime floor 45 for first 6h, off-peak floor 41 overnight, back to 45.
+        floors = [45.0] * 6 + [41.0] * 10 + [45.0] * 8
+        curve = model.predict_managed_tank_curve(
+            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=floors, hours=24,
+        )
+        overnight_min = min(c["predicted_temp"] for c in curve[6:16])
+        # Reaches close to the off-peak floor (within one heating step).
+        assert overnight_min <= 42.0
+        assert overnight_min >= 41.0
+
+    def test_never_coasts_below_floor(self):
+        model = ThermalModel()
+        floors = [45.0] * 12
+        curve = model.predict_managed_tank_curve(
+            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=floors, hours=12,
+        )
+        for c in curve:
+            assert c["predicted_temp"] >= c["floor"] - 1e-6
+
+    def test_reheats_to_target(self):
+        """Once it hits the floor it must climb back to the target."""
+        model = ThermalModel()
+        floors = [45.0] * 48
+        curve = model.predict_managed_tank_curve(
+            current_temp=45.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=floors, hours=48,
+        )
+        temps = [c["predicted_temp"] for c in curve]
+        assert max(temps) >= 51.9  # reheats up to target
+
+    def test_shorter_floor_list_reuses_last(self):
+        model = ThermalModel()
+        curve = model.predict_managed_tank_curve(
+            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
+            tank_min_per_hour=[45.0], hours=6,
+        )
+        assert len(curve) == 6
+        assert all(c["floor"] == 45.0 for c in curve)
+
+
 class TestCalibrateIndoorRates:
     """Test indoor rate calibration with mocked DB data."""
 

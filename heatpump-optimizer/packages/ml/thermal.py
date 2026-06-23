@@ -749,6 +749,75 @@ class ThermalModel:
 
         return curve
 
+    def predict_managed_tank_curve(
+        self,
+        current_temp: float,
+        outdoor_temp: float,
+        tank_target: float,
+        tank_min_per_hour: list[float],
+        hours: int = 24,
+    ) -> list[dict]:
+        """Simulate the tank under the optimizer's deadband control.
+
+        Unlike :meth:`predict_temperature_curve` (which holds the tank pinned at
+        ``target_temp``), this mirrors how the optimizer actually runs the tank:
+        the temperature is allowed to coast down on standby loss until it reaches
+        a per-hour *floor*, then reheats back to ``tank_target``. The floor is
+        lower during off-peak/overnight hours, so the curve dips toward that
+        off-peak minimum overnight and cycles within ``[floor, target]`` during
+        the day — instead of looking like a flat line at the target.
+
+        Args:
+            current_temp: current tank temperature (°C).
+            outdoor_temp: outdoor temperature (°C) driving heat-loss/heating rates.
+            tank_target: reheat ceiling — the tank is heated back up to this.
+            tank_min_per_hour: per-hour reheat floor (e.g. ``tank_min_temp`` during
+                comfort hours, ``tank_min_temp_offpeak`` overnight). Index ``h`` is
+                the floor for hour ``h``; the last value is reused if shorter.
+            hours: number of hours to simulate.
+
+        Returns:
+            list of ``{hour, predicted_temp, state, floor}`` entries.
+        """
+        curve = []
+        temp = current_temp
+        state = "standby"
+        heating_rate = self._tank_heating_rate(outdoor_temp)
+        loss_rate = self._tank_loss_rate(outdoor_temp)
+
+        for h in range(hours):
+            floor = (
+                tank_min_per_hour[h]
+                if h < len(tank_min_per_hour)
+                else (tank_min_per_hour[-1] if tank_min_per_hour else tank_target)
+            )
+
+            # Start reheating once the tank has coasted down to (or below) the
+            # current floor; keep heating until it reaches the target.
+            if state == "standby" and temp <= floor:
+                state = "heating"
+
+            if state == "heating":
+                temp += heating_rate
+                if temp >= tank_target:
+                    temp = tank_target
+                    state = "standby"
+            else:
+                delta = max(temp - outdoor_temp, 0.0)
+                scale = delta / 30.0 if delta < 30.0 else 1.0
+                temp += loss_rate * scale
+                # Never coast below the active floor (or outdoor temp).
+                temp = max(temp, floor, outdoor_temp)
+
+            curve.append({
+                "hour": h + 1,
+                "predicted_temp": round(temp, 1),
+                "state": state,
+                "floor": round(floor, 1),
+            })
+
+        return curve
+
     def optimal_start_time(
         self,
         current_temp: float,

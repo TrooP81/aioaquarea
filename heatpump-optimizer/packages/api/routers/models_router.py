@@ -254,6 +254,13 @@ async def calibrate_thermal_model():
 
 @router.get("/api/thermal/curve")
 async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
+    from packages.core.config import settings
+    from packages.core.settings_service import (
+        get_comfort_schedule,
+        get_setting,
+        get_user_tz,
+        is_comfort_hour,
+    )
     from packages.ml.thermal import thermal_model
 
     async with get_session() as session:
@@ -268,6 +275,24 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     outdoor = status.outdoor_temp or 7.0
     current_zone = status.zone1_temp or 20.0
 
+    # Per-hour tank reheat floor, matching the optimizer (milp.py): the tank is
+    # allowed to coast lower overnight/off-peak than during comfort hours.
+    comfort_schedule = await get_comfort_schedule()
+    tz_name = await get_user_tz()
+    tank_min_temp = int(await get_setting("tank_min_temp") or settings.tank_min_temp)
+    tank_min_temp_offpeak = int(
+        await get_setting("tank_min_temp_offpeak") or settings.tank_min_temp_offpeak
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    tank_min_per_hour = []
+    for h in range(hours):
+        hour_ts = hour_start + dt.timedelta(hours=h)
+        if is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name):
+            tank_min_per_hour.append(float(tank_min_temp))
+        else:
+            tank_min_per_hour.append(float(tank_min_temp_offpeak))
+
     tank_standby_curve = thermal_model.predict_temperature_curve(
         current_temp=current_tank,
         outdoor_temp=outdoor,
@@ -275,12 +300,15 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         target_temp=None,
         is_tank=True,
     )
-    tank_heating_curve = thermal_model.predict_temperature_curve(
+    # "With heating" = the tank under the optimizer's deadband control, allowed to
+    # coast to the per-hour floor (lower overnight) and reheat to target, rather
+    # than being pinned flat at the target.
+    tank_heating_curve = thermal_model.predict_managed_tank_curve(
         current_temp=current_tank,
         outdoor_temp=outdoor,
+        tank_target=float(tank_target),
+        tank_min_per_hour=tank_min_per_hour,
         hours=hours,
-        target_temp=float(tank_target),
-        is_tank=True,
     )
     zone_standby_curve = thermal_model.predict_temperature_curve(
         current_temp=current_zone,
@@ -296,6 +324,8 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
             "tank_target": tank_target,
             "outdoor_temp": outdoor,
             "zone1_temp": current_zone,
+            "tank_min_temp": tank_min_temp,
+            "tank_min_temp_offpeak": tank_min_temp_offpeak,
         },
         "curves": {
             "tank_standby": tank_standby_curve,
