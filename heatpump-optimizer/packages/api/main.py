@@ -7,7 +7,7 @@ import uuid
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from packages.api.auth import require_auth
+from packages.api.auth import is_auth_enabled, require_auth
 from packages.api.routers.admin import router as admin_router
 from packages.api.routers.dashboard import router as dashboard_router
 from packages.api.routers.feeds import router as feeds_router
@@ -20,6 +20,18 @@ from packages.core.config import settings
 from packages.core.logging import configure_logging
 
 configure_logging("api")
+
+if not is_auth_enabled():
+    import structlog
+
+    structlog.get_logger().warning(
+        "api_auth_disabled",
+        detail=(
+            "API_TOKEN is unset/'disabled' - the API accepts unauthenticated "
+            "requests. Set API_TOKEN to a strong secret to require Bearer auth, "
+            "especially if the API is reachable beyond localhost."
+        ),
+    )
 
 app = FastAPI(
     title="Heat Pump Optimizer API",

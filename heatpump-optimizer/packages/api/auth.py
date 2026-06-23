@@ -17,10 +17,14 @@ _PUBLIC_PATHS: set[str] = {
 }
 
 
-def _is_auth_enabled() -> bool:
+def is_auth_enabled() -> bool:
     """Auth is enabled when api_token is set to a non-placeholder value."""
     token = settings.api_token
     return bool(token) and token != "disabled"
+
+
+# Backwards-compatible private alias.
+_is_auth_enabled = is_auth_enabled
 
 
 async def require_auth(

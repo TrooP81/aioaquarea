@@ -18,9 +18,12 @@ from packages.core.settings_service import (
     get_effective_schedule,
     get_learned_usage,
     get_setting,
+    get_setting_spec,
     get_string_setting,
+    is_masked_secret,
     set_setting,
     set_settings_bulk,
+    validate_setting_value,
 )
 
 router = APIRouter()
@@ -73,7 +76,25 @@ async def update_settings(body: SettingsUpdate):
     if invalid_keys:
         raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
 
-    await set_settings_bulk(body.settings)
+    # Drop secret values that still carry the display mask so a real secret is
+    # never overwritten with its "x***y" placeholder.
+    cleaned = {
+        k: v for k, v in body.settings.items()
+        if not is_masked_secret(get_setting_spec(k), v)
+    }
+
+    # Validate every value against its declared type/options before persisting,
+    # so bad input is rejected here instead of crashing the optimizer/poller.
+    errors: dict[str, str] = {}
+    for k, v in cleaned.items():
+        try:
+            validate_setting_value(k, v)
+        except ValueError as exc:
+            errors[k] = str(exc)
+    if errors:
+        raise HTTPException(status_code=400, detail={"invalid_values": errors})
+
+    await set_settings_bulk(cleaned)
 
     async with get_session() as session:
         session.add(
@@ -83,14 +104,14 @@ async def update_settings(body: SettingsUpdate):
                 payload_json=json.dumps(
                     {
                         k: "***" if SETTINGS_SCHEMA[k].get("type") == "secret" else v
-                        for k, v in body.settings.items()
+                        for k, v in cleaned.items()
                     }
                 ),
                 result="updated",
             )
         )
 
-    return {"status": "updated", "count": len(body.settings)}
+    return {"status": "updated", "count": len(cleaned)}
 
 
 @router.get("/api/comfort-schedule")

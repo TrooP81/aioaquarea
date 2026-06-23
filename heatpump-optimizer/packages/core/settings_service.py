@@ -343,6 +343,56 @@ def get_setting_spec(key: str) -> SettingSpec:
         raise KeyError(f"Unknown setting: {key}") from exc
 
 
+# Marker used by the GET /api/settings response to mask secret values.
+SECRET_MASK_MARKER = "***"
+
+
+def is_masked_secret(spec: SettingSpec, value: str) -> bool:
+    """True when a secret value still carries the display mask.
+
+    The settings GET endpoint returns secrets masked (e.g. ``a***z``). If a
+    client echoes that masked value back on PUT we must NOT overwrite the real
+    secret with the mask. The frontend already guards this; this is the
+    matching server-side guard so a direct API client can't clobber a secret.
+    """
+    return spec.value_type == "secret" and SECRET_MASK_MARKER in value
+
+
+def validate_setting_value(key: str, value: str) -> None:
+    """Validate a raw string value against its setting's declared type/options.
+
+    Raises ``KeyError`` for an unknown key and ``ValueError`` for a value that
+    does not match the setting's options or type (so invalid input is rejected
+    at the API boundary instead of crashing later in the optimizer/poller).
+    """
+    spec = get_setting_spec(key)
+
+    if spec.options is not None:
+        if value not in spec.options:
+            raise ValueError(
+                f"{key} must be one of {list(spec.options)} (got {value!r})"
+            )
+        return
+
+    if spec.value_type == "json":
+        try:
+            json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"{key} must be valid JSON ({exc})") from exc
+        return
+
+    # Empty string clears a value (falls back to env/default); allowed for the
+    # free-form types but never needs numeric/bool parsing.
+    if value == "":
+        return
+
+    if spec.value_type in {"int", "float", "bool"}:
+        try:
+            spec.parse(value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a valid {spec.value_type} ({exc})") from exc
+
+
 def _default_setting_value(spec: SettingSpec) -> str:
     if spec.default_env and hasattr(env_settings, spec.default_env):
         return str(getattr(env_settings, spec.default_env))
