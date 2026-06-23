@@ -42,6 +42,11 @@ class MILPOptimizer:
     VERSION = "milp_v1"
     SOLVER_TIMEOUT_SECONDS = 30
 
+    # Penalty (objective units ≈ EUR) per °C·h of indoor comfort shortfall.
+    # Set far above any realistic energy-cost saving so comfort is only ever
+    # violated when physically unreachable, never to save money.
+    COMFORT_VIOLATION_PENALTY = 1000.0
+
     def __init__(self, cop_model=None, demand_model=None):
         """
         Args:
@@ -410,14 +415,20 @@ class MILPOptimizer:
             heat_added = x_dhw[h] * dhw_power_kw_per_h[h] * cops[h]
             prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h[h]
 
-        # Per-hour tank floor: comfort hours use normal min, off-peak uses lower min
-        for h in range(H + 1):
+        # Per-hour tank floor: comfort hours use normal min, off-peak uses lower min.
+        # Skip h=0: the initial tank state is a measured fact (tank_state[0] ==
+        # tank_init), not a decision.  Forcing a floor on it makes the whole
+        # problem infeasible whenever the tank is currently below the comfort
+        # floor (e.g. a comfort hour right after an off-peak draw-down), which
+        # silently dumps the optimizer back to the rules engine.
+        for h in range(1, H + 1):
             floor = tank_min_floors[min(h, H - 1)]
             prob += tank_state[h] >= floor
 
-        # Tank must be above comfort minimum at comfort-schedule deadline hours
+        # Tank must be above comfort minimum at comfort-schedule deadline hours.
+        # Guard h=0 for the same reason — "be hot right now" is unschedulable.
         for ready_hour in (dhw_deadlines or []):
-            if ready_hour < H:
+            if 0 < ready_hour < H:
                 prob += tank_state[ready_hour] >= tank_min_comfort * 1.2
 
         # Limit DHW activations (API rate limit proxy)
@@ -455,11 +466,31 @@ class MILPOptimizer:
             # When x_sh=0 → pure cooling; when x_sh=1 → full heating
             prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
 
-        # Comfort floor: indoor temp must stay at/above the per-hour target
+        # Comfort floor: indoor temp should stay at/above the per-hour target.
+        # This is a SOFT constraint: a non-negative slack variable absorbs any
+        # unavoidable shortfall (e.g. the house starts colder than the target
+        # and the heating rate physically cannot close the gap in one step), and
+        # the shortfall is penalised heavily in the objective.  A hard floor here
+        # made the MILP infeasible whenever the current indoor temperature was
+        # below the comfort target — exactly the cold-house mornings when good
+        # scheduling matters most — silently falling back to the rules engine.
+        # h=0 is skipped entirely because t_indoor[0] is pinned to the measured
+        # current temperature and cannot be a decision.
+        comfort_slack = [
+            pulp.LpVariable(f"comfort_slack_{h}", lowBound=0) for h in range(H + 1)
+        ]
         if indoor_targets:
-            for h in range(H):
+            for h in range(1, H):
                 if h < len(indoor_targets):
-                    prob += t_indoor[h] >= indoor_targets[h]
+                    prob += t_indoor[h] + comfort_slack[h] >= indoor_targets[h]
+
+        # Penalise comfort shortfall far above any achievable energy-cost saving
+        # so the solver only ever leaves slack when the target is physically
+        # unreachable, never to shave cost.
+        comfort_penalty = pulp.lpSum(
+            [self.COMFORT_VIOLATION_PENALTY * comfort_slack[h] for h in range(H + 1)]
+        )
+        prob.setObjective(prob.objective + comfort_penalty)
 
         # --- Solve ---
         solver = pulp.PULP_CBC_CMD(
@@ -607,7 +638,21 @@ class MILPOptimizer:
                 })
                 current_mode = target_mode
 
-        total_cost = pulp.value(prob.objective)
+        # Energy cost only — exclude the comfort-shortfall penalty so the cost
+        # estimate stays a real EUR figure even when slack was needed.
+        energy_cost = sum(
+            price_vals[h]
+            * (
+                (x_dhw[h].varValue or 0) * dhw_power_kw_per_h[h]
+                + (x_sh[h].varValue or 0) * sh_max_power_kw
+            )
+            for h in range(H)
+        )
+
+        # Total unavoidable comfort shortfall (°C·h below target across horizon).
+        comfort_shortfall = round(
+            sum((comfort_slack[h].varValue or 0) for h in range(H + 1)), 2
+        )
 
         # Extract indoor temperature forecast from LP solution
         indoor_forecast = []
@@ -629,7 +674,9 @@ class MILPOptimizer:
             "horizon_end": start_ts + dt.timedelta(hours=H),
             "actions": actions,
             "version": version,
-            "cost_estimate": total_cost,
+            "engine": "milp",
+            "cost_estimate": energy_cost,
+            "comfort_shortfall": comfort_shortfall,
             "indoor_forecast": indoor_forecast,
         }
 

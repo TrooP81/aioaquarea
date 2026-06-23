@@ -10,7 +10,7 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord
-from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor
+from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor, unwrap_model_bundle
 
 # Physical monotonicity for COP features [outdoor_temp, tank_target, hour_sin, hour_cos]:
 # COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
@@ -40,6 +40,22 @@ class COPModel:
     def is_trained(self) -> bool:
         return self._model is not None
 
+    @property
+    def training_samples(self) -> int | None:
+        """Number of samples the persisted model was trained on, if known."""
+        val = self._metrics.get("samples")
+        return int(val) if val is not None else None
+
+    @property
+    def trained_at(self) -> str | None:
+        """ISO timestamp the persisted model was trained, if known."""
+        return self._metrics.get("trained_at")
+
+    @staticmethod
+    def _bundle_for_save(model, metrics: dict) -> dict:
+        """Wrap a fitted model with its metrics for persistence (format v2)."""
+        return {"format": 2, "model": model, "metrics": dict(metrics)}
+
     async def train(self) -> dict[str, object]:
         if not HAS_SKLEARN:
             raise ImportError("scikit-learn required: pip install scikit-learn")
@@ -55,14 +71,19 @@ class COPModel:
 
         self._model = model
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
-        self._metrics = {"mae": mae, "samples": len(X), "cv_std": scores.std()}
+        self._metrics = {
+            "mae": mae,
+            "samples": len(X),
+            "cv_std": scores.std(),
+            "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
 
         _logger.info("cop_model_trained", samples=len(X), mae=round(mae, 3), y_mean=round(float(np.mean(y)), 2), y_std=round(float(np.std(y)), 2))
 
         model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump(model, model_path)
+        safe_dump(self._bundle_for_save(model, self._metrics), model_path)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
     def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
@@ -199,7 +220,7 @@ class COPModel:
             _logger.info("cop_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
         try:
-            self._model = safe_load(models[-1])
+            self._model, self._metrics = unwrap_model_bundle(safe_load(models[-1]))
         except ValueError as exc:
             _logger.warning("cop_model_load_failed", path=str(models[-1]), error=str(exc))
             return False

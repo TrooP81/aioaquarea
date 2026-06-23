@@ -127,3 +127,15 @@ def make_monotonic_regressor(monotonic_cst, **overrides):
     )
     params.update(overrides)
     return HistGradientBoostingRegressor(monotonic_cst=list(monotonic_cst), **params)
+
+
+def unwrap_model_bundle(loaded: object) -> tuple[object, dict]:
+    """Return ``(model, metrics)`` from a persisted checkpoint.
+
+    Supports both the format v2 bundle ``{"format": 2, "model": ..., "metrics":
+    {...}}`` and the legacy bare-estimator format (older ``.pkl`` files that
+    stored the fitted estimator directly). Legacy files report empty metrics.
+    """
+    if isinstance(loaded, dict) and "model" in loaded:
+        return loaded["model"], dict(loaded.get("metrics") or {})
+    return loaded, {}

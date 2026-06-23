@@ -165,6 +165,77 @@ class TestCOPModel:
             assert abs(cop2 - cop) < 0.01
 
 
+class TestModelMetricPersistence:
+    """Persisted checkpoints should carry training metrics, with legacy fallback."""
+
+    def _patch_dir(self, tmp_path):
+        return patch("packages.ml.safe_persistence.settings", SimpleNamespace(
+            model_dir=str(tmp_path), secret_key="test-secret-key"
+        ))
+
+    def test_cop_bundle_roundtrip_restores_samples(self, tmp_path):
+        from packages.ml.models import COPModel, HAS_SKLEARN
+        if not HAS_SKLEARN:
+            pytest.skip("scikit-learn not installed")
+        from sklearn.ensemble import GradientBoostingRegressor
+
+        est = GradientBoostingRegressor(n_estimators=5, random_state=0)
+        est.fit(np.random.RandomState(0).rand(20, 4), np.random.RandomState(1).rand(20))
+
+        with patch("packages.ml.models.MODEL_DIR", tmp_path), self._patch_dir(tmp_path):
+            from packages.ml.safe_persistence import safe_dump
+
+            bundle = {"format": 2, "model": est, "metrics": {"samples": 321, "mae": 0.12,
+                                                              "trained_at": "2026-06-23T10:00:00+00:00"}}
+            safe_dump(bundle, tmp_path / "cop_model_20260623_1000.pkl")
+
+            model = COPModel()
+            assert model.load_latest()
+            assert model.is_trained
+            assert model.training_samples == 321
+            assert model.trained_at == "2026-06-23T10:00:00+00:00"
+
+    def test_cop_legacy_bare_model_loads_without_metrics(self, tmp_path):
+        from packages.ml.models import COPModel, HAS_SKLEARN
+        if not HAS_SKLEARN:
+            pytest.skip("scikit-learn not installed")
+        from sklearn.ensemble import GradientBoostingRegressor
+
+        est = GradientBoostingRegressor(n_estimators=5, random_state=0)
+        est.fit(np.random.RandomState(0).rand(20, 4), np.random.RandomState(1).rand(20))
+
+        with patch("packages.ml.models.MODEL_DIR", tmp_path), self._patch_dir(tmp_path):
+            from packages.ml.safe_persistence import safe_dump
+
+            safe_dump(est, tmp_path / "cop_model_legacy.pkl")  # bare estimator, no bundle
+
+            model = COPModel()
+            assert model.load_latest()
+            assert model.is_trained
+            assert model.training_samples is None
+
+    def test_demand_bundle_roundtrip_restores_samples(self, tmp_path):
+        from packages.ml.models import DemandModel, HAS_SKLEARN
+        if not HAS_SKLEARN:
+            pytest.skip("scikit-learn not installed")
+        from sklearn.ensemble import GradientBoostingRegressor
+
+        est = GradientBoostingRegressor(n_estimators=5, random_state=0)
+        est.fit(np.random.RandomState(0).rand(20, 7), np.random.RandomState(1).rand(20))
+
+        with patch("packages.ml.models.MODEL_DIR", tmp_path), self._patch_dir(tmp_path):
+            from packages.ml.safe_persistence import safe_dump
+
+            bundle = {"format": 2, "model": est, "metrics": {"samples": 654,
+                                                             "trained_at": "2026-06-23T11:00:00+00:00"}}
+            safe_dump(bundle, tmp_path / "demand_model_20260623_1100.pkl")
+
+            model = DemandModel()
+            assert model.load_latest()
+            assert model.training_samples == 654
+            assert model.trained_at == "2026-06-23T11:00:00+00:00"
+
+
 class TestDemandModel:
     def test_untrained_uses_fallback(self):
         """Untrained model should produce reasonable fallback predictions."""

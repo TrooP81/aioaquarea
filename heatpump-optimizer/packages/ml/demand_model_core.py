@@ -17,6 +17,7 @@ from packages.ml.models_common import (
     cross_val_score,
     iter_consumption_intervals,
     make_monotonic_regressor,
+    unwrap_model_bundle,
 )
 
 # Weather samples are typically hourly; only join a consumption interval to a
@@ -34,15 +35,28 @@ class DemandModel:
     def __init__(self):
         self._model = None
         self._version: str = "untrained"
+        self._metrics: dict[str, float] = {}
 
     def reset(self) -> None:
         """Discard the trained model and return to the untrained fallback state."""
         self._model = None
         self._version = "untrained"
+        self._metrics = {}
 
     @property
     def is_trained(self) -> bool:
         return self._model is not None
+
+    @property
+    def training_samples(self) -> int | None:
+        """Number of samples the persisted model was trained on, if known."""
+        val = self._metrics.get("samples")
+        return int(val) if val is not None else None
+
+    @property
+    def trained_at(self) -> str | None:
+        """ISO timestamp the persisted model was trained, if known."""
+        return self._metrics.get("trained_at")
 
     @staticmethod
     def _make_features(outdoor_temp: float, wind_speed: float, irradiance: float, hour: int, dow: int) -> np.ndarray:
@@ -79,11 +93,16 @@ class DemandModel:
 
         self._model = model
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
+        self._metrics = {
+            "mae": -scores.mean(),
+            "samples": len(X),
+            "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
         model_path = MODEL_DIR / f"demand_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump(model, model_path)
-        return {"version": self._version, "mae": -scores.mean(), "samples": len(X)}
+        safe_dump({"format": 2, "model": model, "metrics": dict(self._metrics)}, model_path)
+        return {"version": self._version, "mae": self._metrics["mae"], "samples": len(X)}
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:
         predictions = []
@@ -161,7 +180,7 @@ class DemandModel:
             _logger.info("demand_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
         try:
-            self._model = safe_load(models[-1])
+            self._model, self._metrics = unwrap_model_bundle(safe_load(models[-1]))
         except ValueError as exc:
             _logger.warning("demand_model_load_failed", path=str(models[-1]), error=str(exc))
             return False

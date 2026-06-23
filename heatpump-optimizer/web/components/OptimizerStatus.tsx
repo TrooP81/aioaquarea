@@ -6,7 +6,14 @@ import { LAYER_LABELS } from "@/lib/constants";
 interface ModelInfo {
   trained: boolean;
   last_trained: string | null;
-  samples: number;
+  samples: number | null;
+}
+
+interface LastPlanInfo {
+  version: string;
+  engine: string;
+  fell_back: boolean;
+  created_at: string | null;
 }
 
 interface ThermalInfo {
@@ -34,6 +41,7 @@ interface OptimizerStatusData {
   configured_layer: string;
   active_layer: string;
   fallback_layer: string;
+  last_plan: LastPlanInfo | null;
   cop_model: ModelInfo;
   demand_model: ModelInfo;
   thermal_model: ThermalInfo;
@@ -159,13 +167,13 @@ export function OptimizerStatus() {
       label: "COP Model",
       trained: status.cop_model.trained,
       lastTrained: status.cop_model.last_trained,
-      detail: `${status.cop_model.samples} samples`,
+      detail: status.cop_model.samples != null ? `${status.cop_model.samples} samples` : "samples: n/a",
     },
     {
       label: "Demand Model",
       trained: status.demand_model.trained,
       lastTrained: status.demand_model.last_trained,
-      detail: `${status.demand_model.samples} samples`,
+      detail: status.demand_model.samples != null ? `${status.demand_model.samples} samples` : "samples: n/a",
     },
     {
       label: "Thermal Model",
@@ -203,6 +211,21 @@ export function OptimizerStatus() {
           (configured: {status.configured_layer})
         </span>
       </div>
+
+      {/* What actually produced the latest plan (reveals silent fallbacks) */}
+      {status.last_plan && (
+        <div className="opt-layer-row">
+          <span className="text-muted text-sm">Last plan engine</span>
+          <span className={layerBadgeClass(status.last_plan.version)}>
+            {status.last_plan.engine.toUpperCase()}
+          </span>
+          {status.last_plan.fell_back && (
+            <span className="text-warning text-xs">
+              ⚠ MILP unavailable — fell back to rules
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Model cards */}
       <div className="model-grid">

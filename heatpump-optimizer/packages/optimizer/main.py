@@ -28,7 +28,6 @@ ML_MIN_DATA_DAYS = 14
 
 # Cooldown: skip scheduled optimization if a plan was generated recently
 _OPTIMIZATION_COOLDOWN_S = 300  # 5 minutes
-_last_plan_generated_at: float = 0.0
 
 # Global ML model instances (loaded once, reused across optimization cycles)
 _cop_model = COPModel()
@@ -60,13 +59,17 @@ def _selected_layer_version(layer_name: str) -> str:
 async def get_optimizer_status_snapshot(
     layer: str,
     reload_models: bool = False,
-) -> dict[str, str | bool]:
+) -> dict[str, object]:
     """Return the selected layer and loaded model state for the given configuration."""
     layer_name, _ = await _select_optimizer(layer, reload_models=reload_models)
     return {
         "active_layer": _selected_layer_version(layer_name),
         "cop_trained": _cop_model.is_trained,
         "demand_trained": _demand_model.is_trained,
+        "cop_samples": _cop_model.training_samples,
+        "demand_samples": _demand_model.training_samples,
+        "cop_trained_at": _cop_model.trained_at,
+        "demand_trained_at": _demand_model.trained_at,
     }
 
 
@@ -132,6 +135,35 @@ async def _has_sufficient_ml_data() -> bool:
         return False
 
 
+async def _seconds_since_last_plan() -> float | None:
+    """Seconds since the most recent plan was persisted, shared across processes.
+
+    The API process ("Optimize Now") and the optimizer process run separately
+    with independent module state, so a module-global timestamp can't coordinate
+    them. Reading the latest PlanRecord.created_at from the shared DB lets a
+    scheduled run in the optimizer process honour a manual plan just created by
+    the API process (and vice versa).
+    """
+    from sqlalchemy import select
+
+    try:
+        async with get_session() as session:
+            last_created = (
+                await session.execute(
+                    select(PlanRecord.created_at).order_by(PlanRecord.created_at.desc()).limit(1)
+                )
+            ).scalar()
+    except Exception as exc:  # noqa: BLE001 - never let a cooldown check block control
+        logger.warning("cooldown_check_failed", error=str(exc))
+        return None
+
+    if last_created is None:
+        return None
+    if last_created.tzinfo is None:
+        last_created = last_created.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - last_created).total_seconds()
+
+
 async def run_optimization(*, scheduled: bool = False) -> None:
     """Run the optimizer and store the plan, with layer selection and fallback.
 
@@ -139,15 +171,12 @@ async def run_optimization(*, scheduled: bool = False) -> None:
         scheduled: True when called by the hourly scheduler.  If a plan was
             generated recently (within _OPTIMIZATION_COOLDOWN_S), the
             scheduled run is skipped so a manual "Optimize Now" plan isn't
-            immediately overwritten.
+            immediately overwritten.  The cooldown reads the latest persisted
+            plan from the DB so it works across the API and optimizer processes.
     """
-    import time as _time
-
-    global _last_plan_generated_at
-
     if scheduled:
-        elapsed = _time.monotonic() - _last_plan_generated_at
-        if elapsed < _OPTIMIZATION_COOLDOWN_S:
+        elapsed = await _seconds_since_last_plan()
+        if elapsed is not None and elapsed < _OPTIMIZATION_COOLDOWN_S:
             logger.info(
                 "scheduled_optimization_skipped",
                 reason="recent plan exists",
@@ -210,8 +239,6 @@ async def run_optimization(*, scheduled: bool = False) -> None:
                 add_result = session.add(action_record)
                 if asyncio.iscoroutine(add_result):
                     await add_result
-
-        _last_plan_generated_at = _time.monotonic()
 
         logger.info(
             "plan_generated",
