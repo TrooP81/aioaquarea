@@ -54,11 +54,18 @@ async def get_latest_indoor_temp():
     selected = await get_selected_device_ids()
     async with get_session() as session:
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
+        # Aggregate only over *fresh* readings in the window. Stale rows repeat an
+        # old device_timestamp, so including them drags avg_temperature away from
+        # the true current value. sensor_count is distinct devices so the UI's
+        # "Average across N sensors" reflects sensors, not raw row count.
         agg_stmt = select(
             func.avg(IndoorTempReading.temperature),
             func.max(IndoorTempReading.timestamp),
-            func.count(IndoorTempReading.id),
-        ).where(IndoorTempReading.timestamp >= cutoff)
+            func.count(func.distinct(IndoorTempReading.device_id)),
+        ).where(
+            IndoorTempReading.timestamp >= cutoff,
+            not_(IndoorTempReading.is_stale),
+        )
 
         fresh_stmt = select(func.max(IndoorTempReading.timestamp)).where(
             not_(IndoorTempReading.is_stale)

@@ -500,5 +500,49 @@ class TestLatestIndoorTempFiltering:
                 result = await get_latest_indoor_temp()
 
         assert result["sensor_count"] == 3
-        # With no explicit selection the aggregate must not reference device_id.
-        assert "device_id" not in str(session.statements[0])
+        # With no explicit selection the aggregate must not *filter* by device_id
+        # (it still counts distinct devices, which is correct).
+        assert "IN (" not in str(session.statements[0])
+
+    @pytest.mark.asyncio
+    async def test_aggregate_excludes_stale_readings(self):
+        from packages.api.routers.smartthings import get_latest_indoor_temp
+
+        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
+        session = _RecordingSession(agg_row=(20.8, now, 2), fresh_scalar=now)
+
+        with patch(
+            "packages.poller.smartthings.get_selected_device_ids",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            with patch(
+                "packages.api.routers.smartthings.get_session",
+                return_value=_RecordingSessionCtx(session),
+            ):
+                await get_latest_indoor_temp()
+
+        # The windowed aggregate must filter out stale rows so a sensor stuck on
+        # an old device_timestamp can't drag the average.
+        assert "is_stale" in str(session.statements[0])
+
+    @pytest.mark.asyncio
+    async def test_sensor_count_uses_distinct_devices(self):
+        from packages.api.routers.smartthings import get_latest_indoor_temp
+
+        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
+        session = _RecordingSession(agg_row=(20.8, now, 2), fresh_scalar=now)
+
+        with patch(
+            "packages.poller.smartthings.get_selected_device_ids",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            with patch(
+                "packages.api.routers.smartthings.get_session",
+                return_value=_RecordingSessionCtx(session),
+            ):
+                await get_latest_indoor_temp()
+
+        # "Average across N sensors" must count distinct sensors, not raw rows.
+        assert "distinct" in str(session.statements[0]).lower()
