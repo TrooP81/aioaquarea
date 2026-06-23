@@ -27,20 +27,22 @@ def _enforce_physical_ordering(
     """Clamp indoor-temperature curves in place to a physically valid ordering.
 
     Active heating can never leave the house cooler than the no-heating
-    baseline, and a boosted plan can never be cooler than the base heating
-    forecast. The monotonic comfort model already guarantees this, but the
-    clamp is a cheap safety net so the chart can never show the nonsensical
-    "predicted indoor below no-heating" case (e.g. when the model is untrained
-    and the linear fallback is used).
+    baseline, so both the base forecast and the schedule-managed "with plan"
+    forecast are clamped to never fall below ``forecast_no_heating``. This is a
+    cheap safety net so the chart can never show the nonsensical "predicted
+    indoor below no-heating" case (e.g. when the model is untrained and the
+    linear fallback is used).
+
+    Note: the managed forecast is intentionally allowed to dip *below* the base
+    forecast overnight (it reflects the comfort-schedule setback), so it is not
+    clamped up to the base — only to the no-heating floor.
     """
     key = "predicted_indoor_temp"
     n = min(len(forecast), len(forecast_with_plan), len(forecast_no_heating))
     for h in range(n):
         floor = forecast_no_heating[h][key]
-        base = max(forecast[h][key], floor)
-        plan = max(forecast_with_plan[h][key], base)
-        forecast[h][key] = round(base, 1)
-        forecast_with_plan[h][key] = round(plan, 1)
+        forecast[h][key] = round(max(forecast[h][key], floor), 1)
+        forecast_with_plan[h][key] = round(max(forecast_with_plan[h][key], floor), 1)
 
 
 @router.get("/api/comfort-model/status")
@@ -394,7 +396,6 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
 
     zone_water_temps = [current_zone] * hours
     planned_actions = []
-    plan_water_temps = list(zone_water_temps)
     async with get_session() as session:
         plan_result = await session.execute(
             select(PlanRecord)
@@ -417,44 +418,13 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                 if hour_offset < 0 or hour_offset >= hours:
                     continue
 
-                if action.action_type in ("zone_temp_boost", "comfort_mode_on"):
-                    payload = json.loads(action.payload_json) if action.payload_json else {}
-                    offset = payload.get("offset", 2)
-                    planned_actions.append(
-                        {
-                            "hour": hour_offset,
-                            "action_type": action.action_type,
-                            "status": action.status,
-                            "payload": payload,
-                        }
-                    )
-                    for h in range(hour_offset, hours):
-                        plan_water_temps[h] = current_zone + offset
-                elif action.action_type in ("zone_temp_restore", "eco_mode_on"):
-                    payload = json.loads(action.payload_json) if action.payload_json else {}
-                    planned_actions.append(
-                        {
-                            "hour": hour_offset,
-                            "action_type": action.action_type,
-                            "status": action.status,
-                            "payload": payload,
-                        }
-                    )
-                    for h in range(hour_offset, hours):
-                        plan_water_temps[h] = current_zone
-                elif action.action_type in ("eco_mode_off", "normal_mode_on"):
-                    payload = json.loads(action.payload_json) if action.payload_json else {}
-                    planned_actions.append(
-                        {
-                            "hour": hour_offset,
-                            "action_type": action.action_type,
-                            "status": action.status,
-                            "payload": payload,
-                        }
-                    )
-                    for h in range(hour_offset, hours):
-                        plan_water_temps[h] = current_zone
-                elif action.action_type in (
+                if action.action_type in (
+                    "zone_temp_boost",
+                    "comfort_mode_on",
+                    "zone_temp_restore",
+                    "eco_mode_on",
+                    "eco_mode_off",
+                    "normal_mode_on",
                     "force_dhw_on",
                     "force_dhw_off",
                     "quiet_mode_on",
@@ -470,12 +440,42 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                         }
                     )
 
-    forecast_with_plan = thermal_model.predict_indoor_curve(
+    # Schedule-aware comfort setpoint per hour, matching the optimizer: the home
+    # is held near comfort_temp_target during comfort hours and allowed to set
+    # back toward comfort_temp_min overnight/off-peak.
+    comfort_schedule = await get_comfort_schedule()
+    comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
+    comfort_temp_min_val = float(await get_setting("comfort_temp_min") or 18.0)
+    tz_name = await get_user_tz()
+
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    target_schedule = []
+    indoor_target_per_hour = []
+    for h in range(hours):
+        hour_ts = hour_start + dt.timedelta(hours=h)
+        in_comfort = is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name)
+        target = comfort_temp_target if in_comfort else comfort_temp_min_val
+        indoor_target_per_hour.append(target)
+        target_schedule.append(
+            {
+                "hour": h + 1,
+                "target": target,
+                "comfort_hour": in_comfort,
+            }
+        )
+
+    # "Predicted Indoor" = the home under the optimizer's schedule-aware control,
+    # coasting toward the off-peak setback overnight and reheating during comfort
+    # hours, rather than being held flat at the current zone temp.
+    forecast_with_plan = thermal_model.predict_managed_indoor_curve(
         current_indoor=current_indoor,
-        zone_water_temps=plan_water_temps,
+        indoor_target_per_hour=indoor_target_per_hour,
         weather_forecast=weather_forecast,
         hours=hours,
     )
+    # Base reference: indoor if the current zone water temp were held constantly
+    # (full heating, no setback). Not plotted directly, but used as the upper
+    # reference and to drive the frontend's per-hour iteration length.
     forecast = thermal_model.predict_indoor_curve(
         current_indoor=current_indoor,
         zone_water_temps=zone_water_temps,
@@ -490,23 +490,6 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     )
 
     _enforce_physical_ordering(forecast, forecast_with_plan, forecast_no_heating)
-
-    comfort_schedule = await get_comfort_schedule()
-    comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
-    comfort_temp_min_val = float(await get_setting("comfort_temp_min") or 18.0)
-    tz_name = await get_user_tz()
-
-    target_schedule = []
-    for h in range(hours):
-        hour_ts = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=h)
-        in_comfort = is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name)
-        target_schedule.append(
-            {
-                "hour": h + 1,
-                "target": comfort_temp_target if in_comfort else comfort_temp_min_val,
-                "comfort_hour": in_comfort,
-            }
-        )
 
     return {
         "current_indoor": current_indoor,

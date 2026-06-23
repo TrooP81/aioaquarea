@@ -818,6 +818,78 @@ class ThermalModel:
 
         return curve
 
+    def predict_managed_indoor_curve(
+        self,
+        current_indoor: float,
+        indoor_target_per_hour: list[float],
+        weather_forecast: list[dict],
+        hours: int = 24,
+    ) -> list[dict]:
+        """Simulate indoor air tracking the comfort-schedule setpoint.
+
+        Unlike :meth:`predict_indoor_curve` driven by a *constant* zone water
+        temp (which produces a flat line that ignores the schedule), this
+        mirrors how the optimizer runs the home: indoor is maintained near the
+        comfort target during comfort hours and allowed to coast down toward the
+        lower off-peak/overnight target, then reheated back up in the morning.
+        The curve therefore dips toward the overnight setback and recovers,
+        matching the stepped comfort schedule instead of looking flat.
+
+        Args:
+            current_indoor: current indoor air temperature (°C).
+            indoor_target_per_hour: per-hour comfort setpoint — ``comfort_temp_target``
+                during comfort hours, ``comfort_temp_min`` overnight/off-peak.
+                Index ``h`` is the setpoint for hour ``h``; the last value is
+                reused if the list is shorter than ``hours``.
+            weather_forecast: list of dicts with key ``outdoor_temp`` driving the
+                learned indoor heating/cooling rates.
+            hours: number of hours to simulate.
+
+        Returns:
+            list of ``{hour, predicted_indoor_temp, target, state, source}`` entries.
+        """
+        curve = []
+        indoor = current_indoor
+
+        for h in range(hours):
+            target = (
+                indoor_target_per_hour[h]
+                if h < len(indoor_target_per_hour)
+                else (indoor_target_per_hour[-1] if indoor_target_per_hour else current_indoor)
+            )
+            wx = (
+                weather_forecast[h]
+                if h < len(weather_forecast)
+                else (weather_forecast[-1] if weather_forecast else {})
+            )
+            outdoor = wx.get("outdoor_temp", 5.0)
+
+            if indoor < target:
+                # Below the active setpoint → heat up toward it.
+                indoor += self._indoor_heating_rate(outdoor)
+                if indoor > target:
+                    indoor = target
+                state = "heating"
+            else:
+                # At/above setpoint → coast down toward it (Newton's law toward
+                # outdoor), but never below the active setpoint or outdoor temp.
+                cooling = self._indoor_cooling_rate(outdoor)
+                delta = max(indoor - outdoor, 0.0)
+                scale = delta / 15.0 if delta < 15.0 else 1.0
+                indoor += cooling * scale
+                indoor = max(indoor, target, outdoor)
+                state = "standby"
+
+            curve.append({
+                "hour": h + 1,
+                "predicted_indoor_temp": round(indoor, 1),
+                "target": round(target, 1),
+                "state": state,
+                "source": "managed_schedule",
+            })
+
+        return curve
+
     def optimal_start_time(
         self,
         current_temp: float,

@@ -523,6 +523,78 @@ class TestManagedTankCurve:
         assert all(c["floor"] == 45.0 for c in curve)
 
 
+class TestManagedIndoorCurve:
+    """Test predict_managed_indoor_curve — schedule-aware comfort setback."""
+
+    def _weather(self, hours, outdoor=2.0):
+        return [{"outdoor_temp": outdoor, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
+                for h in range(hours)]
+
+    def test_curve_length_and_keys(self):
+        model = ThermalModel()
+        targets = [20.5] * 24
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24), hours=24,
+        )
+        assert len(curve) == 24
+        assert {"hour", "predicted_indoor_temp", "target", "state", "source"} <= set(curve[0])
+
+    def test_not_flat_follows_setback(self):
+        """Regression: predicted indoor must dip during the overnight setback."""
+        model = ThermalModel()
+        targets = [20.5] * 6 + [18.0] * 8 + [20.5] * 10
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24), hours=24,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Holds at comfort during the first comfort block.
+        assert temps[0] == 20.5
+        # Dips toward the off-peak setback overnight.
+        assert min(temps[6:14]) < 19.0
+
+    def test_recovers_to_comfort_target(self):
+        """After the setback it must reheat back up to the comfort target."""
+        model = ThermalModel()
+        targets = [18.0] * 8 + [20.5] * 16
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=18.0, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24), hours=24,
+        )
+        assert curve[-1]["predicted_indoor_temp"] >= 20.4
+
+    def test_never_below_setpoint_or_outdoor(self):
+        model = ThermalModel()
+        targets = [18.0] * 24
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24, outdoor=5.0), hours=24,
+        )
+        for c in curve:
+            assert c["predicted_indoor_temp"] >= min(c["target"], 5.0) - 1e-6
+            assert c["predicted_indoor_temp"] >= 5.0 - 1e-6
+
+    def test_holds_when_already_at_target(self):
+        """Steady at the comfort target should stay flat at the target."""
+        model = ThermalModel()
+        targets = [20.5] * 12
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12), hours=12,
+        )
+        assert all(abs(c["predicted_indoor_temp"] - 20.5) < 1e-6 for c in curve)
+
+    def test_shorter_target_list_reuses_last(self):
+        model = ThermalModel()
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=[20.5],
+            weather_forecast=self._weather(6), hours=6,
+        )
+        assert len(curve) == 6
+        assert all(c["target"] == 20.5 for c in curve)
+
+
 class TestCalibrateIndoorRates:
     """Test indoor rate calibration with mocked DB data."""
 
