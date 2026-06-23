@@ -63,6 +63,9 @@ interface CurveData {
     tank_target: number;
     outdoor_temp: number;
     zone1_temp: number;
+    plan_driven?: boolean;
+    learning_mode?: boolean;
+    plan_id?: number | null;
   };
   curves: {
     tank_standby: { hour: number; predicted_temp: number; state: string }[];
@@ -224,6 +227,13 @@ export function ThermalPredictionChart() {
         {status?.model_params.last_calibrated
           ? ` Model calibrated from ${status.model_params.sample_count} samples.`
           : " Model using defaults (calibrate to learn from your data)."}
+        {curves?.current.learning_mode
+          ? " 🎓 Learning mode is on — the optimizer plans but dispatches nothing, so the tank curve shows expected coasting, not the plan."
+          : curves?.current.plan_driven
+          ? ` Tank (with heating) follows the active plan${
+              curves.current.plan_id ? ` #${curves.current.plan_id}` : ""
+            }'s hot-water schedule.`
+          : ""}
       </p>
 
       {/* Summary cards */}

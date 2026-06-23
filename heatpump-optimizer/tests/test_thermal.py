@@ -595,6 +595,93 @@ class TestManagedIndoorCurve:
         assert all(c["target"] == 20.5 for c in curve)
 
 
+class TestPlannedTankCurve:
+    """Test predict_planned_tank_curve — follows the optimizer's DHW schedule."""
+
+    def test_curve_length_and_keys(self):
+        model = ThermalModel()
+        dhw = [0.0] * 24
+        curve = model.predict_planned_tank_curve(
+            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=24,
+        )
+        assert len(curve) == 24
+        assert {"hour", "predicted_temp", "state", "dhw_minutes"} <= set(curve[0])
+
+    def test_heats_during_planned_dhw_hours(self):
+        """A planned DHW hour must raise the tank toward target."""
+        model = ThermalModel()
+        dhw = [0.0] * 6
+        dhw[2] = 60.0
+        curve = model.predict_planned_tank_curve(
+            current_temp=46.0, outdoor_temp=7.0, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=6,
+        )
+        # The heating hour is hotter than the hour before it.
+        assert curve[2]["predicted_temp"] > curve[1]["predicted_temp"]
+        assert curve[2]["state"] == "heating"
+
+    def test_coasts_between_dhw_cycles(self):
+        """With no DHW the tank loses heat (standby)."""
+        model = ThermalModel()
+        dhw = [0.0] * 8
+        curve = model.predict_planned_tank_curve(
+            current_temp=52.0, outdoor_temp=7.0, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=8,
+        )
+        assert all(c["state"] == "standby" for c in curve)
+        assert curve[-1]["predicted_temp"] < curve[0]["predicted_temp"]
+
+    def test_caps_at_target(self):
+        model = ThermalModel()
+        dhw = [60.0] * 12
+        curve = model.predict_planned_tank_curve(
+            current_temp=50.0, outdoor_temp=7.0, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=12,
+        )
+        for c in curve:
+            assert c["predicted_temp"] <= 52.0 + 1e-6
+
+    def test_never_below_outdoor(self):
+        model = ThermalModel()
+        dhw = [0.0] * 48
+        curve = model.predict_planned_tank_curve(
+            current_temp=20.0, outdoor_temp=18.0, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=48,
+        )
+        for c in curve:
+            assert c["predicted_temp"] >= 18.0 - 1e-6
+
+    def test_follows_schedule_not_flat(self):
+        """Regression: the curve must track the planned cycles, staying topped up."""
+        model = ThermalModel()
+        dhw = [0.0] * 24
+        for h in (1, 6, 10, 11):
+            dhw[h] = 60.0
+        curve = model.predict_planned_tank_curve(
+            current_temp=48.0, outdoor_temp=23.6, tank_target=52.0,
+            dhw_minutes_per_hour=dhw, hours=24,
+        )
+        heating_hours = [c["hour"] for c in curve if c["state"] == "heating"]
+        # Heating happens exactly on the planned DHW hours (h -> hour h+1).
+        assert heating_hours == [2, 7, 11, 12]
+        # Frequent cycles keep it near target, not dropping to a deep setback.
+        assert min(c["predicted_temp"] for c in curve) > 45.0
+
+    def test_partial_hour_minutes(self):
+        """Half-hour of DHW heats less than a full hour."""
+        model = ThermalModel()
+        full = model.predict_planned_tank_curve(
+            current_temp=46.0, outdoor_temp=7.0, tank_target=60.0,
+            dhw_minutes_per_hour=[60.0], hours=1,
+        )
+        half = model.predict_planned_tank_curve(
+            current_temp=46.0, outdoor_temp=7.0, tank_target=60.0,
+            dhw_minutes_per_hour=[30.0], hours=1,
+        )
+        assert half[0]["predicted_temp"] < full[0]["predicted_temp"]
+
+
 class TestCalibrateIndoorRates:
     """Test indoor rate calibration with mocked DB data."""
 

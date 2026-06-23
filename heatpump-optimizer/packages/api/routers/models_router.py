@@ -264,6 +264,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         is_comfort_hour,
     )
     from packages.ml.thermal import thermal_model
+    from packages.optimizer.executor_core import is_learning_mode_active
 
     async with get_session() as session:
         result = await session.execute(select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1))
@@ -277,16 +278,18 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     outdoor = status.outdoor_temp or 7.0
     current_zone = status.zone1_temp or 20.0
 
-    # Per-hour tank reheat floor, matching the optimizer (milp.py): the tank is
-    # allowed to coast lower overnight/off-peak than during comfort hours.
+    now = dt.datetime.now(dt.timezone.utc)
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+
+    # Per-hour tank reheat floor (deadband fallback), matching the optimizer
+    # (milp.py): the tank may coast lower overnight/off-peak than during comfort
+    # hours. Only used when there is no executable plan to follow.
     comfort_schedule = await get_comfort_schedule()
     tz_name = await get_user_tz()
     tank_min_temp = int(await get_setting("tank_min_temp") or settings.tank_min_temp)
     tank_min_temp_offpeak = int(
         await get_setting("tank_min_temp_offpeak") or settings.tank_min_temp_offpeak
     )
-    now = dt.datetime.now(dt.timezone.utc)
-    hour_start = now.replace(minute=0, second=0, microsecond=0)
     tank_min_per_hour = []
     for h in range(hours):
         hour_ts = hour_start + dt.timedelta(hours=h)
@@ -295,6 +298,45 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         else:
             tank_min_per_hour.append(float(tank_min_temp_offpeak))
 
+    # Prefer the actual optimizer plan: the MILP chose *when* to reheat DHW based
+    # on price/COP, so the "with heating" curve should follow those scheduled
+    # cycles rather than a generic deadband. In learning mode the executor
+    # dispatches nothing — the plan is created but not run, so the tank follows
+    # the heat pump's native behaviour — so we fall back to the deadband estimate
+    # and flag it instead of pretending the plan drives the tank.
+    learning_mode = await is_learning_mode_active()
+    dhw_minutes_per_hour = [0.0] * hours
+    plan_id = None
+    plan_driven = False
+    async with get_session() as session:
+        plan_result = await session.execute(
+            select(PlanRecord)
+            .where(PlanRecord.horizon_end > now)
+            .order_by(desc(PlanRecord.created_at))
+            .limit(1)
+        )
+        active_plan = plan_result.scalar_one_or_none()
+        if active_plan:
+            plan_id = active_plan.id
+            if not learning_mode:
+                actions_result = await session.execute(
+                    select(PlanActionRecord)
+                    .where(PlanActionRecord.plan_id == active_plan.id)
+                    .order_by(PlanActionRecord.scheduled_ts)
+                )
+                for action in actions_result.scalars().all():
+                    if action.action_type != "force_dhw_on":
+                        continue
+                    hour_offset = int((action.scheduled_ts - hour_start).total_seconds() // 3600)
+                    if hour_offset < 0 or hour_offset >= hours:
+                        continue
+                    payload = json.loads(action.payload_json) if action.payload_json else {}
+                    minutes = float(payload.get("dhw_minutes", 60))
+                    dhw_minutes_per_hour[hour_offset] = min(
+                        60.0, dhw_minutes_per_hour[hour_offset] + minutes
+                    )
+                plan_driven = any(m > 0 for m in dhw_minutes_per_hour)
+
     tank_standby_curve = thermal_model.predict_temperature_curve(
         current_temp=current_tank,
         outdoor_temp=outdoor,
@@ -302,16 +344,26 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         target_temp=None,
         is_tank=True,
     )
-    # "With heating" = the tank under the optimizer's deadband control, allowed to
-    # coast to the per-hour floor (lower overnight) and reheat to target, rather
-    # than being pinned flat at the target.
-    tank_heating_curve = thermal_model.predict_managed_tank_curve(
-        current_temp=current_tank,
-        outdoor_temp=outdoor,
-        tank_target=float(tank_target),
-        tank_min_per_hour=tank_min_per_hour,
-        hours=hours,
-    )
+    if plan_driven:
+        # "With heating" follows the optimizer's actual DHW schedule: reheat
+        # during planned hot-water cycles, coast on standby loss in between.
+        tank_heating_curve = thermal_model.predict_planned_tank_curve(
+            current_temp=current_tank,
+            outdoor_temp=outdoor,
+            tank_target=float(tank_target),
+            dhw_minutes_per_hour=dhw_minutes_per_hour,
+            hours=hours,
+        )
+    else:
+        # No executable plan (or learning mode): fall back to the comfort-schedule
+        # deadband — coast to the per-hour floor and reheat to target.
+        tank_heating_curve = thermal_model.predict_managed_tank_curve(
+            current_temp=current_tank,
+            outdoor_temp=outdoor,
+            tank_target=float(tank_target),
+            tank_min_per_hour=tank_min_per_hour,
+            hours=hours,
+        )
     zone_standby_curve = thermal_model.predict_temperature_curve(
         current_temp=current_zone,
         outdoor_temp=outdoor,
@@ -328,6 +380,9 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
             "zone1_temp": current_zone,
             "tank_min_temp": tank_min_temp,
             "tank_min_temp_offpeak": tank_min_temp_offpeak,
+            "plan_driven": plan_driven,
+            "learning_mode": learning_mode,
+            "plan_id": plan_id,
         },
         "curves": {
             "tank_standby": tank_standby_curve,

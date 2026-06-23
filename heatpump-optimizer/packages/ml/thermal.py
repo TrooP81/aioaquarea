@@ -890,6 +890,75 @@ class ThermalModel:
 
         return curve
 
+    def predict_planned_tank_curve(
+        self,
+        current_temp: float,
+        outdoor_temp: float,
+        tank_target: float,
+        dhw_minutes_per_hour: list[float],
+        hours: int = 24,
+    ) -> list[dict]:
+        """Simulate the tank following the optimizer's *actual* DHW schedule.
+
+        The MILP optimizer decides *when* to reheat domestic hot water based on
+        price and COP, emitting ``force_dhw_on`` actions with a per-slot duration
+        (``dhw_minutes``). This walks that schedule hour by hour: during hours
+        with planned DHW minutes the tank is heated toward ``tank_target``
+        (proportional to the share of the hour spent heating), and during all
+        other hours it coasts on standby loss bounded by the outdoor temperature.
+
+        Unlike :meth:`predict_managed_tank_curve` (a generic comfort-schedule
+        deadband), this reflects the *real* plan, so the chart matches the
+        scheduled hot-water cycles instead of an assumed overnight setback.
+
+        Args:
+            current_temp: current tank temperature (°C).
+            outdoor_temp: outdoor temperature (°C) driving heating/loss rates.
+            tank_target: reheat ceiling the DHW cycle heats up to.
+            dhw_minutes_per_hour: minutes of planned DHW heating in each hour
+                (index ``h`` is hour ``h``; values are clamped to ``[0, 60]``).
+            hours: number of hours to simulate.
+
+        Returns:
+            list of ``{hour, predicted_temp, state, dhw_minutes}`` entries.
+        """
+        curve = []
+        temp = current_temp
+        heating_rate = self._tank_heating_rate(outdoor_temp)
+        loss_rate = self._tank_loss_rate(outdoor_temp)
+
+        def _coast(value: float, fraction: float) -> float:
+            delta = max(value - outdoor_temp, 0.0)
+            scale = delta / 30.0 if delta < 30.0 else 1.0
+            value += loss_rate * scale * fraction
+            return max(value, outdoor_temp)
+
+        for h in range(hours):
+            minutes = dhw_minutes_per_hour[h] if h < len(dhw_minutes_per_hour) else 0.0
+            minutes = max(0.0, min(minutes, 60.0))
+
+            if minutes > 0:
+                heat_frac = minutes / 60.0
+                temp += heating_rate * heat_frac
+                if temp > tank_target:
+                    temp = tank_target
+                # The remainder of the hour (if any) coasts on standby loss.
+                if heat_frac < 1.0:
+                    temp = _coast(temp, 1.0 - heat_frac)
+                state = "heating"
+            else:
+                temp = _coast(temp, 1.0)
+                state = "standby"
+
+            curve.append({
+                "hour": h + 1,
+                "predicted_temp": round(temp, 1),
+                "state": state,
+                "dhw_minutes": round(minutes, 1),
+            })
+
+        return curve
+
     def optimal_start_time(
         self,
         current_temp: float,
