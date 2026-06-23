@@ -758,3 +758,102 @@ class TestDirectionAwareCOP:
         # In the real code loop, defrost_active=True causes `continue`
         # so this interval would never produce a COP entry.
         assert record_curr.defrost_active is True
+
+
+class TestPruneOldModels:
+    """prune_old_models keeps the newest N checkpoints and removes older ones."""
+
+    def _touch(self, directory, name):
+        path = directory / name
+        path.write_bytes(b"x")
+        return path
+
+    def test_keeps_newest_n(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        # Names sort chronologically, matching the real timestamped scheme.
+        for stamp in ("20260101_0000", "20260102_0000", "20260103_0000",
+                      "20260104_0000", "20260105_0000", "20260106_0000"):
+            self._touch(tmp_path, f"cop_model_{stamp}.pkl")
+
+        removed = prune_old_models("cop_model_*.pkl", keep=3, model_dir=tmp_path)
+
+        remaining = sorted(p.name for p in tmp_path.glob("cop_model_*.pkl"))
+        assert removed == 3
+        assert remaining == [
+            "cop_model_20260104_0000.pkl",
+            "cop_model_20260105_0000.pkl",
+            "cop_model_20260106_0000.pkl",
+        ]
+
+    def test_noop_when_below_limit(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        self._touch(tmp_path, "demand_model_20260101_0000.pkl")
+        self._touch(tmp_path, "demand_model_20260102_0000.pkl")
+
+        removed = prune_old_models("demand_model_*.pkl", keep=5, model_dir=tmp_path)
+
+        assert removed == 0
+        assert len(list(tmp_path.glob("demand_model_*.pkl"))) == 2
+
+    def test_only_matches_pattern(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        self._touch(tmp_path, "cop_model_20260101_0000.pkl")
+        self._touch(tmp_path, "cop_model_20260102_0000.pkl")
+        self._touch(tmp_path, "demand_model_20260101_0000.pkl")
+
+        prune_old_models("cop_model_*.pkl", keep=1, model_dir=tmp_path)
+
+        # The demand model file is untouched by a cop-model prune.
+        assert (tmp_path / "demand_model_20260101_0000.pkl").exists()
+        assert len(list(tmp_path.glob("cop_model_*.pkl"))) == 1
+
+    def test_negative_keep_raises(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        with pytest.raises(ValueError):
+            prune_old_models("cop_model_*.pkl", keep=-1, model_dir=tmp_path)
+
+
+class TestSafePersistencePathValidation:
+    """_validate_path must reject paths outside the model directory."""
+
+    def test_sibling_prefix_dir_rejected(self, tmp_path):
+        from packages.ml import safe_persistence
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        sibling = tmp_path / "models_evil"
+        sibling.mkdir()
+
+        with patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(model_dir)
+            # A sibling sharing the "models" prefix must NOT pass containment.
+            with pytest.raises(ValueError):
+                safe_persistence._validate_path(sibling / "x.pkl")
+
+    def test_path_inside_model_dir_allowed(self, tmp_path):
+        from packages.ml import safe_persistence
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+
+        with patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(model_dir)
+            resolved = safe_persistence._validate_path(model_dir / "cop_model_x.pkl")
+            assert resolved == (model_dir / "cop_model_x.pkl").resolve()
+
+    def test_dump_load_roundtrip_in_model_dir(self, tmp_path):
+        from packages.ml import safe_persistence
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+
+        with patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(model_dir)
+            mock_settings.secret_key = "test-secret"
+            path = model_dir / "thermal_params_x.pkl"
+            safe_persistence.safe_dump({"a": 1}, path)
+            assert safe_persistence.safe_load(path) == {"a": 1}

@@ -3,7 +3,7 @@
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from packages.ml.thermal import ThermalModel, ThermalPrediction
+from packages.ml.thermal import ThermalModel, ThermalParams, ThermalPrediction
 
 
 def _make_status_record(ts, tank_temp, outdoor_temp, zone1_temp=20.0, direction=None, defrost_active=False):
@@ -202,6 +202,7 @@ class TestCalibrate:
     async def test_calibrate_with_heating_data(self):
         """Calibration with records showing clear tank heating."""
         model = ThermalModel()
+        model._save = lambda: None  # avoid disk writes in tests
 
         # Generate 40 records with tank heating (4°C/h at outdoor=10)
         records = _generate_heating_records(n=40, heating_rate=5.0, outdoor=10.0)
@@ -237,6 +238,7 @@ class TestCalibrate:
     async def test_defrost_intervals_filtered(self):
         """Records with defrost_active=True should be skipped."""
         model = ThermalModel()
+        model._save = lambda: None  # avoid disk writes in tests
         base = dt.datetime(2026, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
 
         records = []
@@ -273,6 +275,7 @@ class TestCalibrate:
     async def test_calibrate_confidence_becomes_learned(self):
         """After calibration, predictions should have confidence='learned'."""
         model = ThermalModel()
+        model._save = lambda: None  # avoid disk writes in tests
         records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
 
         mock_result = MagicMock()
@@ -688,6 +691,7 @@ class TestCalibrateIndoorRates:
     async def test_calibrate_includes_indoor_rates_in_result(self):
         """Calibration result should include indoor rate keys."""
         model = ThermalModel()
+        model._save = lambda: None  # avoid disk writes in tests
         records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
 
         # Mock device status records
@@ -723,6 +727,7 @@ class TestCalibrateIndoorRates:
     async def test_calibrate_no_smartthings_uses_defaults(self):
         """Without SmartThings data, indoor rates stay at defaults."""
         model = ThermalModel()
+        model._save = lambda: None  # avoid disk writes in tests
         records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
 
         mock_result = MagicMock()
@@ -752,3 +757,48 @@ class TestCalibrateIndoorRates:
         assert model.params.indoor_cooling_rate == -0.3
         assert model.params.indoor_heating_samples == 0
         assert model.params.indoor_cooling_samples == 0
+
+
+class TestThermalPersistence:
+    """Thermal params should survive save/load round-trips on disk."""
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        model = ThermalModel()
+        model.params.tank_heating_rate = 6.5
+        model.params.indoor_heating_rate = 0.9
+        model.params.last_calibrated = dt.datetime(2026, 6, 1, 12, 0, tzinfo=dt.timezone.utc)
+        model.params.sample_count = 123
+
+        with patch("packages.ml.thermal.MODEL_DIR", tmp_path), \
+                patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(tmp_path)
+            mock_settings.secret_key = "test-secret"
+            model._save()
+
+            loaded = ThermalModel()
+            assert loaded.load_latest() is True
+
+        assert loaded.params.tank_heating_rate == 6.5
+        assert loaded.params.indoor_heating_rate == 0.9
+        assert loaded.params.sample_count == 123
+        assert loaded.params.last_calibrated == model.params.last_calibrated
+
+    def test_load_latest_no_file_returns_false(self, tmp_path):
+        with patch("packages.ml.thermal.MODEL_DIR", tmp_path):
+            assert ThermalModel().load_latest() is False
+
+    def test_load_latest_tampered_file_returns_false(self, tmp_path):
+        model = ThermalModel()
+        with patch("packages.ml.thermal.MODEL_DIR", tmp_path), \
+                patch("packages.ml.safe_persistence.settings") as mock_settings:
+            mock_settings.model_dir = str(tmp_path)
+            mock_settings.secret_key = "test-secret"
+            model._save()
+
+            saved = sorted(tmp_path.glob("thermal_params_*.pkl"))[-1]
+            saved.write_bytes(b"\x00" * 64)  # corrupt the HMAC + payload
+
+            loaded = ThermalModel()
+            assert loaded.load_latest() is False
+            # Falls back to in-memory defaults rather than crashing.
+            assert isinstance(loaded.params, ThermalParams)

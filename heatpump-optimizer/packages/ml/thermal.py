@@ -18,16 +18,22 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import structlog
 from sqlalchemy import select
 
+from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, IndoorTempReading
+from packages.ml.models_common import prune_old_models
 
 logger = structlog.get_logger(__name__)
+
+MODEL_DIR = Path(app_settings.model_dir)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -104,6 +110,47 @@ class ThermalModel:
     def reset(self) -> None:
         """Discard learned calibration and return to default thermal parameters."""
         self.params = ThermalParams()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _save(self) -> None:
+        """Persist learned thermal parameters so separate processes and restarts
+        reuse the same calibration instead of re-deriving it from the DB."""
+        from packages.ml.safe_persistence import safe_dump
+
+        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = MODEL_DIR / f"thermal_params_{ts}.pkl"
+        safe_dump(self.params, path)
+        prune_old_models("thermal_params_*.pkl")
+        logger.info("thermal_model_saved", path=str(path))
+
+    def load_latest(self) -> bool:
+        """Load the most recent persisted thermal parameters. Returns True if loaded."""
+        from packages.ml.safe_persistence import safe_load
+
+        files = sorted(MODEL_DIR.glob("thermal_params_*.pkl"))
+        if not files:
+            return False
+        try:
+            params = safe_load(files[-1])
+        except ValueError:
+            logger.warning("thermal_model_integrity_failed", path=str(files[-1]))
+            return False
+        if isinstance(params, ThermalParams):
+            self.params = params
+            logger.info(
+                "thermal_model_loaded",
+                path=str(files[-1]),
+                last_calibrated=(
+                    self.params.last_calibrated.isoformat()
+                    if self.params.last_calibrated
+                    else None
+                ),
+            )
+            return True
+        return False
 
     async def calibrate(self) -> dict:
         """
@@ -288,6 +335,10 @@ class ThermalModel:
             indoor_cooling=round(self.params.indoor_cooling_rate, 2),
             defrost_filtered=defrost_filtered,
         )
+
+        # Persist calibration so restarts and the separate API/optimizer
+        # processes can reuse it instead of re-deriving from the DB each time.
+        self._save()
 
         return {
             "status": "calibrated",

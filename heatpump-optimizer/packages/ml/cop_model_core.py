@@ -10,7 +10,7 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord
-from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor
+from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor, prune_old_models
 
 # Physical monotonicity for COP features [outdoor_temp, tank_target, hour_sin, hour_cos]:
 # COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
@@ -63,6 +63,7 @@ class COPModel:
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump(model, model_path)
+        prune_old_models("cop_model_*.pkl")
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
     def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:

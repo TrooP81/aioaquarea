@@ -23,7 +23,7 @@ def _validate_path(path: Path) -> Path:
     """Resolve path and ensure it stays within the configured model directory."""
     model_dir = Path(settings.model_dir).resolve()
     resolved = path.resolve()
-    if not str(resolved).startswith(str(model_dir)):
+    if resolved != model_dir and not resolved.is_relative_to(model_dir):
         raise ValueError(f"Path {path} resolves outside model directory {model_dir}")
     return resolved
 

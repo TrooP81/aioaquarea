@@ -24,7 +24,7 @@ from sqlalchemy import and_, select
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading
 from packages.core.config import settings as app_settings
-from packages.ml.models_common import make_monotonic_regressor
+from packages.ml.models_common import make_monotonic_regressor, prune_old_models
 
 import structlog
 
@@ -140,7 +140,9 @@ class ComfortModel:
 
         for candidate in _LAG_CANDIDATES:
             self._thermal_lag_minutes = candidate
-            result = await self._train_with_current_lag()
+            # Evaluate candidates without writing to disk — only the winning lag
+            # is persisted below, so a training run produces one checkpoint.
+            result = await self._train_with_current_lag(persist=False)
 
             if result.get("status") == "insufficient_data":
                 continue
@@ -156,10 +158,9 @@ class ComfortModel:
             self._thermal_lag_minutes = DEFAULT_THERMAL_LAG_MINUTES
             return await self._train_with_current_lag()
 
-        # Re-train with the best lag so the model state is correct
-        if self._thermal_lag_minutes != best_lag:
-            self._thermal_lag_minutes = best_lag
-            best_result = await self._train_with_current_lag()
+        # Re-fit on all data with the best lag and persist exactly once.
+        self._thermal_lag_minutes = best_lag
+        best_result = await self._train_with_current_lag(persist=True)
 
         logger.info(
             "comfort_model_auto_lag",
@@ -170,7 +171,7 @@ class ComfortModel:
         best_result["auto_lag_minutes"] = best_lag
         return best_result
 
-    async def _train_with_current_lag(self) -> dict[str, Any]:
+    async def _train_with_current_lag(self, persist: bool = True) -> dict[str, Any]:
         """Train once using the currently set ``_thermal_lag_minutes``.
 
         Metrics are computed on a chronological hold-out (the most recent
@@ -224,7 +225,8 @@ class ComfortModel:
         self._training_samples = n_rows
 
         # Persist
-        self._save()
+        if persist:
+            self._save()
 
         logger.info(
             "comfort_model_trained",
@@ -339,6 +341,7 @@ class ComfortModel:
             },
             path,
         )
+        prune_old_models("comfort_model_*.pkl")
         logger.info("comfort_model_saved", path=str(path))
 
     def load_latest(self) -> bool:

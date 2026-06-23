@@ -17,6 +17,7 @@ from packages.ml.models_common import (
     cross_val_score,
     iter_consumption_intervals,
     make_monotonic_regressor,
+    prune_old_models,
 )
 
 # Weather samples are typically hourly; only join a consumption interval to a
@@ -83,6 +84,7 @@ class DemandModel:
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump(model, model_path)
+        prune_old_models("demand_model_*.pkl")
         return {"version": self._version, "mae": -scores.mean(), "samples": len(X)}
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:
