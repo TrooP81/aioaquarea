@@ -594,6 +594,96 @@ class TestManagedIndoorCurve:
         assert len(curve) == 6
         assert all(c["target"] == 20.5 for c in curve)
 
+    def test_summer_does_not_snap_to_outdoor(self):
+        """Regression: hot outdoor must not snap predicted indoor up to outdoor.
+
+        With indoor well above the comfort target and outdoor *hotter* than
+        indoor, the heat pump idles. The home should drift gradually toward
+        outdoor, never jumping straight to the outdoor temperature in one step.
+        """
+        model = ThermalModel()
+        targets = [20.5] * 12
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=25.8, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12, outdoor=27.1), hours=12,
+        )
+        # First step must stay well below the 27.1°C outdoor (no instant snap).
+        assert curve[0]["predicted_indoor_temp"] < 26.5
+        # Indoor warms gradually toward — but never past — outdoor.
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        assert temps == sorted(temps)
+        assert max(temps) <= 27.1 + 1e-6
+
+    def test_summer_held_at_comfort_floor(self):
+        """When outdoor is cooler than the comfort target, indoor holds the floor."""
+        model = ThermalModel()
+        targets = [20.5] * 12
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=25.8, indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12, outdoor=16.0), hours=12,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Cools toward outdoor but never below the comfort target floor.
+        assert all(t >= 20.5 - 1e-6 for t in temps)
+        assert temps[-1] < temps[0]
+
+
+class TestFreeFloatCurve:
+    """Test predict_free_float_curve — passive no-heating baseline."""
+
+    def _weather(self, hours, outdoor=2.0):
+        return [{"outdoor_temp": outdoor, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
+                for h in range(hours)]
+
+    def test_curve_length_and_keys(self):
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0, weather_forecast=self._weather(24), hours=24,
+        )
+        assert len(curve) == 24
+        assert {"hour", "predicted_indoor_temp", "source"} <= set(curve[0])
+        assert all(c["source"] == "free_float" for c in curve)
+
+    def test_cools_toward_cold_outdoor(self):
+        """No heating on a cold day → indoor must drift downward toward outdoor."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0, weather_forecast=self._weather(24, outdoor=2.0), hours=24,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Monotonically non-increasing and clearly cooling.
+        assert temps == sorted(temps, reverse=True)
+        assert temps[-1] < temps[0]
+        # Never overshoots below outdoor.
+        assert all(t >= 2.0 - 1e-6 for t in temps)
+
+    def test_warms_toward_hot_outdoor_without_snapping(self):
+        """No heating on a hot day → indoor warms gradually toward outdoor."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=25.8, weather_forecast=self._weather(12, outdoor=30.0), hours=12,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Warms gradually (no instant snap to 30°C) and never overshoots.
+        assert temps[0] < 27.0
+        assert temps == sorted(temps)
+        assert all(t <= 30.0 + 1e-6 for t in temps)
+
+    def test_holds_when_at_outdoor(self):
+        """Indoor already equal to outdoor stays put (no drift)."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=18.0, weather_forecast=self._weather(6, outdoor=18.0), hours=6,
+        )
+        assert all(abs(c["predicted_indoor_temp"] - 18.0) < 1e-6 for c in curve)
+
+    def test_empty_weather_uses_default(self):
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0, weather_forecast=[], hours=3,
+        )
+        assert len(curve) == 3
+
 
 class TestPlannedTankCurve:
     """Test predict_planned_tank_curve — follows the optimizer's DHW schedule."""

@@ -17,6 +17,7 @@ Phase 3 improvements:
 from __future__ import annotations
 
 import datetime as dt
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -871,13 +872,14 @@ class ThermalModel:
                     indoor = target
                 state = "heating"
             else:
-                # At/above setpoint → coast down toward it (Newton's law toward
-                # outdoor), but never below the active setpoint or outdoor temp.
-                cooling = self._indoor_cooling_rate(outdoor)
-                delta = max(indoor - outdoor, 0.0)
-                scale = delta / 15.0 if delta < 15.0 else 1.0
-                indoor += cooling * scale
-                indoor = max(indoor, target, outdoor)
+                # At/above setpoint → the heat pump idles and the home passively
+                # free-floats toward the outdoor temperature (cooling when warmer
+                # than outside, warming when cooler), held at the comfort floor
+                # which the optimizer would actively defend if the house cooled
+                # to it. Drifting gradually — instead of snapping up to outdoor —
+                # keeps the summer forecast sane when outdoor exceeds indoor.
+                indoor = self._free_float_step(indoor, outdoor)
+                indoor = max(indoor, target)
                 state = "standby"
 
             curve.append({
@@ -889,6 +891,77 @@ class ThermalModel:
             })
 
         return curve
+
+    def predict_free_float_curve(
+        self,
+        current_indoor: float,
+        weather_forecast: list[dict],
+        hours: int = 24,
+    ) -> list[dict]:
+        """Indoor air with the heat pump fully off (passive free-float).
+
+        A physically honest "no heating" baseline: with no heat input the home
+        only exchanges heat with the outside through its envelope, so the indoor
+        temperature drifts toward the (time-varying) outdoor temperature —
+        cooling on cold nights, warming on hot afternoons — at a damped rate
+        that never overshoots outdoor.
+
+        This replaces the previous approach of running the comfort ML model with
+        a synthetic ``water_temp = outdoor`` input. That input lies far outside
+        the model's training range (it never saw "no heating"), so the model
+        extrapolated and drifted the baseline *upward*, which — together with the
+        managed curve snapping to outdoor — made the summer indoor forecast look
+        like it tracked the outdoor temperature instead of the home's behaviour.
+
+        Args:
+            current_indoor: current indoor air temperature (°C).
+            weather_forecast: list of dicts with key ``outdoor_temp`` per hour;
+                the last value is reused if the list is shorter than ``hours``.
+            hours: number of hours to simulate.
+
+        Returns:
+            list of ``{hour, predicted_indoor_temp, source}`` entries.
+        """
+        curve = []
+        indoor = current_indoor
+        for h in range(hours):
+            wx = (
+                weather_forecast[h]
+                if h < len(weather_forecast)
+                else (weather_forecast[-1] if weather_forecast else {})
+            )
+            outdoor = wx.get("outdoor_temp", 5.0)
+            indoor = self._free_float_step(indoor, outdoor)
+            curve.append({
+                "hour": h + 1,
+                "predicted_indoor_temp": round(indoor, 1),
+                "source": "free_float",
+            })
+        return curve
+
+    def _free_float_step(self, indoor: float, outdoor: float) -> float:
+        """Advance indoor one hour with the heat pump off (passive free-float).
+
+        The house drifts toward the outdoor temperature by conduction in *both*
+        directions — cooling when warmer than outside, warming when cooler — at a
+        damped Newton's-law rate (the step shrinks as indoor approaches outdoor)
+        that never overshoots. This replaces the old ``max(indoor, outdoor)``
+        clamp, which snapped the prediction straight up to the outdoor
+        temperature on warm afternoons.
+        """
+        delta = outdoor - indoor
+        if abs(delta) < 1e-9:
+            return indoor
+        # Envelope conductance from the learned standby-loss magnitude (°C/h).
+        rate_mag = abs(self._indoor_cooling_rate(outdoor))
+        if rate_mag <= 0.0:
+            rate_mag = 0.3
+        # Newton's law: the step shrinks as indoor nears outdoor (ref 15°C)…
+        scale = min(abs(delta) / 15.0, 1.0)
+        step = rate_mag * scale
+        # …and can never carry indoor past the outdoor temperature.
+        step = min(step, abs(delta))
+        return indoor + math.copysign(step, delta)
 
     def predict_planned_tank_curve(
         self,

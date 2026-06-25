@@ -537,9 +537,12 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         weather_forecast=weather_forecast,
         hours=hours,
     )
-    forecast_no_heating = thermal_model.predict_indoor_curve(
+    # "No heating" baseline: the home with the heat pump fully off, drifting
+    # toward outdoor through its envelope. A pure physical free-float, rather
+    # than the ML comfort model fed a synthetic water_temp=outdoor (which
+    # extrapolated and drifted the baseline upward in summer).
+    forecast_no_heating = thermal_model.predict_free_float_curve(
         current_indoor=current_indoor,
-        zone_water_temps=[outdoor] * hours,
         weather_forecast=weather_forecast,
         hours=hours,
     )
