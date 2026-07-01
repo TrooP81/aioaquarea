@@ -44,6 +44,14 @@ function formatRelativeTime(iso: string | null): string {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
+/** Turn a raw heat-pump mode string into a readable label. */
+function formatMode(mode: string | null | undefined): string {
+  if (!mode) return "Unknown";
+  return mode
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReading, latestReading }: DashboardProps) {
   const currency = useCurrency();
   const status = data?.current_status;
@@ -66,121 +74,127 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
   }, []);
 
   return (
-    <div className="grid">
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Current Price</span>
-        </div>
-        <div className="card-value price">
-          {formatPricePerKwh(data?.current_price, currency)}
-        </div>
-        <div className="card-subtitle">per kWh</div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Outdoor Temperature</span>
-        </div>
-        <div className="card-value temp">
-          {status?.outdoor_temp != null ? `${status.outdoor_temp.toFixed(1)}°C` : "—"}
-        </div>
-        <div className="card-subtitle">Current</div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Tank Temperature</span>
-        </div>
-        <div className="card-value temp">
-          {status?.tank_temp != null ? `${status.tank_temp.toFixed(1)}°C` : "—"}
-        </div>
-        <div className="card-subtitle">
-          Target: {status?.tank_target_temp ?? "—"}°C
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Indoor Temperature</span>
-        </div>
-        <div className="card-value temp">
-          {indoorTemp != null ? `${indoorTemp.toFixed(1)}°C` : "—"}
-        </div>
-        <div className="card-subtitle">
-          {indoorSensorCount > 0
-            ? `${indoorSensorCount} sensor${indoorSensorCount !== 1 ? "s" : ""}`
-            : "No sensors connected"}
-        </div>
-        {lastFreshReading && lastFreshReading !== latestReading && (
-          <div className="card-subtitle text-warning text-sm">
-            ⚠ Stale — fresh data {formatRelativeTime(lastFreshReading)}
+    <>
+      {/* ── Live readings ── */}
+      <h3 className="card-group-label">Live readings</h3>
+      <div className="grid">
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Current Price</span>
           </div>
-        )}
+          <div className="card-value price">
+            {formatPricePerKwh(data?.current_price, currency)}
+          </div>
+          <div className="card-subtitle">per kWh</div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Outdoor Temperature</span>
+          </div>
+          <div className="card-value temp">
+            {status?.outdoor_temp != null ? `${status.outdoor_temp.toFixed(1)}°C` : "—"}
+          </div>
+          <div className="card-subtitle">Current</div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Tank Temperature</span>
+          </div>
+          <div className="card-value temp">
+            {status?.tank_temp != null ? `${status.tank_temp.toFixed(1)}°C` : "—"}
+          </div>
+          <div className="card-subtitle">
+            {status?.tank_target_temp != null ? `Target: ${status.tank_target_temp}°C` : "Target: —"}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Indoor Temperature</span>
+          </div>
+          <div className="card-value temp">
+            {indoorTemp != null ? `${indoorTemp.toFixed(1)}°C` : "—"}
+          </div>
+          <div className="card-subtitle">
+            {indoorSensorCount > 0
+              ? `${indoorSensorCount} sensor${indoorSensorCount !== 1 ? "s" : ""}`
+              : "No sensors connected"}
+          </div>
+          {lastFreshReading && lastFreshReading !== latestReading && (
+            <div className="card-subtitle text-warning text-sm">
+              ⚠ Stale — fresh data {formatRelativeTime(lastFreshReading)}
+            </div>
+          )}
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Zone 1 Temperature</span>
+          </div>
+          <div className="card-value temp">
+            {status?.zone1_temp != null ? `${status.zone1_temp.toFixed(1)}°C` : "—"}
+          </div>
+          <div className="card-subtitle">Heating zone</div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Today's Consumption</span>
+          </div>
+          <div className="card-value kwh">
+            {data?.today_kwh?.toFixed(1) ?? "0"} kWh
+          </div>
+          <div className="card-subtitle">
+            Cost: {formatCost(data?.today_cost_eur, currency)}
+          </div>
+        </div>
       </div>
 
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Zone 1 Temperature</span>
+      {/* ── System ── */}
+      <h3 className="card-group-label">System</h3>
+      <div className="grid">
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Heat Pump</span>
+          </div>
+          <div className="card-value" style={{ fontSize: "1.5rem" }}>
+            {formatMode(status?.mode)}
+          </div>
+          <div className="card-subtitle">
+            Quiet mode: {status?.quiet_mode === 1 ? "On" : "Off"}
+          </div>
         </div>
-        <div className="card-value temp">
-          {status?.zone1_temp != null ? `${status.zone1_temp.toFixed(1)}°C` : "—"}
-        </div>
-        <div className="card-subtitle">
-          Mode: {status?.mode ?? "—"} | Quiet: {status?.quiet_mode === 1 ? "ON" : "OFF"}
-        </div>
-      </div>
 
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Today's Consumption</span>
-        </div>
-        <div className="card-value kwh">
-          {data?.today_kwh?.toFixed(1) ?? "0"} kWh
-        </div>
-        <div className="card-subtitle">
-          Cost: {formatCost(data?.today_cost_eur, currency)}
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Operation</span>
-        </div>
-        <div className="card-value" style={{ fontSize: "1.5rem" }}>
-          {status?.mode ?? "Unknown"}
-        </div>
-        <div className="card-subtitle">
-          Status: {status ? "Running" : "Offline"}
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Optimizer</span>
-        </div>
-        <div className="card-value" style={{ fontSize: "1.25rem" }}>
-          {optBrief ? (
-            <span
-              title={LAYER_TOOLTIPS[optBrief.active_layer] || optBrief.active_layer}
-              className={`opt-layer-badge ${optBrief.active_layer.includes("ml") ? "opt-layer-badge--ml" : optBrief.active_layer.includes("milp") ? "opt-layer-badge--milp" : ""}`}
-            >
-              {LAYER_LABELS[optBrief.active_layer] || optBrief.active_layer}
-            </span>
-          ) : "—"}
-        </div>
-        <div className="card-subtitle">
-          {optBrief ? (
-            <span className="ml-status-dots">
-              <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} title="COP model" />
-              <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} title="Demand model" />
-              <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} title="Thermal model" />
-              <span className="ml-status-label">
-                {[optBrief.cop_trained, optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/3 models ready
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Optimizer</span>
+          </div>
+          <div className="card-value" style={{ fontSize: "1.25rem" }}>
+            {optBrief ? (
+              <span
+                title={LAYER_TOOLTIPS[optBrief.active_layer] || optBrief.active_layer}
+                className={`opt-layer-badge ${optBrief.active_layer.includes("ml") ? "opt-layer-badge--ml" : optBrief.active_layer.includes("milp") ? "opt-layer-badge--milp" : ""}`}
+              >
+                {LAYER_LABELS[optBrief.active_layer] || optBrief.active_layer}
               </span>
-            </span>
-          ) : "Loading..."}
+            ) : "—"}
+          </div>
+          <div className="card-subtitle">
+            {optBrief ? (
+              <span className="ml-status-dots">
+                <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} title="COP (efficiency) model" />
+                <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} title="Demand (hot-water) model" />
+                <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} title="Thermal (heat-up rate) model" />
+                <span className="ml-status-label">
+                  {[optBrief.cop_trained, optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/3 learning models ready
+                </span>
+              </span>
+            ) : "Loading..."}
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }

@@ -48,6 +48,10 @@ export function PriceChart() {
   return (
     <div className="chart-container" role="region" aria-label="Electricity price chart">
       <div className="chart-title">Electricity Price ({priceAxisLabel(currency)}) — 48h</div>
+      <div className="chart-caption">
+        Forecast electricity price for the next 48 hours. The optimizer shifts heating toward the
+        cheapest hours.
+      </div>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={250}>
           <ComposedChart data={chartData}>
