@@ -86,6 +86,9 @@ export function TemperatureChart() {
   return (
     <div className="chart-container" role="region" aria-label="Temperature history chart">
       <div className="chart-title">Temperature History — 24h</div>
+      <div className="chart-caption">
+        Measured outdoor, tank and zone temperatures over the last 24 hours.
+      </div>
       <ResponsiveContainer width="100%" height={280}>
         <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />

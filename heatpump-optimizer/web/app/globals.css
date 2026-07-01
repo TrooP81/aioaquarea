@@ -68,6 +68,15 @@ body {
   margin-bottom: 2rem;
 }
 
+.card-group-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
 .card {
   background: var(--card-bg);
   border: 1px solid var(--border);
@@ -125,6 +134,14 @@ body {
   font-size: 1rem;
   font-weight: 600;
   margin-bottom: 1rem;
+}
+
+.chart-caption {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: -0.6rem;
+  margin-bottom: 1rem;
+  line-height: 1.4;
 }
 
 .plan-section {
@@ -804,6 +821,12 @@ body {
   border-bottom-color: var(--accent);
 }
 
+/* Settings page reuses the nav but sits below the page header */
+.settings-nav {
+  margin-top: 0;
+  flex-wrap: nowrap;
+}
+
 /* ── Header responsive ── */
 .header-actions {
   display: flex;
@@ -963,6 +986,25 @@ body {
 .model-card-name {
   font-weight: 600;
   font-size: 0.875rem;
+}
+
+.model-card-badge {
+  margin-left: auto;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.45rem;
+  border-radius: 9999px;
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+}
+
+.model-card-plain {
+  font-size: 0.8rem;
+  color: var(--text);
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
 }
 
 .model-card-details {

@@ -57,6 +57,9 @@ export function ConsumptionChart() {
   return (
     <div className="chart-container" role="region" aria-label="Energy consumption chart">
       <div className="chart-title">Energy Consumption — 24h</div>
+      <div className="chart-caption">
+        Electricity drawn by the heat pump over the last 24 hours.
+      </div>
       <ResponsiveContainer width="100%" height={220}>
         <BarChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />

@@ -139,6 +139,14 @@ export default function Home() {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
+  /* ── Auto-dismiss a successful poll banner after a few seconds ── */
+  useEffect(() => {
+    if (pollResult?.success) {
+      const t = setTimeout(() => setPollResult(null), 6000);
+      return () => clearTimeout(t);
+    }
+  }, [pollResult]);
+
   const pollNow = async () => {
     setPolling(true);
     setPollResult(null);
@@ -211,11 +219,19 @@ export default function Home() {
               Updated {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
             </span>
           )}
-          <button className="btn btn-primary" onClick={pollNow} disabled={polling}>
+          <button
+            className="btn btn-primary"
+            onClick={pollNow}
+            disabled={polling}
+            title="Fetch the latest prices, weather and device status right now"
+          >
             {polling ? "Polling..." : "Poll Now"}
           </button>
           <a href="/settings" className="btn">Settings</a>
-          <span className={`status-badge ${data?.current_status ? "online" : "offline"}`}>
+          <span
+            className={`status-badge ${data?.current_status ? "online" : "offline"}`}
+            title={data?.current_status ? "Receiving live data from the heat pump" : "No recent data from the heat pump"}
+          >
             {data?.current_status ? "● Connected" : "● Disconnected"}
           </span>
         </div>
@@ -232,6 +248,13 @@ export default function Home() {
           <p style={{ color: pollResult.success ? "var(--success)" : "var(--warning)" }}>
             {pollResult.message}
           </p>
+          <button
+            className="btn btn-sm"
+            onClick={() => setPollResult(null)}
+            aria-label="Dismiss"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 

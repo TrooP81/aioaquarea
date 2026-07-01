@@ -136,7 +136,7 @@ export function OptimizerStatus() {
   if (error) {
     return (
       <div className="plan-section">
-        <h2 className="chart-title">Optimizer & ML Status</h2>
+        <h2 className="chart-title">How the optimizer is deciding</h2>
         <p className="text-danger">{error}</p>
       </div>
     );
@@ -145,7 +145,7 @@ export function OptimizerStatus() {
   if (!status) {
     return (
       <div className="plan-section">
-        <h2 className="chart-title">Optimizer & ML Status</h2>
+        <h2 className="chart-title">How the optimizer is deciding</h2>
         <div className="plan-loading">
           <div className="plan-loading-skeleton" />
           <div className="plan-loading-skeleton" style={{ width: "60%" }} />
@@ -157,18 +157,21 @@ export function OptimizerStatus() {
   const models = [
     {
       label: "COP Model",
+      plain: "Predicts how efficiently the pump runs at different temperatures",
       trained: status.cop_model.trained,
       lastTrained: status.cop_model.last_trained,
       detail: `${status.cop_model.samples} samples`,
     },
     {
       label: "Demand Model",
+      plain: "Forecasts how much hot water and heating you'll need",
       trained: status.demand_model.trained,
       lastTrained: status.demand_model.last_trained,
       detail: `${status.demand_model.samples} samples`,
     },
     {
       label: "Thermal Model",
+      plain: "Learns how fast your tank and rooms heat up",
       trained: status.thermal_model.calibrated,
       lastTrained: status.thermal_model.last_calibrated,
       detail: `Rate: ${status.thermal_model.tank_heating_rate} °C/h · ${status.thermal_model.confidence}`,
@@ -183,6 +186,7 @@ export function OptimizerStatus() {
       : "";
     models.push({
       label: "Comfort Model",
+      plain: "Estimates indoor temperature from the water supply temperature",
       trained: comfort.trained,
       lastTrained: comfort.last_trained,
       detail: `${comfort.training_samples} samples${metricsStr ? ` · ${metricsStr}` : ""}`,
@@ -191,7 +195,11 @@ export function OptimizerStatus() {
 
   return (
     <div className="plan-section">
-      <h2 className="chart-title">Optimizer & ML Status</h2>
+      <h2 className="chart-title">How the optimizer is deciding</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
+        The active layer chooses your schedule. Optional machine-learning models make it smarter as
+        they collect data — until they&apos;re ready, the optimizer falls back to safe built-in rules.
+      </p>
 
       {/* Active layer badge */}
       <div className="opt-layer-row">
@@ -211,9 +219,10 @@ export function OptimizerStatus() {
             <div className="model-card-header">
               <StatusDot ok={m.trained} />
               <span className="model-card-name">{m.label}</span>
+              <span className="model-card-badge">{m.trained ? "Ready" : "Not ready"}</span>
             </div>
+            <div className="model-card-plain">{m.plain}</div>
             <div className="model-card-details">
-              <div>Status: {m.trained ? "Trained" : "Not trained"}</div>
               <div>Last trained: {formatDate(m.lastTrained)}</div>
               <div>{m.detail}</div>
             </div>

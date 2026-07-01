@@ -19,6 +19,17 @@ interface SettingMeta {
 
 type SettingsMap = Record<string, SettingMeta>;
 
+/** Slugify a section title into a DOM id for anchor navigation. */
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+/** Extra (non-form) sections that also appear in the settings nav. */
+const EXTRA_SECTIONS = [
+  { id: "comfort-schedule", label: "Comfort Schedule" },
+  { id: "test-connection", label: "Test Connection" },
+  { id: "logs", label: "Logs" },
+  { id: "reset-data", label: "Reset Data" },
+];
+
 const SETTING_GROUPS = [
   {
     title: "Optimizer Layer",
@@ -204,6 +215,30 @@ export default function SettingsPage() {
         <a href="/" className="btn">← Dashboard</a>
       </div>
 
+      {/* ── Jump-to navigation ── */}
+      <nav className="section-nav settings-nav" aria-label="Settings sections">
+        {SETTING_GROUPS.map((group) => (
+          <button
+            key={group.title}
+            className="section-nav-item"
+            onClick={() =>
+              document.getElementById(slug(group.title))?.scrollIntoView({ behavior: "smooth", block: "start" })
+            }
+          >
+            {group.title}
+          </button>
+        ))}
+        {EXTRA_SECTIONS.map((s) => (
+          <button
+            key={s.id}
+            className="section-nav-item"
+            onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+          >
+            {s.label}
+          </button>
+        ))}
+      </nav>
+
       {message && (
         <div
           className="override-banner"
@@ -219,7 +254,7 @@ export default function SettingsPage() {
       )}
 
       {SETTING_GROUPS.map((group) => (
-        <div key={group.title} className="plan-section">
+        <div key={group.title} id={slug(group.title)} className="plan-section">
           <h2 className="chart-title">{group.title}</h2>
           <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
             {group.title === "Price Provider"
@@ -298,13 +333,21 @@ export default function SettingsPage() {
         </div>
       ))}
 
-      <ComfortSchedule />
+      <div id="comfort-schedule">
+        <ComfortSchedule />
+      </div>
 
-      <TestConnection editValues={editValues} />
+      <div id="test-connection">
+        <TestConnection editValues={editValues} />
+      </div>
 
-      <LogViewer />
+      <div id="logs">
+        <LogViewer />
+      </div>
 
-      <ResetDataCard />
+      <div id="reset-data">
+        <ResetDataCard />
+      </div>
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
         <button className="btn btn-primary" onClick={handleSave} disabled={saving}>

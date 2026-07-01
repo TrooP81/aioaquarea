@@ -66,6 +66,9 @@ export function ForecastChart() {
   return (
     <div className="chart-container" role="region" aria-label="Weather forecast chart">
       <div className="chart-title">Weather Forecast — 48h</div>
+      <div className="chart-caption">
+        Outdoor temperature and conditions for the next 48 hours, used to plan heating ahead.
+      </div>
       <ResponsiveContainer width="100%" height={250}>
         <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
