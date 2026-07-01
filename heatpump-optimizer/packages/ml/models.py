@@ -138,6 +138,12 @@ class DirectionAwareCOP:
 
             outdoor = curr.outdoor_temp or 5.0
             thermal_kwh = 0.0
+            # DHW tank heating is the only physically-grounded measurement
+            # (fixed thermal mass × ΔT). Space heating/cooling use the water
+            # supply temp as a proxy, which is unreliable (the circuit has no
+            # fixed thermal mass and supply temp is near-constant in steady
+            # state), so those COP values are flagged low-confidence.
+            confidence = "measured"
 
             if action == "HEATING_WATER":
                 # Tank heating: thermal = tank_mass × ΔT
@@ -147,11 +153,13 @@ class DirectionAwareCOP:
             elif action == "HEATING":
                 # Zone heating: thermal output from water circuit ΔT
                 # (zone1_temp is water supply temperature, not indoor air)
+                confidence = "estimated"
                 if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp > prev.zone1_temp:
                     delta_t = curr.zone1_temp - prev.zone1_temp
                     thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
             elif action == "COOLING":
                 # Cooling: thermal = building_mass × |ΔT|
+                confidence = "estimated"
                 if prev.zone1_temp and curr.zone1_temp and curr.zone1_temp < prev.zone1_temp:
                     delta_t = prev.zone1_temp - curr.zone1_temp
                     thermal_kwh = delta_t * self.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG
@@ -179,6 +187,7 @@ class DirectionAwareCOP:
                     "outdoor_temp": outdoor,
                     "electrical_kwh": round(electrical_kwh, 4),
                     "thermal_kwh": round(thermal_kwh, 4),
+                    "confidence": confidence,
                 })
 
         # Persist COP records

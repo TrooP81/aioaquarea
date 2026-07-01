@@ -10,7 +10,15 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord
-from packages.ml.models_common import HAS_SKLEARN, MODEL_DIR, _logger, cross_val_score, make_monotonic_regressor
+from packages.ml.models_common import (
+    HAS_SKLEARN,
+    MODEL_DIR,
+    _logger,
+    evaluate_regression,
+    make_monotonic_regressor,
+    time_series_cv_mae,
+    write_mae_baseline,
+)
 
 # Physical monotonicity for COP features [outdoor_temp, tank_target, hour_sin, hour_cos]:
 # COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
@@ -49,20 +57,32 @@ class COPModel:
             return {"error": "Insufficient data", "samples": len(X)}
 
         model = make_monotonic_regressor(_COP_MONOTONIC_CST, max_iter=300)
-        scores = cross_val_score(model, X, y, cv=min(5, len(X)), scoring="neg_mean_absolute_error")
-        mae = -scores.mean()
+        # Forward-chaining time-series CV (never trains on the future) gives an
+        # honest MAE; plain KFold would leak later intervals into earlier folds.
+        mae, cv_std = time_series_cv_mae(model, X, y)
+
+        has_prior = bool(list(MODEL_DIR.glob("cop_model_*.pkl")))
+        decision = evaluate_regression("cop", mae, has_prior)
+        if not decision["deploy"]:
+            _logger.warning("cop_model_deploy_skipped", mae=round(mae, 3), baseline_mae=decision["baseline_mae"], samples=len(X))
+            return {
+                "status": "regressed",
+                "metrics": {"mae": mae, "baseline_mae": decision["baseline_mae"], "samples": len(X)},
+            }
+
         model.fit(X, y)
 
         self._model = model
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
-        self._metrics = {"mae": mae, "samples": len(X), "cv_std": scores.std()}
+        self._metrics = {"mae": mae, "samples": len(X), "cv_std": cv_std, "baseline_mae": decision["baseline_mae"]}
 
-        _logger.info("cop_model_trained", samples=len(X), mae=round(mae, 3), y_mean=round(float(np.mean(y)), 2), y_std=round(float(np.std(y)), 2))
+        _logger.info("cop_model_trained", samples=len(X), mae=round(mae, 3), baseline_mae=decision["baseline_mae"], y_mean=round(float(np.mean(y)), 2), y_std=round(float(np.std(y)), 2))
 
         model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump(model, model_path)
+        write_mae_baseline("cop", mae)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
     def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
@@ -118,11 +138,10 @@ class COPModel:
         y_list = []
         skip_no_delta = 0
         skip_no_status = 0
-        skip_thermal_zero = 0
         skip_cop_low = 0
         skip_cop_high = 0
         used_status_path = 0
-        used_fallback_path = 0
+        skip_no_measured_thermal = 0
 
         prev_row = None
         for row in consumption_rows:
@@ -148,28 +167,28 @@ class COPModel:
             curr_status = None
             if prev_status_rec and curr_status_rec and prev_status_rec.ts != curr_status_rec.ts:
                 used_status_path += 1
+                # Only DHW tank heating gives a physically-grounded thermal
+                # measurement (energy = tank_mass × ΔT). The zone1 "temperature"
+                # is the *water supply* temp, not a fixed thermal mass, so its
+                # delta is not a reliable proxy for delivered heat and is
+                # excluded to avoid biasing the COP target.
                 tank_thermal = 0.0
                 if prev_status_rec.tank_temp is not None and curr_status_rec.tank_temp is not None:
                     tank_delta = curr_status_rec.tank_temp - prev_status_rec.tank_temp
                     if tank_delta > 0:
                         tank_thermal = tank_delta * self._tank_kwh_per_degree()
-                zone_thermal = 0.0
-                if prev_status_rec.zone1_temp is not None and curr_status_rec.zone1_temp is not None:
-                    zone_delta = curr_status_rec.zone1_temp - prev_status_rec.zone1_temp
-                    if zone_delta > 0:
-                        zone_thermal = zone_delta * 0.5
-                total_thermal = tank_thermal + zone_thermal
-                if total_thermal > 0:
-                    thermal_kwh = total_thermal / elapsed_hours
+                if tank_thermal > 0:
+                    thermal_kwh = tank_thermal / elapsed_hours
                 curr_status = {"tank_target": curr_status_rec.tank_target_temp or 50}
             else:
                 skip_no_status += 1
 
             if thermal_kwh <= 0:
-                used_fallback_path += 1
-                thermal_kwh = elec_kw * self._default_cop_curve(row.outdoor_temp or 5.0) * 0.7
-            if thermal_kwh <= 0:
-                skip_thermal_zero += 1
+                # No measured DHW thermal for this interval. We deliberately do
+                # NOT synthesize thermal from the default COP curve: that would
+                # make the target a deterministic function of the features and
+                # the model would merely relearn the fallback formula. Skip it.
+                skip_no_measured_thermal += 1
                 prev_row = row
                 continue
 
@@ -188,7 +207,7 @@ class COPModel:
             y_list.append(cop)
             prev_row = row
 
-        _logger.info("cop_training_data_prepared", total_consumption_rows=len(consumption_rows), status_rows=len(status_rows), paired_samples=len(y_list), skip_no_delta=skip_no_delta, skip_no_status=skip_no_status, skip_thermal_zero=skip_thermal_zero, skip_cop_low=skip_cop_low, skip_cop_high=skip_cop_high, used_status_path=used_status_path, used_fallback_path=used_fallback_path, kwh_per_degree=round(self._tank_kwh_per_degree(), 4))
+        _logger.info("cop_training_data_prepared", total_consumption_rows=len(consumption_rows), status_rows=len(status_rows), paired_samples=len(y_list), skip_no_delta=skip_no_delta, skip_no_status=skip_no_status, skip_no_measured_thermal=skip_no_measured_thermal, skip_cop_low=skip_cop_low, skip_cop_high=skip_cop_high, used_status_path=used_status_path, kwh_per_degree=round(self._tank_kwh_per_degree(), 4))
         return np.array(X_list), np.array(y_list)
 
     def load_latest(self) -> bool:

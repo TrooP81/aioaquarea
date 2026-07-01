@@ -14,9 +14,11 @@ from packages.ml.models_common import (
     HAS_SKLEARN,
     MODEL_DIR,
     _logger,
-    cross_val_score,
+    evaluate_regression,
     iter_consumption_intervals,
     make_monotonic_regressor,
+    time_series_cv_mae,
+    write_mae_baseline,
 )
 
 # Weather samples are typically hourly; only join a consumption interval to a
@@ -31,13 +33,21 @@ _DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0]
 
 
 class DemandModel:
+    # Quantile levels for the uncertainty band. The median (0.5) is the point
+    # prediction; the optimizer can use the p10/p90 spread to price risk.
+    QUANTILES = (0.1, 0.5, 0.9)
+
     def __init__(self):
-        self._model = None
+        self._model = None  # median (p50) — the point predictor
+        self._model_lower = None  # p10
+        self._model_upper = None  # p90
         self._version: str = "untrained"
 
     def reset(self) -> None:
         """Discard the trained model and return to the untrained fallback state."""
         self._model = None
+        self._model_lower = None
+        self._model_upper = None
         self._version = "untrained"
 
     @property
@@ -66,6 +76,12 @@ class DemandModel:
         """Generous ceiling for electrical demand (kW) used to drop bad intervals."""
         return app_settings.sh_max_power_kw * 1.5 + 3.0
 
+    def _make_quantile_model(self, quantile: float):
+        """Monotonic gradient-boosting regressor fitting the given quantile."""
+        return make_monotonic_regressor(
+            _DEMAND_MONOTONIC_CST, max_iter=250, loss="quantile", quantile=quantile
+        )
+
     async def train(self) -> dict[str, object]:
         if not HAS_SKLEARN:
             raise ImportError("scikit-learn required")
@@ -73,17 +89,34 @@ class DemandModel:
         if len(X) < 168:
             return {"error": "Insufficient data", "samples": len(X)}
 
-        model = make_monotonic_regressor(_DEMAND_MONOTONIC_CST, max_iter=250)
-        scores = cross_val_score(model, X, y, cv=5, scoring="neg_mean_absolute_error")
-        model.fit(X, y)
+        # Median (p50) model is the deployed point predictor. Evaluate it with
+        # forward-chaining time-series CV so the MAE reflects genuine future
+        # accuracy (plain KFold leaks later hours into earlier folds).
+        median = self._make_quantile_model(0.5)
+        mae, cv_std = time_series_cv_mae(median, X, y)
 
-        self._model = model
+        has_prior = bool(list(MODEL_DIR.glob("demand_model_*.pkl")))
+        decision = evaluate_regression("demand", mae, has_prior)
+        if not decision["deploy"]:
+            _logger.warning("demand_model_deploy_skipped", mae=round(mae, 3), baseline_mae=decision["baseline_mae"], samples=len(X))
+            return {"status": "regressed", "mae": mae, "baseline_mae": decision["baseline_mae"], "samples": len(X)}
+
+        median.fit(X, y)
+        lower = self._make_quantile_model(0.1)
+        lower.fit(X, y)
+        upper = self._make_quantile_model(0.9)
+        upper.fit(X, y)
+
+        self._model = median
+        self._model_lower = lower
+        self._model_upper = upper
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
         model_path = MODEL_DIR / f"demand_model_{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump(model, model_path)
-        return {"version": self._version, "mae": -scores.mean(), "samples": len(X)}
+        safe_dump({"median": median, "lower": lower, "upper": upper}, model_path)
+        write_mae_baseline("demand", mae)
+        return {"version": self._version, "mae": mae, "cv_std": cv_std, "baseline_mae": decision["baseline_mae"], "samples": len(X)}
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:
         predictions = []
@@ -101,6 +134,37 @@ class DemandModel:
                 pred = max(0.5, 3.0 - 0.1 * temp)
             predictions.append(max(0, pred))
         return predictions
+
+    def predict_hourly_quantiles(self, weather_forecast: list[dict], hours: int = 24) -> list[dict]:
+        """Predict demand with an uncertainty band per hour.
+
+        Returns a list of ``{"p10", "p50", "p90"}`` dicts (kW). When the model
+        is untrained, the same heuristic point estimate is returned for all
+        three levels so callers get a consistent shape. ``p10 <= p50 <= p90`` is
+        enforced (separately-fit quantile regressors can occasionally cross).
+        """
+        results: list[dict] = []
+        now = dt.datetime.now(dt.timezone.utc)
+        for h in range(hours):
+            ts = now + dt.timedelta(hours=h)
+            weather = weather_forecast[h] if h < len(weather_forecast) else {}
+            temp = weather.get("temperature", 5.0)
+            wind = weather.get("wind_speed", 3.0)
+            irradiance = weather.get("irradiance", 0.0)
+            if self._model is not None:
+                features = self._make_features(temp, wind, irradiance, ts.hour, ts.weekday()).reshape(1, -1)
+                p50 = float(self._model.predict(features)[0])
+                p10 = float(self._model_lower.predict(features)[0]) if self._model_lower is not None else p50
+                p90 = float(self._model_upper.predict(features)[0]) if self._model_upper is not None else p50
+            else:
+                p50 = max(0.5, 3.0 - 0.1 * temp)
+                p10 = p90 = p50
+            # Clamp to non-negative and repair any quantile crossing.
+            p10, p50, p90 = (max(0.0, v) for v in (p10, p50, p90))
+            p50 = max(p50, p10)
+            p90 = max(p90, p50)
+            results.append({"p10": p10, "p50": p50, "p90": p90})
+        return results
 
     async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
         async with get_session() as session:
@@ -127,7 +191,12 @@ class DemandModel:
         skip_rate_bounds = 0
         used_weather_temp = 0
         for interval in iter_consumption_intervals(consumption_rows):
-            rate = interval.total_rate_kw
+            # Target is *space-heating* electrical demand only. DHW and cooling
+            # are excluded because they violate the model's monotonic physics
+            # (DHW is outdoor-independent; cooling demand rises — not falls —
+            # with outdoor temperature). Intervals with no space-heating draw
+            # are naturally dropped by the rate<=0 guard below.
+            rate = interval.heat_rate_kw
             if rate <= 0 or rate > max_rate:
                 skip_rate_bounds += 1
                 continue
@@ -161,10 +230,20 @@ class DemandModel:
             _logger.info("demand_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
         try:
-            self._model = safe_load(models[-1])
+            payload = safe_load(models[-1])
         except ValueError as exc:
             _logger.warning("demand_model_load_failed", path=str(models[-1]), error=str(exc))
             return False
+        # New format persists a dict of quantile models; older files stored a
+        # single bare estimator. Support both for backward compatibility.
+        if isinstance(payload, dict):
+            self._model = payload.get("median")
+            self._model_lower = payload.get("lower")
+            self._model_upper = payload.get("upper")
+        else:
+            self._model = payload
+            self._model_lower = None
+            self._model_upper = None
         self._version = models[-1].stem.replace("demand_model_", "")
-        _logger.info("demand_model_loaded", version=self._version, path=str(models[-1]))
+        _logger.info("demand_model_loaded", version=self._version, path=str(models[-1]), has_quantiles=self._model_lower is not None)
         return True
