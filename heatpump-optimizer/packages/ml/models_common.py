@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import statistics
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,7 +122,11 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:
-    """Return (mean_MAE, std_MAE) using forward-chaining time-series CV.
+    """Cross-validated mean absolute error with forward-chaining time-series CV.
+
+    Returns a ``(mean_MAE, std_MAE)`` tuple where ``mean_MAE`` is the average
+    per-fold MAE and ``std_MAE`` is the standard deviation of those per-fold
+    MAEs (a measure of how stable the error is across folds).
 
     ``X``/``y`` **must** already be ordered chronologically. Unlike plain
     ``KFold`` (which shuffles future rows into the training folds and leaks
@@ -151,10 +156,9 @@ def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:
         fold.fit(X[train_idx], y[train_idx])
         maes.append(mean_absolute_error(y[test_idx], fold.predict(X[test_idx])))
 
-    import numpy as _np
-
-    arr = _np.array(maes)
-    return float(arr.mean()), float(arr.std())
+    mean_mae = statistics.fmean(maes)
+    std_mae = statistics.pstdev(maes) if len(maes) > 1 else 0.0
+    return float(mean_mae), float(std_mae)
 
 
 def make_monotonic_regressor(monotonic_cst, **overrides):
