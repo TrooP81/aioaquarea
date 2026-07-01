@@ -375,10 +375,14 @@ class ComfortModel:
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
 
         async with get_session() as session:
-            # Get indoor temp readings from the last 30 days
+            # Get indoor temp readings from the last 90 days. Stale readings are
+            # excluded: they carry a fresh row timestamp but an old sensor value,
+            # so pairing them with same-time device/weather data would train the
+            # model on a mislabelled target (matches the thermal model filter).
             result = await session.execute(
                 select(IndoorTempReading)
                 .where(IndoorTempReading.timestamp >= cutoff)
+                .where(IndoorTempReading.is_stale == False)  # noqa: E712
                 .order_by(IndoorTempReading.timestamp)
             )
             readings = result.scalars().all()
