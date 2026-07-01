@@ -758,3 +758,217 @@ class TestDirectionAwareCOP:
         # In the real code loop, defrost_active=True causes `continue`
         # so this interval would never produce a COP entry.
         assert record_curr.defrost_active is True
+
+
+class _ScalarResult:
+    """Fake execute() result exposing scalars().all() for ORM-object queries."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class TestDemandHeatingOnlyTarget:
+    """Demand target must be space-heating electrical rate only (not DHW/cooling)."""
+
+    @pytest.mark.asyncio
+    async def test_dhw_only_interval_is_skipped(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        # Only tank (DHW) energy accrues — no space heating. Must be excluded.
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.0, cool_kwh=0.0, tank_kwh=1.0, outdoor_temp=2.0),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        results = [_FakeResult(consumption), _FakeResult(weather)]
+
+        model = DemandModel()
+        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_data()
+
+        assert len(y) == 0  # DHW-only interval contributes no space-heating sample
+
+    @pytest.mark.asyncio
+    async def test_heating_rate_excludes_dhw_component(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        # 0.5 kWh space heating + 2.0 kWh DHW over 0.25h. Target must be the
+        # heating rate (0.5/0.25 = 2.0 kW), NOT the combined 10 kW.
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.5, cool_kwh=0.0, tank_kwh=2.0, outdoor_temp=2.0),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        results = [_FakeResult(consumption), _FakeResult(weather)]
+
+        model = DemandModel()
+        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_data()
+
+        assert len(y) == 1
+        assert float(y[0]) == pytest.approx(2.0)
+
+
+class TestDemandQuantiles:
+    """Demand model exposes a p10/p50/p90 uncertainty band."""
+
+    def test_untrained_band_is_degenerate(self):
+        from packages.ml.models import DemandModel
+
+        model = DemandModel()
+        band = model.predict_hourly_quantiles([{"temperature": 5.0}] * 3, hours=3)
+        assert len(band) == 3
+        for entry in band:
+            assert entry["p10"] == entry["p50"] == entry["p90"]
+            assert entry["p50"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_trained_band_is_ordered(self, tmp_path):
+        from packages.ml.models import DemandModel
+
+        rng = np.random.RandomState(1)
+        n = 400
+        outdoor = rng.uniform(-10, 20, n)
+        X = np.column_stack([
+            outdoor,
+            rng.uniform(0, 10, n),
+            rng.uniform(0, 500, n),
+            np.sin(2 * np.pi * rng.randint(0, 24, n) / 24),
+            np.cos(2 * np.pi * rng.randint(0, 24, n) / 24),
+            np.sin(2 * np.pi * rng.randint(0, 7, n) / 7),
+            np.cos(2 * np.pi * rng.randint(0, 7, n) / 7),
+        ])
+        y = np.clip(3.0 - 0.1 * outdoor + rng.normal(0, 0.5, n), 0.1, None)
+
+        model = DemandModel()
+
+        async def fake_prep():
+            return X, y
+
+        model._prepare_data = fake_prep
+        with patch("packages.ml.models.MODEL_DIR", tmp_path), \
+             patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path), \
+             patch("packages.ml.safe_persistence.safe_dump"):
+            result = await model.train()
+
+        assert "version" in result
+        band = model.predict_hourly_quantiles([{"temperature": 0.0}] * 5, hours=5)
+        for entry in band:
+            assert entry["p10"] <= entry["p50"] <= entry["p90"]
+
+
+class TestCOPExcludesFallback:
+    """COP training must not synthesize samples when status data is missing."""
+
+    @pytest.mark.asyncio
+    async def test_no_status_yields_no_samples(self):
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=5.0),
+            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.0, tank_kwh=0.0, outdoor_temp=5.0),
+        ]
+        results = [_FakeResult(consumption), _FakeResult([])]  # no status rows
+
+        model = COPModel()
+        with patch("packages.ml.cop_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_training_data()
+
+        # Previously a synthetic COP (0.7 × default curve) would leak in here.
+        assert len(y) == 0
+
+
+class TestMAEBaseline:
+    """Regression gating: a worse retrain must not replace a good model."""
+
+    def test_first_train_always_deploys(self, tmp_path):
+        from packages.ml import models_common as mc
+
+        with patch.object(mc, "MODEL_DIR", tmp_path):
+            decision = mc.evaluate_regression("cop", mae=1.0, has_prior_model=False)
+        assert decision["deploy"] is True
+
+    def test_regression_blocks_deploy(self, tmp_path):
+        from packages.ml import models_common as mc
+
+        with patch.object(mc, "MODEL_DIR", tmp_path):
+            mc.write_mae_baseline("cop", 0.5)
+            good = mc.evaluate_regression("cop", mae=0.5, has_prior_model=True)
+            bad = mc.evaluate_regression("cop", mae=1.0, has_prior_model=True)
+
+        assert good["deploy"] is True
+        assert bad["deploy"] is False
+        assert bad["improved"] is False
+
+    def test_time_series_cv_mae_returns_scalar(self):
+        from packages.ml.models_common import make_monotonic_regressor, time_series_cv_mae
+
+        rng = np.random.RandomState(3)
+        X = rng.uniform(-5, 15, (120, 2))
+        y = 3.0 - 0.1 * X[:, 0] + rng.normal(0, 0.2, 120)
+        model = make_monotonic_regressor([-1, 0])
+        mae, std = time_series_cv_mae(model, X, y)
+        assert mae >= 0
+        assert std >= 0
+
+
+class TestDirectionAwareCOPConfidence:
+    """DHW COP is measured; space-heating/cooling COP is flagged estimated."""
+
+    @pytest.mark.asyncio
+    async def test_heating_water_is_measured(self):
+        from packages.ml.models import DirectionAwareCOP
+
+        base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
+        prev = SimpleNamespace(
+            ts=base, device_action="HEATING_WATER", tank_temp=45.0, zone1_temp=30.0,
+            outdoor_temp=5.0, defrost_active=False, device_id="d1",
+        )
+        curr = SimpleNamespace(
+            ts=base + dt.timedelta(hours=1), device_action="HEATING_WATER", tank_temp=50.0,
+            zone1_temp=30.0, outdoor_temp=5.0, defrost_active=False, device_id="d1",
+        )
+        consumption = [SimpleNamespace(ts=base + dt.timedelta(hours=1), tank_kwh=2.0, heat_kwh=0.0, cool_kwh=0.0)]
+        # reads: status, consumption; then a persist session (padded dummies)
+        results = [_ScalarResult([prev, curr]), _ScalarResult(consumption), _FakeResult([]), _FakeResult([])]
+
+        dac = DirectionAwareCOP()
+        with patch("packages.ml.models.get_session", _mock_get_session(results)):
+            intervals = await dac.compute_cop_intervals(hours=24)
+
+        assert len(intervals) == 1
+        assert intervals[0]["mode"] == "HEATING_WATER"
+        assert intervals[0]["confidence"] == "measured"
+
+    @pytest.mark.asyncio
+    async def test_space_heating_is_estimated(self):
+        from packages.ml.models import DirectionAwareCOP
+
+        base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
+        prev = SimpleNamespace(
+            ts=base, device_action="HEATING", tank_temp=45.0, zone1_temp=30.0,
+            outdoor_temp=5.0, defrost_active=False, device_id="d1",
+        )
+        curr = SimpleNamespace(
+            ts=base + dt.timedelta(hours=1), device_action="HEATING", tank_temp=45.0,
+            zone1_temp=34.0, outdoor_temp=5.0, defrost_active=False, device_id="d1",
+        )
+        consumption = [SimpleNamespace(ts=base + dt.timedelta(hours=1), tank_kwh=0.0, heat_kwh=1.0, cool_kwh=0.0)]
+        results = [_ScalarResult([prev, curr]), _ScalarResult(consumption), _FakeResult([]), _FakeResult([])]
+
+        dac = DirectionAwareCOP()
+        with patch("packages.ml.models.get_session", _mock_get_session(results)):
+            intervals = await dac.compute_cop_intervals(hours=24)
+
+        assert len(intervals) == 1
+        assert intervals[0]["mode"] == "HEATING"
+        assert intervals[0]["confidence"] == "estimated"

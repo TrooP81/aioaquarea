@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import statistics
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,22 @@ class ConsumptionInterval:
         """Average electrical demand over the interval, in kW (kWh per hour)."""
         return self.total_kwh / self.elapsed_hours if self.elapsed_hours > 0 else 0.0
 
+    @property
+    def heat_rate_kw(self) -> float:
+        """Average *space-heating* electrical demand over the interval (kW).
+
+        Space heating is the only load whose physics match the demand model's
+        monotonic constraints (demand falls as it warms up outside). DHW and
+        cooling are deliberately excluded — DHW is outdoor-independent and
+        cooling has the opposite temperature relationship.
+        """
+        return self.heat_kwh / self.elapsed_hours if self.elapsed_hours > 0 else 0.0
+
+    @property
+    def cool_rate_kw(self) -> float:
+        """Average *cooling* electrical demand over the interval (kW)."""
+        return self.cool_kwh / self.elapsed_hours if self.elapsed_hours > 0 else 0.0
+
 
 def iter_consumption_intervals(
     rows: Iterable[_ConsumptionRowLike],
@@ -86,7 +103,7 @@ try:
         GradientBoostingRegressor,
         HistGradientBoostingRegressor,
     )
-    from sklearn.model_selection import cross_val_score
+    from sklearn.model_selection import TimeSeriesSplit, cross_val_score
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -96,11 +113,52 @@ except ImportError:
     GradientBoostingRegressor = None
     HistGradientBoostingRegressor = None
     cross_val_score = None
+    TimeSeriesSplit = None
     Pipeline = None
     StandardScaler = None
 
 MODEL_DIR = Path(app_settings.model_dir)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:
+    """Cross-validated mean absolute error with forward-chaining time-series CV.
+
+    Returns a ``(mean_MAE, std_MAE)`` tuple where ``mean_MAE`` is the average
+    per-fold MAE and ``std_MAE`` is the standard deviation of those per-fold
+    MAEs (a measure of how stable the error is across folds).
+
+    ``X``/``y`` **must** already be ordered chronologically. Unlike plain
+    ``KFold`` (which shuffles future rows into the training folds and leaks
+    information backwards in time), ``TimeSeriesSplit`` always trains on the
+    past and validates on the immediately following slice — an honest estimate
+    of how the model will perform on genuinely unseen future data.
+
+    Falls back to a single in-sample MAE when there are too few samples to form
+    at least two folds.
+    """
+    if not HAS_SKLEARN:
+        raise ImportError("scikit-learn required: pip install scikit-learn")
+
+    from sklearn.base import clone
+    from sklearn.metrics import mean_absolute_error
+
+    n = len(X)
+    n_splits = min(max_splits, n - 1)
+    if n_splits < 2:
+        model.fit(X, y)
+        return float(mean_absolute_error(y, model.predict(X))), 0.0
+
+    splitter = TimeSeriesSplit(n_splits=n_splits)
+    maes: list[float] = []
+    for train_idx, test_idx in splitter.split(X):
+        fold = clone(model)
+        fold.fit(X[train_idx], y[train_idx])
+        maes.append(mean_absolute_error(y[test_idx], fold.predict(X[test_idx])))
+
+    mean_mae = statistics.fmean(maes)
+    std_mae = statistics.pstdev(maes) if len(maes) > 1 else 0.0
+    return float(mean_mae), float(std_mae)
 
 
 def make_monotonic_regressor(monotonic_cst, **overrides):
@@ -127,3 +185,62 @@ def make_monotonic_regressor(monotonic_cst, **overrides):
     )
     params.update(overrides)
     return HistGradientBoostingRegressor(monotonic_cst=list(monotonic_cst), **params)
+
+
+# Fractional MAE increase tolerated before a retrained model is treated as a
+# regression and withheld from deployment (keeps the previously good model live).
+MAE_REGRESSION_TOLERANCE = 0.10
+
+
+def _baseline_path(name: str) -> Path:
+    return MODEL_DIR / f"{name}_mae_baseline.json"
+
+
+def read_mae_baseline(name: str) -> float | None:
+    """Return the last-deployed MAE for model ``name``, or ``None`` if unknown."""
+    import json
+
+    path = _baseline_path(name)
+    if not path.exists():
+        return None
+    try:
+        return float(json.loads(path.read_text()).get("mae"))
+    except (ValueError, OSError, TypeError):
+        return None
+
+
+def write_mae_baseline(name: str, mae: float) -> None:
+    """Persist the MAE of the newly deployed model ``name`` as the new baseline."""
+    import json
+
+    payload = {"mae": float(mae), "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    try:
+        _baseline_path(name).write_text(json.dumps(payload))
+    except OSError:
+        _logger.warning("mae_baseline_write_failed", model=name)
+
+
+def evaluate_regression(name: str, mae: float, has_prior_model: bool) -> dict[str, object]:
+    """Decide whether a freshly trained model should be deployed.
+
+    Compares ``mae`` against the persisted baseline for ``name``. Deployment is
+    withheld only when a usable prior model already exists *and* the new MAE is
+    worse than the baseline by more than :data:`MAE_REGRESSION_TOLERANCE` — so a
+    noisy retrain can never replace a better model, while first-ever training
+    always deploys.
+
+    Returns a dict with ``deploy`` (bool), ``baseline_mae`` and ``improved``.
+    """
+    baseline = read_mae_baseline(name)
+    if baseline is None or not has_prior_model:
+        return {"deploy": True, "baseline_mae": baseline, "improved": True}
+    regressed = mae > baseline * (1.0 + MAE_REGRESSION_TOLERANCE)
+    if regressed:
+        _logger.warning(
+            "model_retrain_regressed",
+            model=name,
+            new_mae=round(mae, 4),
+            baseline_mae=round(baseline, 4),
+            tolerance=MAE_REGRESSION_TOLERANCE,
+        )
+    return {"deploy": not regressed, "baseline_mae": baseline, "improved": mae <= baseline}
