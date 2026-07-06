@@ -84,6 +84,23 @@ class ThermalPrediction:
         return self.estimated_minutes / 60.0
 
 
+# Passive solar gain added to indoor-air predictions. Direct sun measurably
+# warms a home; roughly 0.4 °C over an hour at full sun (1000 W/m²), clamped so
+# it can never dominate the learned heating/cooling dynamics. This lets the
+# indoor forecast reflect sunny vs overcast hours (e.g. SMHI cloud-derived
+# irradiance) even before the comfort model is trained.
+_SOLAR_GAIN_C_PER_1000_WM2 = 0.4
+_SOLAR_GAIN_MAX_C_PER_H = 0.5
+
+
+def _solar_gain_c(irradiance: float | None) -> float:
+    """Indoor-air warming (°C over one hour) contributed by solar irradiance."""
+    if not irradiance or irradiance <= 0:
+        return 0.0
+    gain = _SOLAR_GAIN_C_PER_1000_WM2 * (irradiance / 1000.0)
+    return min(_SOLAR_GAIN_MAX_C_PER_H, gain)
+
+
 class ThermalModel:
     """
     Models tank and zone thermal dynamics from historical data.
@@ -680,7 +697,8 @@ class ThermalModel:
                 scale = delta / 15.0 if delta < 15.0 else 1.0
                 rate = rate * scale
 
-            indoor += rate
+            # Passive solar gain warms the home on sunny hours (0 at night/overcast).
+            indoor += rate + _solar_gain_c(irradiance)
             # Indoor temp physically bounded
             indoor = max(indoor, outdoor)
 
@@ -873,10 +891,11 @@ class ThermalModel:
             else:
                 # At/above setpoint → coast down toward it (Newton's law toward
                 # outdoor), but never below the active setpoint or outdoor temp.
+                # Passive solar gain offsets the loss on sunny hours.
                 cooling = self._indoor_cooling_rate(outdoor)
                 delta = max(indoor - outdoor, 0.0)
                 scale = delta / 15.0 if delta < 15.0 else 1.0
-                indoor += cooling * scale
+                indoor += cooling * scale + _solar_gain_c(wx.get("irradiance"))
                 indoor = max(indoor, target, outdoor)
                 state = "standby"
 

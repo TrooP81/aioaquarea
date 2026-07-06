@@ -64,39 +64,67 @@ SAMPLE_SMHI_JSON = {
     "timeSeries": [
         {
             "time": "2026-07-06T22:00:00Z",
-            "data": {"air_temperature": 11.2, "wind_speed": 2.1, "relative_humidity": 54},
+            "data": {
+                "air_temperature": 11.2,
+                "wind_speed": 2.1,
+                "relative_humidity": 54,
+                "cloud_area_fraction": 8,  # fully overcast (octas)
+            },
         },
         {
             "time": "2026-07-06T23:00:00Z",
-            "data": {"air_temperature": 10.5, "wind_speed": 2.4, "relative_humidity": 58},
+            "data": {
+                "air_temperature": 10.5,
+                "wind_speed": 2.4,
+                "relative_humidity": 58,
+                "cloud_area_fraction": 4,  # half cloud
+            },
         },
         {
             # Coarser 3h step later in the forecast — hours in between are filled.
             "time": "2026-07-07T02:00:00Z",
-            "data": {"air_temperature": 9.0, "wind_speed": 3.0, "relative_humidity": 70},
+            "data": {
+                "air_temperature": 9.0,
+                "wind_speed": 3.0,
+                "relative_humidity": 70,
+                "cloud_area_fraction": 0,  # clear sky
+            },
         },
     ],
 }
 
+# Norrköping-ish coordinates for the sample.
+_SMHI_LAT = 58.5812
+_SMHI_LON = 16.158
+
 
 class TestSmhiParser:
     def test_parses_contiguous_hourly_grid(self):
-        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, hours=6)
+        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, _SMHI_LAT, _SMHI_LON, hours=6)
         assert len(result) == 6
         assert result[0]["ts"] == dt.datetime(2026, 7, 6, 22, tzinfo=dt.timezone.utc)
         assert result[1]["ts"] == dt.datetime(2026, 7, 6, 23, tzinfo=dt.timezone.utc)
         assert result[2]["ts"] == dt.datetime(2026, 7, 7, 0, tzinfo=dt.timezone.utc)
 
     def test_maps_parameters(self):
-        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, hours=3)
+        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, _SMHI_LAT, _SMHI_LON, hours=3)
         assert result[0]["temperature"] == 11.2
         assert result[0]["wind_speed"] == 2.1
         assert result[0]["humidity"] == 54
-        # SMHI provides no solar-radiation parameter.
-        assert result[0]["irradiance"] is None
+        # Cloud cover in octas (0–8) mapped to a fraction (0–1).
+        assert result[0]["cloud_cover"] == 1.0
+        assert result[1]["cloud_cover"] == 0.5
+
+    def test_derives_irradiance_from_cloud_and_geometry(self):
+        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, _SMHI_LAT, _SMHI_LON, hours=3)
+        # SMHI has no radiation parameter; irradiance is reconstructed and must
+        # be a number (0 at night — these sample hours are around local midnight).
+        for row in result:
+            assert row["irradiance"] is not None
+            assert row["irradiance"] >= 0.0
 
     def test_forward_fills_coarse_steps(self):
-        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, hours=6)
+        result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, _SMHI_LAT, _SMHI_LON, hours=6)
         # 00:00 and 01:00 have no explicit sample → forward-fill 23:00's value.
         assert result[2]["temperature"] == 10.5
         assert result[3]["temperature"] == 10.5
@@ -104,5 +132,22 @@ class TestSmhiParser:
         assert result[4]["temperature"] == 9.0
 
     def test_empty_series(self):
-        assert _parse_smhi_forecast({"timeSeries": []}) == []
-        assert _parse_smhi_forecast({}) == []
+        assert _parse_smhi_forecast({"timeSeries": []}, _SMHI_LAT, _SMHI_LON) == []
+        assert _parse_smhi_forecast({}, _SMHI_LAT, _SMHI_LON) == []
+
+    def test_daytime_clear_sky_has_positive_irradiance(self):
+        data = {
+            "timeSeries": [
+                {
+                    "time": "2026-06-21T11:00:00Z",  # ~solar noon, high summer sun
+                    "data": {
+                        "air_temperature": 20.0,
+                        "wind_speed": 2.0,
+                        "relative_humidity": 40,
+                        "cloud_area_fraction": 0,
+                    },
+                }
+            ]
+        }
+        result = _parse_smhi_forecast(data, _SMHI_LAT, _SMHI_LON, hours=1)
+        assert result[0]["irradiance"] > 0.0

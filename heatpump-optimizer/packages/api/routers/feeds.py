@@ -57,6 +57,8 @@ async def get_weather(hours: int = Query(48, ge=1, le=168)):
             temperature=r.temperature,
             wind_speed=r.wind_speed,
             humidity=r.humidity,
+            cloud_cover=r.cloud_cover,
+            irradiance=r.irradiance,
         )
         for r in rows
     ]

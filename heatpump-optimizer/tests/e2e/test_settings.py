@@ -39,7 +39,7 @@ class TestSettingsGet:
         data = resp.json()
 
         assert data["price_provider"]["options"] == ["entsoe", "tibber", "manual"]
-        assert data["weather_provider"]["options"] == ["open-meteo", "manual"]
+        assert data["weather_provider"]["options"] == ["open-meteo", "smhi", "manual"]
 
     async def test_get_settings_masks_secrets(self, client: AsyncClient, db_session):
         """Secret values are masked in GET response."""

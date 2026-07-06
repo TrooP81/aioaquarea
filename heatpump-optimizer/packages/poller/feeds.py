@@ -9,6 +9,7 @@ import httpx
 
 from packages.core.config import settings
 from packages.core.settings_service import get_setting
+from packages.core.solar import clear_sky_ghi, estimate_ghi
 
 # ENTSO-E Transparency Platform day-ahead prices
 ENTSOE_URL = "https://web-api.tp.entsoe.eu/api"
@@ -206,7 +207,7 @@ async def fetch_weather() -> list[dict]:
     params = {
         "latitude": float(lat) if lat else settings.latitude,
         "longitude": float(lng) if lng else settings.longitude,
-        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation",
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover",
         "forecast_days": 2,
         "timezone": "UTC",
     }
@@ -222,6 +223,7 @@ async def fetch_weather() -> list[dict]:
     humidity = hourly.get("relative_humidity_2m", [])
     wind = hourly.get("wind_speed_10m", [])
     radiation = hourly.get("direct_radiation", [])
+    cloud = hourly.get("cloud_cover", [])
 
     results = []
     for i, time_str in enumerate(times):
@@ -233,13 +235,21 @@ async def fetch_weather() -> list[dict]:
                 "humidity": humidity[i] if i < len(humidity) else None,
                 "wind_speed": wind[i] if i < len(wind) else None,
                 "irradiance": radiation[i] if i < len(radiation) else None,
+                # Open-Meteo reports cloud cover in percent; store as a fraction.
+                "cloud_cover": (
+                    cloud[i] / 100.0
+                    if i < len(cloud) and cloud[i] is not None
+                    else None
+                ),
             }
         )
 
     return results
 
 
-def _parse_smhi_forecast(data: dict, hours: int = 48) -> list[dict]:
+def _parse_smhi_forecast(
+    data: dict, latitude: float, longitude: float, hours: int = 48
+) -> list[dict]:
     """
     Parse an SMHI point-forecast JSON payload into hourly weather dicts.
 
@@ -248,8 +258,12 @@ def _parse_smhi_forecast(data: dict, hours: int = 48) -> list[dict]:
     of ``hours`` entries via step (forward) fill, so it matches the hourly
     contract the optimizer and thermal model expect from Open-Meteo.
 
-    SMHI provides no solar-radiation parameter, so ``irradiance`` is always None.
-    Returns list of dicts with ts, temperature, humidity, wind_speed, irradiance.
+    SMHI has no solar-radiation parameter, but it reports total cloud cover in
+    octas (``cloud_area_fraction``, 0–8). We reconstruct ``irradiance`` from the
+    sun's position (via ``latitude``/``longitude``/time) attenuated by that
+    cloud cover, so temperature predictions still reflect sunny vs overcast
+    hours. Returns dicts with ts, temperature, humidity, wind_speed, cloud_cover
+    (fraction 0–1) and irradiance (W/m²).
     """
     series: list[tuple[dt.datetime, dict]] = []
     for entry in data.get("timeSeries", []):
@@ -285,14 +299,25 @@ def _parse_smhi_forecast(data: dict, hours: int = 48) -> list[dict]:
         temp = params.get("air_temperature")
         wind = params.get("wind_speed")
         humidity = params.get("relative_humidity")
+        # Total cloud cover in octas (0–8) → fraction (0–1).
+        octas = params.get("cloud_area_fraction")
+        cloud_fraction = (
+            max(0.0, min(1.0, float(octas) / 8.0)) if octas is not None else None
+        )
+        # Reconstruct irradiance from solar geometry, attenuated by cloud cover
+        # (assume clear sky when cloud data is missing).
+        if cloud_fraction is not None:
+            irradiance = estimate_ghi(latitude, longitude, slot, cloud_fraction)
+        else:
+            irradiance = clear_sky_ghi(latitude, longitude, slot)
         results.append(
             {
                 "ts": slot,
                 "temperature": float(temp) if temp is not None else None,
                 "humidity": float(humidity) if humidity is not None else None,
                 "wind_speed": float(wind) if wind is not None else None,
-                # SMHI has no solar-radiation parameter.
-                "irradiance": None,
+                "cloud_cover": cloud_fraction,
+                "irradiance": irradiance,
             }
         )
 
@@ -303,7 +328,8 @@ async def _fetch_weather_smhi() -> list[dict]:
     """
     Fetch a 48h weather forecast from SMHI Open Data (Nordic/Baltic, no API key).
 
-    Returns list of dicts with ts, temperature, humidity, wind_speed, irradiance.
+    Returns list of dicts with ts, temperature, humidity, wind_speed,
+    cloud_cover and (solar-geometry-derived) irradiance.
     """
     lat = await get_setting("latitude")
     lng = await get_setting("longitude")
@@ -318,7 +344,7 @@ async def _fetch_weather_smhi() -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
 
-    return _parse_smhi_forecast(data)
+    return _parse_smhi_forecast(data, latitude, longitude)
 
 
 async def _get_manual_weather() -> list[dict]:
@@ -353,6 +379,7 @@ async def _get_manual_weather() -> list[dict]:
             "humidity": humidity,
             "wind_speed": wind,
             "irradiance": irradiance,
+            "cloud_cover": None,
         }
         for h in range(48)
     ]

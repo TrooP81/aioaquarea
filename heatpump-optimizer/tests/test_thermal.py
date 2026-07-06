@@ -594,6 +594,37 @@ class TestManagedIndoorCurve:
         assert len(curve) == 6
         assert all(c["target"] == 20.5 for c in curve)
 
+    def test_solar_gain_keeps_indoor_warmer(self):
+        """Sunny hours must raise the indoor forecast vs an identical dark day."""
+        model = ThermalModel()
+        targets = [18.0] * 12  # overnight setback → coasting/standby
+        sunny = [
+            {"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 800.0, "hour": h % 24}
+            for h in range(12)
+        ]
+        dark = [
+            {"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
+            for h in range(12)
+        ]
+        sunny_curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=sunny, hours=12,
+        )
+        dark_curve = model.predict_managed_indoor_curve(
+            current_indoor=20.5, indoor_target_per_hour=targets,
+            weather_forecast=dark, hours=12,
+        )
+        # Solar gain offsets the setback loss, so at least some hours are warmer.
+        assert any(
+            s["predicted_indoor_temp"] > d["predicted_indoor_temp"]
+            for s, d in zip(sunny_curve, dark_curve)
+        )
+        # And it never makes the sunny day colder than the dark one.
+        assert all(
+            s["predicted_indoor_temp"] >= d["predicted_indoor_temp"] - 1e-9
+            for s, d in zip(sunny_curve, dark_curve)
+        )
+
 
 class TestPlannedTankCurve:
     """Test predict_planned_tank_curve — follows the optimizer's DHW schedule."""

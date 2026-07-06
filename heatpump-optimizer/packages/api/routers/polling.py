@@ -154,6 +154,7 @@ async def poll_now():
                         irradiance=entry.get("irradiance"),
                         wind_speed=entry.get("wind_speed"),
                         humidity=entry.get("humidity"),
+                        cloud_cover=entry.get("cloud_cover"),
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ts", "source"],
@@ -162,6 +163,7 @@ async def poll_now():
                             "irradiance": entry.get("irradiance"),
                             "wind_speed": entry.get("wind_speed"),
                             "humidity": entry.get("humidity"),
+                            "cloud_cover": entry.get("cloud_cover"),
                         },
                     )
                     await db.execute(stmt)

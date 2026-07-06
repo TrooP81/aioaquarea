@@ -76,6 +76,8 @@ class WeatherResponse(BaseModel):
     temperature: Optional[float] = None
     wind_speed: Optional[float] = None
     humidity: Optional[float] = None
+    cloud_cover: Optional[float] = None
+    irradiance: Optional[float] = None
 
 
 class PlanResponse(BaseModel):

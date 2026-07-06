@@ -99,6 +99,7 @@ class WeatherRecord(Base):
     irradiance: Mapped[float | None] = mapped_column(Float)
     wind_speed: Mapped[float | None] = mapped_column(Float)
     humidity: Mapped[float | None] = mapped_column(Float)
+    cloud_cover: Mapped[float | None] = mapped_column(Float)
 
 
 class PlanRecord(Base):

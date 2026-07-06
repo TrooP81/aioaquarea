@@ -19,6 +19,8 @@ interface WeatherPoint {
   temperature: number | null;
   wind_speed: number | null;
   humidity: number | null;
+  cloud_cover: number | null;
+  irradiance: number | null;
 }
 
 export function ForecastChart() {
@@ -46,6 +48,7 @@ export function ForecastChart() {
       temperature: d.temperature,
       windSpeed: d.wind_speed,
       humidity: d.humidity,
+      cloudCover: d.cloud_cover != null ? Math.round(d.cloud_cover * 100) : null,
       isForecast: ts > now,
     };
   });
@@ -86,6 +89,8 @@ export function ForecastChart() {
             fontSize={11}
             unit=" m/s"
           />
+          {/* Hidden 0–100% axis backing the cloud-cover series. */}
+          <YAxis yAxisId="cloud" domain={[0, 100]} hide />
           <Tooltip
             contentStyle={{
               background: "#1e293b",
@@ -96,6 +101,7 @@ export function ForecastChart() {
               if (name === "Temperature") return [`${value}°C`, name];
               if (name === "Wind Speed") return [`${value} m/s`, name];
               if (name === "Humidity") return [`${value}%`, name];
+              if (name === "Cloud Cover") return [`${value}%`, name];
               return [value, name];
             }}
           />
@@ -117,6 +123,17 @@ export function ForecastChart() {
             strokeWidth={1.5}
             dot={false}
             name="Wind Speed"
+          />
+          <Line
+            yAxisId="cloud"
+            type="monotone"
+            dataKey="cloudCover"
+            stroke="#94a3b8"
+            strokeWidth={1.5}
+            strokeDasharray="4 3"
+            dot={false}
+            connectNulls
+            name="Cloud Cover"
           />
         </LineChart>
       </ResponsiveContainer>
