@@ -681,6 +681,35 @@ class TestPlannedTankCurve:
         )
         assert half[0]["predicted_temp"] < full[0]["predicted_temp"]
 
+    def test_heating_never_below_standby_when_above_target(self):
+        """Regression: starting above target, a DHW cycle must not cool the tank.
+
+        The tank starts at/above ``tank_target`` ("At target"). A scheduled DHW
+        hour must never pull the tank *below* where the pure standby ("no
+        heating") curve would be — heating can only add heat, never remove it.
+        """
+        model = ThermalModel()
+        current_temp = 50.0
+        tank_target = 45.0  # tank already 5°C above target
+        outdoor = 7.0
+        dhw = [0.0] * 12
+        for h in (3, 7, 9):  # scheduled DHW cycles
+            dhw[h] = 60.0
+
+        heating = model.predict_planned_tank_curve(
+            current_temp=current_temp, outdoor_temp=outdoor,
+            tank_target=tank_target, dhw_minutes_per_hour=dhw, hours=12,
+        )
+        standby = model.predict_temperature_curve(
+            current_temp=current_temp, outdoor_temp=outdoor,
+            hours=12, target_temp=None, is_tank=True,
+        )
+        for hh, ss in zip(heating, standby):
+            assert hh["predicted_temp"] >= ss["predicted_temp"] - 1e-6, (
+                f"hour {hh['hour']}: with-heating {hh['predicted_temp']} "
+                f"dropped below no-heating {ss['predicted_temp']}"
+            )
+
 
 class TestCalibrateIndoorRates:
     """Test indoor rate calibration with mocked DB data."""

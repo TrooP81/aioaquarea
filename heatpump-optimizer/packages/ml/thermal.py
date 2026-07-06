@@ -939,12 +939,22 @@ class ThermalModel:
 
             if minutes > 0:
                 heat_frac = minutes / 60.0
-                temp += heating_rate * heat_frac
-                if temp > tank_target:
-                    temp = tank_target
+                # What the tank would do coasting on standby loss for the whole
+                # hour (the "no heating" behaviour).
+                coasted = _coast(temp, 1.0)
+                # What the tank does when the DHW cycle reheats toward target.
+                heated = temp + heating_rate * heat_frac
+                if heated > tank_target:
+                    heated = tank_target
                 # The remainder of the hour (if any) coasts on standby loss.
                 if heat_frac < 1.0:
-                    temp = _coast(temp, 1.0 - heat_frac)
+                    heated = _coast(heated, 1.0 - heat_frac)
+                # Heating can only *add* energy: if the tank is already above the
+                # target, the DHW thermostat won't call for heat and the tank
+                # simply coasts. Taking the max guarantees the "with heating"
+                # curve never dips below the "no heating" curve (the clamp to
+                # ``tank_target`` must never pull an already-hot tank down).
+                temp = max(heated, coasted)
                 state = "heating"
             else:
                 temp = _coast(temp, 1.0)
