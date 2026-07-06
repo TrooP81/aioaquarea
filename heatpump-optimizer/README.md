@@ -22,7 +22,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Hourly-accurate cost tracking**: Today's cost is computed as Σ(per-interval Δ kWh × that hour's spot price), not a flat-rate estimate
 - **Fault detection**: Automatic detection and logging of device faults
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
-- **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
+- **Weather-aware**: Open-Meteo (default) or SMHI forecast for COP estimation and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
 - **Rules-based optimizer (v3)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
 - **MILP optimizer**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor

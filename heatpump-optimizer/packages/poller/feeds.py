@@ -1,4 +1,4 @@
-"""External data feeds: electricity prices (ENTSO-E / Tibber) and weather (Open-Meteo)."""
+"""External data feeds: electricity prices (ENTSO-E / Tibber) and weather (Open-Meteo / SMHI)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ TIBBER_URL = "https://api.tibber.com/v1-beta/gql"
 
 # Open-Meteo free weather API
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+# SMHI Open Data point forecast (Nordic/Baltic coverage, no API key).
+# Note: longitude precedes latitude in the URL path.
+SMHI_URL = (
+    "https://opendata-download-metfcst.smhi.se/api/category/snow1g/version/1"
+    "/geotype/point/lon/{lon}/lat/{lat}/data.json"
+)
 
 
 async def fetch_prices() -> list[tuple[dt.datetime, float]]:
@@ -183,12 +190,15 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
 
 async def fetch_weather() -> list[dict]:
     """
-    Fetch 48h weather forecast from Open-Meteo (free, no API key) or manual static values.
+    Fetch 48h weather forecast from the configured provider (Open-Meteo or SMHI,
+    both free and keyless) or manual static values.
     Returns list of dicts with ts, temperature, irradiance, wind_speed, humidity.
     """
     provider = await get_setting("weather_provider")
     if provider == "manual":
         return await _get_manual_weather()
+    if provider == "smhi":
+        return await _fetch_weather_smhi()
 
     lat = await get_setting("latitude")
     lng = await get_setting("longitude")
@@ -227,6 +237,88 @@ async def fetch_weather() -> list[dict]:
         )
 
     return results
+
+
+def _parse_smhi_forecast(data: dict, hours: int = 48) -> list[dict]:
+    """
+    Parse an SMHI point-forecast JSON payload into hourly weather dicts.
+
+    SMHI returns a variable-resolution forecast (hourly at the start, then 3, 6
+    and 12h steps further out). This resamples it onto a contiguous hourly grid
+    of ``hours`` entries via step (forward) fill, so it matches the hourly
+    contract the optimizer and thermal model expect from Open-Meteo.
+
+    SMHI provides no solar-radiation parameter, so ``irradiance`` is always None.
+    Returns list of dicts with ts, temperature, humidity, wind_speed, irradiance.
+    """
+    series: list[tuple[dt.datetime, dict]] = []
+    for entry in data.get("timeSeries", []):
+        time_str = entry.get("time")
+        if not time_str:
+            continue
+        ts = dt.datetime.fromisoformat(time_str.replace("Z", "+00:00")).astimezone(
+            dt.timezone.utc
+        )
+        params = entry.get("data") or {}
+        series.append((ts, params))
+
+    if not series:
+        return []
+
+    series.sort(key=lambda item: item[0])
+
+    def _sample_at(target: dt.datetime) -> dict:
+        """Return the most recent SMHI sample at or before ``target``."""
+        chosen = series[0][1]
+        for sample_ts, sample_params in series:
+            if sample_ts <= target:
+                chosen = sample_params
+            else:
+                break
+        return chosen
+
+    start = series[0][0].replace(minute=0, second=0, microsecond=0)
+    results: list[dict] = []
+    for h in range(hours):
+        slot = start + dt.timedelta(hours=h)
+        params = _sample_at(slot)
+        temp = params.get("air_temperature")
+        wind = params.get("wind_speed")
+        humidity = params.get("relative_humidity")
+        results.append(
+            {
+                "ts": slot,
+                "temperature": float(temp) if temp is not None else None,
+                "humidity": float(humidity) if humidity is not None else None,
+                "wind_speed": float(wind) if wind is not None else None,
+                # SMHI has no solar-radiation parameter.
+                "irradiance": None,
+            }
+        )
+
+    return results
+
+
+async def _fetch_weather_smhi() -> list[dict]:
+    """
+    Fetch a 48h weather forecast from SMHI Open Data (Nordic/Baltic, no API key).
+
+    Returns list of dicts with ts, temperature, humidity, wind_speed, irradiance.
+    """
+    lat = await get_setting("latitude")
+    lng = await get_setting("longitude")
+    latitude = float(lat) if lat else settings.latitude
+    longitude = float(lng) if lng else settings.longitude
+
+    # SMHI wants coordinates to max 6 decimals, longitude before latitude.
+    url = SMHI_URL.format(lon=round(longitude, 6), lat=round(latitude, 6))
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return _parse_smhi_forecast(data)
 
 
 async def _get_manual_weather() -> list[dict]:

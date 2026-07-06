@@ -85,7 +85,7 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": None,
         "default": "open-meteo",
         "description": "Weather data source",
-        "options": ["open-meteo", "manual"],
+        "options": ["open-meteo", "smhi", "manual"],
     },
     # --- API keys ---
     "entsoe_api_token": {
