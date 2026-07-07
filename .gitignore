@@ -14,9 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-# Anchored to repo root so the Next.js web/lib/ source dir is NOT ignored
-/lib/
-/lib64/
+lib/
+lib64/
 parts/
 sdist/
 var/

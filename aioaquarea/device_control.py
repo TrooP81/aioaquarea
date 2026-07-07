@@ -24,28 +24,9 @@ if TYPE_CHECKING:
 class AquareaDeviceControl:
     """Handles device control operations."""
 
-    _TRANSFER_URL = "remote/v1/app/common/transfer"
-    _TRANSFER_API_NAME = "/remote/v1/api/devices"
-
     def __init__(self, api_client: AquareaAPIClient, base_url: str):
         self._api_client = api_client
         self._base_url = base_url
-
-    @staticmethod
-    def _build_transfer_request(long_id: str, **body_params: object) -> dict[str, object]:
-        return {
-            "apiName": AquareaDeviceControl._TRANSFER_API_NAME,
-            "requestMethod": "POST",
-            "bodyParam": {"gwid": long_id, **body_params},
-        }
-
-    async def _post_transfer(self, payload: dict[str, object]) -> None:
-        await self._api_client.request(
-            "POST",
-            self._TRANSFER_URL,
-            json=payload,
-            throw_on_error=True,
-        )
 
     async def post_device_operation_status(
         self, long_device_id: str, new_operation_status: OperationStatus
@@ -74,11 +55,22 @@ class AquareaDeviceControl:
         self, long_device_id: str, new_temperature: int
     ) -> None:
         """Post device tank temperature."""
-        await self._post_transfer(
-            self._build_transfer_request(
-                long_device_id,
-                tankStatus={"heatSet": new_temperature},
-            )
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {
+                "gwid": long_device_id,
+                "tankStatus": {
+                    "heatSet": new_temperature,
+                },
+            },
+        }
+
+        await self._api_client.request(
+            "POST",
+            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_tank_operation_status(
@@ -97,12 +89,21 @@ class AquareaDeviceControl:
                 }
             )
 
-        await self._post_transfer(
-            self._build_transfer_request(
-                long_device_id,
-                zoneStatus=zone_status_list,
-                tankStatus={"operationStatus": new_operation_status.value},
-            )
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {
+                "gwid": long_device_id,
+                "zoneStatus": zone_status_list,
+                "tankStatus": {"operationStatus": new_operation_status.value},
+            },
+        }
+
+        await self._api_client.request(
+            "POST",
+            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_operation_update(
@@ -133,14 +134,23 @@ class AquareaDeviceControl:
                         break
             zone_status_list.append(zone_data)
 
-        await self._post_transfer(
-            self._build_transfer_request(
-                long_id,
-                operationMode=mode.value,
-                operationStatus=operation_status.value,
-                zoneStatus=zone_status_list,
-                tankStatus={"operationStatus": tank_operation_status.value},
-            )
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {
+                "gwid": long_id,
+                "operationMode": mode.value,
+                "operationStatus": operation_status.value,
+                "zoneStatus": zone_status_list,
+                "tankStatus": {"operationStatus": tank_operation_status.value},
+            },
+        }
+
+        await self._api_client.request(
+            "POST",
+            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_set_special_status(
@@ -201,56 +211,119 @@ class AquareaDeviceControl:
         self, long_id: str, zone_id: int, temperature: int, key: str
     ) -> None:
         """Post device zone temperature."""
-        await self._post_transfer(
-            self._build_transfer_request(
-                long_id,
-                zoneStatus=[
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {
+                "gwid": long_id,
+                "zoneStatus": [
                     {
                         "zoneId": zone_id,
                         key: temperature,
                     }
                 ],
-            )
+            },
+        }
+
+        response = await self._api_client.request(
+            "POST",
+            "/remote/v1/app/common/transfer",
+            headers={},
+            json=data,
         )
 
     async def post_device_set_quiet_mode(self, long_id: str, mode: QuietMode) -> None:
         """Post quiet mode."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, quietMode=mode.value)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "quietMode": mode.value},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_force_dhw(self, long_id: str, force_dhw: ForceDHW) -> None:
         """Post force DHW command."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, forceDHW=force_dhw.value)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "forceDHW": force_dhw.value},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_force_heater(
         self, long_id: str, force_heater: ForceHeater
     ) -> None:
         """Post force heater command."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, forceHeater=force_heater.value)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "forceHeater": force_heater.value},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_holiday_timer(
         self, long_id: str, holiday_timer: HolidayTimer
     ) -> None:
         """Post holidayTimer command."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, holidayTimer=holiday_timer.value)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "holidayTimer": holiday_timer.value},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_request_defrost(self, long_id: str) -> None:
         """Post forcedefrost command."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, forcedefrost=1)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "forcedefrost": 1},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
 
     async def post_device_set_powerful_time(
         self, long_id: str, powerful_time: PowerfulTime
     ) -> None:
         """Post powerful time."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, powerfulRequest=powerful_time.value)
+        data = {
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": long_id, "powerfulRequest": powerful_time.value},
+        }
+
+        await self._api_client.request(
+            "POST",
+            "remote/v1/app/common/transfer",
+            json=data,
+            throw_on_error=True,
         )
