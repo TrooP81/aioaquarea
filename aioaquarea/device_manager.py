@@ -166,8 +166,6 @@ class DeviceManager:
 
     async def get_device_status(self, device_info: DeviceInfo) -> DeviceStatus:
         """Retrives device status."""
-        from .errors import AuthenticationError
-
         json_response = None
         try:
             payload = {
@@ -184,9 +182,6 @@ class DeviceManager:
             self._logger.info(
                 f"get_device_status (live): Raw JSON response for device {device_info.device_id}: {json_response}"
             )
-        except AuthenticationError:
-            # Let auth errors propagate so @auth_required can re-login
-            raise
         except Exception as e:
             self._logger.warning(
                 "Failed to get live status for device {}: {}".format(
@@ -211,9 +206,6 @@ class DeviceManager:
                         device_info.device_id, json_response
                     )
                 )
-            except AuthenticationError:
-                # Let auth errors propagate so @auth_required can re-login
-                raise
             except Exception as e_cached:
                 self._logger.error(
                     "Failed to get cached status for device {}: {}".format(
