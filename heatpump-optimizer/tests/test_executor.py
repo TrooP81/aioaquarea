@@ -174,6 +174,47 @@ class TestVerification:
             result = ACTION_REGISTRY[action_type].verify(device, {}, expected)
             assert result.ok, action_type
 
+    def test_eco_mode_unobservable_special_status_passes(self):
+        """Regression: aioaquarea never reports special_status (always None), so
+        setting ECO must not fail verification forever — it's accepted as applied.
+        """
+        device = _device(special_status=None)  # library always yields None
+        result = ACTION_REGISTRY[ActionType.ECO_MODE_ON].verify(
+            device, {}, {"special_status": "ECO"}
+        )
+        assert result.ok
+        assert result.reason == "special_status_unverifiable"
+        assert result.observed_value is None
+
+    def test_comfort_mode_unobservable_special_status_passes(self):
+        device = _device(special_status=None)
+        result = ACTION_REGISTRY[ActionType.COMFORT_MODE_ON].verify(
+            device, {}, {"special_status": "COMFORT"}
+        )
+        assert result.ok
+        assert result.reason == "special_status_unverifiable"
+
+    def test_special_status_real_mismatch_still_fails(self):
+        """Forward-compatible: if the library ever reports a real (non-None)
+        status that disagrees with the target, verification must still fail.
+        """
+        device = _device(special_status="COMFORT")
+        result = ACTION_REGISTRY[ActionType.ECO_MODE_ON].verify(
+            device, {}, {"special_status": "ECO"}
+        )
+        assert not result.ok
+        assert result.reason == "special_status_mismatch"
+
+    def test_clear_special_status_still_verifies(self):
+        """Clearing (target None) with an unreported status remains verified."""
+        device = _device(special_status=None)
+        result = ACTION_REGISTRY[ActionType.NORMAL_MODE_ON].verify(
+            device, {}, {"special_status": None}
+        )
+        assert result.ok
+        assert result.reason is None
+
+
 
 class TestExecuteDueActions:
     @pytest.mark.asyncio

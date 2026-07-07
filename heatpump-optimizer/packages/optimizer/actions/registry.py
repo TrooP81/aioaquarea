@@ -121,6 +121,23 @@ def _verify_quiet_mode(device: Any, payload: dict[str, Any], expected: dict[str,
 def _verify_special_status(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
     observed = _special_status_name(device)
     target = expected.get("special_status") if expected else None
+
+    # The aioaquarea library does not surface the device's active special status
+    # (DeviceStatus.special_status is hard-coded to None), so ECO/COMFORT can
+    # never be read back via a refresh. When a special mode was requested and the
+    # device reports nothing, accept the successful dispatch as applied instead
+    # of failing verification forever — which otherwise spams
+    # `action_verification_failed` errors and burns API read budget on 12 futile
+    # polls. This stays forward-compatible: if the library ever populates
+    # special_status, a real mismatch (observed non-None) still fails below.
+    if target is not None and observed is None:
+        return VerifyResult(
+            ok=True,
+            observed_value=observed,
+            expected_value=target,
+            reason="special_status_unverifiable",
+        )
+
     ok = observed == target
     return VerifyResult(ok=ok, observed_value=observed, expected_value=target, reason=None if ok else "special_status_mismatch")
 
