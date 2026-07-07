@@ -107,6 +107,7 @@ async def test_get_device_status_parses_status_payload(device_manager, device_in
     device_manager._client._api_client.request.return_value = FakeResponse(
         {
             "status": {
+                "operationStatus": 1,
                 "specialStatus": 1,
                 "deiceStatus": 0,
                 "outdoorNow": 7,
@@ -160,6 +161,86 @@ async def test_get_device_status_parses_status_payload(device_manager, device_in
     assert status.force_heater == ForceHeater.OFF
     assert status.holiday_timer == HolidayTimer.ON
     assert status.powerful_time == PowerfulTime.ON_90MIN
+    assert status.special_status == SpecialStatus.ECO
     assert status.tank_status[0].temperature == 49
     assert status.zones[0].heat_set == 33
     assert status.fault_status[0].error_code == "F01"
+
+
+def _minimal_status_payload(**overrides):
+    """Build a minimal but valid device-status payload for parsing tests."""
+    status = {
+        "operationStatus": 1,
+        "specialStatus": 0,
+        "deiceStatus": 0,
+        "operationMode": 1,
+        "direction": 1,
+        "pumpDuty": 1,
+    }
+    status.update(overrides)
+    return {"status": status}
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (0, None),          # 0 → no special mode active
+        (1, SpecialStatus.ECO),
+        (2, SpecialStatus.COMFORT),
+        (99, None),         # unknown value → treated as no special status
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_device_status_parses_special_status(
+    device_manager, device_info, raw, expected
+):
+    device_manager._client._api_client.request.return_value = FakeResponse(
+        _minimal_status_payload(specialStatus=raw)
+    )
+
+    status = await device_manager.get_device_status(device_info)
+
+    assert status.special_status == expected
+
+
+@pytest.mark.asyncio
+async def test_get_device_status_special_status_absent_is_none(
+    device_manager, device_info
+):
+    payload = _minimal_status_payload()
+    payload["status"].pop("specialStatus")
+    device_manager._client._api_client.request.return_value = FakeResponse(payload)
+
+    status = await device_manager.get_device_status(device_info)
+
+    assert status.special_status is None
+
+
+@pytest.mark.asyncio
+async def test_get_device_status_operation_status_independent_of_special(
+    device_manager, device_info
+):
+    """Regression: operation_status must come from ``operationStatus`` and not be
+    conflated with ``specialStatus`` (previously ECO made the device read as ON).
+    """
+    device_manager._client._api_client.request.return_value = FakeResponse(
+        _minimal_status_payload(operationStatus=0, specialStatus=1)
+    )
+
+    status = await device_manager.get_device_status(device_info)
+
+    assert status.operation_status == OperationStatus.OFF
+    assert status.special_status == SpecialStatus.ECO
+
+
+@pytest.mark.asyncio
+async def test_get_device_status_operation_status_defaults_off_when_absent(
+    device_manager, device_info
+):
+    payload = _minimal_status_payload()
+    payload["status"].pop("operationStatus")
+    device_manager._client._api_client.request.return_value = FakeResponse(payload)
+
+    status = await device_manager.get_device_status(device_info)
+
+    assert status.operation_status == OperationStatus.OFF

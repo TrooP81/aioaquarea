@@ -21,6 +21,7 @@ from .data import (
     PumpDuty,
     QuietMode,
     SensorMode,
+    SpecialStatus,
     StatusDataMode,
     TankStatus,
 )
@@ -30,6 +31,34 @@ if TYPE_CHECKING:
     from .core import AquareaClient
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_operation_status(value: object) -> OperationStatus:
+    """Safely map a raw ``operationStatus`` value to :class:`OperationStatus`.
+
+    Falls back to ``OFF`` when the field is missing or holds an unexpected value
+    instead of raising, so a single unfamiliar payload never breaks a refresh.
+    """
+    try:
+        return OperationStatus(value)
+    except (ValueError, TypeError):
+        return OperationStatus.OFF
+
+
+def _parse_special_status(value: object) -> SpecialStatus | None:
+    """Map the raw ``specialStatus`` field to :class:`SpecialStatus` or ``None``.
+
+    The Aquarea API reports ``0`` (or omits the field) when no special mode is
+    active. :class:`SpecialStatus` only enumerates ``ECO`` (1) and ``COMFORT``
+    (2), so any missing, zero, or otherwise unrecognised value is treated as
+    "no special status" (``None``) rather than raising.
+    """
+    if not value:
+        return None
+    try:
+        return SpecialStatus(value)
+    except (ValueError, TypeError):
+        return None
 
 
 class DeviceManager:
@@ -205,7 +234,7 @@ class DeviceManager:
 
         device_status = DeviceStatus(
             long_id=device_info.device_id,  # Use device_info.long_id here
-            operation_status=OperationStatus(device.get("specialStatus")),
+            operation_status=_coerce_operation_status(device.get("operationStatus")),
             device_status=DeviceModeStatus(device.get("deiceStatus")),
             temperature_outdoor=device.get("outdoorNow"),
             operation_mode=(
@@ -260,7 +289,7 @@ class DeviceManager:
             force_heater=ForceHeater(device.get("forceHeater", 0)),
             holiday_timer=HolidayTimer(device.get("holidayTimer", 0)),
             powerful_time=PowerfulTime(device.get("powerful", 0)),
-            special_status=None,  # Simplified to None
+            special_status=_parse_special_status(device.get("specialStatus")),
         )
 
         return device_status
