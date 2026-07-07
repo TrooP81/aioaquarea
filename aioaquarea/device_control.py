@@ -68,7 +68,7 @@ class AquareaDeviceControl:
 
         await self._api_client.request(
             "POST",
-            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            "remote/v1/app/common/transfer",
             json=data,
             throw_on_error=True,
         )
@@ -101,7 +101,7 @@ class AquareaDeviceControl:
 
         await self._api_client.request(
             "POST",
-            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            "remote/v1/app/common/transfer",
             json=data,
             throw_on_error=True,
         )
@@ -148,7 +148,7 @@ class AquareaDeviceControl:
 
         await self._api_client.request(
             "POST",
-            url="remote/v1/app/common/transfer",  # Specific URL for transfer API
+            "remote/v1/app/common/transfer",
             json=data,
             throw_on_error=True,
         )
