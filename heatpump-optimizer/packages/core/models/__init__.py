@@ -100,6 +100,8 @@ class WeatherRecord(Base):
     wind_speed: Mapped[float | None] = mapped_column(Float)
     humidity: Mapped[float | None] = mapped_column(Float)
     cloud_cover: Mapped[float | None] = mapped_column(Float)
+    # Precipitation amount for the forecast hour (mm/h).
+    precipitation: Mapped[float | None] = mapped_column(Float)
 
 
 class PlanRecord(Base):

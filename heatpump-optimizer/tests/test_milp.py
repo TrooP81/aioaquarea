@@ -266,6 +266,22 @@ class TestMILPSolver:
         assert plan is not None
         assert "+ml" in plan["version"]
 
+    def test_ml_cop_receives_forecast_precipitation(self):
+        """The MILP must pass the matching forecast rain amount to the COP model."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        mock_cop = MagicMock()
+        mock_cop.is_trained = True
+        mock_cop.predict_cop = MagicMock(return_value=4.0)
+        milp = MILPOptimizer(cop_model=mock_cop)
+        ts = _make_prices()[0][0]
+
+        cop_fn = milp._build_cop_function(
+            None, [{"ts": ts, "precipitation": 2.5}]
+        )
+        assert cop_fn(5.0, ts.hour) == 4.0
+        mock_cop.predict_cop.assert_called_once_with(5.0, 50, ts.hour, 2.5)
+
     def test_milp_version_without_ml(self):
         """Version should be plain milp_v1 without ML models."""
         from packages.optimizer.milp import MILPOptimizer

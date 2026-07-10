@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
-from packages.core.models import ConsumptionRecord, DeviceStatusRecord
+from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord
 from packages.ml.models_common import (
     HAS_SKLEARN,
     MODEL_DIR,
@@ -20,9 +20,10 @@ from packages.ml.models_common import (
     write_mae_baseline,
 )
 
-# Physical monotonicity for COP features [outdoor_temp, tank_target, hour_sin, hour_cos]:
+# Physical monotonicity for COP features
+# [outdoor_temp, tank_target, hour_sin, hour_cos, precipitation]:
 # COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
-_COP_MONOTONIC_CST = [1, -1, 0, 0]
+_COP_MONOTONIC_CST = [1, -1, 0, 0, 0]
 
 
 class COPModel:
@@ -85,13 +86,19 @@ class COPModel:
         write_mae_baseline("cop", mae)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
-    def predict(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
-        return self._estimate_thermal_output(outdoor_temp, tank_target) / self.predict_cop(outdoor_temp, tank_target, hour)
+    def predict(
+        self, outdoor_temp: float, tank_target: int, hour: int, precipitation: float = 0.0
+    ) -> float:
+        return self._estimate_thermal_output(outdoor_temp, tank_target) / self.predict_cop(
+            outdoor_temp, tank_target, hour, precipitation
+        )
 
-    def predict_cop(self, outdoor_temp: float, tank_target: int, hour: int) -> float:
+    def predict_cop(
+        self, outdoor_temp: float, tank_target: int, hour: int, precipitation: float = 0.0
+    ) -> float:
         if self._model is None:
             return self._default_cop_curve(outdoor_temp)
-        features = self._make_features(outdoor_temp, tank_target, hour)
+        features = self._make_features(outdoor_temp, tank_target, hour, precipitation)
         raw = float(self._model.predict(features.reshape(1, -1))[0])
         return max(self.COP_MIN, min(self.COP_MAX, raw))
 
@@ -104,21 +111,26 @@ class COPModel:
         return 2.0 * max(0.5, 1.0 - outdoor_temp * 0.02)
 
     @staticmethod
-    def _make_features(outdoor_temp: float, tank_target: int, hour: int) -> np.ndarray:
+    def _make_features(
+        outdoor_temp: float, tank_target: int, hour: int, precipitation: float = 0.0
+    ) -> np.ndarray:
         hour_sin = np.sin(2 * np.pi * hour / 24)
         hour_cos = np.cos(2 * np.pi * hour / 24)
-        return np.array([outdoor_temp, tank_target, hour_sin, hour_cos])
+        return np.array([outdoor_temp, tank_target, hour_sin, hour_cos, max(0.0, precipitation)])
 
     async def _prepare_training_data(self) -> tuple[np.ndarray, np.ndarray]:
         async with get_session() as session:
             consumption_rows = (await session.execute(select(ConsumptionRecord.ts, ConsumptionRecord.heat_kwh, ConsumptionRecord.tank_kwh, ConsumptionRecord.outdoor_temp).order_by(ConsumptionRecord.ts))).all()
             status_rows = (await session.execute(select(DeviceStatusRecord.ts, DeviceStatusRecord.tank_target_temp, DeviceStatusRecord.tank_temp, DeviceStatusRecord.outdoor_temp, DeviceStatusRecord.direction, DeviceStatusRecord.zone1_temp).order_by(DeviceStatusRecord.ts))).all()
+            weather_rows = (await session.execute(select(WeatherRecord.ts, WeatherRecord.precipitation).order_by(WeatherRecord.ts))).all()
 
         if not consumption_rows or not status_rows:
             return np.array([]), np.array([])
 
         status_sorted = sorted(status_rows, key=lambda s: s.ts)
         status_ts = [s.ts for s in status_sorted]
+        weather_sorted = sorted(weather_rows, key=lambda w: w.ts)
+        weather_ts = [w.ts for w in weather_sorted]
 
         def _find_closest_status(ts):
             import bisect
@@ -133,6 +145,18 @@ class COPModel:
                         best_gap = gap
                         best = status_sorted[candidate_idx]
             return best if best and best_gap <= 1200 else None
+
+        def _precipitation_at(ts) -> float:
+            if not weather_sorted:
+                return 0.0
+            import bisect
+
+            idx = bisect.bisect_left(weather_ts, ts)
+            candidates = [weather_sorted[i] for i in (idx - 1, idx) if 0 <= i < len(weather_sorted)]
+            if not candidates:
+                return 0.0
+            closest = min(candidates, key=lambda item: abs((item.ts - ts).total_seconds()))
+            return max(0.0, float(closest.precipitation or 0.0)) if abs((closest.ts - ts).total_seconds()) <= 7200 else 0.0
 
         X_list = []
         y_list = []
@@ -202,7 +226,12 @@ class COPModel:
                 prev_row = row
                 continue
 
-            features = self._make_features(row.outdoor_temp or 5.0, int(curr_status.get("tank_target", 50) if curr_status else 50), row.ts.hour)
+            features = self._make_features(
+                row.outdoor_temp or 5.0,
+                int(curr_status.get("tank_target", 50) if curr_status else 50),
+                row.ts.hour,
+                _precipitation_at(row.ts),
+            )
             X_list.append(features)
             y_list.append(cop)
             prev_row = row
@@ -217,11 +246,17 @@ class COPModel:
         if not models:
             _logger.info("cop_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
-        try:
-            self._model = safe_load(models[-1])
-        except ValueError as exc:
-            _logger.warning("cop_model_load_failed", path=str(models[-1]), error=str(exc))
-            return False
-        self._version = models[-1].stem.replace("cop_model_", "")
-        _logger.info("cop_model_loaded", version=self._version, path=str(models[-1]))
-        return True
+        for path in reversed(models):
+            try:
+                candidate = safe_load(path)
+            except ValueError as exc:
+                _logger.warning("cop_model_load_failed", path=str(path), error=str(exc))
+                continue
+            if getattr(candidate, "n_features_in_", None) != len(_COP_MONOTONIC_CST):
+                _logger.info("cop_model_load_skip", path=str(path), reason="obsolete_feature_schema")
+                continue
+            self._model = candidate
+            self._version = path.stem.replace("cop_model_", "")
+            _logger.info("cop_model_loaded", version=self._version, path=str(path))
+            return True
+        return False
