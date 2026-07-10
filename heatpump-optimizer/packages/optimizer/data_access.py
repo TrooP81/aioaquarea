@@ -52,13 +52,14 @@ async def get_weather(
 async def get_weather_full(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[dict]:
-    """Fetch full weather data (temp, wind, irradiance) from DB."""
+    """Fetch full weather data (temp, wind, irradiance, precipitation) from DB."""
     result = await session.execute(
         select(
             WeatherRecord.ts,
             WeatherRecord.temperature,
             WeatherRecord.wind_speed,
             WeatherRecord.irradiance,
+            WeatherRecord.precipitation,
         )
         .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
         .order_by(WeatherRecord.ts)
@@ -69,6 +70,7 @@ async def get_weather_full(
             "temperature": row.temperature,
             "wind_speed": row.wind_speed,
             "irradiance": row.irradiance,
+            "precipitation": row.precipitation,
         }
         for row in result.all()
     ]
