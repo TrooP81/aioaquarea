@@ -26,10 +26,10 @@ from packages.ml.models_common import (
 MAX_WEATHER_GAP_SECONDS = 2 * 3600
 
 # Physical monotonicity for demand features
-# [outdoor_temp, wind_speed, irradiance, hour_sin, hour_cos, dow_sin, dow_cos]:
+# [outdoor_temp, wind_speed, irradiance, precipitation, hour_sin, hour_cos, dow_sin, dow_cos]:
 # heating demand falls as it warms up outside (-1) and as solar gain rises (-1),
 # and rises with wind-driven heat loss (+1). Time-of-day/week are unconstrained.
-_DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0]
+_DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0, 0]
 
 
 class DemandModel:
@@ -55,16 +55,20 @@ class DemandModel:
         return self._model is not None
 
     @staticmethod
-    def _make_features(outdoor_temp: float, wind_speed: float, irradiance: float, hour: int, dow: int) -> np.ndarray:
-        """Build the 7-feature vector shared by training and prediction.
+    def _make_features(
+        outdoor_temp: float, wind_speed: float, irradiance: float, hour: int, dow: int,
+        precipitation: float = 0.0,
+    ) -> np.ndarray:
+        """Build the 8-feature vector shared by training and prediction.
 
-        Order is fixed for backward compatibility with persisted models:
-        [temp, wind, irradiance, hour_sin, hour_cos, dow_sin, dow_cos].
+        Order is fixed for this persisted feature schema:
+        [temp, wind, irradiance, precipitation, hour_sin, hour_cos, dow_sin, dow_cos].
         """
         return np.array([
             outdoor_temp,
             wind_speed,
             irradiance,
+            max(0.0, precipitation),
             np.sin(2 * np.pi * hour / 24),
             np.cos(2 * np.pi * hour / 24),
             np.sin(2 * np.pi * dow / 7),
@@ -127,8 +131,9 @@ class DemandModel:
             temp = weather.get("temperature", 5.0)
             wind = weather.get("wind_speed", 3.0)
             irradiance = weather.get("irradiance", 0.0)
+            precipitation = weather.get("precipitation", 0.0)
             if self._model is not None:
-                features = self._make_features(temp, wind, irradiance, ts.hour, ts.weekday()).reshape(1, -1)
+                features = self._make_features(temp, wind, irradiance, ts.hour, ts.weekday(), precipitation).reshape(1, -1)
                 pred = float(self._model.predict(features)[0])
             else:
                 pred = max(0.5, 3.0 - 0.1 * temp)
@@ -151,8 +156,9 @@ class DemandModel:
             temp = weather.get("temperature", 5.0)
             wind = weather.get("wind_speed", 3.0)
             irradiance = weather.get("irradiance", 0.0)
+            precipitation = weather.get("precipitation", 0.0)
             if self._model is not None:
-                features = self._make_features(temp, wind, irradiance, ts.hour, ts.weekday()).reshape(1, -1)
+                features = self._make_features(temp, wind, irradiance, ts.hour, ts.weekday(), precipitation).reshape(1, -1)
                 p50 = float(self._model.predict(features)[0])
                 p10 = float(self._model_lower.predict(features)[0]) if self._model_lower is not None else p50
                 p90 = float(self._model_upper.predict(features)[0]) if self._model_upper is not None else p50
@@ -169,7 +175,7 @@ class DemandModel:
     async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
         async with get_session() as session:
             consumption_rows = (await session.execute(select(ConsumptionRecord.ts, ConsumptionRecord.heat_kwh, ConsumptionRecord.cool_kwh, ConsumptionRecord.tank_kwh, ConsumptionRecord.outdoor_temp).order_by(ConsumptionRecord.ts))).all()
-            weather_rows = (await session.execute(select(WeatherRecord.ts, WeatherRecord.temperature, WeatherRecord.wind_speed, WeatherRecord.irradiance).order_by(WeatherRecord.ts))).all()
+            weather_rows = (await session.execute(select(WeatherRecord.ts, WeatherRecord.temperature, WeatherRecord.wind_speed, WeatherRecord.irradiance, WeatherRecord.precipitation).order_by(WeatherRecord.ts))).all()
         if not consumption_rows:
             return np.array([]), np.array([])
 
@@ -205,6 +211,7 @@ class DemandModel:
             outdoor = interval.outdoor_temp
             wind = 3.0
             irradiance = 0.0
+            precipitation = 0.0
             if weather is not None:
                 if outdoor is None and weather.temperature is not None:
                     outdoor = weather.temperature
@@ -213,10 +220,13 @@ class DemandModel:
                     wind = weather.wind_speed
                 if weather.irradiance is not None:
                     irradiance = weather.irradiance
+                weather_precipitation = getattr(weather, "precipitation", None)
+                if weather_precipitation is not None:
+                    precipitation = weather_precipitation
             if outdoor is None:
                 outdoor = 5.0
 
-            X_list.append(self._make_features(outdoor, wind, irradiance, interval.ts.hour, interval.ts.weekday()))
+            X_list.append(self._make_features(outdoor, wind, irradiance, interval.ts.hour, interval.ts.weekday(), precipitation))
             y_list.append(rate)
 
         _logger.info("demand_training_data_prepared", consumption_rows=len(consumption_rows), weather_rows=len(weather_rows), samples=len(y_list), skip_rate_bounds=skip_rate_bounds, used_weather_temp=used_weather_temp, max_rate_kw=round(max_rate, 2))
@@ -229,21 +239,20 @@ class DemandModel:
         if not models:
             _logger.info("demand_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
-        try:
-            payload = safe_load(models[-1])
-        except ValueError as exc:
-            _logger.warning("demand_model_load_failed", path=str(models[-1]), error=str(exc))
-            return False
-        # New format persists a dict of quantile models; older files stored a
-        # single bare estimator. Support both for backward compatibility.
-        if isinstance(payload, dict):
-            self._model = payload.get("median")
-            self._model_lower = payload.get("lower")
-            self._model_upper = payload.get("upper")
-        else:
-            self._model = payload
-            self._model_lower = None
-            self._model_upper = None
-        self._version = models[-1].stem.replace("demand_model_", "")
-        _logger.info("demand_model_loaded", version=self._version, path=str(models[-1]), has_quantiles=self._model_lower is not None)
-        return True
+        for path in reversed(models):
+            try:
+                payload = safe_load(path)
+            except ValueError as exc:
+                _logger.warning("demand_model_load_failed", path=str(path), error=str(exc))
+                continue
+            candidate = payload.get("median") if isinstance(payload, dict) else payload
+            if getattr(candidate, "n_features_in_", None) != len(_DEMAND_MONOTONIC_CST):
+                _logger.info("demand_model_load_skip", path=str(path), reason="obsolete_feature_schema")
+                continue
+            self._model = candidate
+            self._model_lower = payload.get("lower") if isinstance(payload, dict) else None
+            self._model_upper = payload.get("upper") if isinstance(payload, dict) else None
+            self._version = path.stem.replace("demand_model_", "")
+            _logger.info("demand_model_loaded", version=self._version, path=str(path), has_quantiles=self._model_lower is not None)
+            return True
+        return False

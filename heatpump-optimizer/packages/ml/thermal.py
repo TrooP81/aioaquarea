@@ -649,7 +649,8 @@ class ThermalModel:
         Args:
             current_indoor: current indoor air temperature (°C)
             zone_water_temps: planned water supply temp per hour (len >= hours)
-            weather_forecast: list of dicts with keys: outdoor_temp, wind_speed, irradiance
+            weather_forecast: list of dicts with keys: outdoor_temp, wind_speed,
+                irradiance and precipitation
             hours: number of hours to predict (default 24)
 
         Returns:
@@ -666,6 +667,7 @@ class ThermalModel:
             outdoor = wx.get("outdoor_temp", 5.0)
             wind = wx.get("wind_speed", 3.0)
             irradiance = wx.get("irradiance", 0.0)
+            precipitation = wx.get("precipitation", 0.0)
             hour_of_day = wx.get("hour", (h % 24))
 
             if comfort_model.is_trained:
@@ -676,6 +678,7 @@ class ThermalModel:
                     irradiance=irradiance,
                     hour=hour_of_day,
                     indoor_temp=indoor,
+                    precipitation=precipitation,
                 )
                 if predicted is not None:
                     indoor = predicted

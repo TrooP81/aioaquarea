@@ -207,6 +207,7 @@ async def poll_weather() -> None:
                             "wind_speed": entry.get("wind_speed"),
                             "humidity": entry.get("humidity"),
                             "cloud_cover": entry.get("cloud_cover"),
+                            "precipitation": entry.get("precipitation"),
                         }
                         for entry in weather_data
                     ]
@@ -219,6 +220,7 @@ async def poll_weather() -> None:
                         "wind_speed": stmt.excluded.wind_speed,
                         "humidity": stmt.excluded.humidity,
                         "cloud_cover": stmt.excluded.cloud_cover,
+                        "precipitation": stmt.excluded.precipitation,
                     },
                 )
                 await session.execute(stmt)

@@ -94,6 +94,7 @@ async def predict_indoor_temp(
     outdoor_temp: float = Query(..., description="Outdoor temperature (C)"),
     hour: int = Query(12, ge=0, le=23),
     indoor_temp: float | None = Query(None, description="Current indoor temperature (C) from SmartThings"),
+    precipitation: float = Query(0.0, ge=0, description="Precipitation in mm for the forecast hour"),
 ):
     from packages.ml.comfort_model import comfort_model
 
@@ -105,12 +106,14 @@ async def predict_indoor_temp(
         outdoor_temp=outdoor_temp,
         hour=hour,
         indoor_temp=indoor_temp,
+        precipitation=precipitation,
     )
     required_water = comfort_model.required_zone_temp(
         target_indoor=21.0,
         outdoor_temp=outdoor_temp,
         hour=hour,
         indoor_temp=indoor_temp,
+        precipitation=precipitation,
     )
 
     return {
@@ -436,6 +439,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                     "outdoor_temp": w.temperature if w.temperature is not None else outdoor,
                     "wind_speed": w.wind_speed if w.wind_speed is not None else 3.0,
                     "irradiance": getattr(w, "irradiance", 0.0) or 0.0,
+                    "precipitation": getattr(w, "precipitation", 0.0) or 0.0,
                     "hour": w.ts.hour,
                 }
             )
@@ -445,6 +449,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                     "outdoor_temp": outdoor,
                     "wind_speed": 3.0,
                     "irradiance": 0.0,
+                    "precipitation": 0.0,
                     "hour": (now.hour + i) % 24,
                 }
             )

@@ -69,6 +69,7 @@ SAMPLE_SMHI_JSON = {
                 "wind_speed": 2.1,
                 "relative_humidity": 54,
                 "cloud_area_fraction": 8,  # fully overcast (octas)
+                "precipitation": 1.7,
             },
         },
         {
@@ -114,6 +115,7 @@ class TestSmhiParser:
         # Cloud cover in octas (0–8) mapped to a fraction (0–1).
         assert result[0]["cloud_cover"] == 1.0
         assert result[1]["cloud_cover"] == 0.5
+        assert result[0]["precipitation"] == 1.7
 
     def test_derives_irradiance_from_cloud_and_geometry(self):
         result = _parse_smhi_forecast(SAMPLE_SMHI_JSON, _SMHI_LAT, _SMHI_LON, hours=3)

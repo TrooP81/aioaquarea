@@ -92,7 +92,7 @@ class MILPOptimizer:
         )
 
         # Build COP function: prefer ML model, fall back to default curve
-        cop_fn = self._build_cop_function(last_status)
+        cop_fn = self._build_cop_function(last_status, weather_full)
 
         # Build demand estimates: prefer ML model, fall back to constant
         demand_per_hour = self._build_demand_estimates(weather, weather_full)
@@ -144,7 +144,7 @@ class MILPOptimizer:
         indoor_rates: list[tuple[float, float]] | None = None
         if comfort_model.is_trained and latest_indoor_temp is not None:
             indoor_rates = self._precompute_indoor_rates(
-                prices, weather, latest_indoor_temp, heat_curve_water_temp
+                prices, weather, latest_indoor_temp, heat_curve_water_temp, weather_full
             )
             if indoor_rates:
                 logger.info(
@@ -171,7 +171,7 @@ class MILPOptimizer:
         )
         return plan
 
-    def _build_cop_function(self, last_status):
+    def _build_cop_function(self, last_status, weather_full: list[dict] | None = None):
         """Return a callable(outdoor_temp, hour) -> COP."""
         tank_target = (
             last_status.tank_target_temp
@@ -180,9 +180,16 @@ class MILPOptimizer:
         )
         if self._cop_model and self._cop_model.is_trained:
             logger.info("milp_using_ml_cop_model")
+            precipitation_by_hour = {
+                row["ts"].hour: max(0.0, float(row.get("precipitation") or 0.0))
+                for row in (weather_full or [])
+                if row.get("ts") is not None
+            }
 
             def _ml_cop(outdoor_temp: float, hour: int = 12) -> float:
-                return self._cop_model.predict_cop(outdoor_temp, tank_target, hour)
+                return self._cop_model.predict_cop(
+                    outdoor_temp, tank_target, hour, precipitation_by_hour.get(hour, 0.0)
+                )
 
             return _ml_cop
 
@@ -199,6 +206,7 @@ class MILPOptimizer:
                         "temperature": w.get("temperature", 5.0),
                         "wind_speed": w.get("wind_speed") or 3.0,
                         "irradiance": w.get("irradiance") or 0.0,
+                        "precipitation": w.get("precipitation") or 0.0,
                     }
                     for w in weather_full
                 ]
@@ -218,6 +226,7 @@ class MILPOptimizer:
         weather: list[tuple[dt.datetime, float]],
         current_indoor: float,
         heat_curve_water_temp: float,
+        weather_full: list[dict] | None = None,
     ) -> list[tuple[float, float]]:
         """Pre-compute per-hour (gain, loss) indoor rate pairs using comfort model.
 
@@ -236,6 +245,11 @@ class MILPOptimizer:
             hour_ts = prices[h][0]
             outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
             hour_of_day = hour_ts.hour
+            precipitation = (
+                max(0.0, float(weather_full[h].get("precipitation") or 0.0))
+                if weather_full and h < len(weather_full)
+                else 0.0
+            )
 
             # No-heating: water at outdoor temp (radiators not contributing)
             pred_no_heat = comfort_model.predict_indoor_temp(
@@ -243,6 +257,7 @@ class MILPOptimizer:
                 outdoor_temp=outdoor,
                 hour=hour_of_day,
                 indoor_temp=indoor,
+                precipitation=precipitation,
             )
             # Full heating: water at heat curve temp
             pred_heat = comfort_model.predict_indoor_temp(
@@ -250,6 +265,7 @@ class MILPOptimizer:
                 outdoor_temp=outdoor,
                 hour=hour_of_day,
                 indoor_temp=indoor,
+                precipitation=precipitation,
             )
 
             if pred_no_heat is None or pred_heat is None:
