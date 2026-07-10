@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
+import { usePlanActions } from "./usePlanActions";
 import { ACTION_LABELS, LAYER_LABELS, LAYER_TOOLTIPS, formatRelativeTime, formatTime } from "@/lib/constants";
 
 interface NextActionCardProps {
@@ -16,36 +17,17 @@ interface NextActionCardProps {
   } | null;
 }
 
-interface PlanAction {
-  id: number;
-  scheduled_ts: string;
-  action_type: string;
-  payload: Record<string, any>;
-  status: string;
-}
-
 export function NextActionCard({ plan }: NextActionCardProps) {
-  const [nextAction, setNextAction] = useState<PlanAction | null>(null);
   const [relTime, setRelTime] = useState("");
+  const { actions } = usePlanActions(plan?.id);
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
-  useEffect(() => {
-    if (!plan?.id) {
-      setNextAction(null);
-      return;
-    }
-    fetch(`/api/plans/${plan.id}`)
-      .then((r) => r.json())
-      .then((data) => {
-        const now = new Date();
-        const pending = (data.actions || []).find(
-          (a: PlanAction) => a.status === "pending" && new Date(a.scheduled_ts) > now
-        );
-        setNextAction(pending || null);
-      })
-      .catch(() => setNextAction(null));
-  }, [plan?.id]);
+  const nextAction = plan
+    ? actions.find(
+        (action) => action.status === "pending" && new Date(action.scheduled_ts) > new Date()
+      ) || null
+    : null;
 
   // Update relative time every 30 seconds
   useEffect(() => {
