@@ -43,8 +43,9 @@ _LAG_CANDIDATES = [10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
 MIN_ZONE_WATER_TEMP = 20.0
 MAX_ZONE_WATER_TEMP = 65.0
 
-# Physical monotonicity constraints for the 7 model features, in order:
-# [zone_water_temp, outdoor_temp, wind_speed, irradiance, hour_sin, hour_cos, indoor_temp]
+# Physical monotonicity constraints for the 8 model features, in order:
+# [zone_water_temp, outdoor_temp, wind_speed, irradiance, precipitation,
+#  hour_sin, hour_cos, indoor_temp]
 #   +1 = predicted indoor must not decrease as the feature increases
 #   -1 = predicted indoor must not increase as the feature increases
 #    0 = unconstrained
@@ -53,7 +54,7 @@ MAX_ZONE_WATER_TEMP = 65.0
 # stronger wind can only lower (or hold) it. This guarantees, for example, that a
 # heating forecast is never below the no-heating baseline — even when training
 # data is noisy.
-_MONOTONIC_CST = [1, 1, -1, 1, 0, 0, 1]
+_MONOTONIC_CST = [1, 1, -1, 1, 0, 0, 0, 1]
 
 # Fraction of (time-ordered) samples held out at the end for honest validation.
 _VALIDATION_FRACTION = 0.2
@@ -69,6 +70,7 @@ class ComfortModel:
         - outdoor_temp (°C)
         - wind_speed (m/s)
         - irradiance / solar (W/m²)
+        - precipitation (mm/h)
         - hour_sin, hour_cos (cyclical hour of day)
 
     Target:
@@ -249,6 +251,7 @@ class ComfortModel:
         irradiance: float = 0.0,
         hour: int = 12,
         indoor_temp: float | None = None,
+        precipitation: float = 0.0,
     ) -> float | None:
         """Predict the indoor air temperature given operating conditions.
 
@@ -262,7 +265,7 @@ class ComfortModel:
 
         features = self._make_features(
             zone_water_temp, outdoor_temp, wind_speed, irradiance, hour,
-            indoor_temp=indoor_temp,
+            indoor_temp=indoor_temp, precipitation=precipitation,
         )
         return float(self._model.predict(features.reshape(1, -1))[0])
 
@@ -274,6 +277,7 @@ class ComfortModel:
         irradiance: float = 0.0,
         hour: int = 12,
         indoor_temp: float | None = None,
+        precipitation: float = 0.0,
     ) -> float | None:
         """
         Inverse prediction: find the water supply temperature needed to
@@ -291,8 +295,8 @@ class ComfortModel:
         lo, hi = MIN_ZONE_WATER_TEMP, MAX_ZONE_WATER_TEMP
 
         # Early bounds check
-        pred_lo = self.predict_indoor_temp(lo, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
-        pred_hi = self.predict_indoor_temp(hi, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
+        pred_lo = self.predict_indoor_temp(lo, outdoor_temp, wind_speed, irradiance, hour, indoor_temp, precipitation)
+        pred_hi = self.predict_indoor_temp(hi, outdoor_temp, wind_speed, irradiance, hour, indoor_temp, precipitation)
 
         if pred_lo is None or pred_hi is None:
             return None
@@ -308,7 +312,7 @@ class ComfortModel:
         # Bisection
         for _ in range(50):
             mid = (lo + hi) / 2.0
-            pred = self.predict_indoor_temp(mid, outdoor_temp, wind_speed, irradiance, hour, indoor_temp)
+            pred = self.predict_indoor_temp(mid, outdoor_temp, wind_speed, irradiance, hour, indoor_temp, precipitation)
             if pred is None:
                 return None
             if abs(pred - target_indoor) < 0.05:
@@ -353,7 +357,11 @@ class ComfortModel:
         except ValueError:
             logger.warning("comfort_model_integrity_failed", path=str(models[-1]))
             return False
-        self._model = data["model"]
+        candidate = data["model"]
+        if getattr(candidate, "n_features_in_", None) != len(_MONOTONIC_CST):
+            logger.info("comfort_model_load_skip", path=str(models[-1]), reason="obsolete_feature_schema")
+            return False
+        self._model = candidate
         self._metrics = data.get("metrics", {})
         self._last_trained = data.get("trained_at")
         self._training_samples = data.get("samples", 0)
@@ -462,6 +470,9 @@ class ComfortModel:
                 w = weathers[w_idx]
                 wind_speed = w.wind_speed if w.wind_speed is not None else 3.0
                 irradiance = getattr(w, "irradiance", 0.0) or 0.0
+                precipitation = getattr(w, "precipitation", 0.0) or 0.0
+            else:
+                precipitation = 0.0
 
             # Previous indoor temp at the lag-shifted time
             prev_indoor: float | None = None
@@ -473,7 +484,7 @@ class ComfortModel:
             hour = reading.timestamp.hour
             features = self._make_features(
                 zone_water_temp, outdoor_temp, wind_speed, irradiance, hour,
-                indoor_temp=prev_indoor,
+                indoor_temp=prev_indoor, precipitation=precipitation,
             )
             X_rows.append(features)
             y_rows.append(reading.temperature)
@@ -496,6 +507,7 @@ class ComfortModel:
         irradiance: float,
         hour: int,
         indoor_temp: float | None = None,
+        precipitation: float = 0.0,
     ) -> np.ndarray:
         hour_rad = 2.0 * np.pi * hour / 24.0
         return np.array(
@@ -504,6 +516,7 @@ class ComfortModel:
                 outdoor_temp,
                 wind_speed,
                 irradiance,
+                max(0.0, precipitation),
                 np.sin(hour_rad),
                 np.cos(hour_rad),
                 indoor_temp if indoor_temp is not None else outdoor_temp,

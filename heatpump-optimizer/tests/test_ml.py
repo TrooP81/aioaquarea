@@ -83,8 +83,9 @@ class TestCOPModel:
         """Feature vector should have correct shape."""
         from packages.ml.models import COPModel
 
-        features = COPModel._make_features(5.0, 50, 12)
-        assert features.shape == (4,)
+        features = COPModel._make_features(5.0, 50, 12, precipitation=1.5)
+        assert features.shape == (5,)
+        assert features[4] == 1.5
 
     def test_load_latest_no_models(self, tmp_path):
         """load_latest returns False when no model files exist."""
@@ -119,6 +120,7 @@ class TestCOPModel:
             tank_targets,
             np.sin(2 * np.pi * hours / 24),
             np.cos(2 * np.pi * hours / 24),
+            rng.uniform(0, 5, n),
         ])
         # Higher outdoor → higher COP (physically correct)
         y = 3.0 + 0.08 * outdoor_temps - 0.02 * tank_targets + rng.normal(0, 0.15, n)
@@ -173,7 +175,7 @@ class TestDemandModel:
         model = DemandModel()
         assert not model.is_trained
 
-        weather = [{"temperature": 5.0, "wind_speed": 3.0, "irradiance": 0.0}] * 24
+        weather = [{"temperature": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "precipitation": 1.0}] * 24
         predictions = model.predict_hourly(weather, hours=24)
 
         assert len(predictions) == 24
@@ -194,14 +196,15 @@ class TestDemandModel:
         assert sum(cold_demand) > sum(warm_demand)
 
     def test_make_features_shape_and_order(self):
-        """Shared feature builder must return the fixed 7-feature schema."""
+        """Shared feature builder must return the fixed 8-feature schema."""
         from packages.ml.models import DemandModel
 
-        features = DemandModel._make_features(5.0, 3.0, 100.0, 12, 2)
-        assert features.shape == (7,)
+        features = DemandModel._make_features(5.0, 3.0, 100.0, 12, 2, precipitation=1.5)
+        assert features.shape == (8,)
         assert features[0] == 5.0  # temperature
         assert features[1] == 3.0  # wind
         assert features[2] == 100.0  # irradiance
+        assert features[3] == 1.5  # precipitation
 
     @pytest.mark.asyncio
     async def test_prepare_data_uses_interval_rate_not_cumulative(self):
@@ -214,7 +217,7 @@ class TestDemandModel:
             SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
             SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
         ]
-        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0, precipitation=2.5)]
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
@@ -228,6 +231,7 @@ class TestDemandModel:
         assert max(y) == pytest.approx(4.0)
         # Consumption's own outdoor_temp is preferred when present.
         assert X[0][0] == 2.0
+        assert X[0][3] == 2.5
 
     @pytest.mark.asyncio
     async def test_prepare_data_falls_back_to_weather_temp(self):
@@ -239,7 +243,7 @@ class TestDemandModel:
             SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
             SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.25, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
         ]
-        weather = [SimpleNamespace(ts=base + dt.timedelta(minutes=20), temperature=-3.0, wind_speed=5.0, irradiance=0.0)]
+        weather = [SimpleNamespace(ts=base + dt.timedelta(minutes=20), temperature=-3.0, wind_speed=5.0, irradiance=0.0, precipitation=1.0)]
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
@@ -249,6 +253,7 @@ class TestDemandModel:
         assert len(y) == 1
         assert X[0][0] == -3.0  # weather temperature filled in
         assert X[0][1] == 5.0  # weather wind
+        assert X[0][3] == 1.0  # weather precipitation
 
 
 class TestConsumptionIntervals:
@@ -416,6 +421,7 @@ class TestMonotonicCOPModel:
             tank,
             np.sin(2 * np.pi * hours / 24),
             np.cos(2 * np.pi * hours / 24),
+            rng.uniform(0, 5, n),
         ])
         # Physically wrong: colder outside -> higher COP.
         y = np.clip(3.0 - 0.05 * outdoor + rng.normal(0, 0.1, n), 1.5, 6.0)
@@ -447,12 +453,14 @@ class TestMonotonicDemandModel:
         outdoor = rng.uniform(-10, 20, n)
         wind = rng.uniform(0, 10, n)
         irradiance = rng.uniform(0, 500, n)
+        precipitation = rng.uniform(0, 5, n)
         hours = rng.randint(0, 24, n)
         dow = rng.randint(0, 7, n)
         X = np.column_stack([
             outdoor,
             wind,
             irradiance,
+            precipitation,
             np.sin(2 * np.pi * hours / 24),
             np.cos(2 * np.pi * hours / 24),
             np.sin(2 * np.pi * dow / 7),
@@ -841,6 +849,7 @@ class TestDemandQuantiles:
             outdoor,
             rng.uniform(0, 10, n),
             rng.uniform(0, 500, n),
+            rng.uniform(0, 5, n),
             np.sin(2 * np.pi * rng.randint(0, 24, n) / 24),
             np.cos(2 * np.pi * rng.randint(0, 24, n) / 24),
             np.sin(2 * np.pi * rng.randint(0, 7, n) / 7),
@@ -877,7 +886,7 @@ class TestCOPExcludesFallback:
             SimpleNamespace(ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=5.0),
             SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.0, tank_kwh=0.0, outdoor_temp=5.0),
         ]
-        results = [_FakeResult(consumption), _FakeResult([])]  # no status rows
+        results = [_FakeResult(consumption), _FakeResult([]), _FakeResult([])]  # no status/weather rows
 
         model = COPModel()
         with patch("packages.ml.cop_model_core.get_session", _mock_get_session(results)):

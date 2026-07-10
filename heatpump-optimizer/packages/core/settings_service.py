@@ -239,6 +239,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "200.0",
         "description": "Static solar irradiance (W/m²) when weather provider is 'manual'",
     },
+    "manual_precipitation": {
+        "type": "float",
+        "default": "0.0",
+        "description": "Static precipitation (mm/h) when weather provider is 'manual'",
+    },
     # --- SmartThings indoor temperature ---
     "smartthings_enabled": {
         "type": "str",

@@ -193,7 +193,8 @@ async def fetch_weather() -> list[dict]:
     """
     Fetch 48h weather forecast from the configured provider (Open-Meteo or SMHI,
     both free and keyless) or manual static values.
-    Returns list of dicts with ts, temperature, irradiance, wind_speed, humidity.
+    Returns list of dicts with ts, temperature, irradiance, wind_speed, humidity
+    and precipitation (mm/h).
     """
     provider = await get_setting("weather_provider")
     if provider == "manual":
@@ -207,7 +208,7 @@ async def fetch_weather() -> list[dict]:
     params = {
         "latitude": float(lat) if lat else settings.latitude,
         "longitude": float(lng) if lng else settings.longitude,
-        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover",
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover,precipitation",
         "forecast_days": 2,
         "timezone": "UTC",
     }
@@ -224,6 +225,7 @@ async def fetch_weather() -> list[dict]:
     wind = hourly.get("wind_speed_10m", [])
     radiation = hourly.get("direct_radiation", [])
     cloud = hourly.get("cloud_cover", [])
+    precipitation = hourly.get("precipitation", [])
 
     results = []
     for i, time_str in enumerate(times):
@@ -241,6 +243,9 @@ async def fetch_weather() -> list[dict]:
                     if i < len(cloud) and cloud[i] is not None
                     else None
                 ),
+                # Open-Meteo precipitation is the amount falling during the
+                # preceding forecast hour, expressed in mm.
+                "precipitation": precipitation[i] if i < len(precipitation) else None,
             }
         )
 
@@ -263,7 +268,7 @@ def _parse_smhi_forecast(
     sun's position (via ``latitude``/``longitude``/time) attenuated by that
     cloud cover, so temperature predictions still reflect sunny vs overcast
     hours. Returns dicts with ts, temperature, humidity, wind_speed, cloud_cover
-    (fraction 0–1) and irradiance (W/m²).
+    (fraction 0–1), irradiance (W/m²), and precipitation (mm/h).
     """
     series: list[tuple[dt.datetime, dict]] = []
     for entry in data.get("timeSeries", []):
@@ -299,6 +304,7 @@ def _parse_smhi_forecast(
         temp = params.get("air_temperature")
         wind = params.get("wind_speed")
         humidity = params.get("relative_humidity")
+        precipitation = params.get("precipitation")
         # Total cloud cover in octas (0–8) → fraction (0–1).
         octas = params.get("cloud_area_fraction")
         cloud_fraction = (
@@ -318,6 +324,7 @@ def _parse_smhi_forecast(
                 "wind_speed": float(wind) if wind is not None else None,
                 "cloud_cover": cloud_fraction,
                 "irradiance": irradiance,
+                "precipitation": float(precipitation) if precipitation is not None else None,
             }
         )
 
@@ -329,7 +336,7 @@ async def _fetch_weather_smhi() -> list[dict]:
     Fetch a 48h weather forecast from SMHI Open Data (Nordic/Baltic, no API key).
 
     Returns list of dicts with ts, temperature, humidity, wind_speed,
-    cloud_cover and (solar-geometry-derived) irradiance.
+    cloud_cover, precipitation and (solar-geometry-derived) irradiance.
     """
     lat = await get_setting("latitude")
     lng = await get_setting("longitude")
@@ -353,6 +360,7 @@ async def _get_manual_weather() -> list[dict]:
     wind_str = await get_setting("manual_wind_speed")
     humidity_str = await get_setting("manual_humidity")
     irradiance_str = await get_setting("manual_irradiance")
+    precipitation_str = await get_setting("manual_precipitation")
 
     try:
         temp = float(temp_str)
@@ -370,6 +378,10 @@ async def _get_manual_weather() -> list[dict]:
         irradiance = float(irradiance_str)
     except (ValueError, TypeError):
         irradiance = 200.0
+    try:
+        precipitation = max(0.0, float(precipitation_str))
+    except (ValueError, TypeError):
+        precipitation = 0.0
 
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
     return [
@@ -380,6 +392,7 @@ async def _get_manual_weather() -> list[dict]:
             "wind_speed": wind,
             "irradiance": irradiance,
             "cloud_cover": None,
+            "precipitation": precipitation,
         }
         for h in range(48)
     ]

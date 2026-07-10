@@ -92,7 +92,7 @@ class MILPOptimizer:
         )
 
         # Build COP function: prefer ML model, fall back to default curve
-        cop_fn = self._build_cop_function(last_status)
+        cop_fn = self._build_cop_function(last_status, weather_full)
 
         # Build demand estimates: prefer ML model, fall back to constant
         demand_per_hour = self._build_demand_estimates(weather, weather_full)
@@ -144,7 +144,7 @@ class MILPOptimizer:
         indoor_rates: list[tuple[float, float]] | None = None
         if comfort_model.is_trained and latest_indoor_temp is not None:
             indoor_rates = self._precompute_indoor_rates(
-                prices, weather, latest_indoor_temp, heat_curve_water_temp
+                prices, weather, latest_indoor_temp, heat_curve_water_temp, weather_full
             )
             if indoor_rates:
                 logger.info(
@@ -171,7 +171,7 @@ class MILPOptimizer:
         )
         return plan
 
-    def _build_cop_function(self, last_status):
+    def _build_cop_function(self, last_status, weather_full: list[dict] | None = None):
         """Return a callable(outdoor_temp, hour) -> COP."""
         tank_target = (
             last_status.tank_target_temp
@@ -180,9 +180,16 @@ class MILPOptimizer:
         )
         if self._cop_model and self._cop_model.is_trained:
             logger.info("milp_using_ml_cop_model")
+            precipitation_by_hour = {
+                row["ts"].hour: max(0.0, float(row.get("precipitation") or 0.0))
+                for row in (weather_full or [])
+                if row.get("ts") is not None
+            }
 
             def _ml_cop(outdoor_temp: float, hour: int = 12) -> float:
-                return self._cop_model.predict_cop(outdoor_temp, tank_target, hour)
+                return self._cop_model.predict_cop(
+                    outdoor_temp, tank_target, hour, precipitation_by_hour.get(hour, 0.0)
+                )
 
             return _ml_cop
 
@@ -199,6 +206,7 @@ class MILPOptimizer:
                         "temperature": w.get("temperature", 5.0),
                         "wind_speed": w.get("wind_speed") or 3.0,
                         "irradiance": w.get("irradiance") or 0.0,
+                        "precipitation": w.get("precipitation") or 0.0,
                     }
                     for w in weather_full
                 ]
@@ -213,11 +221,35 @@ class MILPOptimizer:
         return [settings.sh_max_power_kw * 0.25] * len(weather)
 
     @staticmethod
+    def _normalise_demand_profile(
+        demand_per_hour: list[float] | None,
+        hours: int,
+        max_power_kw: float,
+    ) -> list[float]:
+        """Return a safe hourly electrical space-heating demand profile.
+
+        The demand model emits average electrical power in kW for each one-hour
+        slot.  Values may be missing, negative or exceed hardware capacity when
+        the model is trained on sparse/noisy intervals, so clamp each slot to
+        the feasible range before it becomes a hard optimisation constraint.
+        """
+        profile: list[float] = []
+        for hour in range(hours):
+            raw = demand_per_hour[hour] if demand_per_hour and hour < len(demand_per_hour) else 0.0
+            try:
+                demand_kw = float(raw)
+            except (TypeError, ValueError):
+                demand_kw = 0.0
+            profile.append(max(0.0, min(max_power_kw, demand_kw)))
+        return profile
+
+    @staticmethod
     def _precompute_indoor_rates(
         prices: list[tuple[dt.datetime, float]],
         weather: list[tuple[dt.datetime, float]],
         current_indoor: float,
         heat_curve_water_temp: float,
+        weather_full: list[dict] | None = None,
     ) -> list[tuple[float, float]]:
         """Pre-compute per-hour (gain, loss) indoor rate pairs using comfort model.
 
@@ -236,6 +268,11 @@ class MILPOptimizer:
             hour_ts = prices[h][0]
             outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
             hour_of_day = hour_ts.hour
+            precipitation = (
+                max(0.0, float(weather_full[h].get("precipitation") or 0.0))
+                if weather_full and h < len(weather_full)
+                else 0.0
+            )
 
             # No-heating: water at outdoor temp (radiators not contributing)
             pred_no_heat = comfort_model.predict_indoor_temp(
@@ -243,6 +280,7 @@ class MILPOptimizer:
                 outdoor_temp=outdoor,
                 hour=hour_of_day,
                 indoor_temp=indoor,
+                precipitation=precipitation,
             )
             # Full heating: water at heat curve temp
             pred_heat = comfort_model.predict_indoor_temp(
@@ -250,6 +288,7 @@ class MILPOptimizer:
                 outdoor_temp=outdoor,
                 hour=hour_of_day,
                 indoor_temp=indoor,
+                precipitation=precipitation,
             )
 
             if pred_no_heat is None or pred_heat is None:
@@ -335,7 +374,10 @@ class MILPOptimizer:
         ]
         tank_loss_kwh_per_h = [abs(r) * kwh_per_degree for r in tank_loss_rates]
 
-        sh_max_power_kw = settings.sh_max_power_kw
+        sh_max_power_kw = max(0.01, float(settings.sh_max_power_kw))
+        demand_profile_kw = self._normalise_demand_profile(
+            demand_per_hour, H, sh_max_power_kw
+        )
 
         # Tank state (thermal kWh stored, using same kwh_per_degree factor)
         # Per-hour tank floor: lower bound during off-peak hours
@@ -374,6 +416,8 @@ class MILPOptimizer:
             avg_tank_heat_rate=round(sum(tank_heat_rates) / H, 2),
             max_thermal_gain=round(max(max_thermal_per_h), 2),
             continuous_dhw=needs_continuous_dhw,
+            forecast_sh_kwh=round(sum(demand_profile_kw), 2),
+            forecast_peak_sh_kw=round(max(demand_profile_kw, default=0.0), 2),
         )
 
         # --- Problem setup ---
@@ -434,6 +478,23 @@ class MILPOptimizer:
                 prob += x_sh[h] >= 0.5
             elif temps[h] < 0:
                 prob += x_sh[h] >= 0.2
+
+        # The demand model predicts the electrical energy the building needs
+        # during each one-hour slot.  Earlier code passed this forecast into
+        # ``_solve`` but never used it, leaving MILP free to plan zero space
+        # heating on mild days even when the learned model predicted demand.
+        #
+        # A cumulative reserve lets the optimiser pre-heat in cheaper earlier
+        # hours while ensuring it has scheduled enough total energy by every
+        # deadline.  It deliberately does not require an exact per-hour match:
+        # the indoor-temperature dynamics remain responsible for deciding
+        # *when* that energy best preserves comfort.
+        cumulative_demand_kwh = 0.0
+        for h, demand_kw in enumerate(demand_profile_kw):
+            cumulative_demand_kwh += demand_kw
+            prob += pulp.lpSum(
+                x_sh[i] * sh_max_power_kw for i in range(h + 1)
+            ) >= cumulative_demand_kwh
 
         # --- Indoor temperature state variable ---
         # Track predicted indoor air temperature through the horizon.
@@ -522,6 +583,7 @@ class MILPOptimizer:
                         "payload": {
                             "reason": "milp_low_demand",
                             "sh_fraction": sh_val,
+                            "forecast_demand_kw": round(demand_profile_kw[h], 2),
                         },
                     }
                 )
@@ -533,6 +595,7 @@ class MILPOptimizer:
                         "payload": {
                             "reason": "milp_demand_increase",
                             "sh_fraction": sh_val,
+                            "forecast_demand_kw": round(demand_profile_kw[h], 2),
                         },
                     }
                 )
@@ -631,6 +694,7 @@ class MILPOptimizer:
             "version": version,
             "cost_estimate": total_cost,
             "indoor_forecast": indoor_forecast,
+            "space_heating_demand_kwh": round(sum(demand_profile_kw), 3),
         }
 
     # --- Data fetching (delegates to shared data_access module) ---

@@ -125,6 +125,35 @@ class TestMILPSolver:
         dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
         assert len(dhw_on) <= 20
 
+    def test_demand_forecast_becomes_an_energy_reserve(self):
+        """A positive demand forecast must affect the MILP cost and plan."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+        common = {
+            "cop_fn": lambda t, h=12: 3.5 + 0.1 * t,
+            "current_tank_temp": 48.0,
+        }
+
+        without_demand = milp._solve(
+            prices, weather, demand_per_hour=[0.0] * 24, **common
+        )
+        with_demand = milp._solve(
+            prices, weather, demand_per_hour=[3.0] * 24, **common
+        )
+
+        assert with_demand["space_heating_demand_kwh"] == pytest.approx(72.0)
+        assert with_demand["cost_estimate"] > without_demand["cost_estimate"]
+
+    def test_demand_profile_clamps_invalid_values(self):
+        from packages.optimizer.milp import MILPOptimizer
+
+        assert MILPOptimizer._normalise_demand_profile(
+            [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
+        ) == [0.0, 0.0, 0.0, 12.0, 0.0]
+
     def test_milp_infeasible_raises(self):
         """MILP should raise InfeasibleError when constraints are impossible."""
         from packages.optimizer.milp import MILPOptimizer
@@ -236,6 +265,22 @@ class TestMILPSolver:
 
         assert plan is not None
         assert "+ml" in plan["version"]
+
+    def test_ml_cop_receives_forecast_precipitation(self):
+        """The MILP must pass the matching forecast rain amount to the COP model."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        mock_cop = MagicMock()
+        mock_cop.is_trained = True
+        mock_cop.predict_cop = MagicMock(return_value=4.0)
+        milp = MILPOptimizer(cop_model=mock_cop)
+        ts = _make_prices()[0][0]
+
+        cop_fn = milp._build_cop_function(
+            None, [{"ts": ts, "precipitation": 2.5}]
+        )
+        assert cop_fn(5.0, ts.hour) == 4.0
+        mock_cop.predict_cop.assert_called_once_with(5.0, 50, ts.hour, 2.5)
 
     def test_milp_version_without_ml(self):
         """Version should be plain milp_v1 without ML models."""
