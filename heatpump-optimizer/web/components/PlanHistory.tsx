@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
+import { PlanAction, usePlanActions } from "./usePlanActions";
 import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
 
 interface PlanSummary {
@@ -13,16 +14,6 @@ interface PlanSummary {
   optimizer_version: string;
   cost_estimate_eur: number | null;
   actions_count: number;
-}
-
-interface PlanAction {
-  id: number;
-  scheduled_ts: string;
-  action_type: string;
-  payload: Record<string, any>;
-  status: string;
-  executed_at: string | null;
-  result: Record<string, any> | null;
 }
 
 function formatReason(payload: Record<string, any>): string | null {
@@ -158,8 +149,11 @@ export function PlanHistory() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [expandedActions, setExpandedActions] = useState<PlanAction[]>([]);
-  const [loadingActions, setLoadingActions] = useState(false);
+  const {
+    actions: expandedActions,
+    loading: loadingActions,
+    error: actionsError,
+  } = usePlanActions(expandedId);
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
@@ -177,19 +171,9 @@ export function PlanHistory() {
   const toggleExpand = (planId: number) => {
     if (expandedId === planId) {
       setExpandedId(null);
-      setExpandedActions([]);
       return;
     }
     setExpandedId(planId);
-    setLoadingActions(true);
-    fetch(`/api/plans/${planId}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`API error (${r.status})`);
-        return r.json();
-      })
-      .then((data) => setExpandedActions(data.actions || []))
-      .catch(() => setExpandedActions([]))
-      .finally(() => setLoadingActions(false));
   };
 
   if (loading) {
@@ -255,6 +239,8 @@ export function PlanHistory() {
                       <div className="plan-loading-skeleton" />
                       <div className="plan-loading-skeleton" style={{ width: "60%" }} />
                     </div>
+                  ) : actionsError ? (
+                    <p className="plan-error">Could not load plan actions: {actionsError}</p>
                   ) : expandedActions.length === 0 ? (
                     <p className="plan-empty-msg" style={{ padding: "0.5rem 0" }}>No actions in this plan.</p>
                   ) : (

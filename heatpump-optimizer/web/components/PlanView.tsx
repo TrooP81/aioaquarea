@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
+import { PlanAction, usePlanActions } from "./usePlanActions";
 import {
   ACTION_LABELS,
   LAYER_LABELS,
@@ -24,16 +25,6 @@ interface PlanProps {
     horizon_end?: string;
     created_at?: string;
   } | null;
-}
-
-interface PlanAction {
-  id: number;
-  scheduled_ts: string;
-  action_type: string;
-  payload: Record<string, any>;
-  status: string;
-  executed_at: string | null;
-  result: Record<string, any> | null;
 }
 
 /* ── Time-of-day groups ── */
@@ -188,28 +179,13 @@ function TimeGroupDivider({ group }: { group: TimeGroup }) {
 /* ── Main Component ── */
 
 export function PlanView({ plan }: PlanProps) {
-  const [actions, setActions] = useState<PlanAction[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const { actions, loading, error: fetchError } = usePlanActions(plan?.id);
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
   useEffect(() => {
-    if (!plan?.id) {
-      setActions([]);
-      return;
-    }
-    setLoading(true);
-    setFetchError(null);
-    fetch(`/api/plans/${plan.id}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`Failed to load actions (${r.status})`);
-        return r.json();
-      })
-      .then((data) => setActions(data.actions || []))
-      .catch((e) => setFetchError(e instanceof Error ? e.message : "Failed to load plan actions"))
-      .finally(() => setLoading(false));
+    setShowAll(false);
   }, [plan?.id]);
 
   const now = new Date();
