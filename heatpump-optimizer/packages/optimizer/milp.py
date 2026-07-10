@@ -221,6 +221,29 @@ class MILPOptimizer:
         return [settings.sh_max_power_kw * 0.25] * len(weather)
 
     @staticmethod
+    def _normalise_demand_profile(
+        demand_per_hour: list[float] | None,
+        hours: int,
+        max_power_kw: float,
+    ) -> list[float]:
+        """Return a safe hourly electrical space-heating demand profile.
+
+        The demand model emits average electrical power in kW for each one-hour
+        slot.  Values may be missing, negative or exceed hardware capacity when
+        the model is trained on sparse/noisy intervals, so clamp each slot to
+        the feasible range before it becomes a hard optimisation constraint.
+        """
+        profile: list[float] = []
+        for hour in range(hours):
+            raw = demand_per_hour[hour] if demand_per_hour and hour < len(demand_per_hour) else 0.0
+            try:
+                demand_kw = float(raw)
+            except (TypeError, ValueError):
+                demand_kw = 0.0
+            profile.append(max(0.0, min(max_power_kw, demand_kw)))
+        return profile
+
+    @staticmethod
     def _precompute_indoor_rates(
         prices: list[tuple[dt.datetime, float]],
         weather: list[tuple[dt.datetime, float]],
@@ -351,7 +374,10 @@ class MILPOptimizer:
         ]
         tank_loss_kwh_per_h = [abs(r) * kwh_per_degree for r in tank_loss_rates]
 
-        sh_max_power_kw = settings.sh_max_power_kw
+        sh_max_power_kw = max(0.01, float(settings.sh_max_power_kw))
+        demand_profile_kw = self._normalise_demand_profile(
+            demand_per_hour, H, sh_max_power_kw
+        )
 
         # Tank state (thermal kWh stored, using same kwh_per_degree factor)
         # Per-hour tank floor: lower bound during off-peak hours
@@ -390,6 +416,8 @@ class MILPOptimizer:
             avg_tank_heat_rate=round(sum(tank_heat_rates) / H, 2),
             max_thermal_gain=round(max(max_thermal_per_h), 2),
             continuous_dhw=needs_continuous_dhw,
+            forecast_sh_kwh=round(sum(demand_profile_kw), 2),
+            forecast_peak_sh_kw=round(max(demand_profile_kw, default=0.0), 2),
         )
 
         # --- Problem setup ---
@@ -450,6 +478,23 @@ class MILPOptimizer:
                 prob += x_sh[h] >= 0.5
             elif temps[h] < 0:
                 prob += x_sh[h] >= 0.2
+
+        # The demand model predicts the electrical energy the building needs
+        # during each one-hour slot.  Earlier code passed this forecast into
+        # ``_solve`` but never used it, leaving MILP free to plan zero space
+        # heating on mild days even when the learned model predicted demand.
+        #
+        # A cumulative reserve lets the optimiser pre-heat in cheaper earlier
+        # hours while ensuring it has scheduled enough total energy by every
+        # deadline.  It deliberately does not require an exact per-hour match:
+        # the indoor-temperature dynamics remain responsible for deciding
+        # *when* that energy best preserves comfort.
+        cumulative_demand_kwh = 0.0
+        for h, demand_kw in enumerate(demand_profile_kw):
+            cumulative_demand_kwh += demand_kw
+            prob += pulp.lpSum(
+                x_sh[i] * sh_max_power_kw for i in range(h + 1)
+            ) >= cumulative_demand_kwh
 
         # --- Indoor temperature state variable ---
         # Track predicted indoor air temperature through the horizon.
@@ -538,6 +583,7 @@ class MILPOptimizer:
                         "payload": {
                             "reason": "milp_low_demand",
                             "sh_fraction": sh_val,
+                            "forecast_demand_kw": round(demand_profile_kw[h], 2),
                         },
                     }
                 )
@@ -549,6 +595,7 @@ class MILPOptimizer:
                         "payload": {
                             "reason": "milp_demand_increase",
                             "sh_fraction": sh_val,
+                            "forecast_demand_kw": round(demand_profile_kw[h], 2),
                         },
                     }
                 )
@@ -647,6 +694,7 @@ class MILPOptimizer:
             "version": version,
             "cost_estimate": total_cost,
             "indoor_forecast": indoor_forecast,
+            "space_heating_demand_kwh": round(sum(demand_profile_kw), 3),
         }
 
     # --- Data fetching (delegates to shared data_access module) ---

@@ -125,6 +125,35 @@ class TestMILPSolver:
         dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
         assert len(dhw_on) <= 20
 
+    def test_demand_forecast_becomes_an_energy_reserve(self):
+        """A positive demand forecast must affect the MILP cost and plan."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+        common = {
+            "cop_fn": lambda t, h=12: 3.5 + 0.1 * t,
+            "current_tank_temp": 48.0,
+        }
+
+        without_demand = milp._solve(
+            prices, weather, demand_per_hour=[0.0] * 24, **common
+        )
+        with_demand = milp._solve(
+            prices, weather, demand_per_hour=[3.0] * 24, **common
+        )
+
+        assert with_demand["space_heating_demand_kwh"] == pytest.approx(72.0)
+        assert with_demand["cost_estimate"] > without_demand["cost_estimate"]
+
+    def test_demand_profile_clamps_invalid_values(self):
+        from packages.optimizer.milp import MILPOptimizer
+
+        assert MILPOptimizer._normalise_demand_profile(
+            [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
+        ) == [0.0, 0.0, 0.0, 12.0, 0.0]
+
     def test_milp_infeasible_raises(self):
         """MILP should raise InfeasibleError when constraints are impossible."""
         from packages.optimizer.milp import MILPOptimizer
