@@ -122,6 +122,29 @@ class ThermalModel:
         """Discard learned calibration and return to default thermal parameters."""
         self.params = ThermalParams()
 
+    @staticmethod
+    def _nearest_prior_index_in_gap(
+        times: np.ndarray,
+        current_index: int,
+        min_gap_seconds: float,
+        max_gap_seconds: float,
+    ) -> int | None:
+        """Return the closest earlier sample in the requested time window.
+
+        Calibration needs a long enough gap to overcome sensor quantisation,
+        but it should use the *closest* valid sample.  Pairing every new row
+        with the oldest sample still inside a two-hour window smears mode
+        changes and biases the learned heating/cooling rates.
+        """
+        if current_index <= 0:
+            return None
+        target = times[current_index] - min_gap_seconds
+        index = int(np.searchsorted(times[:current_index], target, side="right")) - 1
+        if index < 0:
+            return None
+        gap = times[current_index] - times[index]
+        return index if gap <= max_gap_seconds else None
+
     async def calibrate(self) -> dict:
         """
         Learn thermal parameters from historical device status data.
@@ -160,24 +183,24 @@ class ThermalModel:
         zone_cooling_deltas = []
         defrost_filtered = 0
 
-        # Build sliding-window pairs with a minimum 10-min gap to avoid
+        # Pair each record with the closest earlier sample at least 10 minutes
+        # away to avoid amplifying sensor noise into extreme hourly rates.
         # amplifying short-interval temperature noise into extreme hourly
         # rates (e.g. 1°C / 5 min → 12°C/h when it's really ~2°C/h).
         MIN_GAP_S_DEVICE = 600   # 10 min
         MAX_GAP_S_DEVICE = 7200  # 2 h
 
-        j = 0  # trailing pointer
+        record_times = np.array([r.ts.timestamp() for r in records])
         for i in range(1, len(records)):
             curr = records[i]
 
-            # Advance j past records that are too old
-            while j < i and (curr.ts - records[j].ts).total_seconds() > MAX_GAP_S_DEVICE:
-                j += 1
-
-            prev = records[j]
-            gap_s = (curr.ts - prev.ts).total_seconds()
-            if gap_s < MIN_GAP_S_DEVICE or gap_s > MAX_GAP_S_DEVICE:
+            prev_index = self._nearest_prior_index_in_gap(
+                record_times, i, MIN_GAP_S_DEVICE, MAX_GAP_S_DEVICE
+            )
+            if prev_index is None:
                 continue
+            prev = records[prev_index]
+            gap_s = (curr.ts - prev.ts).total_seconds()
 
             dt_hours = gap_s / 3600.0
 
@@ -364,25 +387,24 @@ class ThermalModel:
         indoor_heating_deltas: list[tuple[float, float]] = []  # (delta_per_hour, outdoor)
         indoor_cooling_deltas: list[tuple[float, float]] = []
 
-        # Build a time-indexed list for sliding-window pairing.
-        # We pair each reading with the one ~15-30 min earlier rather than
-        # the immediate predecessor.  This avoids amplifying sensor
-        # quantisation noise (e.g. 0.1°C / 5 min → spurious -1.2°C/h).
+        # Pair each reading with the closest earlier reading at least 15
+        # minutes away rather than the oldest row still inside two hours. This
+        # avoids both sensor-noise amplification and rate estimates blurred by
+        # intervening mode changes.
         MIN_GAP_S = 900   # 15 min minimum between paired readings
         MAX_GAP_S = 7200  # 2 h maximum
 
-        j = 0  # trailing pointer
+        reading_times = np.array([r.timestamp.timestamp() for r in readings])
         for i in range(1, len(readings)):
             curr_reading = readings[i]
 
-            # Advance j until the gap is at least MIN_GAP_S
-            while j < i and (curr_reading.timestamp - readings[j].timestamp).total_seconds() > MAX_GAP_S:
-                j += 1
-
-            prev_reading = readings[j]
-            gap_s = (curr_reading.timestamp - prev_reading.timestamp).total_seconds()
-            if gap_s < MIN_GAP_S or gap_s > MAX_GAP_S:
+            prev_index = self._nearest_prior_index_in_gap(
+                reading_times, i, MIN_GAP_S, MAX_GAP_S
+            )
+            if prev_index is None:
                 continue
+            prev_reading = readings[prev_index]
+            gap_s = (curr_reading.timestamp - prev_reading.timestamp).total_seconds()
 
             dt_hours = gap_s / 3600.0
             abs_delta = abs(curr_reading.temperature - prev_reading.temperature)

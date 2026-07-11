@@ -242,6 +242,14 @@ async def main() -> None:
     # Load ML model checkpoints so MILP can use them
     _load_ml_models()
 
+    # The comfort model's causal feature schema is versioned separately from
+    # COP and demand. Train it once after a schema upgrade instead of running
+    # an older, leaky checkpoint or waiting for a manual request.
+    if not comfort_model.is_trained:
+        logger.info("comfort_model_initial_training_needed")
+        comfort_result = await comfort_model.train()
+        logger.info("comfort_model_initial_training_finished", **comfort_result)
+
     wrapper = AquareaWrapper()
     await wrapper.start()
 

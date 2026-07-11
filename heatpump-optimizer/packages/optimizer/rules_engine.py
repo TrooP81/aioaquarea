@@ -64,11 +64,17 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         ):
             await thermal_model.calibrate()
 
-        current_tank_temp = last_status.tank_temp if last_status and last_status.tank_temp else 48.0
-        current_outdoor_temp = (
-            last_status.outdoor_temp if last_status and last_status.outdoor_temp else 7.0
+        current_tank_temp = (
+            last_status.tank_temp if last_status and last_status.tank_temp is not None else 48.0
         )
-        current_water_temp = last_status.zone1_temp if last_status and last_status.zone1_temp else 35.0
+        current_outdoor_temp = (
+            last_status.outdoor_temp
+            if last_status and last_status.outdoor_temp is not None
+            else 7.0
+        )
+        current_water_temp = (
+            last_status.zone1_temp if last_status and last_status.zone1_temp is not None else 35.0
+        )
         tank_target = (
             last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
         )

@@ -3,6 +3,8 @@
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
+
 from packages.ml.thermal import ThermalModel, ThermalPrediction
 
 
@@ -307,6 +309,15 @@ class TestInternalRates:
         model.params.tank_heating_rate = 0.5
         model.params.tank_heating_outdoor_factor = 0.0
         assert model._tank_heating_rate(-20.0) == 1.0
+
+    def test_calibration_uses_closest_valid_prior_sample(self):
+        """A dense history must not pair each reading with the oldest valid row."""
+        model = ThermalModel()
+        times = np.array([0.0, 300.0, 600.0, 900.0, 1_200.0])
+
+        # At 20 min, the closest reading at least 10 min earlier is 10 min
+        # earlier (index 2), not the start of the two-hour window (index 0).
+        assert model._nearest_prior_index_in_gap(times, 4, 600.0, 7_200.0) == 2
 
     def test_tank_loss_rate_capped(self):
         """Tank loss rate should be capped to -3.0 maximum."""

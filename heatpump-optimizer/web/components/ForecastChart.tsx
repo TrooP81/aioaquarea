@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import {
-  LineChart,
+  Bar,
+  ComposedChart,
   Line,
   XAxis,
   YAxis,
@@ -21,6 +22,7 @@ interface WeatherPoint {
   humidity: number | null;
   cloud_cover: number | null;
   irradiance: number | null;
+  precipitation: number | null;
 }
 
 export function ForecastChart() {
@@ -49,6 +51,7 @@ export function ForecastChart() {
       windSpeed: d.wind_speed,
       humidity: d.humidity,
       cloudCover: d.cloud_cover != null ? Math.round(d.cloud_cover * 100) : null,
+      precipitation: Math.max(0, d.precipitation ?? 0),
       isForecast: ts > now,
     };
   });
@@ -70,10 +73,10 @@ export function ForecastChart() {
     <div className="chart-container" role="region" aria-label="Weather forecast chart">
       <div className="chart-title">Weather Forecast — 48h</div>
       <div className="chart-caption">
-        Outdoor temperature and conditions for the next 48 hours, used to plan heating ahead.
+        Outdoor temperature and conditions for the next 48 hours, used to plan heating ahead. Blue bars show rain in mm/h.
       </div>
       <ResponsiveContainer width="100%" height={250}>
-        <LineChart data={chartData}>
+        <ComposedChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
           <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={5} />
           <YAxis
@@ -91,6 +94,8 @@ export function ForecastChart() {
           />
           {/* Hidden 0–100% axis backing the cloud-cover series. */}
           <YAxis yAxisId="cloud" domain={[0, 100]} hide />
+          {/* Hidden axis lets rainfall retain its own mm/h scale. */}
+          <YAxis yAxisId="rain" domain={[0, "auto"]} hide />
           <Tooltip
             contentStyle={{
               background: "#1e293b",
@@ -102,10 +107,19 @@ export function ForecastChart() {
               if (name === "Wind Speed") return [`${value} m/s`, name];
               if (name === "Humidity") return [`${value}%`, name];
               if (name === "Cloud Cover") return [`${value}%`, name];
+              if (name === "Rain") return [`${Number(value).toFixed(1)} mm/h`, name];
               return [value, name];
             }}
           />
           <Legend />
+          <Bar
+            yAxisId="rain"
+            dataKey="precipitation"
+            fill="#38bdf8"
+            fillOpacity={0.65}
+            radius={[3, 3, 0, 0]}
+            name="Rain"
+          />
           <Line
             yAxisId="temp"
             type="monotone"
@@ -135,7 +149,7 @@ export function ForecastChart() {
             connectNulls
             name="Cloud Cover"
           />
-        </LineChart>
+        </ComposedChart>
       </ResponsiveContainer>
     </div>
   );

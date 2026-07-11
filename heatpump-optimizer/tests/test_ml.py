@@ -157,7 +157,7 @@ class TestCOPModel:
             mock_settings.model_dir = str(tmp_path)
             mock_settings.secret_key = "test-secret-key"
             from packages.ml.safe_persistence import safe_dump
-            model_path = tmp_path / "cop_model_test.pkl"
+            model_path = tmp_path / "cop_model_dhw_v2_test.pkl"
             safe_dump(pipeline, model_path)
 
             model2 = COPModel()
@@ -894,6 +894,53 @@ class TestCOPExcludesFallback:
 
         # Previously a synthetic COP (0.7 × default curve) would leak in here.
         assert len(y) == 0
+
+    @pytest.mark.asyncio
+    async def test_cop_uses_dhw_counter_without_space_heating_energy(self):
+        """Tank COP must not be diluted by space-heating consumption."""
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=0.0),
+            # The same interval has 3 kWh of space heating, but only 1 kWh
+            # belongs to the tank whose 6°C temperature rise is measured.
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=3.0,
+                tank_kwh=1.0,
+                outdoor_temp=0.0,
+            ),
+        ]
+        statuses = [
+            SimpleNamespace(
+                ts=base,
+                tank_target_temp=50.0,
+                tank_temp=45.0,
+                outdoor_temp=0.0,
+                direction="WATER",
+                zone1_temp=30.0,
+                defrost_active=False,
+            ),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=30),
+                tank_target_temp=50.0,
+                tank_temp=51.0,
+                outdoor_temp=0.0,
+                direction="WATER",
+                zone1_temp=30.0,
+                defrost_active=False,
+            ),
+        ]
+        results = [_FakeResult(consumption), _FakeResult(statuses), _FakeResult([])]
+
+        model = COPModel()
+        with patch("packages.ml.cop_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_training_data()
+
+        assert len(y) == 1
+        assert float(y[0]) == pytest.approx(6.0 * model._tank_kwh_per_degree())
+        assert float(X[0][0]) == 0.0  # zero outdoors must not fall back to 5°C
 
 
 class TestMAEBaseline:

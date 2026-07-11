@@ -97,6 +97,7 @@ test.describe("Learning Mode", () => {
     page.on("dialog", (dialog) => dialog.accept());
 
     await page.goto("/");
+    await page.getByRole("tab", { name: "Controls" }).click();
     const toggle = page.getByRole("button", { name: "Turn On Learning Mode" });
     await expect(toggle).toBeVisible({ timeout: 5000 });
     await toggle.click();

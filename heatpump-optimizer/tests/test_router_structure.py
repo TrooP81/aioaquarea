@@ -1,10 +1,24 @@
 from packages.api.main import app
 
 
+def _route_paths(routes):
+    """Yield route paths from both direct routes and FastAPI included routers."""
+    for route in routes:
+        path = getattr(route, "path", None)
+        if path:
+            yield path
+        nested_routes = getattr(route, "routes", None)
+        if nested_routes is None:
+            nested_routes = getattr(getattr(route, "original_router", None), "routes", None)
+        if nested_routes:
+            yield from _route_paths(nested_routes)
+
+
 def test_expected_route_paths_present():
-    paths = {route.path for route in app.routes}
+    paths = set(_route_paths(app.routes))
     expected = {
         "/health",
+        "/api/version",
         "/api/dashboard",
         "/api/status/history",
         "/api/device/settings",
@@ -13,6 +27,7 @@ def test_expected_route_paths_present():
         "/api/weather",
         "/api/plans",
         "/api/plans/{plan_id}",
+        "/api/plan-activity",
         "/api/overrides",
         "/api/overrides/{override_id}",
         "/api/settings",

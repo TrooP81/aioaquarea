@@ -8,7 +8,10 @@ import { SmartThingsSensorSelector } from "../../components/SmartThingsSensorSel
 import { LogViewer } from "../../components/LogViewer";
 import { ResetDataCard } from "../../components/ResetDataCard";
 import { useCurrency } from "../../components/useCurrency";
+import { AppVersionBadge } from "@/components/AppVersionBadge";
+import { TabNavigation } from "@/components/TabNavigation";
 import { OPTIMIZER_LAYER_OPTIONS } from "@/lib/constants";
+import { APP_VERSION, RELEASE_HISTORY } from "@/lib/release";
 
 interface SettingMeta {
   value: string;
@@ -22,13 +25,40 @@ type SettingsMap = Record<string, SettingMeta>;
 /** Slugify a section title into a DOM id for anchor navigation. */
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
-/** Extra (non-form) sections that also appear in the settings nav. */
-const EXTRA_SECTIONS = [
-  { id: "comfort-schedule", label: "Comfort Schedule" },
-  { id: "test-connection", label: "Test Connection" },
-  { id: "logs", label: "Logs" },
-  { id: "reset-data", label: "Reset Data" },
-];
+const SETTINGS_TABS = [
+  {
+    id: "optimizer",
+    label: "Optimizer",
+    description: "Planning rules, comfort targets, and automatic learning",
+    groups: ["Optimizer Layer", "Optimizer Constraints", "Quiet Mode", "Price Sensitivity", "Adaptive Learning", "Comfort Model", "Shower Mode"],
+  },
+  {
+    id: "data",
+    label: "Data Sources",
+    description: "Electricity prices, weather, location, and polling",
+    groups: ["Price Provider", "Weather Provider", "Location", "Polling"],
+  },
+  {
+    id: "integrations",
+    label: "Integrations",
+    description: "Heat-pump and SmartThings connections",
+    groups: ["Panasonic Aquarea", "SmartThings Integration"],
+  },
+  {
+    id: "display",
+    label: "Display",
+    description: "Currency and time-format preferences",
+    groups: ["Display"],
+  },
+  {
+    id: "system",
+    label: "System",
+    description: "Release notes, diagnostics, logs, and data reset",
+    groups: [],
+  },
+] as const;
+
+type SettingsTabId = (typeof SETTINGS_TABS)[number]["id"];
 
 const SETTING_GROUPS = [
   {
@@ -109,11 +139,31 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [apiVersion, setApiVersion] = useState<string | null>(null);
+  const [apiVersionUnavailable, setApiVersionUnavailable] = useState(false);
+  const [activeTab, setActiveTab] = useState<SettingsTabId>("optimizer");
   const currency = useCurrency();
+  const activeTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
+  const visibleGroupTitles: readonly string[] = activeTabMeta.groups;
 
   useEffect(() => {
     fetchSettings();
+    fetchApiVersion();
   }, []);
+
+  const fetchApiVersion = async () => {
+    try {
+      const res = await fetch("/api/version");
+      if (!res.ok) throw new Error("Failed to load API version");
+      const data: { version?: unknown } = await res.json();
+      if (typeof data.version !== "string") throw new Error("Invalid API version response");
+      setApiVersion(data.version);
+      setApiVersionUnavailable(false);
+    } catch {
+      setApiVersion(null);
+      setApiVersionUnavailable(true);
+    }
+  };
 
   const fetchSettings = async () => {
     try {
@@ -201,7 +251,10 @@ export default function SettingsPage() {
       <div className="dashboard">
         <div className="header">
           <h1>Settings</h1>
-          <a href="/" className="btn">← Dashboard</a>
+          <div className="header-actions">
+            <AppVersionBadge />
+            <a href="/" className="btn">← Dashboard</a>
+          </div>
         </div>
         <p style={{ color: "var(--text-muted)" }}>Loading settings...</p>
       </div>
@@ -212,32 +265,24 @@ export default function SettingsPage() {
     <div className="dashboard">
       <div className="header">
         <h1>Settings</h1>
-        <a href="/" className="btn">← Dashboard</a>
+        <div className="header-actions">
+          <AppVersionBadge />
+          <a href="/" className="btn">← Dashboard</a>
+        </div>
       </div>
 
-      {/* ── Jump-to navigation ── */}
-      <nav className="section-nav settings-nav" aria-label="Settings sections">
-        {SETTING_GROUPS.map((group) => (
-          <button
-            key={group.title}
-            className="section-nav-item"
-            onClick={() =>
-              document.getElementById(slug(group.title))?.scrollIntoView({ behavior: "smooth", block: "start" })
-            }
-          >
-            {group.title}
-          </button>
-        ))}
-        {EXTRA_SECTIONS.map((s) => (
-          <button
-            key={s.id}
-            className="section-nav-item"
-            onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}
-          >
-            {s.label}
-          </button>
-        ))}
-      </nav>
+      <TabNavigation
+        activeId={activeTab}
+        ariaLabel="Settings categories"
+        idPrefix="settings"
+        items={SETTINGS_TABS}
+        onChange={setActiveTab}
+      />
+
+      <div className="tab-context" aria-live="polite">
+        <strong>{activeTabMeta.label}</strong>
+        <span>{activeTabMeta.description}</span>
+      </div>
 
       {message && (
         <div
@@ -253,8 +298,38 @@ export default function SettingsPage() {
         </div>
       )}
 
+      <div className="settings-action-bar">
+        <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
+          {saving ? "Saving..." : "Save Settings"}
+        </button>
+        <button className="btn" onClick={fetchSettings}>
+          Reset form
+        </button>
+      </div>
+
+      {SETTINGS_TABS.filter((tab) => tab.id !== activeTab).map((tab) => (
+        <div
+          key={tab.id}
+          id={`settings-panel-${tab.id}`}
+          role="tabpanel"
+          aria-labelledby={`settings-tab-${tab.id}`}
+          hidden
+        />
+      ))}
+
+      <div
+        id={`settings-panel-${activeTab}`}
+        className="settings-tab-workspace"
+        role="tabpanel"
+        aria-labelledby={`settings-tab-${activeTab}`}
+      >
       {SETTING_GROUPS.map((group) => (
-        <div key={group.title} id={slug(group.title)} className="plan-section">
+        <div
+          key={group.title}
+          id={slug(group.title)}
+          className="plan-section settings-tab-panel"
+          hidden={!visibleGroupTitles.includes(group.title)}
+        >
           <h2 className="chart-title">{group.title}</h2>
           <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
             {group.title === "Price Provider"
@@ -333,29 +408,74 @@ export default function SettingsPage() {
         </div>
       ))}
 
-      <div id="comfort-schedule">
+      <section id="release-history" className="plan-section release-history settings-tab-panel" hidden={activeTab !== "system"}>
+        <div className="release-history-header">
+          <div>
+            <h2 className="chart-title">Release History</h2>
+            <p className="release-history-intro">
+              Dashboard version <strong>v{APP_VERSION}</strong> is live in the interface you are viewing.
+            </p>
+          </div>
+          <span className="status-badge online">● Live now</span>
+        </div>
+
+        <dl className="release-runtime" aria-label="Running service versions">
+          <div className="release-runtime-item">
+            <dt>Web dashboard</dt>
+            <dd data-testid="dashboard-version">v{APP_VERSION}</dd>
+            <span>Live build</span>
+          </div>
+          <div className="release-runtime-item">
+            <dt>API service</dt>
+            <dd data-testid="api-version">
+              {apiVersion ? `v${apiVersion}` : apiVersionUnavailable ? "Unavailable" : "Checking..."}
+            </dd>
+            <span className={apiVersion && apiVersion !== APP_VERSION ? "release-version-warning" : undefined}>
+              {apiVersion
+                ? apiVersion === APP_VERSION
+                  ? "Matches dashboard"
+                  : "Different from dashboard"
+                : apiVersionUnavailable
+                  ? "Could not verify"
+                  : "Checking running service"}
+            </span>
+          </div>
+        </dl>
+
+        <ol className="release-list">
+          {RELEASE_HISTORY.map((release, index) => (
+            <li key={release.version} className="release-list-item">
+              <div className="release-list-heading">
+                <span className="release-version">v{release.version}</span>
+                {index === 0 && <span className="release-current">Current</span>}
+                <span className="release-date">{release.released}</span>
+              </div>
+              <h3>{release.title}</h3>
+              <ul>
+                {release.changes.map((change) => (
+                  <li key={change}>{change}</li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <div id="comfort-schedule" className="settings-tab-panel" hidden={activeTab !== "optimizer"}>
         <ComfortSchedule />
       </div>
 
-      <div id="test-connection">
+      <div id="test-connection" className="settings-tab-panel" hidden={activeTab !== "system"}>
         <TestConnection editValues={editValues} />
       </div>
 
-      <div id="logs">
+      <div id="logs" className="settings-tab-panel" hidden={activeTab !== "system"}>
         <LogViewer />
       </div>
 
-      <div id="reset-data">
+      <div id="reset-data" className="settings-tab-panel" hidden={activeTab !== "system"}>
         <ResetDataCard />
       </div>
-
-      <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
-        <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
-          {saving ? "Saving..." : "Save Settings"}
-        </button>
-        <button className="btn" onClick={fetchSettings}>
-          Reset
-        </button>
       </div>
     </div>
   );

@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DeviceStatusResponse(BaseModel):
@@ -93,6 +93,21 @@ class PlanResponse(BaseModel):
 
 class PlanDetailResponse(PlanResponse):
     actions: list[dict]
+
+
+class PlanActivityResponse(BaseModel):
+    """A completed or attempted action across all plan revisions."""
+
+    id: int
+    plan_id: int
+    plan_created_at: dt.datetime
+    optimizer_version: str
+    scheduled_ts: dt.datetime
+    action_type: str
+    status: str
+    executed_at: Optional[dt.datetime] = None
+    payload: dict = Field(default_factory=dict)
+    result: Optional[dict] = None
 
 
 class OverrideCreate(BaseModel):

@@ -88,7 +88,9 @@ class MILPOptimizer:
             await thermal_model.calibrate()
 
         current_tank_temp = (
-            last_status.tank_temp if last_status and last_status.tank_temp else 48.0
+            last_status.tank_temp
+            if last_status and last_status.tank_temp is not None
+            else 48.0
         )
 
         # Build COP function: prefer ML model, fall back to default curve
@@ -168,6 +170,7 @@ class MILPOptimizer:
             tank_min_per_hour,
             tank_max_temp,
             indoor_rates,
+            weather_full,
         )
         return plan
 
@@ -244,6 +247,49 @@ class MILPOptimizer:
         return profile
 
     @staticmethod
+    def _forecast_conditions(
+        weather_full: list[dict] | None,
+        forecast_ts: dt.datetime,
+        fallback_temperature: float = 5.0,
+    ) -> dict[str, float]:
+        """Return the weather features for one forecast slot.
+
+        The comfort model was trained with temperature, wind, solar irradiance,
+        and precipitation.  Keeping this lookup timestamp-based prevents the
+        optimiser from silently falling back to calm, dark defaults whenever a
+        weather feed contains a gap or is not positional with the price feed.
+        """
+        defaults = {
+            "temperature": float(fallback_temperature),
+            "wind_speed": 3.0,
+            "irradiance": 0.0,
+            "precipitation": 0.0,
+        }
+        if not weather_full:
+            return defaults
+
+        candidates = [row for row in weather_full if isinstance(row.get("ts"), dt.datetime)]
+        if not candidates:
+            return defaults
+        closest = min(candidates, key=lambda row: abs((row["ts"] - forecast_ts).total_seconds()))
+        if abs((closest["ts"] - forecast_ts).total_seconds()) > 90 * 60:
+            return defaults
+
+        def _number(key: str, default: float, *, non_negative: bool = False) -> float:
+            try:
+                value = float(closest.get(key))
+            except (TypeError, ValueError):
+                return default
+            return max(0.0, value) if non_negative else value
+
+        return {
+            "temperature": _number("temperature", defaults["temperature"]),
+            "wind_speed": _number("wind_speed", defaults["wind_speed"], non_negative=True),
+            "irradiance": _number("irradiance", defaults["irradiance"], non_negative=True),
+            "precipitation": _number("precipitation", defaults["precipitation"], non_negative=True),
+        }
+
+    @staticmethod
     def _precompute_indoor_rates(
         prices: list[tuple[dt.datetime, float]],
         weather: list[tuple[dt.datetime, float]],
@@ -266,29 +312,32 @@ class MILPOptimizer:
 
         for h in range(len(prices)):
             hour_ts = prices[h][0]
-            outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
-            hour_of_day = hour_ts.hour
-            precipitation = (
-                max(0.0, float(weather_full[h].get("precipitation") or 0.0))
-                if weather_full and h < len(weather_full)
-                else 0.0
+            fallback_outdoor = weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
+            conditions = MILPOptimizer._forecast_conditions(
+                weather_full, hour_ts, fallback_temperature=fallback_outdoor
             )
+            outdoor = conditions["temperature"]
+            hour_of_day = hour_ts.hour
 
             # No-heating: water at outdoor temp (radiators not contributing)
             pred_no_heat = comfort_model.predict_indoor_temp(
                 zone_water_temp=outdoor,
                 outdoor_temp=outdoor,
+                wind_speed=conditions["wind_speed"],
+                irradiance=conditions["irradiance"],
                 hour=hour_of_day,
                 indoor_temp=indoor,
-                precipitation=precipitation,
+                precipitation=conditions["precipitation"],
             )
             # Full heating: water at heat curve temp
             pred_heat = comfort_model.predict_indoor_temp(
                 zone_water_temp=heat_curve_water_temp,
                 outdoor_temp=outdoor,
+                wind_speed=conditions["wind_speed"],
+                irradiance=conditions["irradiance"],
                 hour=hour_of_day,
                 indoor_temp=indoor,
-                precipitation=precipitation,
+                precipitation=conditions["precipitation"],
             )
 
             if pred_no_heat is None or pred_heat is None:
@@ -329,6 +378,7 @@ class MILPOptimizer:
         tank_min_per_hour: list[int] | None = None,
         tank_max_temp_setting: int | None = None,
         indoor_rates: list[tuple[float, float]] | None = None,
+        weather_full: list[dict] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -625,11 +675,17 @@ class MILPOptimizer:
                 else:
                     # SH is needed — use comfort model with the solved indoor
                     # temp as anchor to find required water temperature
+                    conditions = self._forecast_conditions(
+                        weather_full, ts, fallback_temperature=temps[h]
+                    )
                     required_water = comfort_model.required_zone_temp(
                         target_indoor=target_indoor,
-                        outdoor_temp=temps[h],
+                        outdoor_temp=conditions["temperature"],
+                        wind_speed=conditions["wind_speed"],
+                        irradiance=conditions["irradiance"],
                         hour=hours[h],
                         indoor_temp=solved_indoor,
+                        precipitation=conditions["precipitation"],
                     )
                     if required_water is None:
                         target_mode = "normal"

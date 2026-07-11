@@ -18,12 +18,13 @@ from packages.api.routers.settings import router as settings_router
 from packages.api.routers.smartthings import router as smartthings_router
 from packages.core.config import settings
 from packages.core.logging import configure_logging
+from packages.core.version import APP_VERSION
 
 configure_logging("api")
 
 app = FastAPI(
     title="Heat Pump Optimizer API",
-    version="0.1.0",
+    version=APP_VERSION,
     description="API for monitoring and optimizing Panasonic Aquarea heat pump costs",
     dependencies=[Depends(require_auth)],
 )
@@ -35,6 +36,12 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.get("/api/version")
+async def version():
+    """Return the version of the running API service."""
+    return {"version": APP_VERSION}
 
 
 @app.middleware("http")

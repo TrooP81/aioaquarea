@@ -84,6 +84,7 @@ test.describe("Override Controls", () => {
 
   test("controls section is visible", async ({ page }) => {
     await page.goto("/");
+    await page.getByRole("tab", { name: "Controls" }).click();
     // Controls component should render
     await expect(page.locator("text=Controls")).toBeVisible({ timeout: 5000 }).catch(() => {
       // Controls might use different heading text — just verify the page loaded

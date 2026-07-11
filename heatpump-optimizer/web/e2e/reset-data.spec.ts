@@ -58,6 +58,7 @@ test.describe("Reset data card", () => {
     page.on("dialog", (dialog) => dialog.accept());
 
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "System" }).click();
 
     await expect(page.getByText("Danger Zone — Reset Data")).toBeVisible();
 
@@ -99,6 +100,7 @@ test.describe("Reset data card", () => {
     page.on("dialog", (dialog) => dialog.accept());
 
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "System" }).click();
 
     await page
       .locator("label", { hasText: "Start everything fresh (select all)" })

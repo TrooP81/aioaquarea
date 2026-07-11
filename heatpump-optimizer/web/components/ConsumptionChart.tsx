@@ -24,6 +24,7 @@ interface ConsumptionPoint {
 
 export function ConsumptionChart() {
   const [data, setData] = useState<ConsumptionPoint[]>([]);
+  const [showHotWater, setShowHotWater] = useState(false);
   const timeFormat = useTimeFormat();
 
   useEffect(() => {
@@ -56,9 +57,20 @@ export function ConsumptionChart() {
 
   return (
     <div className="chart-container" role="region" aria-label="Energy consumption chart">
-      <div className="chart-title">Energy Consumption — 24h</div>
+      <div className="chart-title-row">
+        <div className="chart-title">Heating Energy — 24h</div>
+        <button
+          type="button"
+          className="btn btn-sm"
+          aria-pressed={showHotWater}
+          onClick={() => setShowHotWater((current) => !current)}
+        >
+          {showHotWater ? "Hide hot water" : "Show hot water"}
+        </button>
+      </div>
       <div className="chart-caption">
-        Electricity drawn by the heat pump over the last 24 hours.
+        Space heating and cooling electricity over the last 24 hours.
+        {showHotWater ? " Hot-water electricity is included." : " Hot-water electricity is hidden to keep the comfort view focused."}
       </div>
       <ResponsiveContainer width="100%" height={220}>
         <BarChart data={chartData}>
@@ -81,13 +93,15 @@ export function ConsumptionChart() {
             name="Heating"
             radius={[0, 0, 0, 0]}
           />
-          <Bar
-            dataKey="tank"
-            stackId="1"
-            fill="#3b82f6"
-            name="Hot Water"
-            radius={[0, 0, 0, 0]}
-          />
+          {showHotWater && (
+            <Bar
+              dataKey="tank"
+              stackId="1"
+              fill="#3b82f6"
+              name="Hot Water"
+              radius={[0, 0, 0, 0]}
+            />
+          )}
           <Bar
             dataKey="cool"
             stackId="1"

@@ -25,6 +25,14 @@ from packages.ml.models_common import (
 # COP rises as it gets warmer outside (+1) and falls as the tank target rises (-1).
 _COP_MONOTONIC_CST = [1, -1, 0, 0, 0]
 
+# Version the persisted artifact by its training-target definition.  Earlier
+# checkpoints used total heating + DHW electricity while the target was based
+# on a tank-only thermal measurement, so they must not be used after the
+# denominator correction below.
+COP_MODEL_ARTIFACT_PREFIX = "cop_model_dhw_v2_"
+COP_MODEL_ARTIFACT_GLOB = f"{COP_MODEL_ARTIFACT_PREFIX}*.pkl"
+COP_MAE_BASELINE = "cop_dhw_v2"
+
 
 class COPModel:
     COP_MIN = 1.5
@@ -62,8 +70,8 @@ class COPModel:
         # honest MAE; plain KFold would leak later intervals into earlier folds.
         mae, cv_std = time_series_cv_mae(model, X, y)
 
-        has_prior = bool(list(MODEL_DIR.glob("cop_model_*.pkl")))
-        decision = evaluate_regression("cop", mae, has_prior)
+        has_prior = bool(list(MODEL_DIR.glob(COP_MODEL_ARTIFACT_GLOB)))
+        decision = evaluate_regression(COP_MAE_BASELINE, mae, has_prior)
         if not decision["deploy"]:
             _logger.warning("cop_model_deploy_skipped", mae=round(mae, 3), baseline_mae=decision["baseline_mae"], samples=len(X))
             return {
@@ -79,11 +87,11 @@ class COPModel:
 
         _logger.info("cop_model_trained", samples=len(X), mae=round(mae, 3), baseline_mae=decision["baseline_mae"], y_mean=round(float(np.mean(y)), 2), y_std=round(float(np.std(y)), 2))
 
-        model_path = MODEL_DIR / f"cop_model_{self._version}.pkl"
+        model_path = MODEL_DIR / f"{COP_MODEL_ARTIFACT_PREFIX}{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump(model, model_path)
-        write_mae_baseline("cop", mae)
+        write_mae_baseline(COP_MAE_BASELINE, mae)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 
     def predict(
@@ -121,7 +129,7 @@ class COPModel:
     async def _prepare_training_data(self) -> tuple[np.ndarray, np.ndarray]:
         async with get_session() as session:
             consumption_rows = (await session.execute(select(ConsumptionRecord.ts, ConsumptionRecord.heat_kwh, ConsumptionRecord.tank_kwh, ConsumptionRecord.outdoor_temp).order_by(ConsumptionRecord.ts))).all()
-            status_rows = (await session.execute(select(DeviceStatusRecord.ts, DeviceStatusRecord.tank_target_temp, DeviceStatusRecord.tank_temp, DeviceStatusRecord.outdoor_temp, DeviceStatusRecord.direction, DeviceStatusRecord.zone1_temp).order_by(DeviceStatusRecord.ts))).all()
+            status_rows = (await session.execute(select(DeviceStatusRecord.ts, DeviceStatusRecord.tank_target_temp, DeviceStatusRecord.tank_temp, DeviceStatusRecord.outdoor_temp, DeviceStatusRecord.direction, DeviceStatusRecord.zone1_temp, DeviceStatusRecord.defrost_active).order_by(DeviceStatusRecord.ts))).all()
             weather_rows = (await session.execute(select(WeatherRecord.ts, WeatherRecord.precipitation).order_by(WeatherRecord.ts))).all()
 
         if not consumption_rows or not status_rows:
@@ -160,8 +168,9 @@ class COPModel:
 
         X_list = []
         y_list = []
-        skip_no_delta = 0
+        skip_no_tank_delta = 0
         skip_no_status = 0
+        skip_defrost = 0
         skip_cop_low = 0
         skip_cop_high = 0
         used_status_path = 0
@@ -174,15 +183,19 @@ class COPModel:
                 continue
             elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
             if not (0.2 <= elapsed_hours <= 2.0):
-                skip_no_delta += 1
+                skip_no_tank_delta += 1
                 prev_row = row
                 continue
 
             prev_status_rec = _find_closest_status(prev_row.ts)
             curr_status_rec = _find_closest_status(row.ts)
-            delta_elec = ((row.heat_kwh or 0) + (row.tank_kwh or 0)) - ((prev_row.heat_kwh or 0) + (prev_row.tank_kwh or 0))
+            # The thermal target below is measured only from the DHW tank's
+            # temperature rise.  Its denominator must therefore be the DHW
+            # counter alone: including ``heat_kwh`` folds space-heating power
+            # into the same interval and biases the learned COP downward.
+            delta_elec = (row.tank_kwh or 0) - (prev_row.tank_kwh or 0)
             if delta_elec <= 0.01:
-                skip_no_delta += 1
+                skip_no_tank_delta += 1
                 prev_row = row
                 continue
 
@@ -190,6 +203,10 @@ class COPModel:
             thermal_kwh = 0.0
             curr_status = None
             if prev_status_rec and curr_status_rec and prev_status_rec.ts != curr_status_rec.ts:
+                if getattr(prev_status_rec, "defrost_active", False) or getattr(curr_status_rec, "defrost_active", False):
+                    skip_defrost += 1
+                    prev_row = row
+                    continue
                 used_status_path += 1
                 # Only DHW tank heating gives a physically-grounded thermal
                 # measurement (energy = tank_mass × ΔT). The zone1 "temperature"
@@ -227,7 +244,7 @@ class COPModel:
                 continue
 
             features = self._make_features(
-                row.outdoor_temp or 5.0,
+                row.outdoor_temp if row.outdoor_temp is not None else 5.0,
                 int(curr_status.get("tank_target", 50) if curr_status else 50),
                 row.ts.hour,
                 _precipitation_at(row.ts),
@@ -236,13 +253,13 @@ class COPModel:
             y_list.append(cop)
             prev_row = row
 
-        _logger.info("cop_training_data_prepared", total_consumption_rows=len(consumption_rows), status_rows=len(status_rows), paired_samples=len(y_list), skip_no_delta=skip_no_delta, skip_no_status=skip_no_status, skip_no_measured_thermal=skip_no_measured_thermal, skip_cop_low=skip_cop_low, skip_cop_high=skip_cop_high, used_status_path=used_status_path, kwh_per_degree=round(self._tank_kwh_per_degree(), 4))
+        _logger.info("cop_training_data_prepared", total_consumption_rows=len(consumption_rows), status_rows=len(status_rows), paired_samples=len(y_list), skip_no_tank_delta=skip_no_tank_delta, skip_no_status=skip_no_status, skip_defrost=skip_defrost, skip_no_measured_thermal=skip_no_measured_thermal, skip_cop_low=skip_cop_low, skip_cop_high=skip_cop_high, used_status_path=used_status_path, kwh_per_degree=round(self._tank_kwh_per_degree(), 4))
         return np.array(X_list), np.array(y_list)
 
     def load_latest(self) -> bool:
         from packages.ml.safe_persistence import safe_load
 
-        models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
+        models = sorted(MODEL_DIR.glob(COP_MODEL_ARTIFACT_GLOB))
         if not models:
             _logger.info("cop_model_load_skip", reason="no model files found", dir=str(MODEL_DIR))
             return False
@@ -256,7 +273,7 @@ class COPModel:
                 _logger.info("cop_model_load_skip", path=str(path), reason="obsolete_feature_schema")
                 continue
             self._model = candidate
-            self._version = path.stem.replace("cop_model_", "")
+            self._version = path.stem.replace(COP_MODEL_ARTIFACT_PREFIX, "")
             _logger.info("cop_model_loaded", version=self._version, path=str(path))
             return True
         return False

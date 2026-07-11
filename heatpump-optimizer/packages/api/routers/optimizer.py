@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
-from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
+from packages.api.schemas import OverrideCreate, PlanActivityResponse, PlanDetailResponse, PlanResponse
 from packages.core.database import get_session
 from packages.core.models import AuditLogRecord, OverrideRecord, PlanActionRecord, PlanRecord
 
@@ -91,6 +91,39 @@ async def get_plan_detail(plan_id: int):
             for a in actions
         ],
     )
+
+
+@router.get("/api/plan-activity", response_model=list[PlanActivityResponse])
+async def get_plan_activity(limit: int = Query(25, ge=1, le=100)):
+    """Get recent actions that were actually attempted by the optimizer.
+
+    Pending actions are intentionally excluded: they belong to a current plan,
+    not to the record of what the system has already done.
+    """
+    async with get_session() as session:
+        result = await session.execute(
+            select(PlanActionRecord, PlanRecord.created_at, PlanRecord.optimizer_version)
+            .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
+            .where(PlanActionRecord.status != "pending")
+            .order_by(desc(func.coalesce(PlanActionRecord.executed_at, PlanActionRecord.scheduled_ts)))
+            .limit(limit)
+        )
+
+        return [
+            PlanActivityResponse(
+                id=action.id,
+                plan_id=action.plan_id,
+                plan_created_at=plan_created_at,
+                optimizer_version=optimizer_version,
+                scheduled_ts=action.scheduled_ts,
+                action_type=action.action_type,
+                status=action.status,
+                executed_at=action.executed_at,
+                payload=json.loads(action.payload_json) if action.payload_json else {},
+                result=json.loads(action.result_json) if action.result_json else None,
+            )
+            for action, plan_created_at, optimizer_version in result.all()
+        ]
 
 
 @router.post("/api/overrides")
@@ -214,7 +247,7 @@ async def get_optimizer_status():
     optimizer_status = await get_optimizer_status_snapshot(layer, reload_models=True)
     learning_mode = await _learning_mode_status()
 
-    cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
+    cop_models = sorted(MODEL_DIR.glob("cop_model_dhw_v2_*.pkl"))
     demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
 
     async with get_session() as session:
@@ -243,7 +276,7 @@ async def get_optimizer_status():
         "learning_mode": learning_mode,
         "cop_model": {
             "trained": optimizer_status["cop_trained"],
-            "last_trained": _version_to_iso("cop_model_", cop_models),
+            "last_trained": _version_to_iso("cop_model_dhw_v2_", cop_models),
             "samples": cop_samples,
         },
         "demand_model": {

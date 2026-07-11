@@ -36,6 +36,12 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 MIN_TRAINING_ROWS = 100
 DEFAULT_THERMAL_LAG_MINUTES = 30
 
+# Earlier artifacts were trained with nearest-neighbour indoor and status
+# samples, which could select values recorded *after* the feature timestamp.
+# Keep them separate from the causal dataset definition below.
+COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_causal_v2_"
+COMFORT_MODEL_ARTIFACT_GLOB = f"{COMFORT_MODEL_ARTIFACT_PREFIX}*.pkl"
+
 # Candidate lags to search when auto-detecting (minutes)
 _LAG_CANDIDATES = [10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
 
@@ -332,7 +338,7 @@ class ComfortModel:
         from packages.ml.safe_persistence import safe_dump
 
         ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        path = MODEL_DIR / f"comfort_model_{ts}.pkl"
+        path = MODEL_DIR / f"{COMFORT_MODEL_ARTIFACT_PREFIX}{ts}.pkl"
         safe_dump(
             {
                 "model": self._model,
@@ -349,7 +355,7 @@ class ComfortModel:
         """Load the most recent saved model.  Returns True if loaded."""
         from packages.ml.safe_persistence import safe_load
 
-        models = sorted(MODEL_DIR.glob("comfort_model_*.pkl"))
+        models = sorted(MODEL_DIR.glob(COMFORT_MODEL_ARTIFACT_GLOB))
         if not models:
             return False
         try:
@@ -371,6 +377,18 @@ class ComfortModel:
     # ------------------------------------------------------------------
     # Dataset builder
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _latest_index_at_or_before(times: np.ndarray, target: float) -> int | None:
+        """Find the latest recorded sample available at ``target``.
+
+        Forecast features must be causal: a reading taken after the target time
+        was not available when the prediction would have been made.  Selecting
+        the nearest row instead leaks future indoor or device measurements into
+        training and inflates validation scores.
+        """
+        index = int(np.searchsorted(times, target, side="right")) - 1
+        return index if index >= 0 else None
 
     async def _build_dataset(self) -> tuple[np.ndarray, np.ndarray, int]:
         """
@@ -429,7 +447,10 @@ class ComfortModel:
         if not statuses:
             return np.array([]), np.array([]), 0
 
-        # Build lookup arrays for nearest-neighbor matching
+        # Build lookup arrays. Status and prior-indoor values are resolved
+        # causally (at or before the feature time); weather can be joined to
+        # the forecast slot itself because it is an input available to the
+        # optimiser when making a future prediction.
         status_times = np.array([(s.ts - earliest).total_seconds() for s in statuses])
         weather_times = (
             np.array([(w.ts - earliest).total_seconds() for w in weathers])
@@ -445,15 +466,19 @@ class ComfortModel:
         X_rows = []
         y_rows = []
 
-        for i, reading in enumerate(readings):
+        for reading in readings:
             target_ts = reading.timestamp - lag
             t_sec = (target_ts - earliest).total_seconds()
 
-            # Nearest device status
-            idx = int(np.argmin(np.abs(status_times - t_sec)))
+            # Latest device status known at the feature timestamp. Using a
+            # later status would leak a water-temperature change that had not
+            # yet happened when predicting this indoor reading.
+            idx = self._latest_index_at_or_before(status_times, t_sec)
+            if idx is None:
+                continue
             status = statuses[idx]
             # Skip if too far (> 15 min)
-            gap = abs((status.ts - target_ts).total_seconds())
+            gap = (target_ts - status.ts).total_seconds()
             if gap > 900:
                 continue
 
@@ -474,11 +499,13 @@ class ComfortModel:
             else:
                 precipitation = 0.0
 
-            # Previous indoor temp at the lag-shifted time
+            # Previous indoor temperature available at the lag-shifted time.
+            # This deliberately uses the latest earlier sample rather than a
+            # nearest neighbour, so no future sensor value can leak into X.
             prev_indoor: float | None = None
-            prev_idx = int(np.argmin(np.abs(reading_times - t_sec)))
-            prev_gap = abs(reading_times[prev_idx] - t_sec)
-            if prev_gap <= 900 and prev_idx != i:  # within 15 min, not self
+            prev_idx = self._latest_index_at_or_before(reading_times, t_sec)
+            prev_gap = t_sec - reading_times[prev_idx] if prev_idx is not None else float("inf")
+            if prev_idx is not None and prev_gap <= 900:
                 prev_indoor = float(reading_temps[prev_idx])
 
             hour = reading.timestamp.hour

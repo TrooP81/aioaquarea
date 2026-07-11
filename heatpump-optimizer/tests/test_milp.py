@@ -154,6 +154,38 @@ class TestMILPSolver:
             [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
         ) == [0.0, 0.0, 0.0, 12.0, 0.0]
 
+    def test_comfort_rates_use_all_forecast_weather_features(self):
+        """Wind and sun learned by the comfort model must reach the MILP."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        ts = _make_prices(hours=1)[0][0]
+        comfort = MagicMock()
+        comfort.predict_indoor_temp.side_effect = [19.8, 20.2]
+
+        with patch("packages.optimizer.milp.comfort_model", comfort):
+            rates = MILPOptimizer._precompute_indoor_rates(
+                prices=[(ts, 0.1)],
+                weather=[(ts, 5.0)],
+                current_indoor=20.0,
+                heat_curve_water_temp=35.0,
+                weather_full=[
+                    {
+                        "ts": ts,
+                        "temperature": 7.0,
+                        "wind_speed": 9.0,
+                        "irradiance": 450.0,
+                        "precipitation": 1.25,
+                    }
+                ],
+            )
+
+        assert rates == [(pytest.approx(0.2), pytest.approx(-0.2))]
+        first_call = comfort.predict_indoor_temp.call_args_list[0].kwargs
+        assert first_call["outdoor_temp"] == 7.0
+        assert first_call["wind_speed"] == 9.0
+        assert first_call["irradiance"] == 450.0
+        assert first_call["precipitation"] == 1.25
+
     def test_milp_infeasible_raises(self):
         """MILP should raise InfeasibleError when constraints are impossible."""
         from packages.optimizer.milp import MILPOptimizer

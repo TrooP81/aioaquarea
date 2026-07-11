@@ -20,14 +20,15 @@
 export interface Section {
   id: string;
   label: string;
+  description: string;
 }
 
 export const SECTIONS = [
-  { id: "overview", label: "Overview" },
-  { id: "controls", label: "Controls" },
-  { id: "plan", label: "Plan" },
-  { id: "charts", label: "Charts" },
-  { id: "status", label: "Status" },
+  { id: "overview", label: "Overview", description: "Live readings and the next planned action" },
+  { id: "controls", label: "Controls", description: "Pause, override, or collect learning data" },
+  { id: "plan", label: "Plan", description: "Current schedule, completed actions, and plan revisions" },
+  { id: "charts", label: "Charts", description: "Prices, temperatures, energy use, weather, and predictions" },
+  { id: "status", label: "Models", description: "Optimizer decisions and learning-model health" },
 ] as const;
 
 export type SectionId = (typeof SECTIONS)[number]["id"];

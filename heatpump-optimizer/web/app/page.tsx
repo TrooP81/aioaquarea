@@ -1,18 +1,22 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
 import { Dashboard } from "@/components/Dashboard";
 import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
 import { ConsumptionChart } from "@/components/ConsumptionChart";
 import { ForecastChart } from "@/components/ForecastChart";
 import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
+import { ComfortImpactChart } from "@/components/ComfortImpactChart";
 import { PlanView } from "@/components/PlanView";
 import { PlanHistory } from "@/components/PlanHistory";
+import { PlanActivityTimeline } from "@/components/PlanActivityTimeline";
 import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { LearningModeCard } from "@/components/LearningModeCard";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
+import { AppVersionBadge } from "@/components/AppVersionBadge";
+import { TabNavigation } from "@/components/TabNavigation";
 import { SECTIONS, SectionId } from "@/lib/constants";
 import { useTimeFormat, formatTime } from "@/components/useTimeFormat";
 
@@ -75,7 +79,9 @@ export default function Home() {
   const [pollResult, setPollResult] = useState<PollResult | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [activeSection, setActiveSection] = useState<SectionId>("overview");
-  const mainRef = useRef<HTMLDivElement>(null);
+  const [showRawChartDetails, setShowRawChartDetails] = useState(false);
+  const [showHotWaterDetails, setShowHotWaterDetails] = useState(false);
+  const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
 
   const fetchData = async () => {
     try {
@@ -114,30 +120,6 @@ export default function Home() {
     }, 30000);
     return () => clearInterval(interval);
   }, []);
-
-  /* ── Intersection observer for active section highlighting ── */
-  useEffect(() => {
-    const ids = SECTIONS.map((s) => s.id);
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            setActiveSection(entry.target.id as SectionId);
-          }
-        }
-      },
-      { rootMargin: "-40% 0px -55% 0px" },
-    );
-    ids.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) observer.observe(el);
-    });
-    return () => observer.disconnect();
-  }, [loading]);
-
-  const scrollTo = (id: SectionId) => {
-    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  };
 
   /* ── Auto-dismiss a successful poll banner after a few seconds ── */
   useEffect(() => {
@@ -186,7 +168,10 @@ export default function Home() {
       <div className="dashboard">
         <div className="header">
           <h1>Heat Pump Optimizer</h1>
-          <span className="status-badge loading">Loading...</span>
+          <div className="header-actions">
+            <AppVersionBadge />
+            <span className="status-badge loading">Loading...</span>
+          </div>
         </div>
         <div className="chart-container">
           <div className="chart-skeleton" />
@@ -197,23 +182,19 @@ export default function Home() {
   }
 
   return (
-    <div className="dashboard" ref={mainRef}>
-      {/* ── Sticky section nav ── */}
-      <nav className="section-nav" aria-label="Dashboard sections">
-        {SECTIONS.map((s) => (
-          <button
-            key={s.id}
-            className={`section-nav-item ${activeSection === s.id ? "active" : ""}`}
-            onClick={() => scrollTo(s.id)}
-          >
-            {s.label}
-          </button>
-        ))}
-      </nav>
+    <div className="dashboard">
+      <TabNavigation
+        activeId={activeSection}
+        ariaLabel="Dashboard views"
+        idPrefix="dashboard"
+        items={SECTIONS}
+        onChange={setActiveSection}
+      />
 
       <div className="header">
         <h1>Heat Pump Optimizer</h1>
         <div className="header-actions">
+          <AppVersionBadge />
           {lastUpdated && (
             <span className="last-updated">
               Updated {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
@@ -235,6 +216,11 @@ export default function Home() {
             {data?.current_status ? "● Connected" : "● Disconnected"}
           </span>
         </div>
+      </div>
+
+      <div className="tab-context" aria-live="polite">
+        <strong>{activeSectionMeta.label}</strong>
+        <span>{activeSectionMeta.description}</span>
       </div>
 
       {pollResult && (
@@ -289,35 +275,82 @@ export default function Home() {
         </div>
       )}
 
-      {/* ── Overview section ── */}
-      <section id="overview">
+      <section
+        id="dashboard-panel-overview"
+        className="workspace-panel"
+        role="tabpanel"
+        aria-labelledby="dashboard-tab-overview"
+        hidden={activeSection !== "overview"}
+      >
         <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
         <NextActionCard plan={data?.active_plan ?? null} />
       </section>
 
-      {/* ── Controls (moved up — emergency actions should be accessible) ── */}
-      <section id="controls">
+      <section
+        id="dashboard-panel-controls"
+        className="workspace-panel"
+        role="tabpanel"
+        aria-labelledby="dashboard-tab-controls"
+        hidden={activeSection !== "controls"}
+      >
         <Controls />
         <LearningModeCard onChange={fetchLearningMode} />
       </section>
 
-      {/* ── Plan section ── */}
-      <section id="plan">
+      <section
+        id="dashboard-panel-plan"
+        className="workspace-panel"
+        role="tabpanel"
+        aria-labelledby="dashboard-tab-plan"
+        hidden={activeSection !== "plan"}
+      >
         <PlanView plan={data?.active_plan ?? null} />
+        <PlanActivityTimeline />
         <PlanHistory />
       </section>
 
-      {/* ── Charts section ── */}
-      <section id="charts">
-        <PriceChart />
-        <TemperatureChart />
+      <section
+        id="dashboard-panel-charts"
+        className="workspace-panel"
+        role="tabpanel"
+        aria-labelledby="dashboard-tab-charts"
+        hidden={activeSection !== "charts"}
+      >
+        <ComfortImpactChart />
         <ConsumptionChart />
-        <ForecastChart />
-        <ThermalPredictionChart />
+        <details
+          className="chart-details"
+          onToggle={(event) => setShowRawChartDetails(event.currentTarget.open)}
+        >
+          <summary>Show raw weather, price and temperature history</summary>
+          {showRawChartDetails && (
+            <div className="chart-detail-content">
+              <TemperatureChart />
+              <ForecastChart />
+              <PriceChart />
+            </div>
+          )}
+        </details>
+        <details
+          className="chart-details chart-details--hot-water"
+          onToggle={(event) => setShowHotWaterDetails(event.currentTarget.open)}
+        >
+          <summary>Show hot-water and tank details</summary>
+          {showHotWaterDetails && (
+            <div className="chart-detail-content">
+              <ThermalPredictionChart />
+            </div>
+          )}
+        </details>
       </section>
 
-      {/* ── Status section ── */}
-      <section id="status">
+      <section
+        id="dashboard-panel-status"
+        className="workspace-panel"
+        role="tabpanel"
+        aria-labelledby="dashboard-tab-status"
+        hidden={activeSection !== "status"}
+      >
         <OptimizerStatus />
       </section>
     </div>

@@ -45,6 +45,7 @@ test.describe("SmartThings sensor selector", () => {
   test("lists discovered sensors with current selection checked", async ({ page }) => {
     await mockSettings(page, "dev-living");
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "Integrations" }).click();
 
     await expect(page.getByText("Living Room Sensor")).toBeVisible();
     await expect(page.getByText("Bedroom Sensor")).toBeVisible();
@@ -69,6 +70,7 @@ test.describe("SmartThings sensor selector", () => {
     });
 
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "Integrations" }).click();
     await page.locator("label", { hasText: "Bedroom Sensor" }).locator("input[type=checkbox]").check();
     await page.getByRole("button", { name: "Save Settings" }).click();
 
@@ -82,6 +84,7 @@ test.describe("SmartThings sensor selector", () => {
     );
 
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "Integrations" }).click();
     await expect(page.getByText("SmartThings not connected")).toBeVisible();
   });
 });

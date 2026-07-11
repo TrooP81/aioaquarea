@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useCurrency, formatCost } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
 import { PlanAction, usePlanActions } from "./usePlanActions";
@@ -157,7 +157,7 @@ export function PlanHistory() {
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
-  useEffect(() => {
+  const loadPlans = useCallback(() => {
     fetch("/api/plans?limit=20")
       .then((r) => {
         if (!r.ok) throw new Error(`API error (${r.status})`);
@@ -167,6 +167,12 @@ export function PlanHistory() {
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load plan history"))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadPlans();
+    const interval = window.setInterval(loadPlans, 30_000);
+    return () => window.clearInterval(interval);
+  }, [loadPlans]);
 
   const toggleExpand = (planId: number) => {
     if (expandedId === planId) {
@@ -179,7 +185,7 @@ export function PlanHistory() {
   if (loading) {
     return (
       <div className="plan-section">
-        <h2 className="chart-title">Plan History</h2>
+        <h2 className="chart-title">Plan Revisions</h2>
         <div className="plan-loading">
           <div className="plan-loading-skeleton" />
           <div className="plan-loading-skeleton" style={{ width: "80%" }} />
@@ -191,7 +197,7 @@ export function PlanHistory() {
   if (error) {
     return (
       <div className="plan-section">
-        <h2 className="chart-title">Plan History</h2>
+        <h2 className="chart-title">Plan Revisions</h2>
         <div className="plan-error"><span>{error}</span></div>
       </div>
     );
@@ -200,7 +206,7 @@ export function PlanHistory() {
   if (plans.length === 0) {
     return (
       <div className="plan-section">
-        <h2 className="chart-title">Plan History</h2>
+        <h2 className="chart-title">Plan Revisions</h2>
         <p className="plan-empty-msg">No past plans yet.</p>
       </div>
     );
@@ -208,7 +214,8 @@ export function PlanHistory() {
 
   return (
     <div className="plan-section">
-      <h2 className="chart-title">Plan History</h2>
+      <h2 className="chart-title">Plan Revisions</h2>
+      <p className="chart-caption">Every generated plan. Expand one to inspect its scheduled actions and the reason for each result.</p>
       <div className="plan-history-list">
         {plans.map((plan) => {
           const isExpanded = expandedId === plan.id;

@@ -38,6 +38,15 @@ async def main() -> None:
     demand_model.load_latest()
     logger.info("ml_models_loaded", cop=cop_model.is_trained, demand=demand_model.is_trained)
 
+    # A missing model is common after an intentional feature or target-schema
+    # upgrade. Train immediately rather than leaving the optimiser on an old
+    # checkpoint or waiting for the weekly maintenance window. If there is not
+    # yet enough data, the train methods return a safe insufficient-data result
+    # and the rules layer remains active.
+    if not cop_model.is_trained or not demand_model.is_trained:
+        logger.info("ml_initial_training_needed")
+        await retrain_models()
+
     scheduler = AsyncIOScheduler()
 
     # Retrain weekly

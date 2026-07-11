@@ -67,6 +67,7 @@ test("plan history ignores a late response from a previously expanded plan", asy
   );
 
   await page.goto("/");
+  await page.getByRole("tab", { name: "Plan" }).click();
   const rows = page.locator(".plan-history-row");
   await expect(rows).toHaveCount(2);
 

@@ -188,6 +188,16 @@ class TestThermalLag:
         np.testing.assert_array_equal(features_a, features_b)
 
 
+class TestCausalFeatureLookup:
+    def test_uses_latest_sample_at_or_before_feature_time(self):
+        """Feature joins must never select the closer future sample."""
+        times = np.array([0.0, 600.0, 1_200.0])
+
+        assert ComfortModel._latest_index_at_or_before(times, 900.0) == 1
+        assert ComfortModel._latest_index_at_or_before(times, 600.0) == 1
+        assert ComfortModel._latest_index_at_or_before(times, -1.0) is None
+
+
 def _inverted_dataset(n=300, seed=0):
     """Synthetic data where MORE water heat correlates with LOWER indoor temp.
 

@@ -1,8 +1,16 @@
 import { test, expect } from "@playwright/test";
 
-const mockPrices = Array.from({ length: 24 }, (_, i) => ({
+const mockPrices = Array.from({ length: 48 }, (_, i) => ({
   ts: new Date(Date.now() - (12 - i) * 3600000).toISOString(),
   price_eur_per_kwh: 0.05 + Math.sin(i / 4) * 0.1,
+}));
+
+const mockWeather = Array.from({ length: 48 }, (_, i) => ({
+  ts: new Date(Date.now() + (i - 1) * 3600000).toISOString(),
+  temperature: 5 - i * 0.15,
+  wind_speed: 3 + i * 0.05,
+  irradiance: i < 10 ? 100 : 0,
+  precipitation: i === 2 ? 0.4 : 0,
 }));
 
 const mockConsumption = Array.from({ length: 12 }, (_, i) => ({
@@ -40,6 +48,24 @@ const mockDashboard = {
   has_override: false,
 };
 
+const mockIndoorForecast = {
+  current_indoor: 21.5,
+  outdoor_temp: 5,
+  forecast_with_plan: [
+    { hour: 1, predicted_indoor_temp: 21.3 },
+    { hour: 2, predicted_indoor_temp: 21.1 },
+  ],
+  forecast_no_heating: [
+    { hour: 1, predicted_indoor_temp: 21.2 },
+    { hour: 2, predicted_indoor_temp: 20.8 },
+  ],
+  target_schedule: [
+    { hour: 1, target: 20.5, comfort_hour: true },
+    { hour: 2, target: 20.5, comfort_hour: true },
+  ],
+  planned_actions: [{ hour: 2, action_type: "normal_mode_on", status: "pending" }],
+};
+
 test.describe("Price Chart", () => {
   test.beforeEach(async ({ page }) => {
     await page.route("**/api/dashboard", (route) =>
@@ -63,6 +89,13 @@ test.describe("Price Chart", () => {
         body: JSON.stringify(mockConsumption),
       })
     );
+    await page.route("**/api/consumption/history*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockConsumption),
+      })
+    );
     await page.route("**/api/plans*", (route) =>
       route.fulfill({
         status: 200,
@@ -70,12 +103,52 @@ test.describe("Price Chart", () => {
         body: JSON.stringify([]),
       })
     );
+    await page.route("**/api/thermal/indoor-forecast*", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockIndoorForecast) })
+    );
+    await page.route("**/api/weather*", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockWeather) })
+    );
+    await page.route("**/api/currency", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh" }),
+      })
+    );
+    await page.route("**/api/indoor-temp/latest", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ avg_temperature: 21.5, latest_reading: new Date().toISOString(), sensor_count: 1, last_fresh_reading: new Date().toISOString() }),
+      })
+    );
+    await page.route("**/api/learning-mode", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: false }) })
+    );
+    await page.route("**/api/time-format", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ hour12: false }) })
+    );
   });
 
   test("renders price chart section", async ({ page }) => {
     await page.goto("/");
-    // Recharts renders SVG elements
-    await expect(page.locator("svg").first()).toBeVisible({ timeout: 10000 });
+    const chartsTab = page.getByRole("tab", { name: "Charts" });
+    const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price chart" });
+    await chartsTab.click();
+    try {
+      await expect(comfortChart).toBeVisible({ timeout: 5000 });
+    } catch {
+      // Next dev can reload once while compiling the initial client bundle.
+      // Re-select the tab after that reload so this test checks the chart, not
+      // the development-server startup race.
+      await chartsTab.click();
+      await expect(comfortChart).toBeVisible({ timeout: 5000 });
+    }
+    await expect(comfortChart.getByText("Indoor Comfort, Weather & Price — 24h", { exact: true })).toBeVisible();
+    await expect(comfortChart.locator(".recharts-area-area")).toHaveCount(1);
+    await expect(comfortChart.locator(".recharts-line-curve")).toHaveCount(4);
+    await expect(page.getByRole("button", { name: "Show hot water" })).toBeVisible();
   });
 
   test("page renders all main sections", async ({ page }) => {
@@ -84,6 +157,23 @@ test.describe("Price Chart", () => {
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     // Dashboard cards should be visible
     await expect(page.locator(".status-badge.online")).toBeVisible();
+  });
+
+  test("switches between dashboard workspaces without scrolling through all sections", async ({ page }) => {
+    await page.goto("/");
+
+    const planTab = page.getByRole("tab", { name: "Plan" });
+    await expect(planTab).toHaveAttribute("aria-selected", "false");
+    await planTab.click();
+
+    await expect(planTab).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("heading", { name: "Recent Activity" })).toBeVisible();
+    await expect(page.locator("#dashboard-panel-overview")).toBeHidden();
+
+    const modelsTab = page.getByRole("tab", { name: "Models" });
+    await modelsTab.click();
+    await expect(modelsTab).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("heading", { name: "How the optimizer is deciding" })).toBeVisible();
   });
 });
 
@@ -151,6 +241,8 @@ test.describe("Plan View", () => {
     // Next action card should be visible in dashboard area
     await expect(page.locator(".next-action-card").first()).toBeVisible({ timeout: 10000 });
 
+    await page.getByRole("tab", { name: "Plan" }).click();
+
     // Active Plan section should show the plan header
     await expect(page.locator("text=Active Plan")).toBeVisible();
 
@@ -158,7 +250,9 @@ test.describe("Plan View", () => {
     await expect(page.locator("text=Scheduled").first()).toBeVisible({ timeout: 5000 });
 
     // Should show human-readable action label
-    await expect(page.locator("text=Hot Water Heating ON").first()).toBeVisible();
+    await expect(
+      page.locator("#dashboard-panel-plan .plan-action-type").getByText("Heat hot water"),
+    ).toBeVisible();
   });
 
   test("handles no active plan gracefully", async ({ page }) => {
@@ -210,6 +304,7 @@ test.describe("Plan View", () => {
     );
 
     await page.goto("/");
+    await page.getByRole("tab", { name: "Plan" }).click();
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     // Should display error message instead of empty list
     await expect(page.locator(".plan-error")).toBeVisible({ timeout: 5000 });

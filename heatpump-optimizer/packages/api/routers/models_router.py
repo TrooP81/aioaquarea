@@ -169,10 +169,10 @@ async def get_thermal_status():
     if not status:
         return {"error": "No device data available"}
 
-    current_tank = status.tank_temp or 48.0
-    tank_target = status.tank_target_temp or 52
-    outdoor = status.outdoor_temp or 7.0
-    current_zone = status.zone1_temp or 20.0
+    current_tank = status.tank_temp if status.tank_temp is not None else 48.0
+    tank_target = status.tank_target_temp if status.tank_target_temp is not None else 52
+    outdoor = status.outdoor_temp if status.outdoor_temp is not None else 7.0
+    current_zone = status.zone1_temp if status.zone1_temp is not None else 20.0
 
     heating_pred = thermal_model.predict_tank_heating_time(current_tank, float(tank_target), outdoor)
     cooling_pred = thermal_model.predict_tank_cooling_time(current_tank, float(tank_target - 7), outdoor)
@@ -276,10 +276,10 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     if not status:
         return {"error": "No device data available"}
 
-    current_tank = status.tank_temp or 48.0
-    tank_target = status.tank_target_temp or 52
-    outdoor = status.outdoor_temp or 7.0
-    current_zone = status.zone1_temp or 20.0
+    current_tank = status.tank_temp if status.tank_temp is not None else 48.0
+    tank_target = status.tank_target_temp if status.tank_target_temp is not None else 52
+    outdoor = status.outdoor_temp if status.outdoor_temp is not None else 7.0
+    current_zone = status.zone1_temp if status.zone1_temp is not None else 20.0
 
     now = dt.datetime.now(dt.timezone.utc)
     hour_start = now.replace(minute=0, second=0, microsecond=0)
@@ -427,8 +427,8 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         return {"error": "No device data available"}
 
     current_indoor = float(indoor_row) if indoor_row is not None else 20.0
-    outdoor = status.outdoor_temp or 7.0
-    current_zone = status.zone1_temp or 35.0
+    outdoor = status.outdoor_temp if status.outdoor_temp is not None else 7.0
+    current_zone = status.zone1_temp if status.zone1_temp is not None else 35.0
 
     weather_forecast = []
     for i in range(hours):
@@ -436,6 +436,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             w = weather_records[i]
             weather_forecast.append(
                 {
+                    "ts": w.ts.isoformat(),
                     "outdoor_temp": w.temperature if w.temperature is not None else outdoor,
                     "wind_speed": w.wind_speed if w.wind_speed is not None else 3.0,
                     "irradiance": getattr(w, "irradiance", 0.0) or 0.0,
@@ -446,6 +447,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         else:
             weather_forecast.append(
                 {
+                    "ts": (now + dt.timedelta(hours=i)).isoformat(),
                     "outdoor_temp": outdoor,
                     "wind_speed": 3.0,
                     "irradiance": 0.0,

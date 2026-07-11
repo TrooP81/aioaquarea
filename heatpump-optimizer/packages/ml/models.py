@@ -136,7 +136,7 @@ class DirectionAwareCOP:
             if getattr(curr, 'defrost_active', None):
                 continue
 
-            outdoor = curr.outdoor_temp or 5.0
+            outdoor = curr.outdoor_temp if curr.outdoor_temp is not None else 5.0
             thermal_kwh = 0.0
             # DHW tank heating is the only physically-grounded measurement
             # (fixed thermal mass × ΔT). Space heating/cooling use the water

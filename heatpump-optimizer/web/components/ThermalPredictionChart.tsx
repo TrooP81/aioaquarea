@@ -84,11 +84,11 @@ interface PlannedAction {
 interface IndoorForecastData {
   current_indoor: number;
   outdoor_temp: number;
-  forecast: { hour: number; predicted_indoor_temp: number }[];
-  forecast_with_plan: { hour: number; predicted_indoor_temp: number }[];
-  forecast_no_heating: { hour: number; predicted_indoor_temp: number }[];
-  target_schedule: { hour: number; target: number; comfort_hour: boolean }[];
-  planned_actions: PlannedAction[];
+  forecast?: { hour: number; predicted_indoor_temp: number }[];
+  forecast_with_plan?: { hour: number; predicted_indoor_temp: number }[];
+  forecast_no_heating?: { hour: number; predicted_indoor_temp: number }[];
+  target_schedule?: { hour: number; target: number; comfort_hour: boolean }[];
+  planned_actions?: PlannedAction[];
 }
 
 interface IndoorTempReading {
@@ -208,12 +208,15 @@ export function ThermalPredictionChart() {
     }
 
     // Build forecast points (positive hours)
-    const forecastPoints = indoorForecast.forecast.map((f, i) => ({
+    const managedForecast = indoorForecast.forecast_with_plan ?? indoorForecast.forecast ?? [];
+    const noHeatingForecast = indoorForecast.forecast_no_heating ?? [];
+    const targets = indoorForecast.target_schedule ?? [];
+    const forecastPoints = managedForecast.map((f, i) => ({
       hour: `+${f.hour}h`,
       actualIndoor: undefined as number | undefined,
-      indoorWithPlan: indoorForecast.forecast_with_plan[i]?.predicted_indoor_temp,
-      indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
-      comfortTarget: indoorForecast.target_schedule[i]?.target,
+      indoorWithPlan: f.predicted_indoor_temp,
+      indoorNoHeating: noHeatingForecast[i]?.predicted_indoor_temp,
+      comfortTarget: targets[i]?.target,
     }));
 
     return [...historyPoints, ...forecastPoints];
