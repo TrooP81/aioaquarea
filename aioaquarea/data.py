@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from .const import PANASONIC
+
 # These imports intentionally preserve the historical ``aioaquarea.data``
 # public API after the enum/model split.
 from .data_enums import (  # noqa: F401
