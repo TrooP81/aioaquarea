@@ -54,6 +54,33 @@ async def test_request_updates_stored_access_token_and_expiration(api_client):
     assert api_client.token_expiration == dt.datetime(
         2026, 5, 8, 12, 34, 56, tzinfo=dt.timezone.utc
     )
+    assert api_client._settings.access_token == "new-token"
+    assert (
+        api_client._settings.expires_at
+        == dt.datetime(2026, 5, 8, 12, 34, 56, tzinfo=dt.timezone.utc).timestamp()
+    )
+
+
+@pytest.mark.asyncio
+async def test_rotated_token_is_used_by_the_next_request(api_client):
+    rotated = FakeResponse(
+        {
+            "accessToken": {
+                "token": "rotated-token",
+                "expires": "2026-05-08T12:34:56+0000",
+            },
+            "message": [],
+        }
+    )
+    success = FakeResponse({"message": []})
+    api_client.access_token = "old-token"
+    api_client._sess.request = AsyncMock(side_effect=[rotated, success])
+
+    await api_client.request("GET", url="/first")
+    await api_client.request("GET", url="/second")
+
+    second_headers = api_client._sess.request.await_args_list[1].kwargs["headers"]
+    assert second_headers["x-user-authorization-v2"] == "Bearer rotated-token"
 
 
 @pytest.mark.asyncio
