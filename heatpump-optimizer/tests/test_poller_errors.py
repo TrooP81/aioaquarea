@@ -4,11 +4,59 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from packages.poller.main import poll_device_status, poll_prices, poll_weather, poll_indoor_temp
+from packages.core.services import (
+    PanasonicAdapterBackoffError,
+    PanasonicAdapterUnavailableError,
+)
 from packages.poller.feeds import PriceFeed
+from packages.poller.main import poll_device_status, poll_indoor_temp, poll_prices, poll_weather
 
 
 class TestPollDeviceStatusErrors:
+    @pytest.mark.asyncio
+    async def test_adapter_outage_has_structured_warning(self):
+        wrapper = AsyncMock()
+        wrapper.refresh_device.side_effect = PanasonicAdapterUnavailableError(
+            device_id="device-1",
+            reason="adaptor offline",
+            consecutive_failures=2,
+            retry_after_seconds=600,
+        )
+
+        with patch("packages.poller.main.logger") as mock_logger:
+            await poll_device_status(wrapper)
+
+        mock_logger.warning.assert_called_once_with(
+            "panasonic_adapter_unavailable",
+            device_id="device-1",
+            consecutive_failures=2,
+            retry_after_seconds=600,
+            reason="adaptor offline",
+        )
+        mock_logger.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_adapter_backoff_has_structured_info(self):
+        wrapper = AsyncMock()
+        wrapper.refresh_device.side_effect = PanasonicAdapterBackoffError(
+            device_id="device-1",
+            reason="adaptor offline",
+            consecutive_failures=2,
+            retry_after_seconds=299,
+        )
+
+        with patch("packages.poller.main.logger") as mock_logger:
+            await poll_device_status(wrapper)
+
+        mock_logger.info.assert_called_once_with(
+            "panasonic_adapter_backoff",
+            device_id="device-1",
+            consecutive_failures=2,
+            retry_after_seconds=299,
+            reason="adaptor offline",
+        )
+        mock_logger.error.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_connection_failure_is_caught(self):
         wrapper = AsyncMock()

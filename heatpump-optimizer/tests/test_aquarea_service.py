@@ -4,14 +4,16 @@ import asyncio
 import datetime as dt
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from aioaquarea import ForceHeater, HolidayTimer, PowerfulTime
+from aioaquarea import DeviceUnavailableError, ForceHeater, HolidayTimer, PowerfulTime
 from aioaquarea.data import StatusDataMode
 
 from packages.core.services.aquarea import (
     AquareaWrapper,
+    PanasonicAdapterBackoffError,
+    PanasonicAdapterUnavailableError,
     PanasonicCachedStatusError,
     PanasonicCommandValidationError,
 )
@@ -118,8 +120,11 @@ async def test_cached_initial_status_is_not_returned_as_fresh() -> None:
     wrapper._client.get_devices.return_value = [device_info]
     wrapper._client.get_device.return_value = device
 
-    with pytest.raises(PanasonicCachedStatusError, match="cloud-cached"):
+    with pytest.raises(PanasonicCachedStatusError, match="cloud-cached") as exc:
         await wrapper.refresh_device()
+
+    assert exc.value.consecutive_failures == 1
+    assert exc.value.retry_after_seconds == 300
 
 
 @pytest.mark.asyncio
@@ -133,6 +138,98 @@ async def test_cached_refresh_is_not_returned_as_fresh() -> None:
 
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
+
+
+@pytest.mark.asyncio
+async def test_adapter_outage_defers_next_live_refresh_without_spending_read_budget() -> None:
+    wrapper = _wrapper()
+    failure = DeviceUnavailableError("device-1", "adaptor offline")
+    device = SimpleNamespace(
+        long_id="device-1",
+        refresh_data=AsyncMock(side_effect=failure),
+        status_data_mode=StatusDataMode.LIVE,
+    )
+    wrapper._device = device
+
+    with patch("packages.core.services.aquarea.time.monotonic", return_value=100.0):
+        with pytest.raises(PanasonicAdapterUnavailableError) as unavailable:
+            await wrapper.refresh_device()
+        with pytest.raises(PanasonicAdapterBackoffError) as deferred:
+            await wrapper.refresh_device()
+
+    assert unavailable.value.device_id == "device-1"
+    assert unavailable.value.consecutive_failures == 1
+    assert unavailable.value.retry_after_seconds == 300
+    assert deferred.value.consecutive_failures == 1
+    assert deferred.value.retry_after_seconds == 300
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
+
+
+@pytest.mark.asyncio
+async def test_repeated_adapter_outages_back_off_exponentially() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        long_id="device-1",
+        refresh_data=AsyncMock(
+            side_effect=[
+                DeviceUnavailableError("device-1", "offline"),
+                DeviceUnavailableError("device-1", "offline"),
+            ]
+        ),
+        status_data_mode=StatusDataMode.LIVE,
+    )
+    wrapper._device = device
+
+    with patch("packages.core.services.aquarea.time.monotonic") as monotonic:
+        monotonic.return_value = 100.0
+        with pytest.raises(PanasonicAdapterUnavailableError) as first:
+            await wrapper.refresh_device()
+        monotonic.return_value = 401.0
+        with pytest.raises(PanasonicAdapterUnavailableError) as second:
+            await wrapper.refresh_device()
+
+    assert first.value.retry_after_seconds == 300
+    assert second.value.consecutive_failures == 2
+    assert second.value.retry_after_seconds == 600
+    assert wrapper._read_limiter.acquire.await_count == 2
+
+
+def test_adapter_backoff_is_capped_at_thirty_minutes() -> None:
+    wrapper = _wrapper()
+
+    with patch("packages.core.services.aquarea.time.monotonic", return_value=100.0):
+        delays = [
+            wrapper._register_adapter_failure(device_id="device-1", reason="offline")[1]
+            for _ in range(5)
+        ]
+
+    assert delays == [300, 600, 1200, 1800, 1800]
+
+
+@pytest.mark.asyncio
+async def test_successful_live_refresh_resets_adapter_backoff() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        long_id="device-1",
+        refresh_data=AsyncMock(
+            side_effect=[DeviceUnavailableError("device-1", "offline"), None, None]
+        ),
+        status_data_mode=StatusDataMode.LIVE,
+    )
+    wrapper._device = device
+
+    with patch("packages.core.services.aquarea.time.monotonic") as monotonic:
+        monotonic.return_value = 100.0
+        with pytest.raises(PanasonicAdapterUnavailableError):
+            await wrapper.refresh_device()
+        monotonic.return_value = 401.0
+        assert await wrapper.refresh_device() is device
+        assert await wrapper.refresh_device() is device
+
+    assert wrapper._adapter_failure_count == 0
+    assert wrapper._adapter_retry_at is None
+    assert wrapper._read_limiter.acquire.await_count == 3
 
 
 @pytest.mark.parametrize(

@@ -17,7 +17,11 @@ from packages.core.models import (
     PriceRecord,
     WeatherRecord,
 )
-from packages.core.services import AquareaWrapper
+from packages.core.services import (
+    AquareaWrapper,
+    PanasonicAdapterBackoffError,
+    PanasonicAdapterUnavailableError,
+)
 from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.poller.feeds import fetch_price_feed, fetch_weather
 from packages.poller.smartthings import poll_smartthings_temps
@@ -120,6 +124,22 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
         if device.is_on_error and device.current_error:
             await _record_fault(device)
 
+    except PanasonicAdapterBackoffError as exc:
+        logger.info(
+            "panasonic_adapter_backoff",
+            device_id=exc.device_id,
+            consecutive_failures=exc.consecutive_failures,
+            retry_after_seconds=exc.retry_after_seconds,
+            reason=exc.reason,
+        )
+    except PanasonicAdapterUnavailableError as exc:
+        logger.warning(
+            "panasonic_adapter_unavailable",
+            device_id=exc.device_id,
+            consecutive_failures=exc.consecutive_failures,
+            retry_after_seconds=exc.retry_after_seconds,
+            reason=exc.reason,
+        )
     except Exception as e:
         logger.error("device_poll_failed", error=str(e))
 

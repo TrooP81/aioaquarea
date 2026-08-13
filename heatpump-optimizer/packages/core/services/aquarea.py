@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 import aiohttp
@@ -12,6 +13,7 @@ import redis.asyncio as redis
 from aioaquarea import (
     AquareaEnvironment,
     Client,
+    DeviceUnavailableError,
     DeviceInfo,
     ForceHeater,
     HolidayTimer,
@@ -25,10 +27,65 @@ from ..resilience import CircuitBreaker, RateLimiter
 logger = logging.getLogger(__name__)
 
 _COMMAND_STATUS_MAX_AGE_SECONDS = 60.0
+_ADAPTER_RETRY_BASE_SECONDS = 300
+_ADAPTER_RETRY_MAX_SECONDS = 1800
 
 
-class PanasonicCachedStatusError(RuntimeError):
+class PanasonicAdapterUnavailableError(RuntimeError):
+    """Normalized live-adaptor outage with retry diagnostics."""
+
+    def __init__(
+        self,
+        *,
+        device_id: str | None,
+        reason: str,
+        consecutive_failures: int,
+        retry_after_seconds: int,
+        message: str | None = None,
+    ) -> None:
+        self.device_id = device_id
+        self.reason = reason
+        self.consecutive_failures = consecutive_failures
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message or "Panasonic adaptor unavailable")
+
+
+class PanasonicCachedStatusError(PanasonicAdapterUnavailableError):
     """Raised when Panasonic returns cloud cache instead of live adaptor data."""
+
+    def __init__(
+        self,
+        *,
+        device_id: str | None = None,
+        reason: str = "cloud_cached_status",
+        consecutive_failures: int = 0,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        super().__init__(
+            device_id=device_id,
+            reason=reason,
+            consecutive_failures=consecutive_failures,
+            retry_after_seconds=retry_after_seconds,
+            message="Panasonic adaptor unavailable; refusing cloud-cached device status",
+        )
+
+
+class PanasonicAdapterBackoffError(RuntimeError):
+    """Raised without network I/O while an adaptor retry delay is active."""
+
+    def __init__(
+        self,
+        *,
+        device_id: str | None,
+        reason: str,
+        consecutive_failures: int,
+        retry_after_seconds: int,
+    ) -> None:
+        self.device_id = device_id
+        self.reason = reason
+        self.consecutive_failures = consecutive_failures
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"Panasonic adaptor retry deferred for {retry_after_seconds} seconds")
 
 
 class PanasonicCommandValidationError(ValueError):
@@ -46,6 +103,10 @@ class AquareaWrapper:
         self._device_info: DeviceInfo | None = None
         self._device_lock = asyncio.Lock()
         self._last_live_status_at: float | None = None
+        self._adapter_failure_count = 0
+        self._adapter_retry_at: float | None = None
+        self._adapter_failure_device_id: str | None = None
+        self._adapter_failure_reason = "unknown"
         self._read_limiter = RateLimiter(max_tokens=30, refill_per_second=30 / 3600)
         self._write_limiter = RateLimiter(max_tokens=20, refill_per_second=20 / 3600)
         self._circuit_breaker = CircuitBreaker()
@@ -124,21 +185,80 @@ class AquareaWrapper:
         immediate second refresh on first use, which previously spent two
         limiter tokens and duplicated the cloud request.
         """
+        self._raise_if_adapter_backoff_active()
+
         if self._device is None:
             return await self.get_device()
 
         await self._read_limiter.acquire()
-        await self._device.refresh_data(allow_cached_fallback=False)
+        try:
+            await self._device.refresh_data(allow_cached_fallback=False)
+        except DeviceUnavailableError as exc:
+            self._last_live_status_at = None
+            failures, retry_after = self._register_adapter_failure(
+                device_id=exc.device_id,
+                reason=exc.reason or str(exc),
+            )
+            raise PanasonicAdapterUnavailableError(
+                device_id=exc.device_id,
+                reason=exc.reason or str(exc),
+                consecutive_failures=failures,
+                retry_after_seconds=retry_after,
+            ) from exc
         self._record_live_status(self._device)
         return self._device
 
     def _record_live_status(self, device) -> None:
         try:
             self._require_live_status(device)
-        except PanasonicCachedStatusError:
+        except PanasonicCachedStatusError as exc:
             self._last_live_status_at = None
-            raise
+            device_id = getattr(device, "long_id", None) or getattr(
+                self._device_info, "device_id", None
+            )
+            failures, retry_after = self._register_adapter_failure(
+                device_id=device_id,
+                reason=exc.reason,
+            )
+            raise PanasonicCachedStatusError(
+                device_id=device_id,
+                reason=exc.reason,
+                consecutive_failures=failures,
+                retry_after_seconds=retry_after,
+            ) from exc
         self._last_live_status_at = time.monotonic()
+        self._reset_adapter_backoff()
+
+    def _register_adapter_failure(self, *, device_id: str | None, reason: str) -> tuple[int, int]:
+        self._adapter_failure_count += 1
+        exponent = min(self._adapter_failure_count - 1, 3)
+        retry_after = min(
+            _ADAPTER_RETRY_BASE_SECONDS * (2**exponent),
+            _ADAPTER_RETRY_MAX_SECONDS,
+        )
+        self._adapter_retry_at = time.monotonic() + retry_after
+        self._adapter_failure_device_id = device_id
+        self._adapter_failure_reason = reason
+        return self._adapter_failure_count, retry_after
+
+    def _reset_adapter_backoff(self) -> None:
+        self._adapter_failure_count = 0
+        self._adapter_retry_at = None
+        self._adapter_failure_device_id = None
+        self._adapter_failure_reason = "unknown"
+
+    def _raise_if_adapter_backoff_active(self) -> None:
+        if self._adapter_retry_at is None:
+            return
+        remaining = self._adapter_retry_at - time.monotonic()
+        if remaining <= 0:
+            return
+        raise PanasonicAdapterBackoffError(
+            device_id=self._adapter_failure_device_id,
+            reason=self._adapter_failure_reason,
+            consecutive_failures=self._adapter_failure_count,
+            retry_after_seconds=max(1, math.ceil(remaining)),
+        )
 
     async def _get_writable_device(self):
         """Require a recent live adaptor response before any cloud write."""
@@ -165,9 +285,7 @@ class AquareaWrapper:
     @staticmethod
     def _require_live_status(device) -> None:
         if device.status_data_mode == StatusDataMode.CACHED:
-            raise PanasonicCachedStatusError(
-                "Panasonic adaptor unavailable; refusing cloud-cached device status"
-            )
+            raise PanasonicCachedStatusError()
 
     async def set_mode(self, mode) -> None:
         device = await self._prepare_write()
