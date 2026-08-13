@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import tempfile
 from typing import AsyncGenerator
 
 import pytest_asyncio
@@ -26,6 +27,7 @@ os.environ.setdefault("AQUAREA_USERNAME", "test@test.com")
 os.environ.setdefault("AQUAREA_PASSWORD", "testpass")
 os.environ.setdefault("LATITUDE", "59.3293")
 os.environ.setdefault("LONGITUDE", "18.0686")
+os.environ.setdefault("MODEL_DIR", os.path.join(tempfile.gettempdir(), "heatpump-optimizer-models"))
 
 from packages.api.main import app  # noqa: E402
 from packages.core.database import engine  # noqa: E402

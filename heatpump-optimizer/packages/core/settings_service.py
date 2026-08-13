@@ -493,9 +493,7 @@ def validate_setting_value(key: str, value: str) -> None:
 
     if spec.options is not None:
         if value not in spec.options:
-            raise ValueError(
-                f"{key} must be one of {list(spec.options)} (got {value!r})"
-            )
+            raise ValueError(f"{key} must be one of {list(spec.options)} (got {value!r})")
         return
 
     if spec.value_type == "json":
