@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
+from packages.ml.cop_model_core import COPModel
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
 from packages.optimizer.actions import ActionType
@@ -132,6 +133,32 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
     # into a one-hour force-on/force-off pair.
     MIN_FORCE_DHW_MINUTES = 10
 
+    def _find_lowest_dhw_energy_cost_slot(
+        self,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        hours_needed: int,
+        fallback_outdoor_temp: float,
+    ) -> list[tuple[dt.datetime, float]] | None:
+        """Choose a DHW slot by electricity cost per unit of delivered heat.
+
+        A heat pump produces more heat per kWh of electricity when outdoor air
+        is warmer. Comparing raw spot prices alone can therefore select a cold
+        hour that costs more and consumes more electricity for the same tank
+        recharge. ``price / COP`` is the effective price per thermal kWh.
+        """
+        effective_prices = []
+        original_prices = {ts: price for ts, price in prices}
+        for ts, price in prices:
+            outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
+            cop = COPModel._default_cop_curve(outdoor_temp)
+            effective_prices.append((ts, price / cop))
+
+        selected = self._find_cheapest_slot(effective_prices, hours_needed)
+        if not selected:
+            return None
+        return [(ts, original_prices[ts]) for ts, _ in selected]
+
     @staticmethod
     def _local_dhw_deadlines_in_horizon(
         comfort_schedule: dict[str, list[int]],
@@ -211,7 +238,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             if not window_prices:
                 continue
 
-            best_slot = self._find_cheapest_slot(window_prices, hours_needed)
+            best_slot = self._find_lowest_dhw_energy_cost_slot(
+                window_prices,
+                weather,
+                hours_needed,
+                current_outdoor_temp,
+            )
             if not best_slot:
                 continue
 

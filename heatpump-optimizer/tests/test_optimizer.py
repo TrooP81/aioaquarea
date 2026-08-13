@@ -76,6 +76,50 @@ def sample_weather():
 
 
 class TestRulesOptimizer:
+    def test_dhw_slot_uses_effective_price_after_cop(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.10),
+            (base + dt.timedelta(hours=1), 0.12),
+        ]
+        weather = [
+            (base, 0.0),
+            (base + dt.timedelta(hours=1), 10.0),
+        ]
+
+        slot = optimizer._find_lowest_dhw_energy_cost_slot(
+            prices,
+            weather,
+            hours_needed=1,
+            fallback_outdoor_temp=5.0,
+        )
+
+        # Raw price favours 00:00, but price/COP is lower at warmer 01:00:
+        # 0.10/3.5 > 0.12/4.5.
+        assert slot == [prices[1]]
+
+    def test_dhw_slot_still_prefers_materially_lower_raw_price(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.05),
+            (base + dt.timedelta(hours=1), 0.12),
+        ]
+        weather = [
+            (base, 0.0),
+            (base + dt.timedelta(hours=1), 10.0),
+        ]
+
+        slot = optimizer._find_lowest_dhw_energy_cost_slot(
+            prices,
+            weather,
+            hours_needed=1,
+            fallback_outdoor_temp=5.0,
+        )
+
+        assert slot == [prices[0]]
+
     def test_plan_dhw_picks_cheapest_hours(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
         comfort_schedule = {
