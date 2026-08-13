@@ -1339,3 +1339,25 @@ class TestDirectionAwareCOPConfidence:
         assert len(intervals) == 1
         assert intervals[0]["mode"] == "HEATING"
         assert intervals[0]["confidence"] == "estimated"
+
+
+class TestModelCheckpointRetention:
+    def test_keeps_only_newest_matching_checkpoints(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        for index in range(7):
+            (tmp_path / f"cop_model_{index:02d}.pkl").write_bytes(b"model")
+        unrelated = tmp_path / "thermal_params_v1.pkl"
+        unrelated.write_bytes(b"thermal")
+
+        assert prune_old_models("cop_model_*.pkl", keep=5, model_dir=tmp_path) == 2
+        assert [path.name for path in sorted(tmp_path.glob("cop_model_*.pkl"))] == [
+            f"cop_model_{index:02d}.pkl" for index in range(2, 7)
+        ]
+        assert unrelated.exists()
+
+    def test_rejects_negative_retention(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        with pytest.raises(ValueError, match="keep must be >= 0"):
+            prune_old_models("*.pkl", keep=-1, model_dir=tmp_path)

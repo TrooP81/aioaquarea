@@ -16,6 +16,7 @@ from packages.ml.models_common import (
     _logger,
     evaluate_regression,
     make_monotonic_regressor,
+    prune_old_models,
     time_series_cv_mae,
     write_mae_baseline,
 )
@@ -122,6 +123,7 @@ class COPModel:
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump({"model": model, "metrics": self._metrics}, model_path)
+        prune_old_models(COP_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
         write_mae_baseline(COP_MAE_BASELINE, mae)
         return {"version": self._version, "metrics": self._metrics, "model_path": str(model_path)}
 

@@ -17,6 +17,7 @@ from packages.ml.models_common import (
     evaluate_regression,
     iter_consumption_intervals,
     make_monotonic_regressor,
+    prune_old_models,
     time_series_cv_mae,
     write_mae_baseline,
 )
@@ -175,6 +176,7 @@ class DemandModel:
         from packages.ml.safe_persistence import safe_dump
 
         safe_dump({"median": median, "lower": lower, "upper": upper}, model_path)
+        prune_old_models(DEMAND_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
         write_mae_baseline("demand", mae)
         return {
             "version": self._version,

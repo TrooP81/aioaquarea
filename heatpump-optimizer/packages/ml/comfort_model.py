@@ -30,6 +30,7 @@ from packages.core.config import settings as app_settings
 from packages.core.settings_service import get_all_settings
 from packages.ml.models_common import (
     make_monotonic_regressor,
+    prune_old_models,
     read_mae_baseline,
     write_mae_baseline,
 )
@@ -677,6 +678,7 @@ class ComfortModel:
             },
             path,
         )
+        prune_old_models(COMFORT_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
         logger.info("comfort_model_saved", path=str(path))
 
     def load_latest(self) -> bool:
