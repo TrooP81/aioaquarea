@@ -48,6 +48,11 @@ class MILPOptimizer:
     VERSION = "milp_v1"
     SOLVER_TIMEOUT_SECONDS = 30
 
+    # Objective penalty per degree-hour below the indoor comfort target. It is
+    # deliberately far above any realistic energy saving, but keeps the model
+    # feasible when a measured cold start cannot physically recover in one hour.
+    COMFORT_VIOLATION_PENALTY = 1000.0
+
     def __init__(self, cop_model=None, demand_model=None):
         """
         Args:
@@ -638,12 +643,13 @@ class MILPOptimizer:
         x_sh = [pulp.LpVariable(f"x_sh_{h}", 0, 1, cat="Continuous") for h in range(H)]
 
         # --- Objective: minimize cost ---
-        prob += pulp.lpSum(
+        energy_cost_objective = pulp.lpSum(
             [
                 price_vals[h] * (x_dhw[h] * dhw_power_kw_per_h[h] + x_sh[h] * sh_max_power_kw)
                 for h in range(H)
             ]
         )
+        prob += energy_cost_objective
 
         # --- Constraints ---
 
@@ -657,14 +663,15 @@ class MILPOptimizer:
             heat_added = x_dhw[h] * dhw_power_kw_per_h[h] * cops[h]
             prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h[h]
 
-        # Per-hour tank floor: comfort hours use normal min, off-peak uses lower min
-        for h in range(H + 1):
+        # The initial state is a measured fact rather than a decision. Applying
+        # a floor at h=0 would make a temporarily cold tank impossible to plan.
+        for h in range(1, H + 1):
             floor = tank_min_floors[min(h, H - 1)]
             prob += tank_state[h] >= floor
 
-        # Tank must be above comfort minimum at comfort-schedule deadline hours
+        # A deadline at h=0 cannot be scheduled, for the same reason.
         for ready_hour in dhw_deadlines or []:
-            if ready_hour < H:
+            if 0 < ready_hour < H:
                 prob += tank_state[ready_hour] >= tank_min_comfort * 1.2
 
         # Limit DHW activations (API rate limit proxy)
@@ -719,15 +726,19 @@ class MILPOptimizer:
             # When x_sh=0 → pure cooling; when x_sh=1 → full heating
             prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
 
-        # Comfort floor: indoor temp must stay at/above the per-hour target
+        # A soft comfort floor prevents a physically unreachable cold start
+        # from making the whole MILP infeasible. The target is evaluated after
+        # the controls for each slot have had one hour to act.
+        comfort_slack = [pulp.LpVariable(f"comfort_slack_{h}", lowBound=0) for h in range(H + 1)]
         if indoor_targets:
             for h in range(H):
                 if h < len(indoor_targets):
-                    # The target applies after the controls for this slot have
-                    # had one hour to act. Constraining T[h] incorrectly
-                    # treated the current reading as an already-met target and
-                    # made an initially-cool home infeasible.
-                    prob += t_indoor[h + 1] >= indoor_targets[h]
+                    prob += t_indoor[h + 1] + comfort_slack[h + 1] >= indoor_targets[h]
+
+        comfort_penalty = pulp.lpSum(
+            self.COMFORT_VIOLATION_PENALTY * comfort_slack[h] for h in range(H + 1)
+        )
+        prob.setObjective(energy_cost_objective + comfort_penalty)
 
         # --- Solve ---
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=self.SOLVER_TIMEOUT_SECONDS)
@@ -898,7 +909,12 @@ class MILPOptimizer:
                 )
                 current_mode = target_mode
 
-        total_cost = pulp.value(prob.objective)
+        # Keep the user-facing estimate as actual energy cost; the artificial
+        # comfort penalty is only a solver priority.
+        energy_cost = pulp.value(energy_cost_objective)
+        comfort_shortfall = round(
+            sum(float(comfort_slack[h].varValue or 0) for h in range(H + 1)), 2
+        )
 
         # Persist the exact counterfactual and solved trajectory that the MILP
         # used.  The dashboard must show this snapshot rather than recomputing
@@ -1013,7 +1029,9 @@ class MILPOptimizer:
             "horizon_end": start_ts + dt.timedelta(hours=H),
             "actions": actions,
             "version": version,
-            "cost_estimate": total_cost,
+            "engine": "milp",
+            "cost_estimate": energy_cost,
+            "comfort_shortfall": comfort_shortfall,
             "indoor_forecast": indoor_forecast,
             "forecast_snapshot": {
                 "version": "indoor_forecast_v1",

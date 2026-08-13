@@ -540,7 +540,21 @@ async def get_optimizer_status():
                 select(DeviceStatusRecord).order_by(DeviceStatusRecord.ts.desc()).limit(1)
             )
         ).scalar_one_or_none()
+        last_plan = (
+            await session.execute(select(PlanRecord).order_by(desc(PlanRecord.created_at)).limit(1))
+        ).scalar_one_or_none()
         control_temperature = await get_control_temperature(session=session)
+
+    last_plan_info = None
+    if last_plan is not None:
+        version = last_plan.optimizer_version or ""
+        engine = "milp" if version.startswith("milp") else "rules"
+        last_plan_info = {
+            "version": version,
+            "engine": engine,
+            "fell_back": layer != "rules_only" and engine == "rules",
+            "created_at": last_plan.created_at.isoformat() if last_plan.created_at else None,
+        }
 
     heat_curve = await get_heat_curve_config()
     comfort_min_c = await get_float_setting("comfort_temp_min")
@@ -596,6 +610,7 @@ async def get_optimizer_status():
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
         "fallback_layer": "rules_v3",
+        "last_plan": last_plan_info,
         "data_freshness": {
             "latest_device_status": latest_device_status.isoformat()
             if latest_device_status

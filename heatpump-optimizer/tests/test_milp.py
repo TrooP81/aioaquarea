@@ -578,6 +578,69 @@ class TestMILPSolver:
         assert plan is not None
         assert plan["version"] == "milp_v1"
 
+    def test_milp_cold_house_below_comfort_stays_feasible(self):
+        """A house colder than the comfort target must NOT make the MILP infeasible.
+
+        Previously the indoor comfort floor was a hard constraint applied from
+        hour 0, so starting below the target produced InfeasibleError and a
+        silent fallback to the rules engine.  The soft floor must instead return
+        a plan, expose the unavoidable shortfall, and still report energy cost.
+        """
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        # Comfort target 21°C every hour, but the house starts at 16°C.
+        indoor_targets = [21.0] * 24
+
+        plan = milp._solve(
+            prices,
+            weather,
+            cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+            demand_per_hour=[3.0] * 24,
+            current_tank_temp=48.0,
+            current_indoor_temp=16.0,
+            indoor_targets=indoor_targets,
+        )
+
+        assert plan is not None
+        assert plan["engine"] == "milp"
+        # The cost estimate must exclude the comfort penalty (stay a real EUR value).
+        assert plan["cost_estimate"] is not None
+        assert plan["cost_estimate"] < 1000.0
+        # A cold start that cannot instantly reach target should report shortfall.
+        assert plan["comfort_shortfall"] >= 0.0
+        # The indoor forecast should trend upward toward the target.
+        temps_forecast = [
+            f["predicted_indoor_temp"]
+            for f in plan["indoor_forecast"]
+            if f["predicted_indoor_temp"] is not None
+        ]
+        assert temps_forecast[-1] >= temps_forecast[0]
+
+    def test_milp_comfort_floor_respected_when_reachable(self):
+        """When the house already meets the target, no shortfall should remain."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        milp = MILPOptimizer()
+        prices = _make_prices()
+        weather = _make_weather()
+
+        plan = milp._solve(
+            prices,
+            weather,
+            cop_fn=lambda t, h=12: 3.5 + 0.1 * t,
+            demand_per_hour=[3.0] * 24,
+            current_tank_temp=48.0,
+            current_indoor_temp=21.5,
+            indoor_targets=[20.0] * 24,
+        )
+
+        assert plan is not None
+        assert plan["comfort_shortfall"] == 0.0
+
 
 class TestMILPGeneratePlan:
     """Tests for the async generate_plan interface."""

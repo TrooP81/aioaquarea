@@ -70,10 +70,18 @@ interface IndoorTempLatest {
   sensors?: { device_id: string; device_label?: string | null; room?: string | null; temperature: number; timestamp: string }[];
 }
 
+interface LastPlanInfo {
+  version: string;
+  engine: string;
+  fell_back: boolean;
+  created_at: string | null;
+}
+
 interface OptimizerStatusData {
   configured_layer: string;
   active_layer: string;
   fallback_layer: string;
+  last_plan: LastPlanInfo | null;
   data_freshness?: {
     latest_device_status: string | null;
     age_seconds: number | null;
@@ -480,6 +488,19 @@ export function OptimizerStatus() {
           {layerExplanation}
         </span>
       </div>
+      {status.last_plan && (
+        <div className="opt-layer-row">
+          <span className="text-muted text-sm">Last plan engine</span>
+          <span className={layerBadgeClass(status.last_plan.version)}>
+            {status.last_plan.engine.toUpperCase()}
+          </span>
+          {status.last_plan.fell_back && (
+            <span className="text-warning text-xs">
+              MILP unavailable — fell back to rules
+            </span>
+          )}
+        </div>
+      )}
       <p className={dataFreshness.fresh ? "text-muted text-xs" : "text-warning text-sm"}>
         Live pump status: {formatAge(dataFreshness.age_seconds)}
         {!dataFreshness.fresh && " — automatic commands are paused until fresh data returns."}
