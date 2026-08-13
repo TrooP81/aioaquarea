@@ -8,7 +8,9 @@ import numpy as np
 from packages.ml.thermal import ThermalModel, ThermalPrediction
 
 
-def _make_status_record(ts, tank_temp, outdoor_temp, zone1_temp=20.0, direction=None, defrost_active=False):
+def _make_status_record(
+    ts, tank_temp, outdoor_temp, zone1_temp=20.0, direction=None, defrost_active=False
+):
     """Create a mock DeviceStatusRecord."""
     rec = MagicMock()
     rec.ts = ts
@@ -29,12 +31,14 @@ def _generate_heating_records(
     tank_temp = start_tank
     for i in range(n):
         ts = base + dt.timedelta(minutes=interval_minutes * i)
-        records.append(_make_status_record(
-            ts=ts,
-            tank_temp=tank_temp,
-            outdoor_temp=outdoor,
-            direction="WATER",
-        ))
+        records.append(
+            _make_status_record(
+                ts=ts,
+                tank_temp=tank_temp,
+                outdoor_temp=outdoor,
+                direction="WATER",
+            )
+        )
         # Increase tank temp at given rate (convert hourly rate to per-interval)
         tank_temp += heating_rate * (interval_minutes / 60.0)
     return records
@@ -85,6 +89,47 @@ class TestThermalPredictions:
         pred = model.predict_zone_heating_time(18.0, 21.0, outdoor_temp=5.0)
         assert pred.estimated_minutes > 0
         assert pred.confidence == "default"
+
+    def test_zone_cooling_fit_rejects_unsafe_extrapolation(self):
+        # A sparse warm-weather line with a huge negative intercept used to
+        # persist as an impossible standby loss (for example -49 °C/h).
+        samples = [(-50.0 + (2.0 * outdoor), outdoor) for outdoor in range(20, 26)]
+
+        assert ThermalModel._robust_zone_cooling_fit(samples) is None
+
+    def test_invalid_persisted_zone_cooling_is_reset_to_safe_defaults(self):
+        model = ThermalModel()
+        model.params.zone_standby_loss = -49.0
+
+        model._sanitize_zone_cooling_params()
+
+        assert model.params.zone_standby_loss == -0.3
+        assert model.params.calibration_status["zone_cooling"].startswith("rejected_previous")
+
+
+class TestThermalPersistence:
+    def test_shared_calibration_round_trip(self, tmp_path):
+        from packages.ml import thermal as thermal_module
+
+        source = ThermalModel()
+        source.params.tank_heating_rate = 6.2
+        source.params.indoor_heating_samples = 8
+        source.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
+
+        with (
+            patch.object(thermal_module, "MODEL_DIR", tmp_path),
+            patch("packages.ml.safe_persistence.settings") as persistence_settings,
+        ):
+            persistence_settings.model_dir = str(tmp_path)
+            persistence_settings.secret_key = "thermal-persistence-test"
+            source.save()
+
+            loaded = ThermalModel()
+            assert loaded.load_latest() is True
+
+        assert loaded.params.tank_heating_rate == 6.2
+        assert loaded.params.indoor_heating_samples == 8
+        assert loaded.confidence_for("indoor_heating") == "learned"
 
     def test_zone_heating_already_at_target(self):
         model = ThermalModel()
@@ -142,12 +187,14 @@ class TestTemperatureCurve:
         """Tank can never cool below outdoor temperature."""
         model = ThermalModel()
         curve = model.predict_temperature_curve(
-            current_temp=50.0, outdoor_temp=5.0, hours=168, is_tank=True  # 7 days
+            current_temp=50.0,
+            outdoor_temp=5.0,
+            hours=168,
+            is_tank=True,  # 7 days
         )
         for entry in curve:
             assert entry["predicted_temp"] >= 5.0, (
-                f"hour {entry['hour']}: {entry['predicted_temp']}°C is below "
-                f"outdoor temp 5.0°C"
+                f"hour {entry['hour']}: {entry['predicted_temp']}°C is below outdoor temp 5.0°C"
             )
 
     def test_standby_curve_loss_slows_near_outdoor(self):
@@ -184,9 +231,7 @@ class TestCalibrate:
         model = ThermalModel()
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = [
-            _make_status_record(
-                dt.datetime(2026, 1, 10, i, 0, tzinfo=dt.timezone.utc), 45.0, 10.0
-            )
+            _make_status_record(dt.datetime(2026, 1, 10, i, 0, tzinfo=dt.timezone.utc), 45.0, 10.0)
             for i in range(5)  # Only 5 records, less than min_samples=20
         ]
 
@@ -216,6 +261,7 @@ class TestCalibrate:
         mock_indoor_result.scalars.return_value.all.return_value = []
 
         call_count = [0]
+
         async def _mock_execute(stmt):
             call_count[0] += 1
             return mock_result if call_count[0] <= 1 else mock_indoor_result
@@ -244,11 +290,16 @@ class TestCalibrate:
         records = []
         for i in range(30):
             ts = base + dt.timedelta(minutes=15 * i)
-            defrost = (i % 5 == 0)  # Every 5th record is defrost
-            records.append(_make_status_record(
-                ts=ts, tank_temp=45.0 + i * 0.5, outdoor_temp=5.0,
-                direction="WATER", defrost_active=defrost,
-            ))
+            defrost = i % 5 == 0  # Every 5th record is defrost
+            records.append(
+                _make_status_record(
+                    ts=ts,
+                    tank_temp=45.0 + i * 0.5,
+                    outdoor_temp=5.0,
+                    direction="WATER",
+                    defrost_active=defrost,
+                )
+            )
 
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = records
@@ -257,6 +308,7 @@ class TestCalibrate:
         mock_indoor_result.scalars.return_value.all.return_value = []
 
         call_count = [0]
+
         async def _mock_execute(stmt):
             call_count[0] += 1
             return mock_result if call_count[0] <= 1 else mock_indoor_result
@@ -284,6 +336,7 @@ class TestCalibrate:
         mock_indoor_result.scalars.return_value.all.return_value = []
 
         call_count = [0]
+
         async def _mock_execute(stmt):
             call_count[0] += 1
             return mock_result if call_count[0] <= 1 else mock_indoor_result
@@ -354,6 +407,19 @@ class TestIndoorPredictions:
         assert pred.estimated_minutes > 0
         assert pred.confidence == "default"
 
+    def test_indoor_confidence_requires_indoor_evidence(self):
+        model = ThermalModel()
+        model.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
+
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "default"
+        )
+
+        model.params.indoor_heating_samples = 5
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "learned"
+        )
+
     def test_indoor_heating_already_at_target(self):
         model = ThermalModel()
         pred = model.predict_indoor_heating_time(21.0, 21.0, outdoor_temp=5.0)
@@ -420,8 +486,10 @@ class TestIndoorCurve:
 
     def test_indoor_curve_length(self):
         model = ThermalModel()
-        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
-                   for h in range(12)]
+        weather = [
+            {"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+            for h in range(12)
+        ]
         water_temps = [35.0] * 12
         curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=12)
         assert len(curve) == 12
@@ -438,8 +506,9 @@ class TestIndoorCurve:
     def test_indoor_curve_fallback_source(self):
         """Without trained comfort model, source should be linear_rates."""
         model = ThermalModel()
-        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
-                   for h in range(6)]
+        weather = [
+            {"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h} for h in range(6)
+        ]
         water_temps = [35.0] * 6
         curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=6)
         assert all(entry["source"] == "linear_rates" for entry in curve)
@@ -447,8 +516,10 @@ class TestIndoorCurve:
     def test_indoor_curve_cooling_without_heating(self):
         """With low water temp, indoor should cool toward outdoor."""
         model = ThermalModel()
-        weather = [{"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
-                   for h in range(24)]
+        weather = [
+            {"outdoor_temp": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+            for h in range(24)
+        ]
         water_temps = [15.0] * 24  # Water temp below indoor → no heating effect
         curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=24)
         # Should be cooling over time
@@ -457,8 +528,10 @@ class TestIndoorCurve:
     def test_indoor_curve_never_below_outdoor(self):
         """Indoor temp should never go below outdoor temperature."""
         model = ThermalModel()
-        weather = [{"outdoor_temp": 10.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
-                   for h in range(48)]
+        weather = [
+            {"outdoor_temp": 10.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+            for h in range(48)
+        ]
         water_temps = [10.0] * 48
         curve = model.predict_indoor_curve(15.0, water_temps, weather, hours=48)
         for entry in curve:
@@ -472,8 +545,11 @@ class TestManagedTankCurve:
         model = ThermalModel()
         floors = [45.0] * 24
         curve = model.predict_managed_tank_curve(
-            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=floors, hours=24,
+            current_temp=48.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=floors,
+            hours=24,
         )
         assert len(curve) == 24
         assert {"hour", "predicted_temp", "state", "floor"} <= set(curve[0])
@@ -483,8 +559,11 @@ class TestManagedTankCurve:
         model = ThermalModel()
         floors = [45.0] * 24
         curve = model.predict_managed_tank_curve(
-            current_temp=52.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=floors, hours=24,
+            current_temp=52.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=floors,
+            hours=24,
         )
         temps = [c["predicted_temp"] for c in curve]
         assert min(temps) < 52.0  # it cools between reheats
@@ -495,8 +574,11 @@ class TestManagedTankCurve:
         # Daytime floor 45 for first 6h, off-peak floor 41 overnight, back to 45.
         floors = [45.0] * 6 + [41.0] * 10 + [45.0] * 8
         curve = model.predict_managed_tank_curve(
-            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=floors, hours=24,
+            current_temp=48.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=floors,
+            hours=24,
         )
         overnight_min = min(c["predicted_temp"] for c in curve[6:16])
         # Reaches close to the off-peak floor (within one heating step).
@@ -507,8 +589,11 @@ class TestManagedTankCurve:
         model = ThermalModel()
         floors = [45.0] * 12
         curve = model.predict_managed_tank_curve(
-            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=floors, hours=12,
+            current_temp=48.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=floors,
+            hours=12,
         )
         for c in curve:
             assert c["predicted_temp"] >= c["floor"] - 1e-6
@@ -518,8 +603,11 @@ class TestManagedTankCurve:
         model = ThermalModel()
         floors = [45.0] * 48
         curve = model.predict_managed_tank_curve(
-            current_temp=45.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=floors, hours=48,
+            current_temp=45.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=floors,
+            hours=48,
         )
         temps = [c["predicted_temp"] for c in curve]
         assert max(temps) >= 51.9  # reheats up to target
@@ -527,8 +615,11 @@ class TestManagedTankCurve:
     def test_shorter_floor_list_reuses_last(self):
         model = ThermalModel()
         curve = model.predict_managed_tank_curve(
-            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
-            tank_min_per_hour=[45.0], hours=6,
+            current_temp=48.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            tank_min_per_hour=[45.0],
+            hours=6,
         )
         assert len(curve) == 6
         assert all(c["floor"] == 45.0 for c in curve)
@@ -538,15 +629,19 @@ class TestManagedIndoorCurve:
     """Test predict_managed_indoor_curve — schedule-aware comfort setback."""
 
     def _weather(self, hours, outdoor=2.0):
-        return [{"outdoor_temp": outdoor, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
-                for h in range(hours)]
+        return [
+            {"outdoor_temp": outdoor, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
+            for h in range(hours)
+        ]
 
     def test_curve_length_and_keys(self):
         model = ThermalModel()
         targets = [20.5] * 24
         curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=self._weather(24), hours=24,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24),
+            hours=24,
         )
         assert len(curve) == 24
         assert {"hour", "predicted_indoor_temp", "target", "state", "source"} <= set(curve[0])
@@ -556,8 +651,10 @@ class TestManagedIndoorCurve:
         model = ThermalModel()
         targets = [20.5] * 6 + [18.0] * 8 + [20.5] * 10
         curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=self._weather(24), hours=24,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24),
+            hours=24,
         )
         temps = [c["predicted_indoor_temp"] for c in curve]
         # Holds at comfort during the first comfort block.
@@ -570,8 +667,10 @@ class TestManagedIndoorCurve:
         model = ThermalModel()
         targets = [18.0] * 8 + [20.5] * 16
         curve = model.predict_managed_indoor_curve(
-            current_indoor=18.0, indoor_target_per_hour=targets,
-            weather_forecast=self._weather(24), hours=24,
+            current_indoor=18.0,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24),
+            hours=24,
         )
         assert curve[-1]["predicted_indoor_temp"] >= 20.4
 
@@ -579,8 +678,10 @@ class TestManagedIndoorCurve:
         model = ThermalModel()
         targets = [18.0] * 24
         curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=self._weather(24, outdoor=5.0), hours=24,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(24, outdoor=5.0),
+            hours=24,
         )
         for c in curve:
             assert c["predicted_indoor_temp"] >= min(c["target"], 5.0) - 1e-6
@@ -591,16 +692,20 @@ class TestManagedIndoorCurve:
         model = ThermalModel()
         targets = [20.5] * 12
         curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=self._weather(12), hours=12,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12),
+            hours=12,
         )
         assert all(abs(c["predicted_indoor_temp"] - 20.5) < 1e-6 for c in curve)
 
     def test_shorter_target_list_reuses_last(self):
         model = ThermalModel()
         curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=[20.5],
-            weather_forecast=self._weather(6), hours=6,
+            current_indoor=20.5,
+            indoor_target_per_hour=[20.5],
+            weather_forecast=self._weather(6),
+            hours=6,
         )
         assert len(curve) == 6
         assert all(c["target"] == 20.5 for c in curve)
@@ -618,12 +723,16 @@ class TestManagedIndoorCurve:
             for h in range(12)
         ]
         sunny_curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=sunny, hours=12,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=sunny,
+            hours=12,
         )
         dark_curve = model.predict_managed_indoor_curve(
-            current_indoor=20.5, indoor_target_per_hour=targets,
-            weather_forecast=dark, hours=12,
+            current_indoor=20.5,
+            indoor_target_per_hour=targets,
+            weather_forecast=dark,
+            hours=12,
         )
         # Solar gain offsets the setback loss, so at least some hours are warmer.
         assert any(
@@ -636,6 +745,159 @@ class TestManagedIndoorCurve:
             for s, d in zip(sunny_curve, dark_curve)
         )
 
+    def test_summer_does_not_snap_to_outdoor(self):
+        """Hot outdoor air must warm the home gradually, without a snap."""
+        model = ThermalModel()
+        targets = [20.5] * 12
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=25.8,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12, outdoor=27.1),
+            hours=12,
+        )
+        assert curve[0]["predicted_indoor_temp"] < 26.5
+        temps = [row["predicted_indoor_temp"] for row in curve]
+        assert temps == sorted(temps)
+        assert max(temps) <= 27.1 + 1e-6
+
+    def test_summer_held_at_comfort_floor(self):
+        model = ThermalModel()
+        targets = [20.5] * 12
+        curve = model.predict_managed_indoor_curve(
+            current_indoor=25.8,
+            indoor_target_per_hour=targets,
+            weather_forecast=self._weather(12, outdoor=16.0),
+            hours=12,
+        )
+        temps = [row["predicted_indoor_temp"] for row in curve]
+        assert all(temp >= 20.5 - 1e-6 for temp in temps)
+        assert temps[-1] < temps[0]
+
+
+class TestControlledIndoorCurve:
+    """Test an explicit heating-duty forecast against its no-heat baseline."""
+
+    def _weather(self, hours: int) -> list[dict]:
+        return [
+            {"outdoor_temp": 2.0, "wind_speed": 3.0, "irradiance": 0.0, "hour": h}
+            for h in range(hours)
+        ]
+
+    def test_zero_heat_plan_matches_no_heating_even_with_normal_supply_temp(self):
+        model = ThermalModel()
+        weather = self._weather(4)
+        plan = model.predict_indoor_controlled_curve(
+            current_indoor=20.0,
+            zone_water_temps=[35.0] * 4,
+            heating_fractions=[0.0] * 4,
+            weather_forecast=weather,
+            hours=4,
+        )
+        no_heating = model.predict_indoor_controlled_curve(
+            current_indoor=20.0,
+            zone_water_temps=[2.0] * 4,
+            heating_fractions=[0.0] * 4,
+            weather_forecast=weather,
+            hours=4,
+        )
+
+        assert [row["predicted_indoor_temp"] for row in plan] == [
+            row["predicted_indoor_temp"] for row in no_heating
+        ]
+        assert all(row["space_heating_fraction"] == 0.0 for row in plan)
+
+    def test_explicit_heating_plan_is_warmer_than_its_counterfactual(self):
+        model = ThermalModel()
+        weather = self._weather(2)
+        heated = model.predict_indoor_controlled_curve(
+            current_indoor=20.0,
+            zone_water_temps=[35.0, 35.0],
+            heating_fractions=[1.0, 1.0],
+            weather_forecast=weather,
+            hours=2,
+        )
+        no_heating = model.predict_indoor_controlled_curve(
+            current_indoor=20.0,
+            zone_water_temps=[35.0, 35.0],
+            heating_fractions=[0.0, 0.0],
+            weather_forecast=weather,
+            hours=2,
+        )
+
+        assert all(
+            hot["predicted_indoor_temp"] >= cold["predicted_indoor_temp"]
+            for hot, cold in zip(heated, no_heating)
+        )
+
+
+class TestFreeFloatCurve:
+    """Test predict_free_float_curve — passive no-heating baseline."""
+
+    def _weather(self, hours, outdoor=2.0):
+        return [
+            {"outdoor_temp": outdoor, "wind_speed": 3.0, "irradiance": 0.0, "hour": h % 24}
+            for h in range(hours)
+        ]
+
+    def test_curve_length_and_keys(self):
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0,
+            weather_forecast=self._weather(24),
+            hours=24,
+        )
+        assert len(curve) == 24
+        assert {"hour", "predicted_indoor_temp", "source"} <= set(curve[0])
+        assert all(c["source"] == "free_float" for c in curve)
+
+    def test_cools_toward_cold_outdoor(self):
+        """No heating on a cold day → indoor must drift downward toward outdoor."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0,
+            weather_forecast=self._weather(24, outdoor=2.0),
+            hours=24,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Monotonically non-increasing and clearly cooling.
+        assert temps == sorted(temps, reverse=True)
+        assert temps[-1] < temps[0]
+        # Never overshoots below outdoor.
+        assert all(t >= 2.0 - 1e-6 for t in temps)
+
+    def test_warms_toward_hot_outdoor_without_snapping(self):
+        """No heating on a hot day → indoor warms gradually toward outdoor."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=25.8,
+            weather_forecast=self._weather(12, outdoor=30.0),
+            hours=12,
+        )
+        temps = [c["predicted_indoor_temp"] for c in curve]
+        # Warms gradually (no instant snap to 30°C) and never overshoots.
+        assert temps[0] < 27.0
+        assert temps == sorted(temps)
+        assert all(t <= 30.0 + 1e-6 for t in temps)
+
+    def test_holds_when_at_outdoor(self):
+        """Indoor already equal to outdoor stays put (no drift)."""
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=18.0,
+            weather_forecast=self._weather(6, outdoor=18.0),
+            hours=6,
+        )
+        assert all(abs(c["predicted_indoor_temp"] - 18.0) < 1e-6 for c in curve)
+
+    def test_empty_weather_uses_default(self):
+        model = ThermalModel()
+        curve = model.predict_free_float_curve(
+            current_indoor=21.0,
+            weather_forecast=[],
+            hours=3,
+        )
+        assert len(curve) == 3
+
 
 class TestPlannedTankCurve:
     """Test predict_planned_tank_curve — follows the optimizer's DHW schedule."""
@@ -644,8 +906,11 @@ class TestPlannedTankCurve:
         model = ThermalModel()
         dhw = [0.0] * 24
         curve = model.predict_planned_tank_curve(
-            current_temp=48.0, outdoor_temp=7.0, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=24,
+            current_temp=48.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=24,
         )
         assert len(curve) == 24
         assert {"hour", "predicted_temp", "state", "dhw_minutes"} <= set(curve[0])
@@ -656,8 +921,11 @@ class TestPlannedTankCurve:
         dhw = [0.0] * 6
         dhw[2] = 60.0
         curve = model.predict_planned_tank_curve(
-            current_temp=46.0, outdoor_temp=7.0, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=6,
+            current_temp=46.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=6,
         )
         # The heating hour is hotter than the hour before it.
         assert curve[2]["predicted_temp"] > curve[1]["predicted_temp"]
@@ -668,8 +936,11 @@ class TestPlannedTankCurve:
         model = ThermalModel()
         dhw = [0.0] * 8
         curve = model.predict_planned_tank_curve(
-            current_temp=52.0, outdoor_temp=7.0, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=8,
+            current_temp=52.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=8,
         )
         assert all(c["state"] == "standby" for c in curve)
         assert curve[-1]["predicted_temp"] < curve[0]["predicted_temp"]
@@ -678,8 +949,11 @@ class TestPlannedTankCurve:
         model = ThermalModel()
         dhw = [60.0] * 12
         curve = model.predict_planned_tank_curve(
-            current_temp=50.0, outdoor_temp=7.0, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=12,
+            current_temp=50.0,
+            outdoor_temp=7.0,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=12,
         )
         for c in curve:
             assert c["predicted_temp"] <= 52.0 + 1e-6
@@ -688,8 +962,11 @@ class TestPlannedTankCurve:
         model = ThermalModel()
         dhw = [0.0] * 48
         curve = model.predict_planned_tank_curve(
-            current_temp=20.0, outdoor_temp=18.0, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=48,
+            current_temp=20.0,
+            outdoor_temp=18.0,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=48,
         )
         for c in curve:
             assert c["predicted_temp"] >= 18.0 - 1e-6
@@ -701,8 +978,11 @@ class TestPlannedTankCurve:
         for h in (1, 6, 10, 11):
             dhw[h] = 60.0
         curve = model.predict_planned_tank_curve(
-            current_temp=48.0, outdoor_temp=23.6, tank_target=52.0,
-            dhw_minutes_per_hour=dhw, hours=24,
+            current_temp=48.0,
+            outdoor_temp=23.6,
+            tank_target=52.0,
+            dhw_minutes_per_hour=dhw,
+            hours=24,
         )
         heating_hours = [c["hour"] for c in curve if c["state"] == "heating"]
         # Heating happens exactly on the planned DHW hours (h -> hour h+1).
@@ -714,12 +994,18 @@ class TestPlannedTankCurve:
         """Half-hour of DHW heats less than a full hour."""
         model = ThermalModel()
         full = model.predict_planned_tank_curve(
-            current_temp=46.0, outdoor_temp=7.0, tank_target=60.0,
-            dhw_minutes_per_hour=[60.0], hours=1,
+            current_temp=46.0,
+            outdoor_temp=7.0,
+            tank_target=60.0,
+            dhw_minutes_per_hour=[60.0],
+            hours=1,
         )
         half = model.predict_planned_tank_curve(
-            current_temp=46.0, outdoor_temp=7.0, tank_target=60.0,
-            dhw_minutes_per_hour=[30.0], hours=1,
+            current_temp=46.0,
+            outdoor_temp=7.0,
+            tank_target=60.0,
+            dhw_minutes_per_hour=[30.0],
+            hours=1,
         )
         assert half[0]["predicted_temp"] < full[0]["predicted_temp"]
 
@@ -739,12 +1025,18 @@ class TestPlannedTankCurve:
             dhw[h] = 60.0
 
         heating = model.predict_planned_tank_curve(
-            current_temp=current_temp, outdoor_temp=outdoor,
-            tank_target=tank_target, dhw_minutes_per_hour=dhw, hours=12,
+            current_temp=current_temp,
+            outdoor_temp=outdoor,
+            tank_target=tank_target,
+            dhw_minutes_per_hour=dhw,
+            hours=12,
         )
         standby = model.predict_temperature_curve(
-            current_temp=current_temp, outdoor_temp=outdoor,
-            hours=12, target_temp=None, is_tank=True,
+            current_temp=current_temp,
+            outdoor_temp=outdoor,
+            hours=12,
+            target_temp=None,
+            is_tank=True,
         )
         for hh, ss in zip(heating, standby):
             assert hh["predicted_temp"] >= ss["predicted_temp"] - 1e-6, (

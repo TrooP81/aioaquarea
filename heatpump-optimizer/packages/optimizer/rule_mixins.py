@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 
+from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
@@ -11,6 +13,8 @@ from packages.optimizer.actions import ActionType
 
 
 class SharedRuleHelpersMixin:
+    COMFORT_SATISFIED_MARGIN_C = 0.3
+
     @staticmethod
     def _find_cheapest_slot(
         prices: list[tuple[dt.datetime, float]], hours_needed: int
@@ -25,8 +29,7 @@ class SharedRuleHelpersMixin:
         for i in range(len(sorted_prices) - hours_needed + 1):
             slot = sorted_prices[i : i + hours_needed]
             contiguous = all(
-                (slot[j + 1][0] - slot[j][0]).total_seconds() == 3600
-                for j in range(len(slot) - 1)
+                (slot[j + 1][0] - slot[j][0]).total_seconds() == 3600 for j in range(len(slot) - 1)
             )
             if not contiguous:
                 continue
@@ -53,8 +56,120 @@ class SharedRuleHelpersMixin:
         closest = min(weather, key=lambda w: abs((w[0] - target_time).total_seconds()))
         return closest[1] if closest[1] is not None else default
 
+    @staticmethod
+    def _weather_conditions_at(
+        timestamp: dt.datetime,
+        weather_full: list[dict] | None,
+        outdoor_temp: float,
+    ) -> dict:
+        """Use the same weather dimensions for rule decisions and charts."""
+        closest: dict | None = None
+        if weather_full:
+            dated = [row for row in weather_full if isinstance(row.get("ts"), dt.datetime)]
+            if dated:
+                closest = min(dated, key=lambda row: abs((row["ts"] - timestamp).total_seconds()))
+
+        def value(name: str, default: float, *, non_negative: bool = False) -> float:
+            raw = closest.get(name) if closest else None
+            try:
+                number = float(raw) if raw is not None else default
+            except (TypeError, ValueError):
+                number = default
+            return max(0.0, number) if non_negative else number
+
+        return {
+            "outdoor_temp": value("temperature", outdoor_temp),
+            "wind_speed": value("wind_speed", 3.0, non_negative=True),
+            "irradiance": value("irradiance", 0.0, non_negative=True),
+            "precipitation": value("precipitation", 0.0, non_negative=True),
+            "hour": timestamp.hour,
+        }
+
+    def _passive_indoor_forecast(
+        self,
+        timestamps: list[dt.datetime],
+        weather: list[tuple[dt.datetime, float]],
+        current_indoor_temp: float,
+        current_outdoor_temp: float,
+        current_water_temp: float,
+        heat_curve: HeatCurveConfig | None = None,
+        weather_full: list[dict] | None = None,
+    ) -> dict[dt.datetime, float]:
+        """Predict indoor temperature with no planned space heating.
+
+        Mode selection and pre-heating are both control decisions.  They must
+        therefore use the same passive trajectory as the plan forecast instead
+        of treating a comfort-schedule label or a cold outdoor reading as a
+        sufficient reason to request heat.
+        """
+        if not timestamps:
+            return {}
+
+        weather_forecast = []
+        zone_water_temps = []
+        for ts in timestamps:
+            outdoor_temp = self._get_outdoor_at(weather, ts, current_outdoor_temp)
+            weather_forecast.append(self._weather_conditions_at(ts, weather_full, outdoor_temp))
+            zone_water_temps.append(
+                heat_curve.planned_supply_temperature(outdoor_temp)
+                if heat_curve is not None
+                else current_water_temp
+            )
+
+        curve = thermal_model.predict_indoor_controlled_curve(
+            current_indoor=current_indoor_temp,
+            zone_water_temps=zone_water_temps,
+            heating_fractions=[0.0] * len(weather_forecast),
+            weather_forecast=weather_forecast,
+            hours=len(weather_forecast),
+        )
+        return {ts: float(row["predicted_indoor_temp"]) for ts, row in zip(timestamps, curve)}
+
 
 class DHWRulesMixin(SharedRuleHelpersMixin):
+    # A forced DHW cycle has API and compressor cost. Very short calculated
+    # top-ups are better left to the heat pump's own thermostat than turned
+    # into a one-hour force-on/force-off pair.
+    MIN_FORCE_DHW_MINUTES = 10
+
+    @staticmethod
+    def _local_dhw_deadlines_in_horizon(
+        comfort_schedule: dict[str, list[int]],
+        horizon_start: dt.datetime,
+        tz_name: str | None,
+    ) -> list[tuple[dt.datetime, int]]:
+        """Return future DHW deadlines as UTC instants with their local hour.
+
+        The comfort schedule stores local wall-clock hours.  Building a
+        deadline with ``horizon_start.replace(hour=...)`` accidentally treats
+        those local hours as UTC, shifting an Amsterdam 08:00 deadline to
+        10:00 in summer.  Enumerating local calendar days also means a plan
+        crossing midnight uses tomorrow's weekday/weekend schedule correctly.
+        """
+        timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
+        if horizon_start.tzinfo is None:
+            horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
+        horizon_end = horizon_start + dt.timedelta(hours=24)
+        local_start = horizon_start.astimezone(timezone)
+        local_end = horizon_end.astimezone(timezone)
+        current_date = local_start.date()
+        deadlines: list[tuple[dt.datetime, int]] = []
+
+        while current_date <= local_end.date():
+            local_noon = dt.datetime.combine(current_date, dt.time(12), tzinfo=timezone)
+            for ready_hour in dhw_deadlines_from_schedule(
+                comfort_schedule, local_noon, tz_name=tz_name
+            ):
+                local_deadline = dt.datetime.combine(
+                    current_date, dt.time(ready_hour), tzinfo=timezone
+                )
+                deadline = local_deadline.astimezone(dt.timezone.utc)
+                if horizon_start < deadline < horizon_end:
+                    deadlines.append((deadline, ready_hour))
+            current_date += dt.timedelta(days=1)
+
+        return sorted(deadlines, key=lambda item: item[0])
+
     def _plan_dhw(
         self,
         prices: list[tuple[dt.datetime, float]],
@@ -73,19 +188,17 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             target_temp=float(tank_target),
             outdoor_temp=current_outdoor_temp,
         )
+        if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
+            return actions
         hours_needed = max(1, int(prediction.estimated_hours + 0.9))
         thermal_model.predict_tank_cooling_time(
             current_temp=float(tank_target),
             min_temp=current_tank_temp,
             outdoor_temp=current_outdoor_temp,
         )
-        ready_hours = dhw_deadlines_from_schedule(comfort_schedule, horizon_start, tz_name=tz_name)
-
-        for ready_hour in ready_hours:
-            deadline = horizon_start.replace(hour=ready_hour, minute=0)
-            if deadline <= horizon_start:
-                deadline += dt.timedelta(days=1)
-
+        for deadline, ready_hour in self._local_dhw_deadlines_in_horizon(
+            comfort_schedule, horizon_start, tz_name
+        ):
             latest_start = thermal_model.optimal_start_time(
                 current_temp=current_tank_temp,
                 target_temp=float(tank_target),
@@ -137,19 +250,53 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         current_indoor_temp: float,
         current_outdoor_temp: float,
         current_water_temp: float,
+        heat_curve: HeatCurveConfig | None = None,
+        comfort_schedule: dict[str, list[int]] | None = None,
+        comfort_temp_target: float = 20.5,
+        comfort_temp_min: float = 18.0,
+        tz_name: str | None = None,
+        weather_full: list[dict] | None = None,
     ) -> list[dict]:
         actions = []
         if not weather:
             return actions
 
-        cold_hours = [(ts, t) for ts, t in weather if t is not None and t < 2.0]
-        if not cold_hours:
+        passive_indoor = self._passive_indoor_forecast(
+            [ts for ts, _ in weather],
+            weather,
+            current_indoor_temp,
+            current_outdoor_temp,
+            current_water_temp,
+            heat_curve,
+            weather_full,
+        )
+        cold_risk: tuple[dt.datetime, float, float] | None = None
+        for ts, outdoor_temp in weather:
+            if outdoor_temp is None or outdoor_temp >= 2.0:
+                continue
+            if heat_curve is not None and outdoor_temp >= heat_curve.heating_off_outdoor_c:
+                continue
+            target_indoor = (
+                comfort_temp_target
+                if comfort_schedule is None
+                or is_comfort_hour(comfort_schedule, ts, tz_name=tz_name)
+                else comfort_temp_min
+            )
+            predicted_indoor = passive_indoor.get(ts, current_indoor_temp)
+            if predicted_indoor < target_indoor - self.COMFORT_SATISFIED_MARGIN_C:
+                cold_risk = (ts, outdoor_temp, target_indoor)
+                break
+
+        if cold_risk is None:
             return actions
 
-        first_cold = cold_hours[0][0]
-        target_indoor = current_indoor_temp + 2.0
-        if comfort_model.is_trained:
-            outdoor_at_cold = cold_hours[0][1] if cold_hours[0][1] is not None else 0.0
+        first_cold, outdoor_at_cold, target_indoor = cold_risk
+        baseline_supply = (
+            heat_curve.supply_temperature(outdoor_at_cold)
+            if heat_curve is not None
+            else current_water_temp
+        )
+        if comfort_model.is_ready_for_control:
             required_water = comfort_model.required_zone_temp(
                 target_indoor=target_indoor,
                 outdoor_temp=outdoor_at_cold,
@@ -157,12 +304,14 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 indoor_temp=current_indoor_temp,
             )
             if required_water is None:
-                required_water = current_water_temp + 2.0
+                required_water = baseline_supply + 2.0
             target_zone_boost = required_water
         else:
-            target_zone_boost = current_water_temp + 2.0
+            target_zone_boost = baseline_supply + 2.0
 
-        outdoor_at_cold = cold_hours[0][1] if cold_hours[0][1] is not None else 0.0
+        if target_zone_boost <= current_water_temp:
+            return actions
+
         prediction = thermal_model.predict_zone_heating_time(
             current_temp=current_water_temp,
             target_temp=target_zone_boost,
@@ -170,8 +319,20 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         )
         hours_needed = max(1, int(prediction.estimated_hours + 0.9))
         preheat_window_start = max(first_cold - dt.timedelta(hours=hours_needed + 4), horizon_start)
+        weather_by_ts = {ts: temp for ts, temp in weather}
+
+        def controller_can_heat(ts: dt.datetime) -> bool:
+            if heat_curve is None:
+                return True
+            outdoor_temp = weather_by_ts.get(ts)
+            if outdoor_temp is None:
+                outdoor_temp = current_outdoor_temp
+            return outdoor_temp < heat_curve.heating_off_outdoor_c
+
         window_prices = [
-            (ts, p) for ts, p in prices if preheat_window_start <= ts < first_cold
+            (ts, p)
+            for ts, p in prices
+            if preheat_window_start <= ts < first_cold and controller_can_heat(ts)
         ]
         if not window_prices:
             return actions
@@ -214,7 +375,9 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         comfort_schedule: dict[str, list[int]],
         comfort_temp_target: float,
         comfort_temp_min: float,
+        heat_curve: HeatCurveConfig | None = None,
         tz_name: str | None = None,
+        weather_full: list[dict] | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
         if not weather:
@@ -226,17 +389,25 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             _, w_temp = weather[h] if h < len(weather) else (None, current_outdoor_temp)
             outdoor = w_temp if w_temp is not None else current_outdoor_temp
             weather_forecast.append(
-                {
-                    "outdoor_temp": outdoor,
-                    "wind_speed": 3.0,
-                    "irradiance": 0.0,
-                    "hour": (horizon_start + dt.timedelta(hours=h)).hour,
-                }
+                self._weather_conditions_at(
+                    horizon_start + dt.timedelta(hours=h), weather_full, outdoor
+                )
             )
 
-        curve = thermal_model.predict_indoor_curve(
+        curve_supply_temps = [
+            heat_curve.planned_supply_temperature(row["outdoor_temp"])
+            if heat_curve is not None
+            else current_water_temp
+            for row in weather_forecast
+        ]
+        # Use the same explicit no-space-heat baseline as the saved plan
+        # snapshot.  ``predict_indoor_curve`` treats a warm zone-water target
+        # as active heating, which could hide a future comfort miss here while
+        # the chart correctly showed the home coasting.
+        curve = thermal_model.predict_indoor_controlled_curve(
             current_indoor=current_indoor_temp,
-            zone_water_temps=[current_water_temp] * hours,
+            zone_water_temps=curve_supply_temps,
+            heating_fractions=[0.0] * hours,
             weather_forecast=weather_forecast,
             hours=hours,
         )
@@ -244,6 +415,13 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         for h in range(hours):
             hour_ts = horizon_start + dt.timedelta(hours=h)
             if not is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name):
+                continue
+            if (
+                heat_curve is not None
+                and weather_forecast[h]["outdoor_temp"] >= heat_curve.heating_off_outdoor_c
+            ):
+                # The controller's own Värme AV threshold prevents space heat,
+                # so do not create an action the pump cannot execute.
                 continue
 
             predicted_indoor = (
@@ -260,8 +438,24 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             )
             hours_needed = max(1, int(heating_pred.estimated_hours + 0.9))
             window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 2))
-            window_prices = [(ts, p) for ts, p in prices if window_start <= ts <= hour_ts]
-            best_slot = self._find_cheapest_slot(window_prices, hours_needed) if window_prices else None
+            weather_by_ts = {ts: temp for ts, temp in weather}
+
+            def controller_can_heat(ts: dt.datetime) -> bool:
+                if heat_curve is None:
+                    return True
+                outdoor_temp = weather_by_ts.get(ts)
+                if outdoor_temp is None:
+                    outdoor_temp = current_outdoor_temp
+                return outdoor_temp < heat_curve.heating_off_outdoor_c
+
+            window_prices = [
+                (ts, p)
+                for ts, p in prices
+                if window_start <= ts <= hour_ts and controller_can_heat(ts)
+            ]
+            best_slot = (
+                self._find_cheapest_slot(window_prices, hours_needed) if window_prices else None
+            )
             slot_start = best_slot[0][0] if best_slot else hour_ts
 
             actions.append(
@@ -287,7 +481,16 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             break
 
         current_is_comfort = is_comfort_hour(comfort_schedule, horizon_start, tz_name=tz_name)
-        if current_is_comfort and current_indoor_temp < comfort_temp_target + 1.0 and not actions:
+        if (
+            current_is_comfort
+            # Never start an emergency boost while the measured home is at or
+            # above its comfort target. The old +1°C allowance could heat an
+            # already warm home merely because the simple cooling estimate was
+            # pessimistic.
+            and current_indoor_temp < comfort_temp_target - 0.3
+            and not actions
+            and (heat_curve is None or current_outdoor_temp < heat_curve.heating_off_outdoor_c)
+        ):
             cooling_pred = thermal_model.predict_indoor_cooling_time(
                 current_temp=current_indoor_temp,
                 min_temp=comfort_temp_target - 1.0,
@@ -399,6 +602,13 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         comfort_override_pct: int = 90,
         eco_upgrade_pct: int = 25,
         tz_name: str | None = None,
+        current_indoor_temp: float | None = None,
+        current_outdoor_temp: float = 5.0,
+        current_water_temp: float = 35.0,
+        heat_curve: HeatCurveConfig | None = None,
+        comfort_temp_target: float | None = None,
+        comfort_temp_min: float | None = None,
+        weather_full: list[dict] | None = None,
     ) -> list[dict]:
         actions = []
         if not prices:
@@ -411,15 +621,43 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         ]
         flat_price = len(set(price_values)) <= 1
         temp_by_ts = {w_ts.isoformat(): w_temp for w_ts, w_temp in weather}
+        passive_indoor = (
+            self._passive_indoor_forecast(
+                [ts for ts, _ in prices],
+                weather,
+                current_indoor_temp,
+                current_outdoor_temp,
+                current_water_temp,
+                heat_curve,
+                weather_full,
+            )
+            if current_indoor_temp is not None and comfort_temp_target is not None
+            else {}
+        )
         mild_outdoor_threshold = 5.0
         current_mode = None
 
         for ts, price in prices:
             scheduled_comfort = is_comfort_hour(comfort_schedule, ts, tz_name=tz_name)
             outdoor_temp = temp_by_ts.get(ts.isoformat())
+            predicted_indoor = passive_indoor.get(ts)
 
             if scheduled_comfort:
-                if not flat_price and price >= p_comfort:
+                if (
+                    predicted_indoor is not None
+                    and comfort_temp_target is not None
+                    and predicted_indoor >= comfort_temp_target + self.COMFORT_SATISFIED_MARGIN_C
+                ):
+                    # A comfort window is a temperature objective, not an
+                    # instruction to clear ECO or restore Normal mode.  Keep
+                    # the lower-demand mode while stored heat already covers
+                    # the target, then reconsider when the forecast cools.
+                    target_mode = "eco"
+                    reason = (
+                        "comfort_satisfied_forecast_"
+                        f"{predicted_indoor:.1f}_target_{comfort_temp_target:.1f}"
+                    )
+                elif not flat_price and price >= p_comfort:
                     target_mode = "normal"
                     reason = f"comfort_hour_but_peak_price_{price:.4f}"
                 elif outdoor_temp is not None and outdoor_temp >= mild_outdoor_threshold:
@@ -429,12 +667,36 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                     target_mode = "comfort"
                     reason = "comfort_schedule"
             else:
-                if not flat_price and price <= p_eco:
+                if (
+                    predicted_indoor is not None
+                    and comfort_temp_min is not None
+                    and predicted_indoor >= comfort_temp_min + self.COMFORT_SATISFIED_MARGIN_C
+                ):
+                    # Cheap electricity is not a reason to restore Normal
+                    # mode when the lower setback target is already covered
+                    # by stored heat.
+                    target_mode = "eco"
+                    reason = (
+                        "setback_satisfied_forecast_"
+                        f"{predicted_indoor:.1f}_target_{comfort_temp_min:.1f}"
+                    )
+                elif not flat_price and price <= p_eco:
                     target_mode = "normal"
                     reason = f"eco_hour_but_cheap_price_{price:.4f}"
                 else:
                     target_mode = "eco"
                     reason = "outside_comfort_schedule"
+
+            if (
+                heat_curve is not None
+                and outdoor_temp is not None
+                and outdoor_temp >= heat_curve.heating_off_outdoor_c
+                and target_mode in {"normal", "comfort"}
+            ):
+                # Normal/Comfort only changes the heating curve. Above the
+                # controller's own Värme AV threshold it cannot request room
+                # heat, so exposing it as a comfort action is misleading.
+                continue
 
             if target_mode == current_mode:
                 continue

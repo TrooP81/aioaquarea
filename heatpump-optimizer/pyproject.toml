@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heatpump-optimizer"
-version = "0.3.0"
+version = "0.12.0"
 description = "Cost-optimizing controller for Panasonic Aquarea heat pumps"
 requires-python = ">=3.11"
 dependencies = [
-    "aioaquarea @ git+https://github.com/cjaliaga/aioaquarea.git@main",
-    "aiohttp>=3.9,<4",
+    "aioaquarea @ git+https://github.com/cjaliaga/aioaquarea.git@a396bf053c2e840a33e985e32d076c3f9df2e3d3",
+    "aiohttp>=3.14.3,<4",
     "sqlalchemy[asyncio]>=2.0,<3",
     "asyncpg>=0.29",
     "alembic>=1.13",
@@ -44,7 +44,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
-    "ruff>=0.3",
+    "ruff==0.15.21",
     "httpx>=0.27",
 ]
 

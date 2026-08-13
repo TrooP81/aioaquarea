@@ -90,9 +90,9 @@ class DeviceImpl(Device):
         self._last_consumption_refresh: dt.datetime | None = None
         self._consumption_refresh_lock = asyncio.Lock()
         self._consumption_refresh_interval = consumption_refresh_interval
-        self._consumption: dict[
-            dt.date, Consumption
-        ] = {}  # Initialize _consumption with dt.date as key and single Consumption object for the day
+        self._consumption: dict[dt.date, Consumption] = (
+            {}
+        )  # Initialize _consumption with dt.date as key and single Consumption object for the day
 
         if self.has_tank and self._status.tank_status:
             self._tank = TankImpl(self._status.tank_status[0], self, self._client)

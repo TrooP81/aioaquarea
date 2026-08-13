@@ -113,9 +113,7 @@ class SmartThingsClient:
 
         return {"value": celsius, "timestamp": timestamp}
 
-    async def get_temperatures_batch(
-        self, device_ids: list[str]
-    ) -> list[dict[str, Any]]:
+    async def get_temperatures_batch(self, device_ids: list[str]) -> list[dict[str, Any]]:
         """Poll multiple devices, returning successful readings only."""
         results: list[dict[str, Any]] = []
         for did in device_ids:
@@ -193,15 +191,21 @@ async def poll_smartthings_temps(session) -> int:
 
     client = SmartThingsClient(access_token)
 
-    # Resolve which devices to poll
-    device_ids = await get_selected_device_ids()
-    if device_ids:
-        device_labels: dict[str, str] = {}
-    else:
-        # Auto-discover (cached for 1 hour)
+    # Keep labels and room identifiers with readings even when the user has
+    # explicitly selected a subset.  Discovery is cached for an hour, so this
+    # does not add a request to normal polling.
+    selected_ids = await get_selected_device_ids()
+    try:
         devices = await _get_cached_devices(client)
-        device_ids = [d["device_id"] for d in devices]
-        device_labels = {d["device_id"]: d["label"] for d in devices}
+    except SmartThingsError as exc:
+        # A configured sensor set remains pollable if discovery is temporarily
+        # unavailable; room labels will be filled again on the next refresh.
+        if not selected_ids:
+            raise
+        logger.warning("smartthings_discovery_metadata_unavailable", error=str(exc))
+        devices = []
+    device_meta = {device["device_id"]: device for device in devices}
+    device_ids = selected_ids or list(device_meta)
 
     if not device_ids:
         return 0
@@ -217,9 +221,7 @@ async def poll_smartthings_temps(session) -> int:
         # Parse the device-reported timestamp and check staleness
         if r.get("timestamp"):
             try:
-                device_ts = dt.datetime.fromisoformat(
-                    r["timestamp"].replace("+0000", "+00:00")
-                )
+                device_ts = dt.datetime.fromisoformat(r["timestamp"].replace("+0000", "+00:00"))
                 if (now - device_ts) > STALE_READING_THRESHOLD:
                     logger.warning(
                         "smartthings_stale_reading",
@@ -234,7 +236,8 @@ async def poll_smartthings_temps(session) -> int:
             IndoorTempReading(
                 timestamp=now,
                 device_id=r["device_id"],
-                device_label=device_labels.get(r["device_id"]),
+                device_label=(device_meta.get(r["device_id"], {}).get("label") or None),
+                room=(device_meta.get(r["device_id"], {}).get("room_id") or None),
                 temperature=r["value"],
                 device_timestamp=device_ts,
                 is_stale=is_stale,
@@ -280,7 +283,7 @@ async def _request_with_retry(
             resp = await client.get(url, params=params)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as exc:
             last_exc = exc
-            wait = BASE_BACKOFF_SECONDS * (2 ** attempt)
+            wait = BASE_BACKOFF_SECONDS * (2**attempt)
             logger.warning(
                 "smartthings_network_error_retrying",
                 attempt=attempt + 1,
@@ -292,7 +295,7 @@ async def _request_with_retry(
 
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2 ** attempt)
+            wait = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2**attempt)
             if attempt < MAX_RETRIES - 1:
                 logger.warning(
                     "smartthings_rate_limited_retrying",
@@ -316,9 +319,7 @@ def _check_response(resp: httpx.Response) -> None:
     if resp.status_code == 401:
         raise SmartThingsAuthError("Invalid or expired SmartThings access token")
     if resp.status_code == 403:
-        raise SmartThingsAuthError(
-            "SmartThings token missing required scopes (need r:devices:*)"
-        )
+        raise SmartThingsAuthError("SmartThings token missing required scopes (need r:devices:*)")
     if resp.status_code == 429:
         raise SmartThingsRateLimited("SmartThings rate limit exceeded")
     resp.raise_for_status()

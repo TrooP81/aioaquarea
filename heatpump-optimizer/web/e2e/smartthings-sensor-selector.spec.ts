@@ -72,7 +72,7 @@ test.describe("SmartThings sensor selector", () => {
     await page.goto("/settings");
     await page.getByRole("tab", { name: "Integrations" }).click();
     await page.locator("label", { hasText: "Bedroom Sensor" }).locator("input[type=checkbox]").check();
-    await page.getByRole("button", { name: "Save Settings" }).click();
+    await page.getByRole("button", { name: /^Save \d+ changes?$/ }).click();
 
     await expect.poll(() => savedDeviceIds).toBe("dev-bedroom");
   });

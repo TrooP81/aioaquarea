@@ -11,7 +11,6 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
-  ReferenceLine,
 } from "recharts";
 import { useTimeFormat } from "./useTimeFormat";
 

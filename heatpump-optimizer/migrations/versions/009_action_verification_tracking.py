@@ -18,7 +18,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.add_column("plan_actions", sa.Column("expected_state_json", sa.Text(), nullable=True))
-    op.add_column("plan_actions", sa.Column("verify_attempts", sa.Integer(), nullable=False, server_default="0"))
+    op.add_column(
+        "plan_actions",
+        sa.Column("verify_attempts", sa.Integer(), nullable=False, server_default="0"),
+    )
     op.add_column("plan_actions", sa.Column("last_observed_json", sa.Text(), nullable=True))
 
 

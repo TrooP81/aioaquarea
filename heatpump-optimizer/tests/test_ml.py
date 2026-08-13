@@ -42,6 +42,17 @@ def _mock_get_session(results):
     return factory
 
 
+def _optimizer_session_mock():
+    """Return a DB-session mock with SQLAlchemy's sync/async boundary intact."""
+
+    active_plans = MagicMock()
+    active_plans.scalars.return_value.all.return_value = []
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=active_plans)
+    session.add = MagicMock()
+    return session
+
+
 class TestCOPModel:
     def test_untrained_uses_fallback(self):
         """Untrained model should use default COP curve."""
@@ -83,9 +94,13 @@ class TestCOPModel:
         """Feature vector should have correct shape."""
         from packages.ml.models import COPModel
 
-        features = COPModel._make_features(5.0, 50, 12, precipitation=1.5)
-        assert features.shape == (5,)
+        features = COPModel._make_features(
+            5.0, 50, 12, precipitation=1.5, humidity=82.0, cloud_cover=0.75
+        )
+        assert features.shape == (7,)
         assert features[4] == 1.5
+        assert features[5] == 82.0
+        assert features[6] == 0.75
 
     def test_load_latest_no_models(self, tmp_path):
         """load_latest returns False when no model files exist."""
@@ -98,6 +113,7 @@ class TestCOPModel:
     def test_train_and_predict_with_synthetic_data(self, tmp_path):
         """Train COP model on synthetic COP data and verify predictions."""
         from packages.ml.models import COPModel, HAS_SKLEARN
+
         if not HAS_SKLEARN:
             pytest.skip("scikit-learn not installed")
 
@@ -115,23 +131,32 @@ class TestCOPModel:
         tank_targets = rng.uniform(45, 55, n).astype(int)
         hours = rng.randint(0, 24, n)
 
-        X = np.column_stack([
-            outdoor_temps,
-            tank_targets,
-            np.sin(2 * np.pi * hours / 24),
-            np.cos(2 * np.pi * hours / 24),
-            rng.uniform(0, 5, n),
-        ])
+        X = np.column_stack(
+            [
+                outdoor_temps,
+                tank_targets,
+                np.sin(2 * np.pi * hours / 24),
+                np.cos(2 * np.pi * hours / 24),
+                rng.uniform(0, 5, n),
+                rng.uniform(30, 95, n),
+                rng.uniform(0, 1, n),
+            ]
+        )
         # Higher outdoor → higher COP (physically correct)
         y = 3.0 + 0.08 * outdoor_temps - 0.02 * tank_targets + rng.normal(0, 0.15, n)
         y = np.clip(y, 1.5, 6.0)
 
-        pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", GradientBoostingRegressor(
-                n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
-            )),
-        ])
+        pipeline = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
+                    ),
+                ),
+            ]
+        )
         pipeline.fit(X, y)
         model._model = pipeline
         model._version = "test"
@@ -152,12 +177,15 @@ class TestCOPModel:
         assert 0.1 < pred < 5.0
 
         # Save and reload
-        with patch("packages.ml.models.MODEL_DIR", tmp_path), \
-             patch("packages.ml.safe_persistence.settings") as mock_settings:
+        with (
+            patch("packages.ml.models.MODEL_DIR", tmp_path),
+            patch("packages.ml.safe_persistence.settings") as mock_settings,
+        ):
             mock_settings.model_dir = str(tmp_path)
             mock_settings.secret_key = "test-secret-key"
             from packages.ml.safe_persistence import safe_dump
-            model_path = tmp_path / "cop_model_dhw_v2_test.pkl"
+
+            model_path = tmp_path / "cop_model_weather_dhw_v4_test.pkl"
             safe_dump(pipeline, model_path)
 
             model2 = COPModel()
@@ -175,7 +203,9 @@ class TestDemandModel:
         model = DemandModel()
         assert not model.is_trained
 
-        weather = [{"temperature": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "precipitation": 1.0}] * 24
+        weather = [
+            {"temperature": 5.0, "wind_speed": 3.0, "irradiance": 0.0, "precipitation": 1.0}
+        ] * 24
         predictions = model.predict_hourly(weather, hours=24)
 
         assert len(predictions) == 24
@@ -196,15 +226,19 @@ class TestDemandModel:
         assert sum(cold_demand) > sum(warm_demand)
 
     def test_make_features_shape_and_order(self):
-        """Shared feature builder must return the fixed 8-feature schema."""
+        """Shared feature builder must return the fixed 10-feature schema."""
         from packages.ml.models import DemandModel
 
-        features = DemandModel._make_features(5.0, 3.0, 100.0, 12, 2, precipitation=1.5)
-        assert features.shape == (8,)
+        features = DemandModel._make_features(
+            5.0, 3.0, 100.0, 12, 2, precipitation=1.5, humidity=82.0, cloud_cover=0.75
+        )
+        assert features.shape == (10,)
         assert features[0] == 5.0  # temperature
         assert features[1] == 3.0  # wind
         assert features[2] == 100.0  # irradiance
         assert features[3] == 1.5  # precipitation
+        assert features[4] == 82.0  # humidity
+        assert features[5] == 0.75  # cloud cover
 
     @pytest.mark.asyncio
     async def test_prepare_data_uses_interval_rate_not_cumulative(self):
@@ -214,10 +248,26 @@ class TestDemandModel:
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
             SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.5, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.5,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=1.5,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
         ]
-        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0, precipitation=2.5)]
+        weather = [
+            SimpleNamespace(
+                ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0, precipitation=2.5
+            )
+        ]
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
@@ -229,21 +279,53 @@ class TestDemandModel:
         assert sorted(round(float(v), 6) for v in y) == [2.0, 4.0]
         # The cumulative reading (1.5) must NOT leak through as a target.
         assert max(y) == pytest.approx(4.0)
-        # Consumption's own outdoor_temp is preferred when present.
-        assert X[0][0] == 2.0
+        # Reported weather is canonical because the physical pump sensor may
+        # be sun-heated by its installation.
+        assert X[0][0] == 1.0
         assert X[0][3] == 2.5
+        assert model.last_data_quality == {
+            "raw_records": 3,
+            "intervals": 2,
+            "usable_samples": 2,
+            "minimum_samples": 168,
+            "rejected_nonpositive": 0,
+            "rejected_rate_bounds": 0,
+            "weather_records": 1,
+            "weather_matches": 2,
+            "weather_temperature_fallbacks": 0,
+            "max_rate_kw": model._max_plausible_rate_kw(),
+            "ready_to_train": False,
+            "remaining_samples": 166,
+            "heating_activity_ratio": 1.0,
+            "training_blocker": "collecting_space_heating_intervals",
+            "seasonal_guidance": "Collecting additional valid space-heating intervals before training.",
+        }
 
     @pytest.mark.asyncio
-    async def test_prepare_data_falls_back_to_weather_temp(self):
-        """When consumption lacks outdoor_temp, use nearest weather temperature."""
+    async def test_prepare_data_uses_weather_temp_when_consumption_temp_is_missing(self):
+        """The nearest reported temperature remains canonical when the old row has no temperature."""
         from packages.ml.models import DemandModel
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
             SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.25, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.25,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=None,
+            ),
         ]
-        weather = [SimpleNamespace(ts=base + dt.timedelta(minutes=20), temperature=-3.0, wind_speed=5.0, irradiance=0.0, precipitation=1.0)]
+        weather = [
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=20),
+                temperature=-3.0,
+                wind_speed=5.0,
+                irradiance=0.0,
+                precipitation=1.0,
+            )
+        ]
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
@@ -254,6 +336,42 @@ class TestDemandModel:
         assert X[0][0] == -3.0  # weather temperature filled in
         assert X[0][1] == 5.0  # weather wind
         assert X[0][3] == 1.0  # weather precipitation
+        assert model.last_data_quality["weather_temperature_fallbacks"] == 0
+
+    @pytest.mark.asyncio
+    async def test_prepare_data_counts_fallback_when_weather_has_no_temperature(self):
+        """Only a missing weather temperature may fall back to the stored pump value."""
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=4.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.25,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=4.0,
+            ),
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=base,
+                temperature=None,
+                wind_speed=5.0,
+                irradiance=0.0,
+                precipitation=1.0,
+            )
+        ]
+        results = [_FakeResult(consumption), _FakeResult(weather)]
+
+        model = DemandModel()
+        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+            X, y = await model._prepare_data()
+
+        assert len(y) == 1
+        assert X[0][0] == 4.0
+        assert model.last_data_quality["weather_temperature_fallbacks"] == 1
 
 
 class TestConsumptionIntervals:
@@ -263,7 +381,13 @@ class TestConsumptionIntervals:
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         rows = [
             SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.5, outdoor_temp=3.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=1.4, cool_kwh=0.0, tank_kwh=0.6, outdoor_temp=3.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=1.4,
+                cool_kwh=0.0,
+                tank_kwh=0.6,
+                outdoor_temp=3.0,
+            ),
         ]
         intervals = list(iter_consumption_intervals(rows))
         assert len(intervals) == 1
@@ -278,8 +402,20 @@ class TestConsumptionIntervals:
         from packages.ml.models_common import iter_consumption_intervals
 
         rows = [
-            SimpleNamespace(ts=dt.datetime(2026, 1, 5, 23, 55, tzinfo=dt.timezone.utc), heat_kwh=10.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
-            SimpleNamespace(ts=dt.datetime(2026, 1, 6, 0, 10, tzinfo=dt.timezone.utc), heat_kwh=0.3, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(
+                ts=dt.datetime(2026, 1, 5, 23, 55, tzinfo=dt.timezone.utc),
+                heat_kwh=10.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=3.0,
+            ),
+            SimpleNamespace(
+                ts=dt.datetime(2026, 1, 6, 0, 10, tzinfo=dt.timezone.utc),
+                heat_kwh=0.3,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=3.0,
+            ),
         ]
         assert list(iter_consumption_intervals(rows)) == []
 
@@ -289,7 +425,13 @@ class TestConsumptionIntervals:
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         rows = [
             SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
-            SimpleNamespace(ts=base + dt.timedelta(hours=3), heat_kwh=2.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(hours=3),
+                heat_kwh=2.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=3.0,
+            ),
         ]
         assert list(iter_consumption_intervals(rows)) == []
 
@@ -299,7 +441,13 @@ class TestConsumptionIntervals:
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         rows = [
             SimpleNamespace(ts=base, heat_kwh=2.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.5, cool_kwh=0.0, tank_kwh=1.0, outdoor_temp=3.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=1.5,
+                cool_kwh=0.0,
+                tank_kwh=1.0,
+                outdoor_temp=3.0,
+            ),
         ]
         intervals = list(iter_consumption_intervals(rows))
         assert len(intervals) == 1
@@ -346,9 +494,7 @@ class TestThermalModel:
         from packages.ml.thermal import ThermalModel
 
         model = ThermalModel()
-        pred = model.predict_tank_cooling_time(
-            current_temp=52.0, min_temp=45.0, outdoor_temp=5.0
-        )
+        pred = model.predict_tank_cooling_time(current_temp=52.0, min_temp=45.0, outdoor_temp=5.0)
 
         assert pred.estimated_minutes > 0
 
@@ -416,13 +562,17 @@ class TestMonotonicCOPModel:
         outdoor = rng.uniform(-10, 20, n)
         tank = rng.uniform(45, 55, n)
         hours = rng.randint(0, 24, n)
-        X = np.column_stack([
-            outdoor,
-            tank,
-            np.sin(2 * np.pi * hours / 24),
-            np.cos(2 * np.pi * hours / 24),
-            rng.uniform(0, 5, n),
-        ])
+        X = np.column_stack(
+            [
+                outdoor,
+                tank,
+                np.sin(2 * np.pi * hours / 24),
+                np.cos(2 * np.pi * hours / 24),
+                rng.uniform(0, 5, n),
+                rng.uniform(30, 95, n),
+                rng.uniform(0, 1, n),
+            ]
+        )
         # Physically wrong: colder outside -> higher COP.
         y = np.clip(3.0 - 0.05 * outdoor + rng.normal(0, 0.1, n), 1.5, 6.0)
 
@@ -454,18 +604,24 @@ class TestMonotonicDemandModel:
         wind = rng.uniform(0, 10, n)
         irradiance = rng.uniform(0, 500, n)
         precipitation = rng.uniform(0, 5, n)
+        humidity = rng.uniform(30, 95, n)
+        cloud_cover = rng.uniform(0, 1, n)
         hours = rng.randint(0, 24, n)
         dow = rng.randint(0, 7, n)
-        X = np.column_stack([
-            outdoor,
-            wind,
-            irradiance,
-            precipitation,
-            np.sin(2 * np.pi * hours / 24),
-            np.cos(2 * np.pi * hours / 24),
-            np.sin(2 * np.pi * dow / 7),
-            np.cos(2 * np.pi * dow / 7),
-        ])
+        X = np.column_stack(
+            [
+                outdoor,
+                wind,
+                irradiance,
+                precipitation,
+                humidity,
+                cloud_cover,
+                np.sin(2 * np.pi * hours / 24),
+                np.cos(2 * np.pi * hours / 24),
+                np.sin(2 * np.pi * dow / 7),
+                np.cos(2 * np.pi * dow / 7),
+            ]
+        )
         # Physically wrong: warmer outside -> higher demand.
         y = np.clip(1.0 + 0.1 * outdoor + rng.normal(0, 0.1, n), 0.1, None)
 
@@ -571,12 +727,20 @@ class TestOrchestratorFallback:
 
         try:
             # Mock insufficient data
-            with patch("packages.optimizer.main._has_sufficient_ml_data", new_callable=AsyncMock, return_value=False):
+            with patch(
+                "packages.optimizer.main._has_sufficient_ml_data",
+                new_callable=AsyncMock,
+                return_value=False,
+            ):
                 layer_name, optimizer = await _select_optimizer("auto")
                 assert layer_name == "rules"
 
             # Mock sufficient data
-            with patch("packages.optimizer.main._has_sufficient_ml_data", new_callable=AsyncMock, return_value=True):
+            with patch(
+                "packages.optimizer.main._has_sufficient_ml_data",
+                new_callable=AsyncMock,
+                return_value=True,
+            ):
                 layer_name, optimizer = await _select_optimizer("auto")
                 assert layer_name == "milp"
         finally:
@@ -623,7 +787,9 @@ class TestOrchestratorFallback:
         """End-to-end: rules_only setting should produce a rules plan."""
         from packages.optimizer.main import run_optimization
 
-        with patch("packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="rules_only"):
+        with patch(
+            "packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="rules_only"
+        ):
             with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
                 mock_plan = {
                     "horizon_start": dt.datetime.now(dt.timezone.utc),
@@ -634,14 +800,64 @@ class TestOrchestratorFallback:
                 }
                 MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                with patch("packages.optimizer.main.get_session") as mock_session_ctx:
-                    mock_session = AsyncMock()
+                with (
+                    patch(
+                        "packages.optimizer.main.get_active_price_context",
+                        new_callable=AsyncMock,
+                        return_value=SimpleNamespace(area="test", currency="EUR", source="test"),
+                    ),
+                    patch(
+                        "packages.optimizer.main._has_material_near_term_change",
+                        new_callable=AsyncMock,
+                        return_value=(True, None),
+                    ),
+                    patch("packages.optimizer.main.get_session") as mock_session_ctx,
+                ):
+                    mock_session = _optimizer_session_mock()
                     mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
                     mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
                     await run_optimization()
 
                 MockRules.return_value.generate_plan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_replace_bypasses_plan_stability_check(self):
+        """Explicit manual replans must be allowed to replace later actions."""
+        from packages.optimizer.main import run_optimization
+
+        mock_plan = {
+            "horizon_start": dt.datetime.now(dt.timezone.utc),
+            "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
+            "actions": [],
+            "version": "rules_v3",
+            "cost_estimate": 0.0,
+        }
+        with patch(
+            "packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="rules_only"
+        ):
+            with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
+                MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
+                with (
+                    patch(
+                        "packages.optimizer.main.get_active_price_context",
+                        new_callable=AsyncMock,
+                        return_value=SimpleNamespace(area="test", currency="EUR", source="test"),
+                    ),
+                    patch(
+                        "packages.optimizer.main._has_material_near_term_change",
+                        new_callable=AsyncMock,
+                        side_effect=AssertionError("manual replan must bypass stability"),
+                    ),
+                    patch("packages.optimizer.main.get_session") as mock_session_ctx,
+                ):
+                    mock_session = _optimizer_session_mock()
+                    mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+                    mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                    await run_optimization(force_replace=True)
+
+        MockRules.return_value.generate_plan.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_milp_failure_falls_back_to_rules(self):
@@ -657,8 +873,14 @@ class TestOrchestratorFallback:
             "cost_estimate": 0.0,
         }
 
-        with patch("packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="milp_preferred"):
-            with patch("packages.optimizer.main._select_optimizer", new_callable=AsyncMock) as mock_select:
+        with patch(
+            "packages.optimizer.main.get_setting",
+            new_callable=AsyncMock,
+            return_value="milp_preferred",
+        ):
+            with patch(
+                "packages.optimizer.main._select_optimizer", new_callable=AsyncMock
+            ) as mock_select:
                 mock_milp = AsyncMock()
                 mock_milp.generate_plan = AsyncMock(side_effect=DataIncompleteError("no prices"))
                 mock_select.return_value = ("milp", mock_milp)
@@ -666,9 +888,36 @@ class TestOrchestratorFallback:
                 with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
                     MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                    with patch("packages.optimizer.main.get_session") as mock_session_ctx:
-                        mock_session = AsyncMock()
-                        mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+                    with (
+                        patch(
+                            "packages.optimizer.main.get_planning_data_quality",
+                            new_callable=AsyncMock,
+                            return_value={
+                                "control_allowed": True,
+                                "status": "healthy",
+                                "reasons": [],
+                                "price": {},
+                                "weather": {},
+                            },
+                        ),
+                        patch(
+                            "packages.optimizer.main.get_active_price_context",
+                            new_callable=AsyncMock,
+                            return_value=SimpleNamespace(
+                                area="test", currency="EUR", source="test"
+                            ),
+                        ),
+                        patch(
+                            "packages.optimizer.main._has_material_near_term_change",
+                            new_callable=AsyncMock,
+                            return_value=(True, None),
+                        ),
+                        patch("packages.optimizer.main.get_session") as mock_session_ctx,
+                    ):
+                        mock_session = _optimizer_session_mock()
+                        mock_session_ctx.return_value.__aenter__ = AsyncMock(
+                            return_value=mock_session
+                        )
                         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
                         await run_optimization()
@@ -721,7 +970,7 @@ class TestDirectionAwareCOP:
         record_curr = MagicMock()
         record_curr.ts = base + dt.timedelta(hours=1)
         record_curr.device_action = "HEATING_WATER"
-        record_curr.tank_temp = 50.0   # +5°C in tank
+        record_curr.tank_temp = 50.0  # +5°C in tank
         record_curr.zone1_temp = 30.0  # zone unchanged
         record_curr.outdoor_temp = 5.0
         record_curr.defrost_active = False
@@ -792,7 +1041,13 @@ class TestDemandHeatingOnlyTarget:
         # Only tank (DHW) energy accrues — no space heating. Must be excluded.
         consumption = [
             SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.0, cool_kwh=0.0, tank_kwh=1.0, outdoor_temp=2.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.0,
+                cool_kwh=0.0,
+                tank_kwh=1.0,
+                outdoor_temp=2.0,
+            ),
         ]
         weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
         results = [_FakeResult(consumption), _FakeResult(weather)]
@@ -812,7 +1067,13 @@ class TestDemandHeatingOnlyTarget:
         # heating rate (0.5/0.25 = 2.0 kW), NOT the combined 10 kW.
         consumption = [
             SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=15), heat_kwh=0.5, cool_kwh=0.0, tank_kwh=2.0, outdoor_temp=2.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.5,
+                cool_kwh=0.0,
+                tank_kwh=2.0,
+                outdoor_temp=2.0,
+            ),
         ]
         weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
         results = [_FakeResult(consumption), _FakeResult(weather)]
@@ -845,16 +1106,20 @@ class TestDemandQuantiles:
         rng = np.random.RandomState(1)
         n = 400
         outdoor = rng.uniform(-10, 20, n)
-        X = np.column_stack([
-            outdoor,
-            rng.uniform(0, 10, n),
-            rng.uniform(0, 500, n),
-            rng.uniform(0, 5, n),
-            np.sin(2 * np.pi * rng.randint(0, 24, n) / 24),
-            np.cos(2 * np.pi * rng.randint(0, 24, n) / 24),
-            np.sin(2 * np.pi * rng.randint(0, 7, n) / 7),
-            np.cos(2 * np.pi * rng.randint(0, 7, n) / 7),
-        ])
+        X = np.column_stack(
+            [
+                outdoor,
+                rng.uniform(0, 10, n),
+                rng.uniform(0, 500, n),
+                rng.uniform(0, 5, n),
+                rng.uniform(30, 95, n),
+                rng.uniform(0, 1, n),
+                np.sin(2 * np.pi * rng.randint(0, 24, n) / 24),
+                np.cos(2 * np.pi * rng.randint(0, 24, n) / 24),
+                np.sin(2 * np.pi * rng.randint(0, 7, n) / 7),
+                np.cos(2 * np.pi * rng.randint(0, 7, n) / 7),
+            ]
+        )
         y = np.clip(3.0 - 0.1 * outdoor + rng.normal(0, 0.5, n), 0.1, None)
 
         model = DemandModel()
@@ -863,9 +1128,11 @@ class TestDemandQuantiles:
             return X, y
 
         model._prepare_data = fake_prep
-        with patch("packages.ml.models.MODEL_DIR", tmp_path), \
-             patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path), \
-             patch("packages.ml.safe_persistence.safe_dump"):
+        with (
+            patch("packages.ml.models.MODEL_DIR", tmp_path),
+            patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path),
+            patch("packages.ml.safe_persistence.safe_dump"),
+        ):
             result = await model.train()
 
         assert "version" in result
@@ -884,9 +1151,15 @@ class TestCOPExcludesFallback:
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
             SimpleNamespace(ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=5.0),
-            SimpleNamespace(ts=base + dt.timedelta(minutes=30), heat_kwh=1.0, tank_kwh=0.0, outdoor_temp=5.0),
+            SimpleNamespace(
+                ts=base + dt.timedelta(minutes=30), heat_kwh=1.0, tank_kwh=0.0, outdoor_temp=5.0
+            ),
         ]
-        results = [_FakeResult(consumption), _FakeResult([]), _FakeResult([])]  # no status/weather rows
+        results = [
+            _FakeResult(consumption),
+            _FakeResult([]),
+            _FakeResult([]),
+        ]  # no status/weather rows
 
         model = COPModel()
         with patch("packages.ml.cop_model_core.get_session", _mock_get_session(results)):
@@ -986,16 +1259,35 @@ class TestDirectionAwareCOPConfidence:
 
         base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
         prev = SimpleNamespace(
-            ts=base, device_action="HEATING_WATER", tank_temp=45.0, zone1_temp=30.0,
-            outdoor_temp=5.0, defrost_active=False, device_id="d1",
+            ts=base,
+            device_action="HEATING_WATER",
+            tank_temp=45.0,
+            zone1_temp=30.0,
+            outdoor_temp=5.0,
+            defrost_active=False,
+            device_id="d1",
         )
         curr = SimpleNamespace(
-            ts=base + dt.timedelta(hours=1), device_action="HEATING_WATER", tank_temp=50.0,
-            zone1_temp=30.0, outdoor_temp=5.0, defrost_active=False, device_id="d1",
+            ts=base + dt.timedelta(hours=1),
+            device_action="HEATING_WATER",
+            tank_temp=50.0,
+            zone1_temp=30.0,
+            outdoor_temp=5.0,
+            defrost_active=False,
+            device_id="d1",
         )
-        consumption = [SimpleNamespace(ts=base + dt.timedelta(hours=1), tank_kwh=2.0, heat_kwh=0.0, cool_kwh=0.0)]
+        consumption = [
+            SimpleNamespace(
+                ts=base + dt.timedelta(hours=1), tank_kwh=2.0, heat_kwh=0.0, cool_kwh=0.0
+            )
+        ]
         # reads: status, consumption; then a persist session (padded dummies)
-        results = [_ScalarResult([prev, curr]), _ScalarResult(consumption), _FakeResult([]), _FakeResult([])]
+        results = [
+            _ScalarResult([prev, curr]),
+            _ScalarResult(consumption),
+            _FakeResult([]),
+            _FakeResult([]),
+        ]
 
         dac = DirectionAwareCOP()
         with patch("packages.ml.models.get_session", _mock_get_session(results)):
@@ -1011,15 +1303,34 @@ class TestDirectionAwareCOPConfidence:
 
         base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
         prev = SimpleNamespace(
-            ts=base, device_action="HEATING", tank_temp=45.0, zone1_temp=30.0,
-            outdoor_temp=5.0, defrost_active=False, device_id="d1",
+            ts=base,
+            device_action="HEATING",
+            tank_temp=45.0,
+            zone1_temp=30.0,
+            outdoor_temp=5.0,
+            defrost_active=False,
+            device_id="d1",
         )
         curr = SimpleNamespace(
-            ts=base + dt.timedelta(hours=1), device_action="HEATING", tank_temp=45.0,
-            zone1_temp=34.0, outdoor_temp=5.0, defrost_active=False, device_id="d1",
+            ts=base + dt.timedelta(hours=1),
+            device_action="HEATING",
+            tank_temp=45.0,
+            zone1_temp=34.0,
+            outdoor_temp=5.0,
+            defrost_active=False,
+            device_id="d1",
         )
-        consumption = [SimpleNamespace(ts=base + dt.timedelta(hours=1), tank_kwh=0.0, heat_kwh=1.0, cool_kwh=0.0)]
-        results = [_ScalarResult([prev, curr]), _ScalarResult(consumption), _FakeResult([]), _FakeResult([])]
+        consumption = [
+            SimpleNamespace(
+                ts=base + dt.timedelta(hours=1), tank_kwh=0.0, heat_kwh=1.0, cool_kwh=0.0
+            )
+        ]
+        results = [
+            _ScalarResult([prev, curr]),
+            _ScalarResult(consumption),
+            _FakeResult([]),
+            _FakeResult([]),
+        ]
 
         dac = DirectionAwareCOP()
         with patch("packages.ml.models.get_session", _mock_get_session(results)):
@@ -1028,3 +1339,25 @@ class TestDirectionAwareCOPConfidence:
         assert len(intervals) == 1
         assert intervals[0]["mode"] == "HEATING"
         assert intervals[0]["confidence"] == "estimated"
+
+
+class TestModelCheckpointRetention:
+    def test_keeps_only_newest_matching_checkpoints(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        for index in range(7):
+            (tmp_path / f"cop_model_{index:02d}.pkl").write_bytes(b"model")
+        unrelated = tmp_path / "thermal_params_v1.pkl"
+        unrelated.write_bytes(b"thermal")
+
+        assert prune_old_models("cop_model_*.pkl", keep=5, model_dir=tmp_path) == 2
+        assert [path.name for path in sorted(tmp_path.glob("cop_model_*.pkl"))] == [
+            f"cop_model_{index:02d}.pkl" for index in range(2, 7)
+        ]
+        assert unrelated.exists()
+
+    def test_rejects_negative_retention(self, tmp_path):
+        from packages.ml.models_common import prune_old_models
+
+        with pytest.raises(ValueError, match="keep must be >= 0"):
+            prune_old_models("*.pkl", keep=-1, model_dir=tmp_path)

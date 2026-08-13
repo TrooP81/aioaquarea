@@ -15,7 +15,6 @@ from typing import Any
 
 import httpx
 import structlog
-from sqlalchemy import select
 
 from packages.core.database import get_session
 from packages.core.settings_service import get_setting
@@ -49,13 +48,15 @@ def build_authorize_url(
     (RFC 6749 §10.12).
     """
     state = secrets.token_urlsafe(32)
-    params = httpx.QueryParams({
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": scopes,
-        "state": state,
-    })
+    params = httpx.QueryParams(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": scopes,
+            "state": state,
+        }
+    )
     return f"{AUTHORIZE_URL}?{params}", state
 
 
@@ -221,9 +222,7 @@ async def get_valid_access_token() -> str | None:
         return None
 
     try:
-        new_tokens = await refresh_access_token(
-            tokens["refresh_token"], client_id, client_secret
-        )
+        new_tokens = await refresh_access_token(tokens["refresh_token"], client_id, client_secret)
         await save_tokens(new_tokens)
         logger.info("smartthings_oauth_token_refreshed")
         return new_tokens["access_token"]

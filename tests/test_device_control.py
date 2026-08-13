@@ -2,7 +2,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from aioaquarea.data import OperationStatus, PowerfulTime, QuietMode, UpdateOperationMode, ZoneTemperatureSetUpdate
+from aioaquarea.data import (
+    OperationStatus,
+    PowerfulTime,
+    QuietMode,
+    UpdateOperationMode,
+    ZoneTemperatureSetUpdate,
+)
 from aioaquarea.device_control import AquareaDeviceControl
 
 
@@ -28,7 +34,9 @@ async def test_post_device_tank_temperature_uses_transfer_payload(device_control
 
 
 @pytest.mark.asyncio
-async def test_post_device_operation_update_includes_zone_temperature_updates(device_control):
+async def test_post_device_operation_update_includes_zone_temperature_updates(
+    device_control,
+):
     await device_control.post_device_operation_update(
         long_id="device-1",
         mode=UpdateOperationMode.HEAT,
@@ -52,8 +60,16 @@ async def test_post_device_operation_update_includes_zone_temperature_updates(de
                 "operationMode": UpdateOperationMode.HEAT.value,
                 "operationStatus": OperationStatus.ON.value,
                 "zoneStatus": [
-                    {"zoneId": 1, "operationStatus": OperationStatus.ON.value, "heatSet": 35},
-                    {"zoneId": 2, "operationStatus": OperationStatus.OFF.value, "coolSet": 18},
+                    {
+                        "zoneId": 1,
+                        "operationStatus": OperationStatus.ON.value,
+                        "heatSet": 35,
+                    },
+                    {
+                        "zoneId": 2,
+                        "operationStatus": OperationStatus.OFF.value,
+                        "coolSet": 18,
+                    },
                 ],
                 "tankStatus": {"operationStatus": OperationStatus.OFF.value},
             },
@@ -80,7 +96,9 @@ async def test_post_device_set_quiet_mode_uses_transfer_payload(device_control):
 
 @pytest.mark.asyncio
 async def test_post_device_set_powerful_time_uses_transfer_payload(device_control):
-    await device_control.post_device_set_powerful_time("device-1", PowerfulTime.ON_60MIN)
+    await device_control.post_device_set_powerful_time(
+        "device-1", PowerfulTime.ON_60MIN
+    )
 
     device_control._api_client.request.assert_awaited_once_with(
         "POST",
@@ -88,7 +106,10 @@ async def test_post_device_set_powerful_time_uses_transfer_payload(device_contro
         json={
             "apiName": "/remote/v1/api/devices",
             "requestMethod": "POST",
-            "bodyParam": {"gwid": "device-1", "powerfulRequest": PowerfulTime.ON_60MIN.value},
+            "bodyParam": {
+                "gwid": "device-1",
+                "powerfulRequest": PowerfulTime.ON_60MIN.value,
+            },
         },
         throw_on_error=True,
     )

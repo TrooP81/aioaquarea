@@ -1,7 +1,6 @@
 """E2E tests: Comfort model and indoor temperature endpoints."""
 
 import datetime as dt
-import json
 
 import pytest
 import pytest_asyncio
@@ -53,9 +52,7 @@ class TestIndoorTemp:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_indoor_temp_returns_readings(
-        self, client: AsyncClient, seed_indoor_temps
-    ):
+    async def test_indoor_temp_returns_readings(self, client: AsyncClient, seed_indoor_temps):
         resp = await client.get("/api/indoor-temp?hours=1")
         assert resp.status_code == 200
         data = resp.json()
@@ -63,9 +60,7 @@ class TestIndoorTemp:
         assert all("temperature" in r for r in data)
         assert all("device_id" in r for r in data)
 
-    async def test_indoor_temp_filter_by_device(
-        self, client: AsyncClient, seed_indoor_temps
-    ):
+    async def test_indoor_temp_filter_by_device(self, client: AsyncClient, seed_indoor_temps):
         resp = await client.get("/api/indoor-temp?device_id=sensor-bedroom")
         assert resp.status_code == 200
         data = resp.json()
@@ -73,9 +68,7 @@ class TestIndoorTemp:
         assert data[0]["device_id"] == "sensor-bedroom"
         assert data[0]["temperature"] == 20.0
 
-    async def test_indoor_temp_latest(
-        self, client: AsyncClient, seed_indoor_temps
-    ):
+    async def test_indoor_temp_latest(self, client: AsyncClient, seed_indoor_temps):
         resp = await client.get("/api/indoor-temp/latest")
         assert resp.status_code == 200
         data = resp.json()
@@ -107,9 +100,7 @@ class TestComfortModel:
         assert data["last_trained"] is None
         assert data["training_samples"] == 0
 
-    async def test_comfort_model_predict_requires_training(
-        self, client: AsyncClient
-    ):
+    async def test_comfort_model_predict_requires_training(self, client: AsyncClient):
         resp = await client.get(
             "/api/comfort-model/predict",
             params={"water_temp": 35.0, "outdoor_temp": 5.0, "hour": 12},
@@ -117,9 +108,7 @@ class TestComfortModel:
         assert resp.status_code == 409
         assert "not yet trained" in resp.json()["detail"]
 
-    async def test_comfort_model_train_insufficient_data(
-        self, client: AsyncClient
-    ):
+    async def test_comfort_model_train_insufficient_data(self, client: AsyncClient):
         """Training with no status data should return insufficient_data."""
         resp = await client.post("/api/comfort-model/train")
         assert resp.status_code == 200

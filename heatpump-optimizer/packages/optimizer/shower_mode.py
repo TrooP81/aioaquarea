@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
+from packages.core.plan_lifecycle import activate_plan
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
@@ -42,9 +43,7 @@ class ShowerDetector:
             else:
                 await self._check_for_drop(session, record)
 
-    async def _get_active_event(
-        self, session: AsyncSession
-    ) -> ShowerEventRecord | None:
+    async def _get_active_event(self, session: AsyncSession) -> ShowerEventRecord | None:
         result = await session.execute(
             select(ShowerEventRecord)
             .where(ShowerEventRecord.status == "active")
@@ -53,9 +52,7 @@ class ShowerDetector:
         )
         return result.scalar_one_or_none()
 
-    async def _check_for_drop(
-        self, session: AsyncSession, current: DeviceStatusRecord
-    ) -> None:
+    async def _check_for_drop(self, session: AsyncSession, current: DeviceStatusRecord) -> None:
         """Detect a rapid tank temp drop between this poll and the previous one."""
         if current.tank_temp is None:
             return
@@ -123,8 +120,11 @@ class ShowerDetector:
             plan_json="[]",
             optimizer_version="shower_reactive",
         )
-        session.add(plan)
-        await session.flush()  # Get plan.id
+        await activate_plan(
+            session,
+            plan,
+            reason="shower_mode_reactive_override",
+        )
 
         action = PlanActionRecord(
             plan_id=plan.id,
@@ -207,16 +207,17 @@ class ShowerDetector:
             plan_json="[]",
             optimizer_version="shower_reactive",
         )
-        session.add(plan)
-        await session.flush()
+        await activate_plan(
+            session,
+            plan,
+            reason="shower_mode_reactive_override",
+        )
 
         action = PlanActionRecord(
             plan_id=plan.id,
             scheduled_ts=now,
             action_type=str(ActionType.FORCE_DHW_OFF),
-            payload_json=json.dumps(
-                {"trigger": "shower_mode", "reason": reason}
-            ),
+            payload_json=json.dumps({"trigger": "shower_mode", "reason": reason}),
             status="pending",
         )
         session.add(action)

@@ -1,13 +1,17 @@
 """E2E tests: Price provider integration (Tibber and ENTSO-E feeds)."""
 
-import datetime as dt
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 import respx
-from httpx import AsyncClient, Response
+from httpx import Response
 
-from packages.poller.feeds import fetch_prices, _fetch_prices_entsoe, _fetch_prices_tibber
+from packages.poller.feeds import (
+    fetch_price_feed,
+    fetch_prices,
+    _fetch_prices_entsoe,
+    _fetch_prices_tibber,
+)
 
 
 SAMPLE_ENTSOE_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -36,14 +40,38 @@ SAMPLE_TIBBER_RESPONSE = {
                     "currentSubscription": {
                         "priceInfo": {
                             "today": [
-                                {"total": 0.2850, "startsAt": "2026-04-30T00:00:00+02:00"},
-                                {"total": 0.2510, "startsAt": "2026-04-30T01:00:00+02:00"},
-                                {"total": 0.2340, "startsAt": "2026-04-30T02:00:00+02:00"},
-                                {"total": 0.2200, "startsAt": "2026-04-30T03:00:00+02:00"},
+                                {
+                                    "total": 0.2850,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-04-30T00:00:00+02:00",
+                                },
+                                {
+                                    "total": 0.2510,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-04-30T01:00:00+02:00",
+                                },
+                                {
+                                    "total": 0.2340,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-04-30T02:00:00+02:00",
+                                },
+                                {
+                                    "total": 0.2200,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-04-30T03:00:00+02:00",
+                                },
                             ],
                             "tomorrow": [
-                                {"total": 0.3100, "startsAt": "2026-05-01T00:00:00+02:00"},
-                                {"total": 0.2750, "startsAt": "2026-05-01T01:00:00+02:00"},
+                                {
+                                    "total": 0.3100,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-05-01T00:00:00+02:00",
+                                },
+                                {
+                                    "total": 0.2750,
+                                    "currency": "SEK",
+                                    "startsAt": "2026-05-01T01:00:00+02:00",
+                                },
                             ],
                         }
                     }
@@ -64,7 +92,11 @@ class TestEntsoeIntegration:
         )
 
         async def mock_get_setting(key):
-            return {"entsoe_api_token": "test-token", "entsoe_area": "10Y1001A1001A46L", "price_provider": "entsoe"}.get(key, "")
+            return {
+                "entsoe_api_token": "test-token",
+                "entsoe_area": "10Y1001A1001A46L",
+                "price_provider": "entsoe",
+            }.get(key, "")
 
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_entsoe()
@@ -78,8 +110,13 @@ class TestEntsoeIntegration:
     @respx.mock
     async def test_fetch_entsoe_empty_token(self):
         """No fetch when token is empty."""
+
         async def mock_get_setting(key):
-            return {"entsoe_api_token": "", "entsoe_area": "10Y1001A1001A46L", "price_provider": "entsoe"}.get(key, "")
+            return {
+                "entsoe_api_token": "",
+                "entsoe_area": "10Y1001A1001A46L",
+                "price_provider": "entsoe",
+            }.get(key, "")
 
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_entsoe()
@@ -97,7 +134,9 @@ class TestTibberIntegration:
         )
 
         async def mock_get_setting(key):
-            return {"tibber_api_token": "test-tibber-token", "price_provider": "tibber"}.get(key, "")
+            return {"tibber_api_token": "test-tibber-token", "price_provider": "tibber"}.get(
+                key, ""
+            )
 
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_tibber()
@@ -112,6 +151,7 @@ class TestTibberIntegration:
     @respx.mock
     async def test_fetch_tibber_empty_token(self):
         """No fetch when token is empty."""
+
         async def mock_get_setting(key):
             return {"tibber_api_token": "", "price_provider": "tibber"}.get(key, "")
 
@@ -219,7 +259,11 @@ class TestProviderRouting:
         )
 
         async def mock_get_setting(key):
-            return {"price_provider": "entsoe", "entsoe_api_token": "test-token", "entsoe_area": "10Y1001A1001A46L"}.get(key, "")
+            return {
+                "price_provider": "entsoe",
+                "entsoe_api_token": "test-token",
+                "entsoe_area": "10Y1001A1001A46L",
+            }.get(key, "")
 
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await fetch_prices()
@@ -240,3 +284,21 @@ class TestProviderRouting:
             prices = await fetch_prices()
 
         assert len(prices) == 6
+
+    @respx.mock
+    async def test_fetch_price_feed_retains_tibber_currency(self):
+        respx.post("https://api.tibber.com/v1-beta/gql").mock(
+            return_value=Response(200, json=SAMPLE_TIBBER_RESPONSE)
+        )
+
+        async def mock_get_setting(key):
+            return {"price_provider": "tibber", "tibber_api_token": "test-tibber-token"}.get(
+                key, ""
+            )
+
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+            feed = await fetch_price_feed()
+
+        assert feed.currency == "SEK"
+        assert feed.source == "tibber"
+        assert len(feed.prices) == 6

@@ -5,12 +5,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import tempfile
 from typing import AsyncGenerator
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # Override settings BEFORE importing app modules
 os.environ.setdefault(
@@ -26,11 +27,11 @@ os.environ.setdefault("AQUAREA_USERNAME", "test@test.com")
 os.environ.setdefault("AQUAREA_PASSWORD", "testpass")
 os.environ.setdefault("LATITUDE", "59.3293")
 os.environ.setdefault("LONGITUDE", "18.0686")
+os.environ.setdefault("MODEL_DIR", os.path.join(tempfile.gettempdir(), "heatpump-optimizer-models"))
 
 from packages.api.main import app  # noqa: E402
 from packages.core.database import engine  # noqa: E402
 from packages.core.models import (  # noqa: E402
-    AuditLogRecord,
     Base,
     ConsumptionRecord,
     DeviceStatusRecord,
@@ -38,7 +39,6 @@ from packages.core.models import (  # noqa: E402
     PlanActionRecord,
     PlanRecord,
     PriceRecord,
-    SettingRecord,
     WeatherRecord,
 )
 
@@ -51,6 +51,11 @@ async def setup_database():
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+        # CI applies migrations before the API E2E suite. Remove Alembic's
+        # marker together with the application tables so the same isolated
+        # test database can be reused without claiming that a missing schema
+        # is still at the previous head revision.
+        await conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
     await engine.dispose()
 
 
@@ -107,10 +112,30 @@ async def seed_prices(db_session: AsyncSession):
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
     prices = []
     hourly = [
-        0.05, 0.04, 0.03, 0.03, 0.04, 0.06,
-        0.08, 0.12, 0.15, 0.18, 0.20, 0.22,
-        0.20, 0.18, 0.15, 0.14, 0.16, 0.25,
-        0.30, 0.28, 0.20, 0.12, 0.08, 0.06,
+        0.05,
+        0.04,
+        0.03,
+        0.03,
+        0.04,
+        0.06,
+        0.08,
+        0.12,
+        0.15,
+        0.18,
+        0.20,
+        0.22,
+        0.20,
+        0.18,
+        0.15,
+        0.14,
+        0.16,
+        0.25,
+        0.30,
+        0.28,
+        0.20,
+        0.12,
+        0.08,
+        0.06,
     ]
     for h, price in enumerate(hourly):
         ts = now - dt.timedelta(hours=12) + dt.timedelta(hours=h)

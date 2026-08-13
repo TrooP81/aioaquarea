@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from packages.core.config import settings as env_settings
 from packages.core.database import get_session
+from packages.core.heat_curve import HeatCurveConfig
 from packages.core.models import SettingRecord
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ def _parse_bool(value: str) -> bool:
         return False
     raise ValueError(f"Invalid boolean value: {value}")
 
+
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     # --- Optimizer layer ---
@@ -73,6 +75,60 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "",
         "description": "ISO timestamp when learning mode was last enabled (internal)",
     },
+    "seasonal_calibration_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": (
+            "Opt-in, observe-only seasonal calibration. During detected cold weather, "
+            "plans are recorded but no heat-pump commands are sent so natural heating "
+            "data can improve the demand and indoor thermal models."
+        ),
+    },
+    "seasonal_calibration_max_outdoor_c": {
+        "type": "float",
+        "default": "12",
+        "description": "Activate seasonal observation only when recent average outdoor temperature is at or below this value (°C)",
+    },
+    "seasonal_calibration_window_days": {
+        "type": "int",
+        "default": "7",
+        "description": "Days of recent outdoor data used to decide whether heating season has started",
+    },
+    "seasonal_calibration_auto_train": {
+        "type": "bool",
+        "default": "true",
+        "description": "When seasonal evidence is sufficient, train demand and thermal models automatically (still observe-only)",
+    },
+    "seasonal_calibration_auto_exit": {
+        "type": "bool",
+        "default": "true",
+        "description": "End seasonal observe-only mode after demand and indoor-heating evidence have both trained successfully",
+    },
+    "outcome_experiments_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": "Enable optional manual heat-curve trials. Suggestions require your review and never send heat-pump commands.",
+    },
+    "outcome_experiment_max_curve_step_c": {
+        "type": "float",
+        "default": "0.5",
+        "description": "Largest heat-curve adjustment suggested for one manual trial (°C)",
+    },
+    "operational_alerts_enabled": {
+        "type": "bool",
+        "default": "true",
+        "description": "Show in-app alerts for stale data, failed plan actions, and degraded forecast or planning quality",
+    },
+    "operational_alert_webhook_url": {
+        "type": "secret",
+        "default": "",
+        "description": "Optional HTTPS webhook for operational alerts; leave empty for in-app alerts only",
+    },
+    "_operational_alert_delivery_state": {
+        "type": "json",
+        "default": "{}",
+        "description": "Internal webhook delivery throttle state",
+    },
     # --- Service modes ---
     "price_provider": {
         "type": "str",
@@ -86,6 +142,22 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "open-meteo",
         "description": "Weather data source",
         "options": ["open-meteo", "smhi", "manual"],
+    },
+    "outdoor_temperature_source": {
+        "type": "str",
+        "default": "weather",
+        "description": "Outdoor temperature used by planning and ML; weather uses the configured weather report and falls back to the heat-pump sensor only when needed",
+        "options": ["weather", "heat_pump"],
+    },
+    "outdoor_temperature_weather_offset_c": {
+        "type": "float",
+        "default": "0.0",
+        "description": "Optional local adjustment added to the reported weather temperature (°C)",
+    },
+    "outdoor_temperature_weather_max_age_minutes": {
+        "type": "int",
+        "default": "180",
+        "description": "Maximum age of a weather report before the system temporarily falls back to the heat-pump sensor (minutes)",
     },
     # --- API keys ---
     "entsoe_api_token": {
@@ -166,6 +238,42 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "comfort_temp_max",
         "description": "Comfort zone maximum (°C)",
     },
+    # --- Controller heat curve (recorded from Panasonic controller) ---
+    "heat_curve_outdoor_cold_c": {
+        "type": "float",
+        "default": "5",
+        "description": "Controller curve: outdoor cold point (°C); Värme PÅ: Vattentemp",
+    },
+    "heat_curve_supply_cold_c": {
+        "type": "float",
+        "default": "47",
+        "description": "Controller curve: supply water at cold outdoor point (°C)",
+    },
+    "heat_curve_outdoor_warm_c": {
+        "type": "float",
+        "default": "15",
+        "description": "Controller curve: outdoor warm point (°C); Värme PÅ: Vattentemp",
+    },
+    "heat_curve_supply_warm_c": {
+        "type": "float",
+        "default": "23",
+        "description": "Controller curve: supply water at warm outdoor point (°C)",
+    },
+    "heat_curve_heating_off_outdoor_c": {
+        "type": "float",
+        "default": "13",
+        "description": "Controller: Värme AV above this outdoor temperature (°C)",
+    },
+    "heat_curve_delta_t_c": {
+        "type": "float",
+        "default": "4",
+        "description": "Controller: Värme PÅ ΔT (°C); recorded hydraulic setting",
+    },
+    "_heat_curve_verification_state": {
+        "type": "json",
+        "default": "{}",
+        "description": "Internal evidence window for the latest heat-curve change",
+    },
     # --- Quiet mode ---
     "quiet_mode_start": {
         "type": "int",
@@ -204,7 +312,7 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     "currency": {
         "type": "str",
         "default": "EUR",
-        "description": "Display currency",
+        "description": "Preferred display currency (the price source currency is used when no FX conversion is configured)",
         "options": ["EUR", "GBP", "USD", "SEK", "NOK", "DKK", "CHF", "PLN", "CZK", "HUF"],
     },
     "time_format": {
@@ -217,7 +325,13 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     "manual_price_eur_per_kwh": {
         "type": "float",
         "default": "0.25",
-        "description": "Static electricity price per kWh when provider is 'manual'",
+        "description": "Static electricity price per kWh when provider is 'manual' (in manual price currency)",
+    },
+    "manual_price_currency": {
+        "type": "str",
+        "default": "EUR",
+        "description": "Currency of the manual electricity price",
+        "options": ["EUR", "SEK", "NOK", "DKK", "GBP", "USD", "CHF", "PLN", "CZK", "HUF"],
     },
     "manual_outdoor_temp": {
         "type": "float",
@@ -275,6 +389,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "str",
         "default": "",
         "description": "Indoor temperature sensors to poll (none selected = poll all discovered)",
+    },
+    "comfort_reference_sensor_id": {
+        "type": "str",
+        "default": "",
+        "description": "Optional reference room sensor for comfort control (empty = robust median of selected sensors)",
     },
     "smartthings_poll_interval": {
         "type": "int",
@@ -348,6 +467,54 @@ def get_setting_spec(key: str) -> SettingSpec:
         raise KeyError(f"Unknown setting: {key}") from exc
 
 
+# Marker used by the GET /api/settings response to mask secret values.
+SECRET_MASK_MARKER = "***"
+
+
+def is_masked_secret(spec: SettingSpec, value: str) -> bool:
+    """True when a secret value still carries the display mask.
+
+    The settings GET endpoint returns secrets masked (e.g. ``a***z``). If a
+    client echoes that masked value back on PUT we must NOT overwrite the real
+    secret with the mask. The frontend already guards this; this is the
+    matching server-side guard so a direct API client can't clobber a secret.
+    """
+    return spec.value_type == "secret" and SECRET_MASK_MARKER in value
+
+
+def validate_setting_value(key: str, value: str) -> None:
+    """Validate a raw string value against its setting's declared type/options.
+
+    Raises ``KeyError`` for an unknown key and ``ValueError`` for a value that
+    does not match the setting's options or type (so invalid input is rejected
+    at the API boundary instead of crashing later in the optimizer/poller).
+    """
+    spec = get_setting_spec(key)
+
+    if spec.options is not None:
+        if value not in spec.options:
+            raise ValueError(f"{key} must be one of {list(spec.options)} (got {value!r})")
+        return
+
+    if spec.value_type == "json":
+        try:
+            json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"{key} must be valid JSON ({exc})") from exc
+        return
+
+    # Empty string clears a value (falls back to env/default); allowed for the
+    # free-form types but never needs numeric/bool parsing.
+    if value == "":
+        return
+
+    if spec.value_type in {"int", "float", "bool"}:
+        try:
+            spec.parse(value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a valid {spec.value_type} ({exc})") from exc
+
+
 def _default_setting_value(spec: SettingSpec) -> str:
     if spec.default_env and hasattr(env_settings, spec.default_env):
         return str(getattr(env_settings, spec.default_env))
@@ -375,9 +542,7 @@ async def get_all_settings() -> dict[str, str]:
 async def get_setting(key: str) -> str:
     """Get a single setting value (DB first, then env fallback)."""
     async with get_session() as session:
-        row = await session.execute(
-            select(SettingRecord).where(SettingRecord.key == key)
-        )
+        row = await session.execute(select(SettingRecord).where(SettingRecord.key == key))
         record = row.scalar_one_or_none()
         if record is not None:
             return record.value
@@ -401,6 +566,26 @@ async def get_int_setting(key: str) -> int:
 
 async def get_float_setting(key: str) -> float:
     return float(await get_typed_setting(key))
+
+
+async def get_heat_curve_config() -> HeatCurveConfig:
+    """Load and validate the controller heat curve recorded in Settings."""
+    return HeatCurveConfig.from_settings(await get_all_settings())
+
+
+async def get_heat_curve_verification_state() -> dict[str, Any]:
+    """Load the internal, persisted heat-curve evidence window safely."""
+    raw = await get_setting("_heat_curve_verification_state")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def set_heat_curve_verification_state(state: dict[str, Any]) -> None:
+    """Persist verification progress without exposing it as a user-editable setting."""
+    await set_setting("_heat_curve_verification_state", json.dumps(state, sort_keys=True))
 
 
 async def get_bool_setting(key: str) -> bool:
@@ -474,14 +659,18 @@ async def get_user_tz() -> str:
     return await get_setting("timezone") or "Europe/Amsterdam"
 
 
-def is_comfort_hour(schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None) -> bool:
+def is_comfort_hour(
+    schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None
+) -> bool:
     """Check if a given timestamp falls within a comfort hour (in local time)."""
     local = _to_local(ts, tz_name)
     day_type = "weekday" if local.weekday() < 5 else "weekend"
     return local.hour in schedule.get(day_type, [])
 
 
-def dhw_deadlines_from_schedule(schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None) -> list[int]:
+def dhw_deadlines_from_schedule(
+    schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None
+) -> list[int]:
     """
     Derive DHW ready-by hours from the comfort schedule.
 
@@ -511,6 +700,7 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
 
     async with get_session() as session:
         from sqlalchemy import select
+
         result = await session.execute(
             select(DeviceStatusRecord.ts, DeviceStatusRecord.device_action)
             .where(DeviceStatusRecord.ts >= since)
@@ -518,8 +708,14 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
         )
         rows = result.all()
 
-    heating_counts: dict[str, dict[int, int]] = {"weekday": defaultdict(int), "weekend": defaultdict(int)}
-    total_counts: dict[str, dict[int, int]] = {"weekday": defaultdict(int), "weekend": defaultdict(int)}
+    heating_counts: dict[str, dict[int, int]] = {
+        "weekday": defaultdict(int),
+        "weekend": defaultdict(int),
+    }
+    total_counts: dict[str, dict[int, int]] = {
+        "weekday": defaultdict(int),
+        "weekend": defaultdict(int),
+    }
 
     for ts, action in rows:
         local = _to_local(ts)

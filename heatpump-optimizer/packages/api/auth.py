@@ -11,16 +11,24 @@ from packages.core.config import settings
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
-# Paths that skip auth (OAuth callbacks from external services, health checks)
+# Paths that skip auth. Health endpoints deliberately reveal only liveness and
+# readiness, and must remain reachable by Docker's unauthenticated healthcheck.
+# All control and data APIs continue to require the configured bearer token.
 _PUBLIC_PATHS: set[str] = {
     "/api/smartthings/oauth/callback",
+    "/health",
+    "/health/ready",
 }
 
 
-def _is_auth_enabled() -> bool:
+def is_auth_enabled() -> bool:
     """Auth is enabled when api_token is set to a non-placeholder value."""
     token = settings.api_token
     return bool(token) and token != "disabled"
+
+
+# Backwards-compatible private alias.
+_is_auth_enabled = is_auth_enabled
 
 
 async def require_auth(

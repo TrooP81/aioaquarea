@@ -6,7 +6,10 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from .const import PANASONIC
-from .data_enums import (
+
+# These imports intentionally preserve the historical ``aioaquarea.data``
+# public API after the enum/model split.
+from .data_enums import (  # noqa: F401
     AirSwingAutoMode,
     AirSwingLR,
     AirSwingUD,
@@ -38,7 +41,7 @@ from .data_enums import (
     ZoneSensor,
     ZoneType,
 )
-from .data_models import (
+from .data_models import (  # noqa: F401
     DeviceInfo,
     DeviceOperationStatusUpdate,
     DeviceStatus,

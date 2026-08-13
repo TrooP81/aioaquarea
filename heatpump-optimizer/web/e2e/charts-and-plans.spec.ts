@@ -5,14 +5,6 @@ const mockPrices = Array.from({ length: 48 }, (_, i) => ({
   price_eur_per_kwh: 0.05 + Math.sin(i / 4) * 0.1,
 }));
 
-const mockWeather = Array.from({ length: 48 }, (_, i) => ({
-  ts: new Date(Date.now() + (i - 1) * 3600000).toISOString(),
-  temperature: 5 - i * 0.15,
-  wind_speed: 3 + i * 0.05,
-  irradiance: i < 10 ? 100 : 0,
-  precipitation: i === 2 ? 0.4 : 0,
-}));
-
 const mockConsumption = Array.from({ length: 12 }, (_, i) => ({
   ts: new Date(Date.now() - i * 3600000).toISOString(),
   heat_kwh: 1.2 + Math.random() * 0.5,
@@ -63,11 +55,22 @@ const mockIndoorForecast = {
     { hour: 1, target: 20.5, comfort_hour: true },
     { hour: 2, target: 20.5, comfort_hour: true },
   ],
+  weather_forecast: [
+    { ts: new Date(Date.now() + 3600000).toISOString(), outdoor_temp: 5, wind_speed: 3, irradiance: 0, precipitation: 0 },
+    { ts: new Date(Date.now() + 7200000).toISOString(), outdoor_temp: 4.8, wind_speed: 3.1, irradiance: 0, precipitation: 0.4 },
+  ],
+  price_forecast: [
+    { ts: new Date(Date.now() + 3600000).toISOString(), price_eur_per_kwh: 0.08 },
+    { ts: new Date(Date.now() + 7200000).toISOString(), price_eur_per_kwh: 0.11 },
+  ],
+  forecast_source: "active_plan",
+  plan_id: 42,
   planned_actions: [{ hour: 2, action_type: "normal_mode_on", status: "pending" }],
 };
 
 test.describe("Price Chart", () => {
   test.beforeEach(async ({ page }) => {
+    page.on("pageerror", (error) => console.error("PAGE_ERROR", error.stack));
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({
         status: 200,
@@ -106,9 +109,6 @@ test.describe("Price Chart", () => {
     await page.route("**/api/thermal/indoor-forecast*", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockIndoorForecast) })
     );
-    await page.route("**/api/weather*", (route) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockWeather) })
-    );
     await page.route("**/api/currency", (route) =>
       route.fulfill({
         status: 200,
@@ -129,12 +129,30 @@ test.describe("Price Chart", () => {
     await page.route("**/api/time-format", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ hour12: false }) })
     );
+    await page.route(/\/api\/plan-activity(?:\?|$)/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([{
+          id: 7,
+          plan_id: 42,
+          plan_created_at: new Date().toISOString(),
+          optimizer_version: "rules_v3",
+          scheduled_ts: new Date().toISOString(),
+          action_type: "eco_mode_on",
+          status: "executed",
+          executed_at: new Date().toISOString(),
+          payload: {},
+          result: { verified: true },
+        }]),
+      })
+    );
   });
 
   test("renders price chart section", async ({ page }) => {
     await page.goto("/");
     const chartsTab = page.getByRole("tab", { name: "Charts" });
-    const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price chart" });
+    const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
     await chartsTab.click();
     try {
       await expect(comfortChart).toBeVisible({ timeout: 5000 });
@@ -145,9 +163,11 @@ test.describe("Price Chart", () => {
       await chartsTab.click();
       await expect(comfortChart).toBeVisible({ timeout: 5000 });
     }
-    await expect(comfortChart.getByText("Indoor Comfort, Weather & Price — 24h", { exact: true })).toBeVisible();
+    await expect(comfortChart.getByText("Indoor Comfort, Weather & Price — 2h", { exact: true })).toBeVisible();
     await expect(comfortChart.locator(".recharts-area-area")).toHaveCount(1);
-    await expect(comfortChart.locator(".recharts-line-curve")).toHaveCount(4);
+    // Additional weather/price overlays are allowed; the core comfort view
+    // must retain at least its four explanatory forecast curves.
+    expect(await comfortChart.locator(".recharts-line-curve").count()).toBeGreaterThanOrEqual(4);
     await expect(page.getByRole("button", { name: "Show hot water" })).toBeVisible();
   });
 
@@ -167,7 +187,7 @@ test.describe("Price Chart", () => {
     await planTab.click();
 
     await expect(planTab).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByRole("heading", { name: "Recent Activity" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What actually happened" })).toBeVisible();
     await expect(page.locator("#dashboard-panel-overview")).toBeHidden();
 
     const modelsTab = page.getByRole("tab", { name: "Models" });

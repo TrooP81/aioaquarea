@@ -85,9 +85,11 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting, \
-             patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+            patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -141,8 +143,10 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -191,8 +195,10 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -243,8 +249,10 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -294,9 +302,11 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting, \
-             patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+            patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -344,8 +354,10 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -393,8 +405,10 @@ class TestShowerDetection:
 
         mock_session.execute = mock_execute
 
-        with patch("packages.optimizer.shower_mode.get_session") as mock_get_session, \
-             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting:
+        with (
+            patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
+            patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
+        ):
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -421,15 +435,23 @@ class TestShowerConflictPrevention:
         comfort_schedule = {"weekday": [7, 8, 9, 17, 18, 19, 20, 21], "weekend": [8, 9, 10]}
 
         actions_normal = optimizer._plan_dhw(
-            prices, weather, base,
-            current_tank_temp=42.0, tank_target=50,
-            current_outdoor_temp=10.0, comfort_schedule=comfort_schedule,
+            prices,
+            weather,
+            base,
+            current_tank_temp=42.0,
+            tank_target=50,
+            current_outdoor_temp=10.0,
+            comfort_schedule=comfort_schedule,
             suppress_dhw_off=False,
         )
         actions_suppressed = optimizer._plan_dhw(
-            prices, weather, base,
-            current_tank_temp=42.0, tank_target=50,
-            current_outdoor_temp=10.0, comfort_schedule=comfort_schedule,
+            prices,
+            weather,
+            base,
+            current_tank_temp=42.0,
+            tank_target=50,
+            current_outdoor_temp=10.0,
+            comfort_schedule=comfort_schedule,
             suppress_dhw_off=True,
         )
 

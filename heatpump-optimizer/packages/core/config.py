@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     sh_max_power_kw: float = 12.0  # Heat pump max electrical input for SH
 
     # App
+    app_environment: str = "development"  # development / staging / production
     secret_key: str = "change-this-to-a-random-string"
     api_token: str = "disabled"  # Set to a strong token to enable API auth; "disabled" = no auth
     model_dir: str = "/app/models"
@@ -67,8 +68,15 @@ settings = Settings()
 
 if settings.secret_key == "change-this-to-a-random-string":
     import warnings
+
     warnings.warn(
         "SECRET_KEY is using the insecure default. "
         "Set SECRET_KEY environment variable to a random string in production.",
         stacklevel=1,
     )
+
+if settings.app_environment.lower() in {"staging", "production"}:
+    if settings.secret_key == "change-this-to-a-random-string":
+        raise RuntimeError("SECRET_KEY must be set outside development")
+    if not settings.api_token or settings.api_token == "disabled":
+        raise RuntimeError("API_TOKEN must be set outside development")

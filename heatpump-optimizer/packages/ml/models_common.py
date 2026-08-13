@@ -98,6 +98,7 @@ def iter_consumption_intervals(
                 )
         prev = row
 
+
 try:
     from sklearn.ensemble import (
         GradientBoostingRegressor,
@@ -119,6 +120,42 @@ except ImportError:
 
 MODEL_DIR = Path(app_settings.model_dir)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# How many timestamped checkpoints to keep per model type. Training writes a new
+# ``<name>_<timestamp>.pkl`` each run; ``load_latest`` only ever reads the newest,
+# so older files are dead weight. Keep a small history for rollback/debugging and
+# prune the rest to stop MODEL_DIR growing without bound.
+MODEL_RETENTION = 5
+
+
+def prune_old_models(
+    pattern: str, keep: int = MODEL_RETENTION, model_dir: Path | None = None
+) -> int:
+    """Delete all but the newest ``keep`` checkpoint files matching ``pattern``.
+
+    Files are named ``<name>_YYYYmmdd_HHMM[SS].pkl`` so lexical sort is also
+    chronological. Returns the number of files removed. Failures to unlink an
+    individual file are logged and skipped (never raised) so a stray lock can't
+    break a training run.
+    """
+    if keep < 0:
+        raise ValueError("keep must be >= 0")
+
+    directory = model_dir if model_dir is not None else MODEL_DIR
+    files = sorted(directory.glob(pattern))
+    stale = files[:-keep] if keep else list(files)
+
+    removed = 0
+    for path in stale:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            _logger.warning("model_prune_failed", path=str(path), error=str(exc))
+
+    if removed:
+        _logger.info("models_pruned", pattern=pattern, removed=removed, kept=keep)
+    return removed
 
 
 def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:

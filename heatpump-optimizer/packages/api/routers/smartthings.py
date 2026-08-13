@@ -5,9 +5,10 @@ import json
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from sqlalchemy import func, not_, select
+from sqlalchemy import select
 
 from packages.api.schemas import IndoorTempResponse
+from packages.core.control_temperature import get_control_temperature
 from packages.core.database import get_session
 from packages.core.models import IndoorTempReading
 from packages.core.settings_service import get_setting, set_setting
@@ -49,36 +50,33 @@ async def get_indoor_temp(
 
 @router.get("/api/indoor-temp/latest")
 async def get_latest_indoor_temp():
-    from packages.poller.smartthings import get_selected_device_ids
-
-    selected = await get_selected_device_ids()
     async with get_session() as session:
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
-        agg_stmt = select(
-            func.avg(IndoorTempReading.temperature),
-            func.max(IndoorTempReading.timestamp),
-            func.count(IndoorTempReading.id),
-        ).where(IndoorTempReading.timestamp >= cutoff)
-
-        fresh_stmt = select(func.max(IndoorTempReading.timestamp)).where(
-            not_(IndoorTempReading.is_stale)
-        )
-
-        if selected:
-            agg_stmt = agg_stmt.where(IndoorTempReading.device_id.in_(selected))
-            fresh_stmt = fresh_stmt.where(IndoorTempReading.device_id.in_(selected))
-
-        result = await session.execute(agg_stmt)
-        row = result.one()
-
-        fresh_result = await session.execute(fresh_stmt)
-        last_fresh = fresh_result.scalar()
+        control = await get_control_temperature(session=session)
 
     return {
-        "avg_temperature": round(row[0], 1) if row[0] is not None else None,
-        "latest_reading": row[1].isoformat() if row[1] else None,
-        "sensor_count": row[2] or 0,
-        "last_fresh_reading": last_fresh.isoformat() if last_fresh else None,
+        "avg_temperature": round(control.value, 1) if control.value is not None else None,
+        "latest_reading": control.latest_reading.isoformat() if control.latest_reading else None,
+        "sensor_count": control.sensor_count,
+        "sample_count": control.sample_count,
+        "last_fresh_reading": control.latest_reading.isoformat()
+        if control.latest_reading
+        else None,
+        "confidence": control.confidence,
+        "reason": control.reason,
+        "reference_sensor_id": control.reference_sensor_id,
+        "reference_sensor_label": control.reference_sensor_label,
+        "reference_room": control.reference_room,
+        "spread_c": control.spread_c,
+        "sensors": [
+            {
+                "device_id": sensor.device_id,
+                "device_label": sensor.device_label,
+                "room": sensor.room,
+                "temperature": sensor.temperature,
+                "timestamp": sensor.timestamp.isoformat(),
+            }
+            for sensor in control.sensors
+        ],
     }
 
 
@@ -89,7 +87,9 @@ async def list_smartthings_devices():
 
     access_token = await get_valid_access_token()
     if not access_token:
-        raise HTTPException(status_code=400, detail="SmartThings not connected (configure OAuth or PAT)")
+        raise HTTPException(
+            status_code=400, detail="SmartThings not connected (configure OAuth or PAT)"
+        )
 
     try:
         client = SmartThingsClient(access_token)
@@ -121,7 +121,9 @@ async def smartthings_oauth_authorize(request: Request):
     url, state = build_authorize_url(client_id, redirect_uri)
     await set_setting("_smartthings_oauth_state", state)
 
-    response = Response(content=json.dumps({"authorize_url": url, "state": state}), media_type="application/json")
+    response = Response(
+        content=json.dumps({"authorize_url": url, "state": state}), media_type="application/json"
+    )
     response.set_cookie(
         key="smartthings_oauth_state",
         value=state,
@@ -168,7 +170,9 @@ async def smartthings_oauth_callback(
         raise HTTPException(status_code=502, detail=str(e))
 
     await save_tokens(token_data)
-    response = Response(status_code=302, headers={"Location": "/settings?smartthings_oauth=connected"})
+    response = Response(
+        status_code=302, headers={"Location": "/settings?smartthings_oauth=connected"}
+    )
     response.delete_cookie("smartthings_oauth_state")
     return response
 
