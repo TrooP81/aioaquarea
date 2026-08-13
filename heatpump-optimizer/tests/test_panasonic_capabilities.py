@@ -51,6 +51,10 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         "zones": [1],
     }
     assert result["commands"]["force_dhw"]["available"] is True
+    assert result["commands"]["set_tank_temperature"]["constraints"] == {
+        "observed_range": {"minimum_celsius": 40, "maximum_celsius": 65},
+        "whole_degrees_only": True,
+    }
     assert result["commands"]["request_defrost"]["policy"] == "manual_only"
     assert result["commands"]["set_special_status"]["device_supported"] is None
 
@@ -82,6 +86,10 @@ def test_missing_observation_reports_unknown_device_support() -> None:
     assert result["device"]["has_tank"] is None
     assert result["commands"]["set_force_heater"]["device_supported"] is None
     assert result["commands"]["set_force_heater"]["available"] is False
+    assert result["commands"]["set_tank_temperature"]["constraints"] == {
+        "observed_range": None,
+        "whole_degrees_only": True,
+    }
 
 
 def test_stale_poller_heartbeat_blocks_otherwise_fresh_device() -> None:

@@ -59,6 +59,14 @@ def build_panasonic_capabilities(
         if observed_device
         else None
     )
+    tank_temperature_limits = None
+    tank_min = getattr(latest_status, "tank_heat_min", None)
+    tank_max = getattr(latest_status, "tank_heat_max", None)
+    if isinstance(tank_min, (int, float)) and isinstance(tank_max, (int, float)):
+        tank_temperature_limits = {
+            "minimum_celsius": tank_min,
+            "maximum_celsius": tank_max,
+        }
     zones = []
     if observed_device and _observed(
         latest_status, "zone1_temp", "zone1_target_temp", "zone1_operation_status"
@@ -85,6 +93,15 @@ def build_panasonic_capabilities(
 
     def observed_support(*names: str) -> bool | None:
         return _observed(latest_status, *names) if observed_device else None
+
+    tank_temperature_command = command(
+        policy="automatic_with_plan",
+        device_supported=has_tank,
+    )
+    tank_temperature_command["constraints"] = {
+        "observed_range": tank_temperature_limits,
+        "whole_degrees_only": True,
+    }
 
     return {
         "api": {
@@ -118,10 +135,7 @@ def build_panasonic_capabilities(
                 values=zones,
                 device_supported=bool(zones) if observed_device else None,
             ),
-            "set_tank_temperature": command(
-                policy="automatic_with_plan",
-                device_supported=has_tank,
-            ),
+            "set_tank_temperature": tank_temperature_command,
             "set_quiet_mode": command(
                 policy="automatic_with_plan",
                 values=[0, 1, 2, 3],

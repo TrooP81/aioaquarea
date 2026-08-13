@@ -10,7 +10,11 @@ import pytest
 from aioaquarea import ForceHeater, HolidayTimer, PowerfulTime
 from aioaquarea.data import StatusDataMode
 
-from packages.core.services.aquarea import AquareaWrapper, PanasonicCachedStatusError
+from packages.core.services.aquarea import (
+    AquareaWrapper,
+    PanasonicCachedStatusError,
+    PanasonicCommandValidationError,
+)
 
 
 def _wrapper() -> AquareaWrapper:
@@ -231,3 +235,71 @@ async def test_write_wait_rechecks_status_before_command() -> None:
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
     device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)
+
+
+@pytest.mark.asyncio
+async def test_tank_temperature_uses_tank_entity_api() -> None:
+    wrapper = _wrapper()
+    tank = SimpleNamespace(
+        heat_min=40,
+        heat_max=65,
+        target_temperature=50,
+        set_target_temperature=AsyncMock(),
+    )
+    device = SimpleNamespace(tank=tank, status_data_mode=StatusDataMode.LIVE)
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_tank_temperature(52)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    tank.set_target_temperature.assert_awaited_once_with(52)
+
+
+@pytest.mark.asyncio
+async def test_tank_temperature_skips_already_applied_target() -> None:
+    wrapper = _wrapper()
+    tank = SimpleNamespace(
+        heat_min=40,
+        heat_max=65,
+        target_temperature=52,
+        set_target_temperature=AsyncMock(),
+    )
+    wrapper._device = SimpleNamespace(tank=tank, status_data_mode=StatusDataMode.LIVE)
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_tank_temperature(52)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    tank.set_target_temperature.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tank_temperature_rejects_missing_tank_before_write_budget() -> None:
+    wrapper = _wrapper()
+    wrapper._device = SimpleNamespace(tank=None, status_data_mode=StatusDataMode.LIVE)
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCommandValidationError, match="no writable"):
+        await wrapper.set_tank_temperature(52)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tank_temperature_rejects_live_out_of_range_target() -> None:
+    wrapper = _wrapper()
+    tank = SimpleNamespace(
+        heat_min=40,
+        heat_max=60,
+        target_temperature=50,
+        set_target_temperature=AsyncMock(),
+    )
+    wrapper._device = SimpleNamespace(tank=tank, status_data_mode=StatusDataMode.LIVE)
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCommandValidationError, match="outside.*40-60"):
+        await wrapper.set_tank_temperature(65)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    tank.set_target_temperature.assert_not_awaited()
