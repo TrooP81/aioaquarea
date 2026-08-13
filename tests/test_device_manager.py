@@ -112,7 +112,6 @@ async def test_get_device_status_parses_status_payload(device_manager, device_in
         {
             "status": {
                 "operationStatus": 1,
-                "specialStatus": 1,
                 "deiceStatus": 0,
                 "outdoorNow": 7,
                 "operationMode": 1,

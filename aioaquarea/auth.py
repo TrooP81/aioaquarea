@@ -166,7 +166,7 @@ class PanasonicRequestHeader:
 
             result = hash_str[:9] + "cfc" + hash_str[9:]
             return result
-        except Exception as ex:
+        except Exception:
             _LOGGER.error("Failed to generate API key")
 
 
