@@ -8,7 +8,14 @@ import logging
 import aiohttp
 import redis.asyncio as redis
 
-from aioaquarea import AquareaEnvironment, Client, DeviceInfo
+from aioaquarea import (
+    AquareaEnvironment,
+    Client,
+    DeviceInfo,
+    ForceHeater,
+    HolidayTimer,
+    PowerfulTime,
+)
 from aioaquarea.data import StatusDataMode
 
 from ..config import settings
@@ -147,6 +154,34 @@ class AquareaWrapper:
         device = await self.get_device()
         await device.set_force_dhw(state)
         logger.info("Set force DHW to %s", state)
+
+    async def set_powerful_time(self, duration: PowerfulTime) -> None:
+        """Set Panasonic's bounded 30/60/90 minute powerful mode."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        await device.set_powerful_time(duration)
+        logger.info("Set powerful mode to %s", duration)
+
+    async def set_force_heater(self, state: ForceHeater) -> None:
+        """Enable or disable Panasonic's auxiliary-heater override."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        await device.set_force_heater(state)
+        logger.info("Set force heater to %s", state)
+
+    async def set_holiday_timer(self, state: HolidayTimer) -> None:
+        """Enable or disable the Panasonic holiday timer."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        await device.set_holiday_timer(state)
+        logger.info("Set holiday timer to %s", state)
+
+    async def request_defrost(self) -> None:
+        """Request defrost; the device entity suppresses an already-active request."""
+        await self._write_limiter.acquire()
+        device = await self.get_device()
+        await device.request_defrost()
+        logger.info("Requested defrost")
 
     async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
         await self._write_limiter.acquire()
