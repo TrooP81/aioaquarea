@@ -506,5 +506,7 @@ class TestLatestIndoorTempFiltering:
 
         assert result["sensor_count"] == 3
         assert result["avg_temperature"] == 22.0
-        # With no explicit selection there must be no device-selection filter.
+        # Freshness and distinct-device handling live in the shared control
+        # temperature query; no explicit selection means no IN filter.
+        assert "is_stale" in str(session.statements[0])
         assert "device_id IN" not in str(session.statements[0])
