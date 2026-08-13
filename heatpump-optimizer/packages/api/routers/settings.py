@@ -25,10 +25,13 @@ from packages.core.settings_service import (
     get_float_setting,
     get_learned_usage,
     get_setting,
+    get_setting_spec,
     get_string_setting,
+    is_masked_secret,
     set_setting,
     set_settings_bulk,
     set_heat_curve_verification_state,
+    validate_setting_value,
 )
 from packages.core.heat_curve import (
     HEAT_CURVE_SETTING_KEYS,
@@ -88,7 +91,23 @@ async def update_settings(body: SettingsUpdate):
     if invalid_keys:
         raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
 
-    heat_curve_changed = any(key in HEAT_CURVE_SETTING_KEYS for key in body.settings)
+    # Do not overwrite a real secret with the masked value returned by GET.
+    cleaned = {
+        key: value
+        for key, value in body.settings.items()
+        if not is_masked_secret(get_setting_spec(key), value)
+    }
+
+    errors: dict[str, str] = {}
+    for key, value in cleaned.items():
+        try:
+            validate_setting_value(key, value)
+        except ValueError as exc:
+            errors[key] = str(exc)
+    if errors:
+        raise HTTPException(status_code=400, detail={"invalid_values": errors})
+
+    heat_curve_changed = any(key in HEAT_CURVE_SETTING_KEYS for key in cleaned)
     previous_curve: HeatCurveConfig | None = None
     applied_curve: HeatCurveConfig | None = None
     # Validate the curve as one unit.  A valid individual number can still
@@ -97,13 +116,13 @@ async def update_settings(body: SettingsUpdate):
     if heat_curve_changed:
         values = await get_all_settings()
         previous_curve = HeatCurveConfig.from_settings(values)
-        values.update(body.settings)
+        values.update(cleaned)
         try:
             applied_curve = HeatCurveConfig.from_settings(values)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    await set_settings_bulk(body.settings)
+    await set_settings_bulk(cleaned)
 
     if heat_curve_changed and applied_curve is not None:
         async with get_session() as session:
@@ -142,7 +161,7 @@ async def update_settings(body: SettingsUpdate):
                 payload_json=json.dumps(
                     {
                         k: "***" if SETTINGS_SCHEMA[k].get("type") == "secret" else v
-                        for k, v in body.settings.items()
+                        for k, v in cleaned.items()
                     }
                 ),
                 result="updated",
@@ -151,7 +170,7 @@ async def update_settings(body: SettingsUpdate):
 
     return {
         "status": "updated",
-        "count": len(body.settings),
+        "count": len(cleaned),
         "heat_curve_verification_started": heat_curve_changed,
     }
 

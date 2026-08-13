@@ -2,11 +2,16 @@
 
 import datetime as dt
 
+import pytest
+
 from packages.core.settings_service import (
     SETTINGS_SCHEMA,
     SETTING_SPECS,
+    get_setting_spec,
     is_comfort_hour,
+    is_masked_secret,
     dhw_deadlines_from_schedule,
+    validate_setting_value,
 )
 
 TZ = "UTC"  # Tests use UTC timestamps with UTC-aligned schedule hours
@@ -122,3 +127,66 @@ class TestManualTrialSettings:
         assert "outcome_experiment_max_curve_step_c" in SETTINGS_SCHEMA
         assert SETTING_SPECS["outcome_experiments_enabled"].parse("false") is False
         assert SETTING_SPECS["outcome_experiment_max_curve_step_c"].parse("0.5") == 0.5
+
+
+class TestValidateSettingValue:
+    def test_unknown_key_raises_keyerror(self):
+        with pytest.raises(KeyError):
+            validate_setting_value("does_not_exist", "1")
+
+    def test_valid_int_passes(self):
+        validate_setting_value("tank_min_temp", "42")
+
+    def test_invalid_int_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("tank_min_temp", "not-a-number")
+
+    def test_valid_float_passes(self):
+        validate_setting_value("comfort_temp_min", "20.5")
+
+    def test_invalid_float_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("comfort_temp_min", "warm")
+
+    def test_valid_bool_passes(self):
+        validate_setting_value("learning_mode_enabled", "true")
+
+    def test_invalid_bool_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("learning_mode_enabled", "maybe")
+
+    def test_valid_option_passes(self):
+        validate_setting_value("optimizer_layer", "milp_preferred")
+
+    def test_invalid_option_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("optimizer_layer", "nonsense")
+
+    def test_valid_json_passes(self):
+        validate_setting_value("comfort_schedule", '{"weekday": [7], "weekend": []}')
+
+    def test_invalid_json_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("comfort_schedule", "{not json")
+
+    def test_empty_string_allowed_for_numeric_to_clear(self):
+        # Empty clears the override and falls back to env/default.
+        validate_setting_value("comfort_temp_min", "")
+
+    def test_empty_string_rejected_for_option(self):
+        with pytest.raises(ValueError):
+            validate_setting_value("optimizer_layer", "")
+
+
+class TestIsMaskedSecret:
+    def test_masked_secret_detected(self):
+        spec = get_setting_spec("entsoe_api_token")
+        assert is_masked_secret(spec, "ab***yz") is True
+
+    def test_unmasked_secret_not_flagged(self):
+        spec = get_setting_spec("entsoe_api_token")
+        assert is_masked_secret(spec, "real-secret-value") is False
+
+    def test_non_secret_never_flagged(self):
+        spec = get_setting_spec("optimizer_layer")
+        assert is_masked_secret(spec, "***") is False
