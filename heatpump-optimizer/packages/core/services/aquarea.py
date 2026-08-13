@@ -146,8 +146,7 @@ class AquareaWrapper:
 
         if (
             self._last_live_status_at is None
-            or time.monotonic() - self._last_live_status_at
-            > _COMMAND_STATUS_MAX_AGE_SECONDS
+            or time.monotonic() - self._last_live_status_at > _COMMAND_STATUS_MAX_AGE_SECONDS
         ):
             device = await self.refresh_device()
         return device

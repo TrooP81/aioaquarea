@@ -98,9 +98,7 @@ def build_panasonic_capabilities(
             "reason": reason,
             "last_live_status_at": status_at.isoformat() if status_at else None,
             "poller_heartbeat_at": heartbeat_at.isoformat() if heartbeat_at else None,
-            "age_seconds": (
-                round((now - status_at).total_seconds()) if status_at else None
-            ),
+            "age_seconds": (round((now - status_at).total_seconds()) if status_at else None),
             "stale_after_seconds": stale_after_seconds,
         },
         "device": {

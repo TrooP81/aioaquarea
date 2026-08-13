@@ -22,9 +22,7 @@ async def panasonic_capabilities():
     async with get_session() as session:
         latest_status = (
             await session.execute(
-                select(DeviceStatusRecord)
-                .order_by(DeviceStatusRecord.ts.desc())
-                .limit(1)
+                select(DeviceStatusRecord).order_by(DeviceStatusRecord.ts.desc()).limit(1)
             )
         ).scalar_one_or_none()
         poller_heartbeat = await session.get(ServiceHeartbeatRecord, "poller")

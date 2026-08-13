@@ -84,9 +84,7 @@ async def test_concurrent_device_loads_share_one_panasonic_request() -> None:
 async def test_first_refresh_reuses_status_fetched_during_device_load() -> None:
     wrapper = _wrapper()
     device_info = SimpleNamespace(device_id="device-1")
-    device = SimpleNamespace(
-        refresh_data=AsyncMock(), status_data_mode=StatusDataMode.LIVE
-    )
+    device = SimpleNamespace(refresh_data=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
     wrapper._client.get_devices.return_value = [device_info]
     wrapper._client.get_device.return_value = device
 
@@ -99,9 +97,7 @@ async def test_first_refresh_reuses_status_fetched_during_device_load() -> None:
 @pytest.mark.asyncio
 async def test_cached_refresh_consumes_one_read_token() -> None:
     wrapper = _wrapper()
-    device = SimpleNamespace(
-        refresh_data=AsyncMock(), status_data_mode=StatusDataMode.LIVE
-    )
+    device = SimpleNamespace(refresh_data=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
     wrapper._device = device
 
     assert await wrapper.refresh_device() is device
@@ -125,9 +121,7 @@ async def test_cached_initial_status_is_not_returned_as_fresh() -> None:
 @pytest.mark.asyncio
 async def test_cached_refresh_is_not_returned_as_fresh() -> None:
     wrapper = _wrapper()
-    device = SimpleNamespace(
-        refresh_data=AsyncMock(), status_data_mode=StatusDataMode.CACHED
-    )
+    device = SimpleNamespace(refresh_data=AsyncMock(), status_data_mode=StatusDataMode.CACHED)
     wrapper._device = device
 
     with pytest.raises(PanasonicCachedStatusError, match="cloud-cached"):
@@ -168,9 +162,7 @@ async def test_extended_panasonic_commands_share_write_budget(
 @pytest.mark.asyncio
 async def test_defrost_command_uses_write_budget_and_device_guardrail() -> None:
     wrapper = _wrapper()
-    device = SimpleNamespace(
-        request_defrost=AsyncMock(), status_data_mode=StatusDataMode.LIVE
-    )
+    device = SimpleNamespace(request_defrost=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
