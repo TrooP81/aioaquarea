@@ -168,6 +168,24 @@ async def test_get_device_status_parses_status_payload(device_manager, device_in
     assert status.tank_status[0].temperature == 49
     assert status.zones[0].heat_set == 33
     assert status.fault_status[0].error_code == "F01"
+    assert status.status_data_mode == StatusDataMode.LIVE
+
+
+@pytest.mark.asyncio
+async def test_get_device_status_marks_cached_fallback(device_manager, device_info):
+    device_manager._client._api_client.request.side_effect = [
+        RuntimeError("adaptor unavailable"),
+        FakeResponse(_minimal_status_payload()),
+    ]
+
+    status = await device_manager.get_device_status(device_info)
+
+    assert status.status_data_mode == StatusDataMode.CACHED
+    assert device_manager._client._api_client.request.await_count == 2
+    live_request = device_manager._client._api_client.request.await_args_list[0]
+    cached_request = device_manager._client._api_client.request.await_args_list[1]
+    assert "deviceDirect=1" in live_request.kwargs["json"]["apiName"]
+    assert "deviceDirect=0" in cached_request.kwargs["json"]["apiName"]
 
 
 def _minimal_status_payload(**overrides):
