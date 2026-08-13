@@ -1,0 +1,6 @@
+ARG TIMESCALE_IMAGE=timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
+FROM ${TIMESCALE_IMAGE}
+
+# Backup replication can optionally encrypt archives before copying them to
+# the replica directory. The pinned Timescale image is Alpine-based.
+RUN apk add --no-cache openssl
