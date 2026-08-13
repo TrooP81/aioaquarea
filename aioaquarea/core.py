@@ -202,9 +202,13 @@ class AquareaClient:  # Renamed Client to AquareaClient
         return await self._device_manager.get_devices()
 
     @auth_required
-    async def get_device_status(self, device_info: DeviceInfo) -> DeviceStatus:
-        """Retrives device status."""
-        return await self._device_manager.get_device_status(device_info)
+    async def get_device_status(
+        self, device_info: DeviceInfo, allow_cached_fallback: bool = True
+    ) -> DeviceStatus:
+        """Retrieve device status, optionally requiring live adaptor data."""
+        return await self._device_manager.get_device_status(
+            device_info, allow_cached_fallback=allow_cached_fallback
+        )
 
     @auth_required
     async def get_device(

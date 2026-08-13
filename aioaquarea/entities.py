@@ -114,8 +114,10 @@ class DeviceImpl(Device):
         zone = self.zones.get(1)
         return zone.cool_max if zone else None
 
-    async def refresh_data(self) -> None:
-        self._status = await self._client.get_device_status(self._info)
+    async def refresh_data(self, allow_cached_fallback: bool = True) -> None:
+        self._status = await self._client.get_device_status(
+            self._info, allow_cached_fallback=allow_cached_fallback
+        )
 
         if self.has_tank and self._status.tank_status:
             self._tank = TankImpl(self._status.tank_status[0], self, self._client)
