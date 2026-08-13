@@ -164,8 +164,10 @@ class DeviceManager:
                             self._devices.append(device_info)
         return self._devices + self._unknown_devices
 
-    async def get_device_status(self, device_info: DeviceInfo) -> DeviceStatus:
-        """Retrives device status."""
+    async def get_device_status(
+        self, device_info: DeviceInfo, allow_cached_fallback: bool = True
+    ) -> DeviceStatus:
+        """Retrieve device status, optionally requiring a live adaptor response."""
         from .errors import AuthenticationError
 
         json_response = None
@@ -194,6 +196,11 @@ class DeviceManager:
                     device_info.device_id, e
                 )
             )
+            if not allow_cached_fallback:
+                raise RequestFailedError(
+                    "Failed to retrieve live device status."
+                ) from e
+
             # If live data fails, try cached data as a fallback
             try:
                 payload = {

@@ -264,8 +264,8 @@ class Device(ABC):
             self._zones[zone_id] = DeviceZone(zone, zone_status)
 
     @abstractmethod
-    async def refresh_data(self) -> None:
-        """Refresh device data"""
+    async def refresh_data(self, allow_cached_fallback: bool = True) -> None:
+        """Refresh device data, optionally requiring live adaptor data."""
 
     @property
     def mode(self) -> ExtendedOperationMode:
