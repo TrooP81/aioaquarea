@@ -107,7 +107,7 @@ class AquareaWrapper:
             return await self.get_device()
 
         await self._read_limiter.acquire()
-        await self._device.refresh_data()
+        await self._device.refresh_data(allow_cached_fallback=False)
         self._require_live_status(self._device)
         return self._device
 
