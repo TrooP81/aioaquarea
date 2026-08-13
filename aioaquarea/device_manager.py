@@ -169,6 +169,7 @@ class DeviceManager:
         from .errors import AuthenticationError
 
         json_response = None
+        status_data_mode = StatusDataMode.LIVE
         try:
             payload = {
                 "apiName": f"/remote/v1/api/devices?gwid={device_info.device_id}&deviceDirect=1",
@@ -206,6 +207,7 @@ class DeviceManager:
                     throw_on_error=True,
                 )
                 json_response = await response.json()
+                status_data_mode = StatusDataMode.CACHED
                 self._logger.info(
                     "Successfully retrieved cached status for device {} after live data failure. Raw JSON: {}".format(
                         device_info.device_id, json_response
@@ -290,6 +292,7 @@ class DeviceManager:
             holiday_timer=HolidayTimer(device.get("holidayTimer", 0)),
             powerful_time=PowerfulTime(device.get("powerful", 0)),
             special_status=_parse_special_status(device.get("specialStatus")),
+            status_data_mode=status_data_mode,
         )
 
         return device_status

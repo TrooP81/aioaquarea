@@ -278,6 +278,11 @@ class Device(ABC):
         return self._status.temperature_outdoor
 
     @property
+    def status_data_mode(self) -> StatusDataMode:
+        """Whether the current status came from the live adaptor or cloud cache."""
+        return self._status.status_data_mode
+
+    @property
     def is_on_error(self) -> bool:
         """True if the device is in an error state"""
         return len(self._status.fault_status) > 0

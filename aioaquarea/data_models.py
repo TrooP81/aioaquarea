@@ -120,6 +120,7 @@ class DeviceStatus:
     holiday_timer: HolidayTimer
     powerful_time: PowerfulTime
     special_status: SpecialStatus | None
+    status_data_mode: StatusDataMode = StatusDataMode.LIVE
 
 
 @dataclass
