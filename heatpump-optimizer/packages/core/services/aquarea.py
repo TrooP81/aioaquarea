@@ -68,28 +68,41 @@ class AquareaWrapper:
             raise
 
     async def get_device(self):
-        """Get or refresh the device object."""
+        """Return the cached device, loading it once when necessary.
+
+        Merely retrieving the in-process object must not consume Panasonic's
+        read budget. Initialisation does perform network I/O and therefore
+        acquires exactly one logical read token.
+        """
+        if self._device is not None:
+            return self._device
+
         await self._read_limiter.acquire()
+        devices = await self._client.get_devices()
+        if not devices:
+            raise RuntimeError("No devices found on account")
+        self._device_info = devices[0]
+        from datetime import timedelta
 
-        if self._device is None:
-            devices = await self._client.get_devices()
-            if not devices:
-                raise RuntimeError("No devices found on account")
-            self._device_info = devices[0]
-            from datetime import timedelta
-
-            self._device = await self._client.get_device(
-                device_info=self._device_info,
-                consumption_refresh_interval=timedelta(minutes=5),
-            )
+        self._device = await self._client.get_device(
+            device_info=self._device_info,
+            consumption_refresh_interval=timedelta(minutes=5),
+        )
         return self._device
 
     async def refresh_device(self):
-        """Refresh device data."""
+        """Refresh device data using one logical Panasonic read token.
+
+        Creating a device already fetches its current status. Avoid an
+        immediate second refresh on first use, which previously spent two
+        limiter tokens and duplicated the cloud request.
+        """
+        if self._device is None:
+            return await self.get_device()
+
         await self._read_limiter.acquire()
-        device = await self.get_device()
-        await device.refresh_data()
-        return device
+        await self._device.refresh_data()
+        return self._device
 
     async def set_mode(self, mode) -> None:
         await self._write_limiter.acquire()
