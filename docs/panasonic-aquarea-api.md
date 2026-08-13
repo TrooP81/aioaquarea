@@ -66,6 +66,13 @@ Every wrapper write also requires a live adaptor status no older than 60
 seconds. A stale object is refreshed first, and a cloud-cached response blocks
 the command before a write-rate-limit token is consumed.
 
+Tank targets use the library's tank entity (`device.tank.set_target_temperature`)
+rather than a non-existent device-level method. The wrapper requires live
+device-reported `heat_min` and `heat_max` bounds, rejects targets outside that
+range before consuming the write budget, and skips a write when the live target
+already matches. The observed range is exposed under the command's
+`constraints.observed_range` capability field.
+
 ## Primary implementation references
 
 - `aioaquarea/device_control.py` and `aioaquarea/entities.py` in this repository

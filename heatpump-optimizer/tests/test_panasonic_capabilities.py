@@ -51,6 +51,10 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         "zones": [1],
     }
     assert result["commands"]["force_dhw"]["available"] is True
+    assert result["commands"]["set_tank_temperature"]["constraints"] == {
+        "observed_range": {"minimum_celsius": 40, "maximum_celsius": 65},
+        "whole_degrees_only": True,
+    }
     assert result["commands"]["request_defrost"]["policy"] == "manual_only"
     assert result["commands"]["set_special_status"]["device_supported"] is None
 
@@ -69,6 +73,22 @@ def test_stale_status_blocks_every_command_without_hiding_capabilities() -> None
     assert all(not command["available"] for command in result["commands"].values())
 
 
+def test_missing_tank_limits_blocks_target_write_but_keeps_tank_support() -> None:
+    now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, tank_heat_min=None, tank_heat_max=None),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        now=now,
+    )
+
+    command = result["commands"]["set_tank_temperature"]
+    assert result["availability"]["commands_allowed"] is True
+    assert command["device_supported"] is True
+    assert command["available"] is False
+    assert command["constraints"]["observed_range"] is None
+
+
 def test_missing_observation_reports_unknown_device_support() -> None:
     now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
     result = build_panasonic_capabilities(
@@ -82,6 +102,10 @@ def test_missing_observation_reports_unknown_device_support() -> None:
     assert result["device"]["has_tank"] is None
     assert result["commands"]["set_force_heater"]["device_supported"] is None
     assert result["commands"]["set_force_heater"]["available"] is False
+    assert result["commands"]["set_tank_temperature"]["constraints"] == {
+        "observed_range": None,
+        "whole_degrees_only": True,
+    }
 
 
 def test_stale_poller_heartbeat_blocks_otherwise_fresh_device() -> None:

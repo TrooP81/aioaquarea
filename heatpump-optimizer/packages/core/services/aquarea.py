@@ -31,6 +31,10 @@ class PanasonicCachedStatusError(RuntimeError):
     """Raised when Panasonic returns cloud cache instead of live adaptor data."""
 
 
+class PanasonicCommandValidationError(ValueError):
+    """Raised when a command is incompatible with the live device state."""
+
+
 class AquareaWrapper:
     """Wrapper around aioaquarea.Client for application use."""
 
@@ -171,9 +175,44 @@ class AquareaWrapper:
         logger.info("Set mode to %s", mode)
 
     async def set_tank_temperature(self, temperature: int) -> None:
-        device = await self._prepare_write()
-        await device.set_tank_temperature(temperature)
+        device = await self._get_writable_device()
+        tank = self._validate_tank_temperature(device, temperature)
+        if tank.target_temperature == temperature:
+            logger.info("Tank target already %sC; skipping Panasonic write", temperature)
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        tank = self._validate_tank_temperature(device, temperature)
+        if tank.target_temperature == temperature:
+            logger.info("Tank target became %sC while waiting; skipping write", temperature)
+            return
+
+        await tank.set_target_temperature(temperature)
         logger.info("Set tank target to %sC", temperature)
+
+    @staticmethod
+    def _validate_tank_temperature(device, temperature: int):
+        tank = getattr(device, "tank", None)
+        if tank is None:
+            raise PanasonicCommandValidationError("Panasonic device has no writable hot-water tank")
+
+        minimum = getattr(tank, "heat_min", None)
+        maximum = getattr(tank, "heat_max", None)
+        if not isinstance(minimum, (int, float)) or not isinstance(maximum, (int, float)):
+            raise PanasonicCommandValidationError(
+                "Panasonic tank did not report writable temperature limits"
+            )
+        if isinstance(temperature, bool) or not isinstance(temperature, int):
+            raise PanasonicCommandValidationError(
+                "Panasonic tank target must be a whole number of degrees Celsius"
+            )
+        if not minimum <= temperature <= maximum:
+            raise PanasonicCommandValidationError(
+                f"Panasonic tank target {temperature}C is outside the live "
+                f"device range {minimum}-{maximum}C"
+            )
+        return tank
 
     async def set_quiet_mode(self, mode) -> None:
         device = await self._prepare_write()
