@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from packages.core.scheduling import create_scheduler
 from packages.ml.models import COPModel, DemandModel
 
 logger = structlog.get_logger()
@@ -47,7 +47,7 @@ async def main() -> None:
         logger.info("ml_initial_training_needed")
         await retrain_models()
 
-    scheduler = AsyncIOScheduler()
+    scheduler = create_scheduler()
 
     # Retrain weekly
     scheduler.add_job(
@@ -55,6 +55,7 @@ async def main() -> None:
         "cron",
         day_of_week="sun",
         hour=3,
+        timezone="UTC",
         id="retrain",
     )
 

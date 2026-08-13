@@ -11,9 +11,7 @@ class TestStatusHistory:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_status_history_returns_records(
-        self, client: AsyncClient, seed_device_status
-    ):
+    async def test_status_history_returns_records(self, client: AsyncClient, seed_device_status):
         resp = await client.get("/api/status/history?hours=1")
         assert resp.status_code == 200
         data = resp.json()
@@ -43,9 +41,7 @@ class TestConsumptionHistory:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_consumption_returns_records(
-        self, client: AsyncClient, seed_consumption
-    ):
+    async def test_consumption_returns_records(self, client: AsyncClient, seed_consumption):
         resp = await client.get("/api/consumption/history?hours=24")
         assert resp.status_code == 200
         data = resp.json()
@@ -53,9 +49,7 @@ class TestConsumptionHistory:
         # Check total_kwh is computed
         for entry in data:
             assert entry["total_kwh"] == (
-                (entry["heat_kwh"] or 0)
-                + (entry["cool_kwh"] or 0)
-                + (entry["tank_kwh"] or 0)
+                (entry["heat_kwh"] or 0) + (entry["cool_kwh"] or 0) + (entry["tank_kwh"] or 0)
             )
 
     async def test_consumption_validates_range(self, client: AsyncClient):

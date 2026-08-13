@@ -126,6 +126,7 @@ export interface StatusDisplay {
 
 export const STATUS_DISPLAY: Record<string, StatusDisplay> = {
   pending: { text: "Scheduled", className: "pending" },
+  executing: { text: "Sending…", className: "pending" },
   dispatched: { text: "Sending…", className: "pending" },
   active: { text: "Active", className: "executed" },
   executed: { text: "Done", className: "executed" },
@@ -133,6 +134,7 @@ export const STATUS_DISPLAY: Record<string, StatusDisplay> = {
   failed: { text: "Failed", className: "failed" },
   skipped: { text: "Skipped", className: "skipped" },
   skipped_peak: { text: "Skipped (peak price)", className: "skipped" },
+  cancelled: { text: "Cancelled", className: "skipped" },
   expired: { text: "Missed", className: "skipped" },
 };
 
@@ -159,6 +161,11 @@ function humanizeReason(reason: string): string {
   const peakMatch = reason.match(/^peak_price_([\d.]+)_eur_kwh$/);
   if (peakMatch) return `Price peak (${parseFloat(peakMatch[1]).toFixed(2)}/kWh)`;
 
+  const forecastSatisfiedMatch = reason.match(/^(?:comfort|setback)_satisfied_forecast_([\d.]+)_target_([\d.]+)$/);
+  if (forecastSatisfiedMatch) {
+    return `Indoor forecast ${parseFloat(forecastSatisfiedMatch[1]).toFixed(1)}°C already exceeds ${parseFloat(forecastSatisfiedMatch[2]).toFixed(1)}°C target`;
+  }
+
   const map: Record<string, string> = {
     dhw_target_reached: "Tank reached target",
     thermal_preheat_before_cold: "Pre-heat before cold spell",
@@ -177,18 +184,22 @@ function humanizeReason(reason: string): string {
  * Render a plan action payload as a compact, human-readable summary.
  * Falls back to a humanized `reason` when no concrete parameters are present.
  */
-export function formatPayload(payload: Record<string, any> | null | undefined): string {
+export function formatPayload(payload: Record<string, unknown> | null | undefined): string {
   if (!payload || typeof payload !== "object") return "";
   const parts: string[] = [];
 
   const temp = payload.target_temp ?? payload.temperature ?? payload.temp ?? payload.tank_temp;
   if (typeof temp === "number") parts.push(`→ ${temp}°C`);
 
-  if (payload.level != null) parts.push(`level ${payload.level}`);
+  if (typeof payload.level === "number" || typeof payload.level === "string") {
+    parts.push(`level ${payload.level}`);
+  }
   if (typeof payload.offset === "number") {
     parts.push(`${payload.offset > 0 ? "+" : ""}${payload.offset}°C`);
   }
-  if (parts.length === 0 && payload.zone_id != null) parts.push(`zone ${payload.zone_id}`);
+  if (parts.length === 0 && (typeof payload.zone_id === "number" || typeof payload.zone_id === "string")) {
+    parts.push(`zone ${payload.zone_id}`);
+  }
   if (parts.length === 0 && typeof payload.reason === "string") {
     parts.push(humanizeReason(payload.reason));
   }

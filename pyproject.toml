@@ -2,7 +2,7 @@
 
 [build-system]
 requires = [
-    "setuptools>=61.0",
+    "setuptools>=77.0.3",
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
@@ -15,17 +15,33 @@ authors = [
 ]
 description = "Asynchronous library to control Panasonic Aquarea devices"
 readme = "README.md"
-license = { file="LICENSE" }
-requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
 dependencies = [
-  "aiohttp",
-  'StrEnum; python_version < "3.11"',
-  "bs4"
+  "aiohttp>=3.14.3,<4",
+  'StrEnum>=0.4.15; python_version < "3.11"',
+  "beautifulsoup4>=4.12,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.0",
+  "build>=1.2",
+  "isort>=5.13",
+  "pylint>=3.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "twine>=5.0",
 ]
 
 [project.urls]
@@ -36,7 +52,7 @@ dependencies = [
 aioaquarea = ["py.typed"]
 
 [tool.black]
-target-version = ["py39", "py310", "py311"]
+target-version = ["py310"]
 
 [tool.isort]
 # https://github.com/PyCQA/isort/wiki/isort-Settings

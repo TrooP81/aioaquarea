@@ -69,7 +69,11 @@ def device_manager():
         client=client,
         settings=settings,
         app_version=CCAppVersion(),
-        logger=SimpleNamespace(info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None, error=lambda *args, **kwargs: None),
+        logger=SimpleNamespace(
+            info=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+        ),
     )
 
 
@@ -184,10 +188,10 @@ def _minimal_status_payload(**overrides):
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        (0, None),          # 0 → no special mode active
+        (0, None),  # 0 → no special mode active
         (1, SpecialStatus.ECO),
         (2, SpecialStatus.COMFORT),
-        (99, None),         # unknown value → treated as no special status
+        (99, None),  # unknown value → treated as no special status
     ],
 )
 @pytest.mark.asyncio

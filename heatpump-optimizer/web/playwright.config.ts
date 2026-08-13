@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const liveBaseURL = process.env.PLAYWRIGHT_BASE_URL;
+const localPort = Number(process.env.PLAYWRIGHT_PORT ?? "3100");
+const localBaseURL = `http://127.0.0.1:${localPort}`;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -8,9 +10,11 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
-  reporter: process.env.CI ? "github" : "html",
+  reporter: process.env.CI
+    ? [["github"], ["html", { outputFolder: "playwright-report", open: "never" }]]
+    : "html",
   use: {
-    baseURL: liveBaseURL ?? "http://localhost:3000",
+    baseURL: liveBaseURL ?? localBaseURL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
   },
@@ -33,9 +37,9 @@ export default defineConfig({
   webServer: liveBaseURL
     ? undefined
     : {
-        command: "npm run dev",
-        url: "http://localhost:3000",
-        reuseExistingServer: !process.env.CI,
+        command: `npm run dev -- --hostname 127.0.0.1 --port ${localPort}`,
+        url: localBaseURL,
+        reuseExistingServer: false,
         timeout: 120_000,
       },
 });

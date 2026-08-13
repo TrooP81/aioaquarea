@@ -9,6 +9,9 @@ from packages.core.config import settings
 
 from .types import ActionType, VerifyResult
 
+ZONE_WATER_TARGET_MIN_C = 20
+ZONE_WATER_TARGET_MAX_C = 65
+
 DispatchFn = Callable[[Any, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 VerifyFn = Callable[[Any, dict[str, Any], dict[str, Any] | None], VerifyResult]
 
@@ -25,6 +28,13 @@ def _zone_from_device(device: Any):
     return device.zones.get(0) or device.zones.get(1) or next(iter(device.zones.values()), None)
 
 
+def _is_valid_zone_water_target(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and ZONE_WATER_TARGET_MIN_C <= value <= ZONE_WATER_TARGET_MAX_C
+    )
+
+
 def _special_status_name(device: Any) -> str | None:
     status = getattr(device, "special_status", None)
     return getattr(status, "name", None)
@@ -32,6 +42,22 @@ def _special_status_name(device: Any) -> str | None:
 
 async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     from aioaquarea import ForceDHW
+
+    device = await wrapper.get_device()
+    tank = getattr(device, "tank", None)
+    current_temp = getattr(tank, "temperature", None)
+    target_temp = getattr(tank, "target_temperature", None)
+    if (
+        isinstance(current_temp, (int, float))
+        and isinstance(target_temp, (int, float))
+        and current_temp >= target_temp - 0.5
+    ):
+        return {
+            "skip": True,
+            "reason": "tank_at_target",
+            "current_tank_temp": current_temp,
+            "tank_target_temp": target_temp,
+        }
 
     await wrapper.force_dhw(ForceDHW.ON)
     return {"force_dhw": "ON"}
@@ -64,14 +90,39 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
     device = await wrapper.get_device()
     zone = _zone_from_device(device)
     current_target = getattr(zone, "heat_target_temperature", None)
+    if not _is_valid_zone_water_target(current_target):
+        return {
+            "skip": True,
+            "reason": "zone_target_not_a_safe_water_setpoint",
+            "observed_zone_target": current_target,
+        }
     new_temp = int((current_target or 20) + offset)
+    if not _is_valid_zone_water_target(new_temp):
+        return {
+            "skip": True,
+            "reason": "zone_boost_outside_safe_water_range",
+            "observed_zone_target": current_target,
+            "requested_zone_target": new_temp,
+        }
     await wrapper.set_zone_heat_temperature(zone_id, new_temp)
     return {"zone_id": zone_id, "temperature": new_temp}
 
 
 async def _dispatch_zone_temp_restore(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     zone_id = int(payload.get("zone_id", 0))
-    target = int(payload.get("temperature") or ((settings.comfort_temp_min + settings.comfort_temp_max) // 2))
+    target = int(
+        payload.get("temperature") or ((settings.comfort_temp_min + settings.comfort_temp_max) // 2)
+    )
+    device = await wrapper.get_device()
+    zone = _zone_from_device(device)
+    observed_target = getattr(zone, "heat_target_temperature", None)
+    if not _is_valid_zone_water_target(observed_target) or not _is_valid_zone_water_target(target):
+        return {
+            "skip": True,
+            "reason": "zone_restore_not_safe_in_curve_mode",
+            "observed_zone_target": observed_target,
+            "requested_zone_target": target,
+        }
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
 
@@ -82,9 +133,17 @@ async def _dispatch_set_tank_temp(wrapper: Any, payload: dict[str, Any]) -> dict
     return {"temperature": target}
 
 
-async def _dispatch_set_zone_heat_temperature(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+async def _dispatch_set_zone_heat_temperature(
+    wrapper: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
     zone_id = int(payload.get("zone_id", 0))
     target = int(payload["temperature"])
+    if not _is_valid_zone_water_target(target):
+        return {
+            "skip": True,
+            "reason": "zone_target_outside_safe_water_range",
+            "requested_zone_target": target,
+        }
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
 
@@ -104,21 +163,39 @@ async def _dispatch_comfort_mode_on(wrapper: Any, payload: dict[str, Any]) -> di
     return {"special_status": "COMFORT"}
 
 
-def _verify_force_dhw(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
+def _verify_force_dhw(
+    device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
+) -> VerifyResult:
     observed = getattr(getattr(device, "force_dhw", None), "value", None)
     expected_value = 1 if expected and expected.get("force_dhw") == "ON" else 0
     ok = observed == expected_value
-    return VerifyResult(ok=ok, observed_value=observed, expected_value=expected_value, reason=None if ok else "force_dhw_mismatch")
+    return VerifyResult(
+        ok=ok,
+        observed_value=observed,
+        expected_value=expected_value,
+        reason=None if ok else "force_dhw_mismatch",
+    )
 
 
-def _verify_quiet_mode(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
+def _verify_quiet_mode(
+    device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
+) -> VerifyResult:
     observed = getattr(getattr(device, "quiet_mode", None), "value", None)
     target = expected.get("quiet_mode") if expected else None
-    ok = (target == "OFF" and observed == 0) or (target == "LEVEL1" and observed is not None and observed >= 1)
-    return VerifyResult(ok=ok, observed_value=observed, expected_value=target, reason=None if ok else "quiet_mode_mismatch")
+    ok = (target == "OFF" and observed == 0) or (
+        target == "LEVEL1" and observed is not None and observed >= 1
+    )
+    return VerifyResult(
+        ok=ok,
+        observed_value=observed,
+        expected_value=target,
+        reason=None if ok else "quiet_mode_mismatch",
+    )
 
 
-def _verify_special_status(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
+def _verify_special_status(
+    device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
+) -> VerifyResult:
     observed = _special_status_name(device)
     target = expected.get("special_status") if expected else None
 
@@ -139,22 +216,41 @@ def _verify_special_status(device: Any, payload: dict[str, Any], expected: dict[
         )
 
     ok = observed == target
-    return VerifyResult(ok=ok, observed_value=observed, expected_value=target, reason=None if ok else "special_status_mismatch")
+    return VerifyResult(
+        ok=ok,
+        observed_value=observed,
+        expected_value=target,
+        reason=None if ok else "special_status_mismatch",
+    )
 
 
-def _verify_tank_temp(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
+def _verify_tank_temp(
+    device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
+) -> VerifyResult:
     observed = getattr(getattr(device, "tank", None), "target_temperature", None)
     target = expected.get("temperature") if expected else None
     ok = observed == target
-    return VerifyResult(ok=ok, observed_value=observed, expected_value=target, reason=None if ok else "tank_target_mismatch")
+    return VerifyResult(
+        ok=ok,
+        observed_value=observed,
+        expected_value=target,
+        reason=None if ok else "tank_target_mismatch",
+    )
 
 
-def _verify_zone_temp(device: Any, payload: dict[str, Any], expected: dict[str, Any] | None) -> VerifyResult:
+def _verify_zone_temp(
+    device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
+) -> VerifyResult:
     zone = _zone_from_device(device)
     observed = getattr(zone, "heat_target_temperature", None)
     target = expected.get("temperature") if expected else None
     ok = observed == target
-    return VerifyResult(ok=ok, observed_value=observed, expected_value=target, reason=None if ok else "zone_target_mismatch")
+    return VerifyResult(
+        ok=ok,
+        observed_value=observed,
+        expected_value=target,
+        reason=None if ok else "zone_target_mismatch",
+    )
 
 
 ACTION_REGISTRY: dict[ActionType, ActionHandler] = {
@@ -165,10 +261,14 @@ ACTION_REGISTRY: dict[ActionType, ActionHandler] = {
     ActionType.ZONE_TEMP_BOOST: ActionHandler(_dispatch_zone_temp_boost, _verify_zone_temp),
     ActionType.ZONE_TEMP_RESTORE: ActionHandler(_dispatch_zone_temp_restore, _verify_zone_temp),
     ActionType.SET_TANK_TEMP: ActionHandler(_dispatch_set_tank_temp, _verify_tank_temp),
-    ActionType.SET_ZONE_HEAT_TEMPERATURE: ActionHandler(_dispatch_set_zone_heat_temperature, _verify_zone_temp),
+    ActionType.SET_ZONE_HEAT_TEMPERATURE: ActionHandler(
+        _dispatch_set_zone_heat_temperature, _verify_zone_temp
+    ),
     ActionType.ECO_MODE_ON: ActionHandler(_dispatch_eco_mode_on, _verify_special_status),
     ActionType.ECO_MODE_OFF: ActionHandler(_dispatch_clear_special_status, _verify_special_status),
-    ActionType.NORMAL_MODE_ON: ActionHandler(_dispatch_clear_special_status, _verify_special_status),
+    ActionType.NORMAL_MODE_ON: ActionHandler(
+        _dispatch_clear_special_status, _verify_special_status
+    ),
     ActionType.COMFORT_MODE_ON: ActionHandler(_dispatch_comfort_mode_on, _verify_special_status),
 }
 

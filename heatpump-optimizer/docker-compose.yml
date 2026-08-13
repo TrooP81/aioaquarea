@@ -1,13 +1,15 @@
 services:
   db:
-    image: timescale/timescaledb:latest-pg16
+    # TimescaleDB 2.26.4, pinned by digest.  Existing installations created
+    # with this extension version cannot be opened by an older server image.
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
     env_file: .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "${DB_PORT}:5432"
+      - "127.0.0.1:${DB_PORT}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,7 +19,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
     volumes:
       - redisdata:/data
     healthcheck:
@@ -91,7 +93,7 @@ services:
     volumes:
       - modeldata:/app/models
     ports:
-      - "${API_PORT}:8500"
+      - "127.0.0.1:${API_PORT}:8500"
     depends_on:
       db:
         condition: service_healthy
@@ -100,6 +102,11 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8500/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   web:
     build:
@@ -107,9 +114,73 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${WEB_PORT}:3000"
+    environment:
+      # Kept server-side by the Next route handler; never exposed as NEXT_PUBLIC.
+      INTERNAL_API_URL: http://api:8500
+      INTERNAL_API_TOKEN: ${API_TOKEN:-}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
+
+  backup:
+    # Uses the same pinned PostgreSQL/Timescale image as the primary database,
+    # so pg_dump and pg_restore always match the server major version. The
+    # derived image adds only OpenSSL for optional encrypted replication.
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+      args:
+        TIMESCALE_IMAGE: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
+    env_file: .env
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_VERIFY_AFTER_DUMP: ${BACKUP_VERIFY_AFTER_DUMP:-false}
+      BACKUP_REPLICA_ENABLED: ${BACKUP_REPLICA_ENABLED:-false}
+      BACKUP_REPLICA_DIR: /replica
+      BACKUP_REPLICA_REQUIRED: ${BACKUP_REPLICA_REQUIRED:-false}
+      BACKUP_REPLICA_ENCRYPTION_KEY: ${BACKUP_REPLICA_ENCRYPTION_KEY:-}
+    command: ["/bin/sh", "/scripts/backup_db.sh"]
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup_db.sh:/scripts/backup_db.sh:ro
+      - ./scripts/verify_backup.sh:/scripts/verify_backup.sh:ro
+      - ${BACKUP_REPLICA_HOST_DIR:-./backups-replica}:/replica
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backup-verify:
+    # Run manually with: docker compose --profile maintenance run --rm backup-verify
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+      args:
+        TIMESCALE_IMAGE: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
+    env_file: .env
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_DIR: /backups
+      BACKUP_REPLICA_ENCRYPTION_KEY: ${BACKUP_REPLICA_ENCRYPTION_KEY:-}
+    command: ["/bin/sh", "/scripts/verify_backup.sh"]
+    volumes:
+      - ./backups:/backups
+      - ./scripts/verify_backup.sh:/scripts/verify_backup.sh:ro
+      - ${BACKUP_REPLICA_HOST_DIR:-./backups-replica}:/replica
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   pgdata:

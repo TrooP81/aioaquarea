@@ -4,6 +4,7 @@ Revision ID: 001
 Revises:
 Create Date: 2026-04-30
 """
+
 from typing import Sequence, Union
 
 from alembic import op
@@ -39,9 +40,7 @@ def upgrade() -> None:
         sa.Column("special_status", sa.Integer),
         sa.PrimaryKeyConstraint("ts", "device_id"),
     )
-    op.execute(
-        "SELECT create_hypertable('device_status', 'ts', if_not_exists => TRUE)"
-    )
+    op.execute("SELECT create_hypertable('device_status', 'ts', if_not_exists => TRUE)")
 
     # Consumption
     op.create_table(
@@ -54,9 +53,7 @@ def upgrade() -> None:
         sa.Column("outdoor_temp", sa.Float),
         sa.PrimaryKeyConstraint("ts", "device_id"),
     )
-    op.execute(
-        "SELECT create_hypertable('consumption', 'ts', if_not_exists => TRUE)"
-    )
+    op.execute("SELECT create_hypertable('consumption', 'ts', if_not_exists => TRUE)")
 
     # Prices
     op.create_table(
@@ -66,9 +63,7 @@ def upgrade() -> None:
         sa.Column("price_eur_per_kwh", sa.Float, nullable=False),
         sa.PrimaryKeyConstraint("ts", "area"),
     )
-    op.execute(
-        "SELECT create_hypertable('prices', 'ts', if_not_exists => TRUE)"
-    )
+    op.execute("SELECT create_hypertable('prices', 'ts', if_not_exists => TRUE)")
 
     # Weather
     op.create_table(
@@ -81,9 +76,7 @@ def upgrade() -> None:
         sa.Column("humidity", sa.Float),
         sa.PrimaryKeyConstraint("ts", "source"),
     )
-    op.execute(
-        "SELECT create_hypertable('weather', 'ts', if_not_exists => TRUE)"
-    )
+    op.execute("SELECT create_hypertable('weather', 'ts', if_not_exists => TRUE)")
 
     # Plans
     op.create_table(

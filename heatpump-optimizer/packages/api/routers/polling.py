@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from packages.api._helpers import get_price_area
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, PriceRecord, WeatherRecord
+from packages.core.outdoor_temperature import resolve_outdoor_temperature
 
 router = APIRouter()
 
@@ -16,7 +17,7 @@ async def poll_now():
     import aiohttp
     from aioaquarea import AquareaEnvironment, Client
     from packages.core.settings_service import get_setting
-    from packages.poller.feeds import fetch_prices, fetch_weather
+    from packages.poller.feeds import fetch_price_feed, fetch_weather
 
     results = {"device": None, "prices": None, "weather": None}
 
@@ -51,23 +52,35 @@ async def poll_now():
                     direction = device.current_direction.name
                     device_action = device.current_action.name
                     defrost_active = device.device_mode_status.name == "DEFROST"
+                    raw_outdoor_temp = device.temperature_outdoor
+                    async with get_session() as db:
+                        outdoor = await resolve_outdoor_temperature(
+                            db,
+                            heat_pump_c=raw_outdoor_temp,
+                        )
 
                     record = DeviceStatusRecord(
                         ts=dt.datetime.now(dt.timezone.utc),
                         device_id=device.long_id,
                         mode=str(device.mode),
                         operation_status=device.operation_status.value,
-                        outdoor_temp=device.temperature_outdoor,
+                        outdoor_temp=outdoor.effective_c,
+                        heat_pump_outdoor_temp=outdoor.heat_pump_c,
+                        outdoor_temp_source=outdoor.source,
                         tank_temp=device.tank.temperature if device.tank else None,
                         tank_target_temp=device.tank.target_temperature if device.tank else None,
-                        tank_operation_status=device.tank.operation_status.value if device.tank else None,
+                        tank_operation_status=device.tank.operation_status.value
+                        if device.tank
+                        else None,
                         zone1_temp=zone1.temperature if zone1 else None,
                         zone1_target_temp=zone1.heat_target_temperature if zone1 else None,
                         zone2_temp=zone2.temperature if zone2 else None,
                         zone2_target_temp=zone2.heat_target_temperature if zone2 else None,
                         quiet_mode=device.quiet_mode.value,
                         powerful_mode=device.powerful_time.value,
-                        special_status=device.special_status.value if device.special_status else None,
+                        special_status=device.special_status.value
+                        if device.special_status
+                        else None,
                         direction=direction,
                         pump_duty=device.pump_duty,
                         device_action=device_action,
@@ -88,9 +101,18 @@ async def poll_now():
 
                     now = dt.datetime.now(dt.timezone.utc)
                     try:
-                        heat = await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
-                        cool = await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
-                        tank = await device.get_and_refresh_consumption(now, ConsumptionType.WATER_TANK) or 0
+                        heat = (
+                            await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
+                        )
+                        cool = (
+                            await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
+                        )
+                        tank = (
+                            await device.get_and_refresh_consumption(
+                                now, ConsumptionType.WATER_TANK
+                            )
+                            or 0
+                        )
 
                         cons_record = ConsumptionRecord(
                             ts=now,
@@ -98,7 +120,9 @@ async def poll_now():
                             heat_kwh=heat,
                             cool_kwh=cool,
                             tank_kwh=tank,
-                            outdoor_temp=device.temperature_outdoor,
+                            outdoor_temp=outdoor.effective_c,
+                            heat_pump_outdoor_temp=outdoor.heat_pump_c,
+                            outdoor_temp_source=outdoor.source,
                         )
                         async with get_session() as db:
                             db.add(cons_record)
@@ -106,12 +130,22 @@ async def poll_now():
                         total = heat + cool + tank
                         results["device"] = {
                             "success": True,
-                            "message": f"Device polled: outdoor={record.outdoor_temp}degC, tank={record.tank_temp}degC, action={device_action}, consumption={total:.1f} kWh",
+                            "message": (
+                                f"Device polled: outdoor={record.outdoor_temp}degC "
+                                f"({record.outdoor_temp_source}; pump={record.heat_pump_outdoor_temp}degC), "
+                                f"tank={record.tank_temp}degC, action={device_action}, "
+                                f"consumption={total:.1f} kWh"
+                            ),
                         }
                     except Exception as ce:
                         results["device"] = {
                             "success": True,
-                            "message": f"Device polled: outdoor={record.outdoor_temp}degC, tank={record.tank_temp}degC, action={device_action} (consumption not yet available: {ce})",
+                            "message": (
+                                f"Device polled: outdoor={record.outdoor_temp}degC "
+                                f"({record.outdoor_temp_source}; pump={record.heat_pump_outdoor_temp}degC), "
+                                f"tank={record.tank_temp}degC, action={device_action} "
+                                f"(consumption not yet available: {ce})"
+                            ),
                         }
                 else:
                     results["device"] = {"success": False, "message": "No devices found"}
@@ -121,17 +155,31 @@ async def poll_now():
         results["device"] = {"success": False, "message": "Credentials not configured"}
 
     try:
-        prices = await fetch_prices()
+        feed = await fetch_price_feed()
+        prices = feed.prices
         if prices:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             area = await get_price_area()
+            fetched_at = dt.datetime.now(dt.timezone.utc)
             async with get_session() as db:
                 for ts, price in prices:
-                    stmt = pg_insert(PriceRecord).values(ts=ts, area=area, price_eur_per_kwh=price)
+                    stmt = pg_insert(PriceRecord).values(
+                        ts=ts,
+                        area=area,
+                        price_eur_per_kwh=price,
+                        price_currency=feed.currency,
+                        price_source=feed.source,
+                        fetched_at=fetched_at,
+                    )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ts", "area"],
-                        set_={"price_eur_per_kwh": price},
+                        set_={
+                            "price_eur_per_kwh": price,
+                            "price_currency": feed.currency,
+                            "price_source": feed.source,
+                            "fetched_at": fetched_at,
+                        },
                     )
                     await db.execute(stmt)
             results["prices"] = {"success": True, "message": f"Fetched {len(prices)} price points"}
@@ -149,13 +197,14 @@ async def poll_now():
                 for entry in weather_data:
                     stmt = pg_insert(WeatherRecord).values(
                         ts=entry["ts"],
-                        source="open-meteo",
+                        source=entry.get("source", "open-meteo"),
                         temperature=entry["temperature"],
                         irradiance=entry.get("irradiance"),
                         wind_speed=entry.get("wind_speed"),
                         humidity=entry.get("humidity"),
                         cloud_cover=entry.get("cloud_cover"),
                         precipitation=entry.get("precipitation"),
+                        forecast_issued_at=entry.get("forecast_issued_at"),
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ts", "source"],
@@ -166,10 +215,14 @@ async def poll_now():
                             "humidity": entry.get("humidity"),
                             "cloud_cover": entry.get("cloud_cover"),
                             "precipitation": entry.get("precipitation"),
+                            "forecast_issued_at": entry.get("forecast_issued_at"),
                         },
                     )
                     await db.execute(stmt)
-            results["weather"] = {"success": True, "message": f"Fetched {len(weather_data)} weather entries"}
+            results["weather"] = {
+                "success": True,
+                "message": f"Fetched {len(weather_data)} weather entries",
+            }
         else:
             results["weather"] = {"success": False, "message": "No weather data returned"}
     except Exception as e:

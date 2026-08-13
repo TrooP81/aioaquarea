@@ -40,7 +40,9 @@ class PlanExecutor(_CorePlanExecutor):
         finally:
             core_method.__globals__["get_session"] = original_get_session
 
-    async def _verify_with_retry(self, action, payload: dict, expected_state: dict[str, object]) -> None:
+    async def _verify_with_retry(
+        self, action, payload: dict, expected_state: dict[str, object]
+    ) -> None:
         core_method = self.__class__.__mro__[1]._verify_with_retry
         original_get_session = core_method.__globals__["get_session"]
         core_method.__globals__["get_session"] = get_session
@@ -49,7 +51,15 @@ class PlanExecutor(_CorePlanExecutor):
         finally:
             core_method.__globals__["get_session"] = original_get_session
 
-    async def _poll_until_verified(self, *, action_id: int, handler, payload: dict, expected_state: dict[str, object], attempts: int):
+    async def _poll_until_verified(
+        self,
+        *,
+        action_id: int,
+        handler,
+        payload: dict,
+        expected_state: dict[str, object],
+        attempts: int,
+    ):
         core_method = self.__class__.__mro__[1]._poll_until_verified
         original_asyncio = core_method.__globals__["asyncio"]
         core_method.__globals__["asyncio"] = asyncio

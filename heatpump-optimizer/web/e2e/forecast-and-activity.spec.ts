@@ -90,6 +90,9 @@ test("shows rainfall and separates actual activity from plan revisions", async (
         forecast_no_heating: [{ hour: 1, predicted_indoor_temp: 20.5 }],
         target_schedule: [{ hour: 1, target: 20.5, comfort_hour: true }],
         weather_forecast: [{ ts: now.toISOString(), outdoor_temp: 6, wind_speed: 4, irradiance: 25, precipitation: 1.6 }],
+        price_forecast: [{ ts: now.toISOString(), price_eur_per_kwh: 0.085 }],
+        forecast_source: "active_plan",
+        plan_id: 42,
         planned_actions: [],
       }),
     })
@@ -115,13 +118,15 @@ test("shows rainfall and separates actual activity from plan revisions", async (
   await page.goto("/");
 
   await page.getByRole("tab", { name: "Charts" }).click();
-  await expect(page.getByRole("region", { name: "Indoor comfort, weather and price chart" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Indoor comfort, weather and price forecast" })).toBeVisible();
   await page.getByText("Show raw weather, price and temperature history").click();
-  await expect(page.locator(".recharts-bar-rectangle").first()).toBeVisible();
+    await expect(
+      page.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
+    ).toBeVisible();
   await expect(page.getByText("Blue bars show rain in mm/h.")).toBeVisible();
   await page.getByRole("tab", { name: "Plan" }).click();
   await expect(page.getByTestId("plan-activity")).toBeVisible();
   await expect(page.getByText("Heat hot water")).toBeVisible();
   await expect(page.getByText("Command completed and verified")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Plan Revisions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Plan change history" })).toBeVisible();
 });

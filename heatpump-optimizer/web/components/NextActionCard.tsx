@@ -36,7 +36,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
     update();
     const interval = setInterval(update, 30000);
     return () => clearInterval(interval);
-  }, [nextAction?.scheduled_ts]);
+  }, [nextAction]);
 
   if (!plan) {
     return (

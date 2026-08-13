@@ -11,6 +11,9 @@ interface Sensor {
 interface Props {
   value: string;
   onChange: (next: string) => void;
+  single?: boolean;
+  title?: string;
+  emptyMessage?: string;
 }
 
 function parseIds(value: string): string[] {
@@ -20,7 +23,13 @@ function parseIds(value: string): string[] {
     .filter(Boolean);
 }
 
-export function SmartThingsSensorSelector({ value, onChange }: Props) {
+export function SmartThingsSensorSelector({
+  value,
+  onChange,
+  single = false,
+  title = "Sensors to poll",
+  emptyMessage,
+}: Props) {
   const [sensors, setSensors] = useState<Sensor[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +72,10 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
   };
 
   const toggle = (id: string) => {
+    if (single) {
+      onChange(selected.includes(id) ? "" : id);
+      return;
+    }
     const set = new Set(selected);
     if (set.has(id)) {
       set.delete(id);
@@ -96,11 +109,11 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
   return (
     <div style={wrapStyle}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
-        <span style={{ fontSize: "0.875rem", fontWeight: 500 }}>Sensors to poll</span>
+          <span style={{ fontSize: "0.875rem", fontWeight: 500 }}>{title}</span>
         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
           {selected.length === 0
-            ? "None selected — all discovered sensors are polled automatically"
-            : `${selected.length} selected`}
+            ? (emptyMessage || (single ? "No reference — use robust median" : "None selected — all discovered sensors are polled automatically"))
+            : single ? "Reference selected" : `${selected.length} selected`}
         </span>
         <button
           type="button"
@@ -148,7 +161,8 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
                   }}
                 >
                   <input
-                    type="checkbox"
+                    type={single ? "radio" : "checkbox"}
+                    name={single ? "smartthings-reference-sensor" : undefined}
                     checked={checked}
                     onChange={() => toggle(s.device_id)}
                   />
@@ -162,6 +176,7 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
           </div>
 
           <div style={{ display: "flex", gap: "0.5rem" }}>
+            {!single && (
             <button
               type="button"
               className="btn"
@@ -170,6 +185,7 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
             >
               Select all
             </button>
+            )}
             <button
               type="button"
               className="btn"
@@ -185,7 +201,7 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
       {unavailable.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
           <span style={{ fontSize: "0.75rem", color: "var(--warning, orange)" }}>
-            Selected but not currently discovered:
+            {single ? "Reference sensor not currently discovered:" : "Selected but not currently discovered:"}
           </span>
           {unavailable.map((id) => (
             <label
@@ -198,7 +214,7 @@ export function SmartThingsSensorSelector({ value, onChange }: Props) {
                 cursor: "pointer",
               }}
             >
-              <input type="checkbox" checked onChange={() => toggle(id)} />
+              <input type={single ? "radio" : "checkbox"} checked onChange={() => toggle(id)} />
               <span style={{ color: "var(--text-muted)" }}>{id}</span>
             </label>
           ))}

@@ -65,7 +65,12 @@ def reset_ml_models() -> list[str]:
     thermal_model.reset()
 
     deleted: list[str] = []
-    for pattern in ("cop_model_*.pkl", "demand_model_*.pkl", "comfort_model_*.pkl"):
+    for pattern in (
+        "cop_model_*.pkl",
+        "demand_model_*.pkl",
+        "comfort_model_*.pkl",
+        "thermal_params_v1.pkl",
+    ):
         for path in MODEL_DIR.glob(pattern):
             try:
                 path.unlink()
@@ -91,9 +96,7 @@ async def reset_data(body: ResetRequest):
                 await session.execute(delete(model))
                 deleted_rows[model.__tablename__] = count or 0
 
-    models_affected = body.reset_models and bool(
-        MODEL_FEEDING_SCOPES.intersection(body.scopes)
-    )
+    models_affected = body.reset_models and bool(MODEL_FEEDING_SCOPES.intersection(body.scopes))
     deleted_models: list[str] = reset_ml_models() if models_affected else []
 
     async with get_session() as session:

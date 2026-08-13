@@ -16,7 +16,14 @@ import structlog
 from sqlalchemy import and_, select, update
 
 from packages.core.database import get_session
-from packages.core.models import AuditLogRecord, OverrideRecord, PlanActionRecord, PlanRecord
+from packages.core.models import (
+    AuditLogRecord,
+    DeviceStatusRecord,
+    OverrideRecord,
+    PlanActionRecord,
+    PlanRecord,
+)
+from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS
 from packages.core.services import AquareaWrapper
 from packages.optimizer.actions import ActionType, VerifyResult, get_action_handler
 
@@ -26,6 +33,14 @@ MAX_ACTIONS_PER_CYCLE = 3
 VERIFY_POLL_INTERVAL_S = 10
 VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
+
+
+def _device_status_freshness_cutoff(now: dt.datetime) -> dt.datetime:
+    """Allow normal poll jitter, but never dispatch against stale pump state."""
+    from packages.core.config import settings
+
+    max_age_seconds = max(int(settings.poll_interval_seconds) * 3, 15 * 60)
+    return now - dt.timedelta(seconds=max_age_seconds)
 
 
 async def is_learning_mode_active() -> bool:
@@ -39,11 +54,18 @@ async def is_learning_mode_active() -> bool:
     from packages.core.settings_service import get_bool_setting
 
     try:
-        return await get_bool_setting("learning_mode_enabled")
+        if await get_bool_setting("learning_mode_enabled"):
+            return True
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status()
+        if seasonal["observe_only_active"]:
+            logger.info("executor_seasonal_calibration_active", **seasonal)
+            return True
+        return False
     except Exception as exc:  # noqa: BLE001 - never let a settings error pause control
         logger.warning("learning_mode_check_failed", error=str(exc))
         return False
-
 
 
 class PlanExecutor:
@@ -70,16 +92,76 @@ class PlanExecutor:
 
             result = await session.execute(
                 select(PlanActionRecord)
+                .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
                 .where(
                     and_(
                         PlanActionRecord.status == "pending",
                         PlanActionRecord.scheduled_ts <= now,
+                        PlanRecord.status == ACTIVE_PLAN_STATUS,
                     )
                 )
                 .order_by(PlanActionRecord.scheduled_ts)
                 .limit(MAX_ACTIONS_PER_CYCLE)
+                # Lock both the action and its active plan.  A replacement
+                # plan waits until these actions are either claimed or left
+                # pending, so it cannot race a command sent to the pump.
+                .with_for_update()
             )
             actions = result.scalars().all()
+
+            if actions:
+                latest_status_ts = (
+                    await session.execute(
+                        select(DeviceStatusRecord.ts)
+                        .order_by(DeviceStatusRecord.ts.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                freshness_cutoff = _device_status_freshness_cutoff(now)
+                if latest_status_ts is None or latest_status_ts < freshness_cutoff:
+                    age_seconds = (
+                        None
+                        if latest_status_ts is None
+                        else round((now - latest_status_ts).total_seconds())
+                    )
+                    logger.warning(
+                        "executor_device_status_stale",
+                        action_count=len(actions),
+                        latest_status=latest_status_ts.isoformat() if latest_status_ts else None,
+                        age_seconds=age_seconds,
+                    )
+                    for action in actions:
+                        await session.execute(
+                            update(PlanActionRecord)
+                            .where(PlanActionRecord.id == action.id)
+                            .where(PlanActionRecord.status == "pending")
+                            .values(
+                                status="skipped",
+                                executed_at=now,
+                                result_json=json.dumps(
+                                    {
+                                        "reason": "device_status_stale",
+                                        "detail": "Automatic command not sent because live pump status was stale",
+                                        "latest_status": latest_status_ts.isoformat()
+                                        if latest_status_ts
+                                        else None,
+                                    }
+                                ),
+                            )
+                        )
+                    return
+
+            if actions:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(
+                        and_(
+                            PlanActionRecord.id.in_([action.id for action in actions]),
+                            PlanActionRecord.status == "pending",
+                        )
+                    )
+                    .values(status="executing")
+                )
 
             if await is_learning_mode_active():
                 logger.info(
@@ -141,6 +223,35 @@ class PlanExecutor:
 
             expected_state = await handler.dispatch(self._wrapper, payload) or {}
             now = dt.datetime.now(dt.timezone.utc)
+            if expected_state.get("skip"):
+                result = {
+                    "reason": expected_state.get("reason", "action_precondition_not_met"),
+                    "detail": "Automatic command was not sent after its final live-device safety check",
+                    "observed": {
+                        key: value
+                        for key, value in expected_state.items()
+                        if key not in {"skip", "reason"}
+                    },
+                }
+                async with get_session() as session:
+                    await session.execute(
+                        update(PlanActionRecord)
+                        .where(PlanActionRecord.id == action.id)
+                        .values(
+                            status="skipped",
+                            executed_at=now,
+                            expected_state_json=json.dumps(expected_state),
+                            result_json=json.dumps(result),
+                        )
+                    )
+                logger.info(
+                    "action_skipped_live_precondition",
+                    action_type=action.action_type,
+                    action_id=action.id,
+                    reason=result["reason"],
+                )
+                return
+
             async with get_session() as session:
                 await session.execute(
                     update(PlanActionRecord)
@@ -327,7 +438,7 @@ class PlanExecutor:
         )
 
     async def expire_stale_actions(self) -> None:
-        """Mark stale pending actions as expired with a diagnostic reason.
+        """Mark stale claimed or pending actions as expired with a diagnostic reason.
 
         Runs periodically to catch actions that the executor never picked up
         (e.g. scheduled during an override window, or from a superseded plan).
@@ -340,10 +451,12 @@ class PlanExecutor:
         async with get_session() as session:
             result = await session.execute(
                 select(PlanActionRecord)
+                .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
                 .where(
                     and_(
-                        PlanActionRecord.status == "pending",
+                        PlanActionRecord.status.in_(("pending", "executing")),
                         PlanActionRecord.scheduled_ts <= cutoff,
+                        PlanRecord.status == ACTIVE_PLAN_STATUS,
                     )
                 )
                 .order_by(PlanActionRecord.scheduled_ts)
@@ -378,7 +491,9 @@ class PlanExecutor:
                 )
 
     @staticmethod
-    async def _diagnose_missed(session, action: PlanActionRecord, latest_plan_id: int | None, now) -> dict:
+    async def _diagnose_missed(
+        session, action: PlanActionRecord, latest_plan_id: int | None, now
+    ) -> dict:
         """Determine why a pending action was never executed."""
         scheduled = action.scheduled_ts
         gap_minutes = round((now - scheduled).total_seconds() / 60, 1)

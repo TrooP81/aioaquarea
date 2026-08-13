@@ -98,6 +98,7 @@ def iter_consumption_intervals(
                 )
         prev = row
 
+
 try:
     from sklearn.ensemble import (
         GradientBoostingRegressor,

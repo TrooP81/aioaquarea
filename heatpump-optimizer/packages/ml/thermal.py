@@ -17,7 +17,7 @@ Phase 3 improvements:
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, fields
 from typing import Optional
 
 import numpy as np
@@ -25,9 +25,17 @@ import structlog
 from sqlalchemy import select
 
 from packages.core.database import get_session
-from packages.core.models import DeviceStatusRecord, IndoorTempReading
+from packages.core.heating_evidence import has_confirmed_space_heating
+from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+from packages.ml.models_common import MODEL_DIR
 
 logger = structlog.get_logger(__name__)
+
+# A successful tank calibration is not evidence that the separate indoor-air
+# fallback has been learned. Keep confidence tied to each sub-model's samples.
+MIN_LEARNED_RATE_SAMPLES = 5
+THERMAL_MODEL_ARTIFACT = "thermal_params_v1.pkl"
+THERMAL_MODEL_SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -66,6 +74,9 @@ class ThermalParams:
     indoor_cooling_outdoor_factor: float = 0.01  # reduced loss per °C warmer outdoor
     indoor_heating_samples: int = 0
     indoor_cooling_samples: int = 0
+    # Per-component validation result from the latest calibration. Persisted so
+    # the API process can explain a rejected candidate calibrated by optimizer.
+    calibration_status: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -122,6 +133,131 @@ class ThermalModel:
         """Discard learned calibration and return to default thermal parameters."""
         self.params = ThermalParams()
 
+    def _sanitize_zone_cooling_params(self) -> None:
+        """Reset impossible persisted zone-loss values before they reach control."""
+        if not (-3.0 <= self.params.zone_standby_loss <= 0.0):
+            self.params.zone_standby_loss = ThermalParams().zone_standby_loss
+            self.params.calibration_status["zone_cooling"] = (
+                "rejected_previous_base_outside_safe_range"
+            )
+        if abs(self.params.zone_loss_outdoor_factor) > 0.2:
+            self.params.zone_loss_outdoor_factor = ThermalParams().zone_loss_outdoor_factor
+            self.params.calibration_status["zone_cooling"] = (
+                "rejected_previous_slope_outside_safe_range"
+            )
+
+    @staticmethod
+    def _robust_zone_cooling_fit(
+        samples: list[tuple[float, float]],
+    ) -> tuple[float, float] | None:
+        """Fit zone standby loss only when its raw parameters are plausible.
+
+        The old direct regression could extrapolate a sparse warm-weather
+        sample into a very large negative intercept (for example -49°C/h at
+        0°C). Runtime clamping hid that value but forecasts still became
+        pessimistic. Trim MAD outliers and reject, rather than clamp, an
+        implausible candidate so the last validated/default parameters remain.
+        """
+        deltas = np.array([sample[0] for sample in samples], dtype=float)
+        outdoors = np.array([sample[1] for sample in samples], dtype=float)
+        median = float(np.median(deltas))
+        mad = float(np.median(np.abs(deltas - median)))
+        spread = max(0.1, mad * 1.4826)
+        keep = np.abs(deltas - median) <= 3.0 * spread
+        deltas = deltas[keep]
+        outdoors = outdoors[keep]
+        if len(deltas) < MIN_LEARNED_RATE_SAMPLES:
+            return None
+
+        if np.std(outdoors) > 0.1:
+            slope, base = np.polyfit(outdoors, deltas, 1)
+        else:
+            slope, base = 0.0, float(np.mean(deltas))
+
+        if not (-3.0 <= base <= 0.0) or abs(slope) > 0.2:
+            return None
+        return float(base), float(slope)
+
+    @staticmethod
+    def _artifact_path():
+        return MODEL_DIR / THERMAL_MODEL_ARTIFACT
+
+    def save(self) -> None:
+        """Persist calibrated parameters for API, poller, and optimizer processes."""
+        from packages.ml.safe_persistence import safe_dump
+
+        safe_dump(
+            {
+                "schema_version": THERMAL_MODEL_SCHEMA_VERSION,
+                "params": asdict(self.params),
+            },
+            self._artifact_path(),
+        )
+
+    def load_latest(self) -> bool:
+        """Load the shared calibrated parameters, returning whether one was valid."""
+        from packages.ml.safe_persistence import safe_load
+
+        path = self._artifact_path()
+        if not path.exists():
+            return False
+        try:
+            payload = safe_load(path)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != THERMAL_MODEL_SCHEMA_VERSION
+            ):
+                raise ValueError("obsolete thermal outdoor-temperature schema")
+            params = payload.get("params") if isinstance(payload, dict) else None
+            if not isinstance(params, dict):
+                raise ValueError("missing thermal parameter payload")
+
+            allowed = {field.name for field in fields(ThermalParams)}
+            values = {key: value for key, value in params.items() if key in allowed}
+            calibrated = values.get("last_calibrated")
+            if isinstance(calibrated, str):
+                calibrated_at = dt.datetime.fromisoformat(calibrated)
+                values["last_calibrated"] = (
+                    calibrated_at.replace(tzinfo=dt.timezone.utc)
+                    if calibrated_at.tzinfo is None
+                    else calibrated_at
+                )
+            elif calibrated is not None and not isinstance(calibrated, dt.datetime):
+                raise ValueError("invalid thermal calibration timestamp")
+
+            loaded = ThermalParams(**values)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("thermal_model_load_failed", path=str(path), error=str(exc))
+            return False
+
+        if (
+            self.params.last_calibrated is not None
+            and loaded.last_calibrated is not None
+            and self.params.last_calibrated >= loaded.last_calibrated
+        ):
+            return True
+        self.params = loaded
+        logger.info(
+            "thermal_model_loaded",
+            path=str(path),
+            last_calibrated=loaded.last_calibrated.isoformat() if loaded.last_calibrated else None,
+        )
+        return True
+
+    def confidence_for(self, component: str) -> str:
+        """Return evidence-based confidence for one thermal sub-model."""
+        if self.params.last_calibrated is None:
+            return "default"
+        samples = {
+            "tank_heating": self.params.dhw_heating_samples,
+            "zone_heating": self.params.zone_compressor_samples,
+            "indoor_heating": self.params.indoor_heating_samples,
+            "indoor_cooling": self.params.indoor_cooling_samples,
+        }.get(component)
+        if samples is None:
+            return "learned"
+        return "learned" if samples >= MIN_LEARNED_RATE_SAMPLES else "default"
+
     @staticmethod
     def _nearest_prior_index_in_gap(
         times: np.ndarray,
@@ -164,6 +300,12 @@ class ThermalModel:
                 .order_by(DeviceStatusRecord.ts)
             )
             records = result.scalars().all()
+            weather_result = await session.execute(
+                select(WeatherRecord)
+                .where(WeatherRecord.ts >= since - dt.timedelta(hours=2))
+                .order_by(WeatherRecord.ts)
+            )
+            weather_rows = weather_result.scalars().all()
 
         if len(records) < self.params.min_samples:
             logger.warning(
@@ -187,10 +329,25 @@ class ThermalModel:
         # away to avoid amplifying sensor noise into extreme hourly rates.
         # amplifying short-interval temperature noise into extreme hourly
         # rates (e.g. 1°C / 5 min → 12°C/h when it's really ~2°C/h).
-        MIN_GAP_S_DEVICE = 600   # 10 min
+        MIN_GAP_S_DEVICE = 600  # 10 min
         MAX_GAP_S_DEVICE = 7200  # 2 h
 
         record_times = np.array([r.ts.timestamp() for r in records])
+        weather_by_hour = {
+            row.ts.replace(minute=0, second=0, microsecond=0): float(row.temperature)
+            for row in weather_rows
+            if row.temperature is not None
+        }
+
+        def weather_temperature_at(timestamp: dt.datetime, fallback: float) -> float:
+            hour = timestamp.replace(minute=0, second=0, microsecond=0)
+            candidates = [
+                (abs(offset), weather_by_hour.get(hour + dt.timedelta(hours=offset)))
+                for offset in (-2, -1, 0, 1, 2)
+            ]
+            available = [(gap, value) for gap, value in candidates if value is not None]
+            return min(available, key=lambda item: item[0])[1] if available else fallback
+
         for i in range(1, len(records)):
             curr = records[i]
 
@@ -205,13 +362,16 @@ class ThermalModel:
             dt_hours = gap_s / 3600.0
 
             # FILTER: Skip defrost intervals — temperature readings are unreliable
-            if getattr(curr, 'defrost_active', None) or getattr(prev, 'defrost_active', None):
+            if getattr(curr, "defrost_active", None) or getattr(prev, "defrost_active", None):
                 defrost_filtered += 1
                 continue
 
-            outdoor = curr.outdoor_temp if curr.outdoor_temp is not None else 10.0
-            curr_direction = getattr(curr, 'direction', None)
-            prev_direction = getattr(prev, 'direction', None)
+            outdoor = weather_temperature_at(
+                curr.ts,
+                curr.outdoor_temp if curr.outdoor_temp is not None else 10.0,
+            )
+            curr_direction = getattr(curr, "direction", None)
+            prev_direction = getattr(prev, "direction", None)
 
             # Tank temperature delta
             if (
@@ -225,7 +385,11 @@ class ThermalModel:
                 # With sliding-window gaps, direction may change mid-interval.
                 # Accept heating samples when EITHER endpoint was in WATER mode.
                 either_water = "WATER" in (curr_direction, prev_direction)
-                either_idle = curr_direction in (None, "IDLE", "PUMP") and prev_direction in (None, "IDLE", "PUMP")
+                either_idle = curr_direction in (None, "IDLE", "PUMP") and prev_direction in (
+                    None,
+                    "IDLE",
+                    "PUMP",
+                )
 
                 if tank_delta > 0.5:
                     if curr_direction is None or either_water:
@@ -245,7 +409,11 @@ class ThermalModel:
 
                 # Accept zone heating when EITHER endpoint was in PUMP mode
                 either_pump = "PUMP" in (curr_direction, prev_direction)
-                either_not_pump = curr_direction in (None, "IDLE", "WATER") and prev_direction in (None, "IDLE", "WATER")
+                either_not_pump = curr_direction in (None, "IDLE", "WATER") and prev_direction in (
+                    None,
+                    "IDLE",
+                    "WATER",
+                )
 
                 if zone_delta > 0.2:
                     if curr_direction is None or either_pump:
@@ -255,6 +423,8 @@ class ThermalModel:
                         zone_cooling_deltas.append((zone_delta, outdoor))
 
         # --- Fit linear relationships ---
+        self.params.calibration_status = {}
+        self._sanitize_zone_cooling_params()
 
         # Tank heating rate: base_rate + factor * outdoor_temp
         if len(tank_heating_deltas) >= 5:
@@ -292,17 +462,19 @@ class ThermalModel:
             else:
                 self.params.zone_heating_rate = min(15.0, float(np.mean(deltas)))
 
-        # Zone standby loss
+        # Zone standby loss. Unlike the old direct fit, retain a validated
+        # parameter set when sparse data produces an unsafe extrapolation.
         if len(zone_cooling_deltas) >= 5:
-            deltas = np.array([d[0] for d in zone_cooling_deltas])
-            outdoors = np.array([d[1] for d in zone_cooling_deltas])
-
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.zone_loss_outdoor_factor = float(coeffs[0])
-                self.params.zone_standby_loss = float(coeffs[1])
+            fitted = self._robust_zone_cooling_fit(zone_cooling_deltas)
+            if fitted is not None:
+                self.params.zone_standby_loss, self.params.zone_loss_outdoor_factor = fitted
+                self.params.calibration_status["zone_cooling"] = "validated"
             else:
-                self.params.zone_standby_loss = float(np.mean(deltas))
+                self.params.calibration_status["zone_cooling"] = (
+                    "rejected_candidate_outside_safe_range"
+                )
+        else:
+            self.params.calibration_status["zone_cooling"] = "insufficient_samples"
 
         # --- Indoor air temperature rates (from SmartThings data) ---
         indoor_heating_deltas, indoor_cooling_deltas = await self._calibrate_indoor_rates(
@@ -314,6 +486,7 @@ class ThermalModel:
         self.params.defrost_intervals_filtered = defrost_filtered
         self.params.dhw_heating_samples = len(tank_heating_deltas)
         self.params.zone_compressor_samples = len(zone_heating_deltas)
+        self.save()
 
         logger.info(
             "thermal_model_calibrated",
@@ -375,14 +548,27 @@ class ThermalModel:
                 .order_by(IndoorTempReading.timestamp)
             )
             readings = result.scalars().all()
+            weather_result = await session.execute(
+                select(WeatherRecord)
+                .where(WeatherRecord.ts >= since - dt.timedelta(hours=2))
+                .order_by(WeatherRecord.ts)
+            )
+            weather_rows = weather_result.scalars().all()
 
         if len(readings) < 2:
             return [], []
 
         # Build lookup for device status → nearest-neighbor matching
-        status_times = np.array([
-            (r.ts - since).total_seconds() for r in device_records
-        ]) if device_records else np.array([])
+        status_times = (
+            np.array([(r.ts - since).total_seconds() for r in device_records])
+            if device_records
+            else np.array([])
+        )
+        weather_by_hour = {
+            row.ts.replace(minute=0, second=0, microsecond=0): float(row.temperature)
+            for row in weather_rows
+            if row.temperature is not None
+        }
 
         indoor_heating_deltas: list[tuple[float, float]] = []  # (delta_per_hour, outdoor)
         indoor_cooling_deltas: list[tuple[float, float]] = []
@@ -391,16 +577,14 @@ class ThermalModel:
         # minutes away rather than the oldest row still inside two hours. This
         # avoids both sensor-noise amplification and rate estimates blurred by
         # intervening mode changes.
-        MIN_GAP_S = 900   # 15 min minimum between paired readings
+        MIN_GAP_S = 900  # 15 min minimum between paired readings
         MAX_GAP_S = 7200  # 2 h maximum
 
         reading_times = np.array([r.timestamp.timestamp() for r in readings])
         for i in range(1, len(readings)):
             curr_reading = readings[i]
 
-            prev_index = self._nearest_prior_index_in_gap(
-                reading_times, i, MIN_GAP_S, MAX_GAP_S
-            )
+            prev_index = self._nearest_prior_index_in_gap(reading_times, i, MIN_GAP_S, MAX_GAP_S)
             if prev_index is None:
                 continue
             prev_reading = readings[prev_index]
@@ -424,14 +608,22 @@ class ThermalModel:
             if gap > 900:  # > 15 min gap — skip
                 continue
 
-            outdoor = status.outdoor_temp if status.outdoor_temp is not None else 10.0
-            direction = getattr(status, 'direction', None)
-            device_action = getattr(status, 'device_action', None)
-
-            zone_active = (
-                direction in ("PUMP", None)
-                and device_action in ("HEATING", None)
-            ) if direction is not None or device_action is not None else False
+            weather_hour = curr_reading.timestamp.replace(minute=0, second=0, microsecond=0)
+            weather_candidates = [
+                (abs(offset), weather_by_hour.get(weather_hour + dt.timedelta(hours=offset)))
+                for offset in (-2, -1, 0, 1, 2)
+            ]
+            weather_available = [
+                (gap_hours, value) for gap_hours, value in weather_candidates if value is not None
+            ]
+            outdoor = (
+                min(weather_available, key=lambda item: item[0])[1]
+                if weather_available
+                else status.outdoor_temp
+                if status.outdoor_temp is not None
+                else 10.0
+            )
+            zone_active = has_confirmed_space_heating(status)
 
             if indoor_delta > 0.1 and zone_active:
                 indoor_heating_deltas.append((indoor_delta, outdoor))
@@ -439,7 +631,7 @@ class ThermalModel:
                 indoor_cooling_deltas.append((indoor_delta, outdoor))
 
         # Fit indoor heating rate
-        if len(indoor_heating_deltas) >= 5:
+        if len(indoor_heating_deltas) >= MIN_LEARNED_RATE_SAMPLES:
             deltas = np.array([d[0] for d in indoor_heating_deltas])
             outdoors = np.array([d[1] for d in indoor_heating_deltas])
             if np.std(outdoors) > 0:
@@ -450,7 +642,7 @@ class ThermalModel:
                 self.params.indoor_heating_rate = float(np.mean(deltas))
 
         # Fit indoor cooling rate (clamped: a house rarely cools faster than 1°C/h)
-        if len(indoor_cooling_deltas) >= 5:
+        if len(indoor_cooling_deltas) >= MIN_LEARNED_RATE_SAMPLES:
             deltas = np.array([d[0] for d in indoor_cooling_deltas])
             outdoors = np.array([d[1] for d in indoor_cooling_deltas])
             if np.std(outdoors) > 0:
@@ -599,7 +791,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=0.0,
                 heating_rate_per_hour=rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=self.confidence_for("indoor_heating"),
             )
 
         hours_needed = delta_needed / rate
@@ -609,7 +801,7 @@ class ThermalModel:
             outdoor_temp=outdoor_temp,
             estimated_minutes=hours_needed * 60.0,
             heating_rate_per_hour=rate,
-            confidence="learned" if self.params.last_calibrated else "default",
+            confidence=self.confidence_for("indoor_heating"),
         )
 
     def predict_indoor_cooling_time(
@@ -629,7 +821,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=float("inf"),
                 heating_rate_per_hour=loss_rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=self.confidence_for("indoor_cooling"),
             )
 
         effective_min = max(min_temp, outdoor_temp)
@@ -641,7 +833,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=0.0 if current_temp <= min_temp else float("inf"),
                 heating_rate_per_hour=loss_rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=self.confidence_for("indoor_cooling"),
             )
 
         hours_until_cold = delta_until_min / abs(loss_rate)
@@ -651,7 +843,7 @@ class ThermalModel:
             outdoor_temp=outdoor_temp,
             estimated_minutes=hours_until_cold * 60.0,
             heating_rate_per_hour=loss_rate,
-            confidence="learned" if self.params.last_calibrated else "default",
+            confidence=self.confidence_for("indoor_cooling"),
         )
 
     def predict_indoor_curve(
@@ -686,29 +878,40 @@ class ThermalModel:
         for h in range(hours):
             water_temp = zone_water_temps[h] if h < len(zone_water_temps) else zone_water_temps[-1]
             wx = weather_forecast[h] if h < len(weather_forecast) else weather_forecast[-1]
-            outdoor = wx.get("outdoor_temp", 5.0)
-            wind = wx.get("wind_speed", 3.0)
-            irradiance = wx.get("irradiance", 0.0)
-            precipitation = wx.get("precipitation", 0.0)
+            outdoor = float(wx.get("outdoor_temp", 5.0) or 5.0)
+            wind = float(wx.get("wind_speed", 3.0) or 0.0)
+            irradiance = float(wx.get("irradiance", 0.0) or 0.0)
+            precipitation = float(wx.get("precipitation", 0.0) or 0.0)
+            humidity = float(wx.get("humidity", 60.0) or 60.0)
+            cloud_cover = float(wx.get("cloud_cover", 0.5) or 0.5)
             hour_of_day = wx.get("hour", (h % 24))
 
-            if comfort_model.is_trained:
+            if comfort_model.is_ready_for_control:
+                use_direct = bool(comfort_model.direct_forecast_horizons_minutes)
                 predicted = comfort_model.predict_indoor_temp(
                     zone_water_temp=water_temp,
                     outdoor_temp=outdoor,
                     wind_speed=wind,
                     irradiance=irradiance,
                     hour=hour_of_day,
-                    indoor_temp=indoor,
+                    indoor_temp=current_indoor if use_direct else indoor,
                     precipitation=precipitation,
+                    humidity=humidity,
+                    cloud_cover=cloud_cover,
+                    zone_target_temp=water_temp,
+                    space_heating_fraction=1.0,
+                    recent_heat_fraction=1.0,
+                    forecast_horizon_minutes=(h + 1) * 60 if use_direct else None,
                 )
                 if predicted is not None:
                     indoor = predicted
-                    curve.append({
-                        "hour": h + 1,
-                        "predicted_indoor_temp": round(indoor, 1),
-                        "source": "comfort_model",
-                    })
+                    curve.append(
+                        {
+                            "hour": h + 1,
+                            "predicted_indoor_temp": round(indoor, 1),
+                            "source": "comfort_model_direct" if use_direct else "comfort_model",
+                        }
+                    )
                     continue
 
             # Fallback: linear rates
@@ -727,11 +930,161 @@ class ThermalModel:
             # Indoor temp physically bounded
             indoor = max(indoor, outdoor)
 
-            curve.append({
-                "hour": h + 1,
-                "predicted_indoor_temp": round(indoor, 1),
-                "source": "linear_rates",
-            })
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_indoor_temp": round(indoor, 1),
+                    "source": "linear_rates",
+                }
+            )
+
+        return curve
+
+    def predict_indoor_controlled_curve(
+        self,
+        current_indoor: float,
+        zone_water_temps: list[float],
+        heating_fractions: list[float],
+        weather_forecast: list[dict],
+        hours: int = 24,
+    ) -> list[dict]:
+        """Predict indoor temperature under an explicit per-hour heat plan.
+
+        ``zone_water_temps`` describes the available supply temperature while
+        ``heating_fractions`` describes how much of each hour the plan actually
+        asks for space heating.  A value of ``0`` is therefore the exact
+        no-space-heating counterfactual, even if the heat pump remains in
+        NORMAL or ECO mode.  This avoids treating a mode setting as evidence
+        that the compressor will heat the house for the full hour.
+        """
+        from packages.ml.comfort_model import comfort_model
+
+        curve = []
+        indoor = current_indoor
+        recent_heat_fraction = 0.0
+
+        for h in range(hours):
+            water_temp = zone_water_temps[h] if h < len(zone_water_temps) else zone_water_temps[-1]
+            fraction_raw = heating_fractions[h] if h < len(heating_fractions) else 0.0
+            try:
+                fraction = max(0.0, min(1.0, float(fraction_raw)))
+            except (TypeError, ValueError):
+                fraction = 0.0
+            wx = weather_forecast[h] if h < len(weather_forecast) else weather_forecast[-1]
+            outdoor = float(wx.get("outdoor_temp", 5.0))
+            wind = float(wx.get("wind_speed", 3.0) or 0.0)
+            irradiance = float(wx.get("irradiance", 0.0) or 0.0)
+            precipitation = float(wx.get("precipitation", 0.0) or 0.0)
+            humidity_raw = wx.get("humidity", 60.0)
+            cloud_cover_raw = wx.get("cloud_cover", 0.5)
+            humidity = float(60.0 if humidity_raw is None else humidity_raw)
+            cloud_cover = float(0.5 if cloud_cover_raw is None else cloud_cover_raw)
+            hour_of_day = wx.get("hour", h % 24)
+
+            if comfort_model.is_ready_for_control:
+                no_heat = comfort_model.predict_indoor_temp(
+                    zone_water_temp=outdoor,
+                    outdoor_temp=outdoor,
+                    wind_speed=wind,
+                    irradiance=irradiance,
+                    hour=hour_of_day,
+                    indoor_temp=indoor,
+                    precipitation=precipitation,
+                    humidity=humidity,
+                    cloud_cover=cloud_cover,
+                    zone_target_temp=outdoor,
+                    space_heating_fraction=0.0,
+                    recent_heat_fraction=recent_heat_fraction,
+                )
+                with_heat = comfort_model.predict_indoor_temp(
+                    zone_water_temp=water_temp,
+                    outdoor_temp=outdoor,
+                    wind_speed=wind,
+                    irradiance=irradiance,
+                    hour=hour_of_day,
+                    indoor_temp=indoor,
+                    precipitation=precipitation,
+                    humidity=humidity,
+                    cloud_cover=cloud_cover,
+                    zone_target_temp=water_temp,
+                    space_heating_fraction=1.0,
+                    recent_heat_fraction=recent_heat_fraction,
+                )
+                if no_heat is not None and with_heat is not None:
+                    # Heating must not make the home colder than the same
+                    # model's no-heating counterfactual.
+                    with_heat = max(with_heat, no_heat)
+                    indoor = no_heat + fraction * (with_heat - no_heat)
+                    curve.append(
+                        {
+                            "hour": h + 1,
+                            "predicted_indoor_temp": round(indoor, 1),
+                            "source": "comfort_model_controlled",
+                            "space_heating_fraction": round(fraction, 3),
+                        }
+                    )
+                    recent_heat_fraction = round(0.65 * recent_heat_fraction + 0.35 * fraction, 3)
+                    continue
+
+            # In warm weather there may be no verified compressor-on samples,
+            # which correctly keeps the *control* model observation-only.  Its
+            # independently validated direct forecasts are still a much better
+            # no-space-heat baseline than recursively applying a cooling rate.
+            # They are trained on the configured room input plus weather at the
+            # requested lead time, so a 12-hour forecast cannot accumulate 11
+            # one-hour fallback errors.
+            if fraction == 0.0:
+                passive, readiness = comfort_model.predict_passive_indoor_temp(
+                    outdoor_temp=outdoor,
+                    wind_speed=wind,
+                    irradiance=irradiance,
+                    hour=hour_of_day,
+                    indoor_temp=current_indoor,
+                    precipitation=precipitation,
+                    humidity=humidity,
+                    cloud_cover=cloud_cover,
+                    forecast_horizon_minutes=(h + 1) * 60,
+                )
+                if passive is not None:
+                    # A direct model should follow measured inertia, not make a
+                    # physically implausible jump from one hourly forecast. A
+                    # broad bound protects against an out-of-domain weather row
+                    # while preserving real day-scale solar/passive gains.
+                    maximum_change = 3.0 if h < 12 else 4.0
+                    indoor = max(
+                        current_indoor - maximum_change,
+                        min(current_indoor + maximum_change, float(passive)),
+                    )
+                    curve.append(
+                        {
+                            "hour": h + 1,
+                            "predicted_indoor_temp": round(indoor, 1),
+                            "source": "comfort_model_passive_direct",
+                            "direct_horizon_minutes": readiness.get("horizon_minutes"),
+                            "space_heating_fraction": 0.0,
+                        }
+                    )
+                    continue
+
+            cooling = self._indoor_cooling_rate(outdoor)
+            delta = max(indoor - outdoor, 0.0)
+            cooling *= delta / 15.0 if delta < 15.0 else 1.0
+            no_heat_rate = cooling + _solar_gain_c(irradiance)
+            heating_rate = no_heat_rate
+            if water_temp > indoor + 5.0:
+                heating_rate = self._indoor_heating_rate(outdoor) + _solar_gain_c(irradiance)
+
+            indoor += no_heat_rate + fraction * (heating_rate - no_heat_rate)
+            indoor = max(indoor, outdoor)
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_indoor_temp": round(indoor, 1),
+                    "source": "linear_controlled",
+                    "space_heating_fraction": round(fraction, 3),
+                }
+            )
+            recent_heat_fraction = round(0.65 * recent_heat_fraction + 0.35 * fraction, 3)
 
         return curve
 
@@ -761,9 +1114,7 @@ class ThermalModel:
             else self._zone_heating_rate(outdoor_temp)
         )
         loss_rate = (
-            self._tank_loss_rate(outdoor_temp)
-            if is_tank
-            else self._zone_loss_rate(outdoor_temp)
+            self._tank_loss_rate(outdoor_temp) if is_tank else self._zone_loss_rate(outdoor_temp)
         )
 
         for h in range(hours):
@@ -784,11 +1135,13 @@ class ThermalModel:
                 # Can never cool below outdoor temperature
                 temp = max(temp, outdoor_temp)
 
-            curve.append({
-                "hour": h + 1,
-                "predicted_temp": round(temp, 1),
-                "state": state,
-            })
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_temp": round(temp, 1),
+                    "state": state,
+                }
+            )
 
         return curve
 
@@ -852,12 +1205,14 @@ class ThermalModel:
                 # Never coast below the active floor (or outdoor temp).
                 temp = max(temp, floor, outdoor_temp)
 
-            curve.append({
-                "hour": h + 1,
-                "predicted_temp": round(temp, 1),
-                "state": state,
-                "floor": round(floor, 1),
-            })
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_temp": round(temp, 1),
+                    "state": state,
+                    "floor": round(floor, 1),
+                }
+            )
 
         return curve
 
@@ -924,13 +1279,15 @@ class ThermalModel:
                 indoor = max(indoor, target, outdoor)
                 state = "standby"
 
-            curve.append({
-                "hour": h + 1,
-                "predicted_indoor_temp": round(indoor, 1),
-                "target": round(target, 1),
-                "state": state,
-                "source": "managed_schedule",
-            })
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_indoor_temp": round(indoor, 1),
+                    "target": round(target, 1),
+                    "state": state,
+                    "source": "managed_schedule",
+                }
+            )
 
         return curve
 
@@ -1004,12 +1361,14 @@ class ThermalModel:
                 temp = _coast(temp, 1.0)
                 state = "standby"
 
-            curve.append({
-                "hour": h + 1,
-                "predicted_temp": round(temp, 1),
-                "state": state,
-                "dhw_minutes": round(minutes, 1),
-            })
+            curve.append(
+                {
+                    "hour": h + 1,
+                    "predicted_temp": round(temp, 1),
+                    "state": state,
+                    "dhw_minutes": round(minutes, 1),
+                }
+            )
 
         return curve
 
@@ -1045,17 +1404,13 @@ class ThermalModel:
     def _tank_heating_rate(self, outdoor_temp: float) -> float:
         """Tank heating rate (°C/hour) adjusted for outdoor temp."""
         rate = (
-            self.params.tank_heating_rate
-            + self.params.tank_heating_outdoor_factor * outdoor_temp
+            self.params.tank_heating_rate + self.params.tank_heating_outdoor_factor * outdoor_temp
         )
         return max(1.0, min(30.0, rate))
 
     def _tank_loss_rate(self, outdoor_temp: float) -> float:
         """Tank standby loss rate (°C/hour, negative)."""
-        loss = (
-            self.params.tank_standby_loss
-            + self.params.tank_loss_outdoor_factor * outdoor_temp
-        )
+        loss = self.params.tank_standby_loss + self.params.tank_loss_outdoor_factor * outdoor_temp
         return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
     def _zone_heating_rate(self, outdoor_temp: float) -> float:
@@ -1066,10 +1421,7 @@ class ThermalModel:
 
     def _zone_loss_rate(self, outdoor_temp: float) -> float:
         """Zone standby loss rate (°C/hour, negative)."""
-        loss = (
-            self.params.zone_standby_loss
-            + self.params.zone_loss_outdoor_factor * outdoor_temp
-        )
+        loss = self.params.zone_standby_loss + self.params.zone_loss_outdoor_factor * outdoor_temp
         return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
     def _indoor_heating_rate(self, outdoor_temp: float) -> float:

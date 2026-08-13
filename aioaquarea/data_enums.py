@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from enum import Enum, IntEnum, StrEnum
+from enum import Enum, IntEnum
+
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - exercised by the Python 3.10 CI job
+    from strenum import StrEnum
 
 
 class ZoneSensor(StrEnum):

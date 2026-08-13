@@ -49,9 +49,8 @@ def solar_elevation_deg(latitude: float, longitude: float, ts: dt.datetime) -> f
 
     lat_r = math.radians(latitude)
     decl_r = math.radians(decl)
-    sin_elev = (
-        math.sin(lat_r) * math.sin(decl_r)
-        + math.cos(lat_r) * math.cos(decl_r) * math.cos(math.radians(hour_angle))
+    sin_elev = math.sin(lat_r) * math.sin(decl_r) + math.cos(lat_r) * math.cos(decl_r) * math.cos(
+        math.radians(hour_angle)
     )
     sin_elev = max(-1.0, min(1.0, sin_elev))
     return math.degrees(math.asin(sin_elev))
@@ -85,5 +84,5 @@ def estimate_ghi(
     clear = clear_sky_ghi(latitude, longitude, ts)
     if clear <= 0.0:
         return 0.0
-    attenuation = 1.0 - 0.75 * (cf ** 3.4)
+    attenuation = 1.0 - 0.75 * (cf**3.4)
     return round(max(0.0, clear * attenuation), 1)

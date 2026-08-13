@@ -156,15 +156,25 @@ class TestManualMode:
 @pytest.mark.asyncio(loop_scope="session")
 class TestTypedSettingsAccessors:
     async def test_typed_getters_parse_defaults(self):
-        from packages.core.settings_service import get_bool_setting, get_float_setting, get_int_setting
+        from packages.core.settings_service import (
+            get_bool_setting,
+            get_float_setting,
+            get_int_setting,
+        )
 
-        with patch("packages.core.settings_service.get_setting", new=AsyncMock(side_effect=lambda key: "")):
+        with patch(
+            "packages.core.settings_service.get_setting", new=AsyncMock(side_effect=lambda key: "")
+        ):
             assert await get_int_setting("smartthings_poll_interval") == 300
             assert await get_float_setting("comfort_temp_target") == 20.5
             assert await get_bool_setting("smartthings_enabled") is False
 
     async def test_typed_getters_parse_stored_values(self):
-        from packages.core.settings_service import get_bool_setting, get_float_setting, get_int_setting
+        from packages.core.settings_service import (
+            get_bool_setting,
+            get_float_setting,
+            get_int_setting,
+        )
 
         values = {
             "smartthings_poll_interval": "450",

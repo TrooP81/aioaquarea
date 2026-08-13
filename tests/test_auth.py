@@ -1,6 +1,11 @@
+import json
+import logging
+from unittest.mock import AsyncMock
+
 import pytest
 
 from aioaquarea.auth import (
+    Authenticator,
     CCAppVersion,
     PanasonicRequestHeader,
     PanasonicSettings,
@@ -9,6 +14,7 @@ from aioaquarea.auth import (
     get_querystring_parameter_from_header_entry_url,
     has_new_version_been_published,
 )
+from aioaquarea.const import AquareaEnvironment
 from aioaquarea.errors import AuthenticationError, AuthenticationErrorCodes
 
 
@@ -93,3 +99,57 @@ async def test_has_new_version_been_published_ignores_other_responses():
     response = DummyResponse(status=401, json_data={"code": 9999})
 
     assert await has_new_version_been_published(response) is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_sends_token_and_preserves_it_when_not_rotated(monkeypatch):
+    settings = PanasonicSettings()
+    settings.access_token = "old-access-token"
+    settings.refresh_token = "stable-refresh-token"
+    settings.scope = "openid offline_access"
+    session = AsyncMock()
+    session.post.return_value = DummyResponse(
+        status=200,
+        text_data=json.dumps(
+            {
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+            }
+        ),
+    )
+    monkeypatch.setattr("aioaquarea.auth.time.time", lambda: 1_700_000_000.0)
+    authenticator = Authenticator(
+        session,
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+
+    await authenticator.refresh_token()
+
+    request = session.post.await_args
+    assert request.kwargs["json"]["refresh_token"] == "stable-refresh-token"
+    assert settings.access_token == "new-access-token"
+    assert settings.refresh_token == "stable-refresh-token"
+    assert settings.scope == "openid offline_access"
+    assert settings.expires_at == 1_700_003_600.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_rejects_missing_token_before_request():
+    settings = PanasonicSettings()
+    session = AsyncMock()
+    authenticator = Authenticator(
+        session,
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+
+    with pytest.raises(AuthenticationError) as exc:
+        await authenticator.refresh_token()
+
+    assert exc.value.error_code == AuthenticationErrorCodes.API_ERROR
+    session.post.assert_not_awaited()

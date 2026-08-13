@@ -49,7 +49,7 @@ test("plan history ignores a late response from a previously expanded plan", asy
       }),
     })
   );
-  await page.route("**/api/plans?limit=20", (route) =>
+  await page.route(/\/api\/plans\?limit=\d+$/, (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(plans) })
   );
   await page.route("**/api/plans/101", async (route) => {
