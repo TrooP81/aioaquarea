@@ -25,7 +25,7 @@ from .data import (
     StatusDataMode,
     TankStatus,
 )
-from .errors import RequestFailedError  # Import RequestFailedError
+from .errors import DeviceUnavailableError, RequestFailedError
 
 if TYPE_CHECKING:
     from .core import AquareaClient
@@ -197,8 +197,8 @@ class DeviceManager:
                 )
             )
             if not allow_cached_fallback:
-                raise RequestFailedError(
-                    "Failed to retrieve live device status."
+                raise DeviceUnavailableError(
+                    device_info.device_id, reason=str(e)
                 ) from e
 
             # If live data fails, try cached data as a fallback

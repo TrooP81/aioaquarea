@@ -25,6 +25,23 @@ class RequestFailedError(ClientError):
         return f"Invalid response: {self.response.status} - {self.response.reason}"
 
 
+class DeviceUnavailableError(RequestFailedError):
+    """Raised when a live Panasonic adaptor cannot be reached.
+
+    The exception remains a :class:`RequestFailedError` for backwards
+    compatibility while exposing a stable type and device identifier to
+    integrations that need outage-specific retry behaviour.
+    """
+
+    def __init__(self, device_id: str, reason: str | None = None):
+        self.device_id = device_id
+        self.reason = reason
+        super().__init__(
+            f"Failed to retrieve live device status: "
+            f"Panasonic adaptor unavailable for device {device_id}"
+        )
+
+
 class ApiError(ClientError):
     """API error"""
 

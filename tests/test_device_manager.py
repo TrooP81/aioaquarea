@@ -25,7 +25,7 @@ from aioaquarea.data import (
     ZoneType,
 )
 from aioaquarea.device_manager import DeviceManager
-from aioaquarea.errors import RequestFailedError
+from aioaquarea.errors import DeviceUnavailableError, RequestFailedError
 
 
 class FakeResponse:
@@ -191,15 +191,18 @@ async def test_get_device_status_marks_cached_fallback(device_manager, device_in
 
 @pytest.mark.asyncio
 async def test_get_device_status_can_require_live_data(device_manager, device_info):
-    device_manager._client._api_client.request.side_effect = RuntimeError(
-        "adaptor unavailable"
-    )
+    failure = RuntimeError("adaptor unavailable")
+    device_manager._client._api_client.request.side_effect = failure
 
     with pytest.raises(
-        RequestFailedError, match="Failed to retrieve live device status"
-    ):
+        DeviceUnavailableError, match="Panasonic adaptor unavailable"
+    ) as exc:
         await device_manager.get_device_status(device_info, allow_cached_fallback=False)
 
+    assert isinstance(exc.value, RequestFailedError)
+    assert exc.value.device_id == device_info.device_id
+    assert exc.value.reason == "adaptor unavailable"
+    assert exc.value.__cause__ is failure
     assert device_manager._client._api_client.request.await_count == 1
     live_request = device_manager._client._api_client.request.await_args
     assert "deviceDirect=1" in live_request.kwargs["json"]["apiName"]

@@ -31,6 +31,7 @@ from .errors import (
     AuthenticationErrorCodes,
     ClientError,
     DataNotAvailableError,
+    DeviceUnavailableError,
     RequestFailedError,
 )
 from .statistics import Consumption, ConsumptionType, DateType
@@ -40,6 +41,7 @@ __all__: Final[tuple[str, ...]] = (
     "Device",
     "ClientError",
     "RequestFailedError",
+    "DeviceUnavailableError",
     "AuthenticationError",
     "AuthenticationErrorCodes",
     "ApiError",
