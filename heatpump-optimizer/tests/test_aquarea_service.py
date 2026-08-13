@@ -71,7 +71,7 @@ async def test_cached_refresh_consumes_one_read_token() -> None:
     assert await wrapper.refresh_device() is device
 
     wrapper._read_limiter.acquire.assert_awaited_once()
-    device.refresh_data.assert_awaited_once()
+    device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
 
 
 @pytest.mark.asyncio
@@ -96,4 +96,4 @@ async def test_cached_refresh_is_not_returned_as_fresh() -> None:
         await wrapper.refresh_device()
 
     wrapper._read_limiter.acquire.assert_awaited_once()
-    device.refresh_data.assert_awaited_once()
+    device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
