@@ -102,6 +102,9 @@ def build_panasonic_capabilities(
         "observed_range": tank_temperature_limits,
         "whole_degrees_only": True,
     }
+    tank_temperature_command["available"] = (
+        commands_allowed and has_tank is True and tank_temperature_limits is not None
+    )
 
     return {
         "api": {

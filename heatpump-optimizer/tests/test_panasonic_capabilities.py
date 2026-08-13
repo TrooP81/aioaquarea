@@ -73,6 +73,22 @@ def test_stale_status_blocks_every_command_without_hiding_capabilities() -> None
     assert all(not command["available"] for command in result["commands"].values())
 
 
+def test_missing_tank_limits_blocks_target_write_but_keeps_tank_support() -> None:
+    now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, tank_heat_min=None, tank_heat_max=None),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        now=now,
+    )
+
+    command = result["commands"]["set_tank_temperature"]
+    assert result["availability"]["commands_allowed"] is True
+    assert command["device_supported"] is True
+    assert command["available"] is False
+    assert command["constraints"]["observed_range"] is None
+
+
 def test_missing_observation_reports_unknown_device_support() -> None:
     now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
     result = build_panasonic_capabilities(
