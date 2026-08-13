@@ -85,10 +85,19 @@ class AquareaAPIClient:
 
             # let's check for access token and expiration time
             if self._access_token and self.__contains_valid_token(data):
-                self._access_token = data["accessToken"]["token"]
-                self._token_expiration = dt.datetime.strptime(
+                access_token = data["accessToken"]["token"]
+                token_expiration = dt.datetime.strptime(
                     data["accessToken"]["expires"], "%Y-%m-%dT%H:%M:%S%z"
                 )
+                self.access_token = access_token
+                self.token_expiration = token_expiration
+
+                # Panasonic may rotate the bearer token in an ordinary API
+                # response. Request headers are built from PanasonicSettings,
+                # so keeping only AquareaAPIClient in sync makes the next
+                # request reuse the expired token and enter a login loop.
+                self._settings.access_token = access_token
+                self._settings.expires_at = token_expiration.timestamp()
 
             # Aquarea returns a 200 even if the request failed, we need to check the message property to see if it's an error
             # Some errors just require to login again, so we raise a AuthenticationError in those known cases
