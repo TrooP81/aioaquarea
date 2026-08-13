@@ -17,6 +17,8 @@ permissions:
 jobs:
   backend-unit:
     runs-on: ubuntu-latest
+    env:
+      MODEL_DIR: ${{ runner.temp }}/heatpump-optimizer-models
     defaults:
       run:
         working-directory: heatpump-optimizer
