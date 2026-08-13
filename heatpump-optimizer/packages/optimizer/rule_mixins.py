@@ -57,6 +57,26 @@ class SharedRuleHelpersMixin:
         closest = min(weather, key=lambda w: abs((w[0] - target_time).total_seconds()))
         return closest[1] if closest[1] is not None else default
 
+    def _find_lowest_heat_energy_cost_slot(
+        self,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        hours_needed: int,
+        fallback_outdoor_temp: float,
+    ) -> list[tuple[dt.datetime, float]] | None:
+        """Choose heat-pump hours by electricity cost per delivered thermal kWh."""
+        effective_prices = []
+        original_prices = {ts: price for ts, price in prices}
+        for ts, price in prices:
+            outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
+            cop = COPModel._default_cop_curve(outdoor_temp)
+            effective_prices.append((ts, price / cop))
+
+        selected = self._find_cheapest_slot(effective_prices, hours_needed)
+        if not selected:
+            return None
+        return [(ts, original_prices[ts]) for ts, _ in selected]
+
     @staticmethod
     def _weather_conditions_at(
         timestamp: dt.datetime,
@@ -147,17 +167,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         hour that costs more and consumes more electricity for the same tank
         recharge. ``price / COP`` is the effective price per thermal kWh.
         """
-        effective_prices = []
-        original_prices = {ts: price for ts, price in prices}
-        for ts, price in prices:
-            outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
-            cop = COPModel._default_cop_curve(outdoor_temp)
-            effective_prices.append((ts, price / cop))
-
-        selected = self._find_cheapest_slot(effective_prices, hours_needed)
-        if not selected:
-            return None
-        return [(ts, original_prices[ts]) for ts, _ in selected]
+        return self._find_lowest_heat_energy_cost_slot(
+            prices,
+            weather,
+            hours_needed,
+            fallback_outdoor_temp,
+        )
 
     @staticmethod
     def _local_dhw_deadlines_in_horizon(
@@ -369,7 +384,12 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         if not window_prices:
             return actions
 
-        best_slot = self._find_cheapest_slot(window_prices, hours_needed)
+        best_slot = self._find_lowest_heat_energy_cost_slot(
+            window_prices,
+            weather,
+            hours_needed,
+            current_outdoor_temp,
+        )
         if best_slot:
             slot_start = best_slot[0][0]
             actions.append(
@@ -486,7 +506,14 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 if window_start <= ts <= hour_ts and controller_can_heat(ts)
             ]
             best_slot = (
-                self._find_cheapest_slot(window_prices, hours_needed) if window_prices else None
+                self._find_lowest_heat_energy_cost_slot(
+                    window_prices,
+                    weather,
+                    hours_needed,
+                    current_outdoor_temp,
+                )
+                if window_prices
+                else None
             )
             slot_start = best_slot[0][0] if best_slot else hour_ts
 

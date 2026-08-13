@@ -1,6 +1,8 @@
 """Tests for the rules optimizer."""
 
 import datetime as dt
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -76,6 +78,50 @@ def sample_weather():
 
 
 class TestRulesOptimizer:
+    def test_preheat_slot_uses_effective_price_after_cop(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.10),
+            (base + dt.timedelta(hours=1), 0.12),
+            (base + dt.timedelta(hours=2), 0.50),
+        ]
+        weather = [
+            (base, 0.0),
+            (base + dt.timedelta(hours=1), 10.0),
+            (base + dt.timedelta(hours=2), -5.0),
+        ]
+        passive = {
+            base: 21.0,
+            base + dt.timedelta(hours=1): 21.0,
+            base + dt.timedelta(hours=2): 19.0,
+        }
+
+        with (
+            patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
+                return_value=SimpleNamespace(
+                    estimated_hours=0.5,
+                    estimated_minutes=30.0,
+                    heating_rate_per_hour=4.0,
+                ),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=21.0,
+                current_outdoor_temp=0.0,
+                current_water_temp=30.0,
+                comfort_temp_target=20.5,
+                comfort_temp_min=18.0,
+            )
+
+        boost = next(action for action in actions if action["type"] == "zone_temp_boost")
+        assert boost["ts"] == (base + dt.timedelta(hours=1)).isoformat()
+
     def test_dhw_slot_uses_effective_price_after_cop(self):
         optimizer = RulesOptimizer()
         base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
