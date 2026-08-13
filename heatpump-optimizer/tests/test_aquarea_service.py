@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aioaquarea import ForceHeater, HolidayTimer, PowerfulTime
 from aioaquarea.data import StatusDataMode
 
 from packages.core.services.aquarea import AquareaWrapper, PanasonicCachedStatusError
@@ -127,3 +128,39 @@ async def test_cached_refresh_is_not_returned_as_fresh() -> None:
 
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "device_method", "value"),
+    [
+        ("set_powerful_time", "set_powerful_time", PowerfulTime.ON_60MIN),
+        ("set_force_heater", "set_force_heater", ForceHeater.ON),
+        ("set_holiday_timer", "set_holiday_timer", HolidayTimer.ON),
+    ],
+)
+@pytest.mark.asyncio
+async def test_extended_panasonic_commands_share_write_budget(
+    method_name: str,
+    device_method: str,
+    value: PowerfulTime | ForceHeater | HolidayTimer,
+) -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(**{device_method: AsyncMock()})
+    wrapper._device = device
+
+    await getattr(wrapper, method_name)(value)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    getattr(device, device_method).assert_awaited_once_with(value)
+
+
+@pytest.mark.asyncio
+async def test_defrost_command_uses_write_budget_and_device_guardrail() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(request_defrost=AsyncMock())
+    wrapper._device = device
+
+    await wrapper.request_defrost()
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.request_defrost.assert_awaited_once()

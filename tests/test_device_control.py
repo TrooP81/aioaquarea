@@ -3,6 +3,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from aioaquarea.data import (
+    ForceDHW,
+    ForceHeater,
+    HolidayTimer,
     OperationStatus,
     PowerfulTime,
     QuietMode,
@@ -110,6 +113,48 @@ async def test_post_device_set_powerful_time_uses_transfer_payload(device_contro
                 "gwid": "device-1",
                 "powerfulRequest": PowerfulTime.ON_60MIN.value,
             },
+        },
+        throw_on_error=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "value", "field"),
+    [
+        ("post_device_force_dhw", ForceDHW.ON, "forceDHW"),
+        ("post_device_force_heater", ForceHeater.ON, "forceHeater"),
+        ("post_device_holiday_timer", HolidayTimer.ON, "holidayTimer"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_post_device_switch_commands_use_transfer_payload(
+    device_control, method_name, value, field
+):
+    await getattr(device_control, method_name)("device-1", value)
+
+    device_control._api_client.request.assert_awaited_once_with(
+        "POST",
+        "remote/v1/app/common/transfer",
+        json={
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": "device-1", field: value.value},
+        },
+        throw_on_error=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_device_request_defrost_uses_transfer_payload(device_control):
+    await device_control.post_device_request_defrost("device-1")
+
+    device_control._api_client.request.assert_awaited_once_with(
+        "POST",
+        "remote/v1/app/common/transfer",
+        json={
+            "apiName": "/remote/v1/api/devices",
+            "requestMethod": "POST",
+            "bodyParam": {"gwid": "device-1", "forcedefrost": 1},
         },
         throw_on_error=True,
     )
