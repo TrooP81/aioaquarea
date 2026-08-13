@@ -55,6 +55,17 @@ some devices or cached responses may omit it.
   the device entity's already-defrosting guard.
 - every new wrapper command consumes the shared Panasonic write budget.
 
+## Runtime capability discovery
+
+`GET /api/panasonic/capabilities` reports the mapped command surface, observed
+tank/zones, safety policy, and current command availability. It reads the last
+poller-owned live observation and poller heartbeat from the database; it never
+opens a second Panasonic session or spends the cloud request budget.
+
+Every wrapper write also requires a live adaptor status no older than 60
+seconds. A stale object is refreshed first, and a cloud-cached response blocks
+the command before a write-rate-limit token is consumed.
+
 ## Primary implementation references
 
 - `aioaquarea/device_control.py` and `aioaquarea/entities.py` in this repository
