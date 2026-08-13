@@ -36,9 +36,7 @@ _FLUSH_TASK: asyncio.Task[None] | None = None
 _RETENTION_HOURS = 24
 
 
-def _db_log_processor(
-    logger: Any, method_name: str, event_dict: dict[str, Any]
-) -> dict[str, Any]:
+def _db_log_processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Structlog processor: enqueue a log row for async DB persistence."""
     # Extract the fields we care about
     level = method_name.upper()
@@ -99,9 +97,8 @@ async def _flush_loop() -> None:
                 # Prune old entries
                 cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=_RETENTION_HOURS)
                 from sqlalchemy import delete
-                await session.execute(
-                    delete(AppLogRecord).where(AppLogRecord.ts < cutoff)
-                )
+
+                await session.execute(delete(AppLogRecord).where(AppLogRecord.ts < cutoff))
         except Exception:
             # Never crash the flush loop — losing a few log entries is fine
             pass

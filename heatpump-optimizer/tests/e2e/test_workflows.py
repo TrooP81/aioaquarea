@@ -101,6 +101,9 @@ class TestOptimizerWorkflow:
                 plan_json=json.dumps({"version": f"test_{i}"}),
                 optimizer_version="rules_v1",
                 cost_estimate_eur=2.0 + i * 0.5,
+                status="active" if i == 4 else "superseded",
+                status_reason=None if i == 4 else "replaced_by_newer_test_plan",
+                superseded_at=None if i == 4 else now - dt.timedelta(hours=4 - i),
             )
             db_session.add(plan)
         await db_session.commit()

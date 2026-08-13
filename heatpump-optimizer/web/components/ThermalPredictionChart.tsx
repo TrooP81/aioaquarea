@@ -40,12 +40,13 @@ interface ThermalStatus {
     indoor?: {
       current_indoor_temp: number | null;
       minutes_to_cool_2deg: number | null;
-      minutes_to_heat_1deg: number;
+      minutes_to_heat_1deg: number | null;
       indoor_heating_rate: number;
       indoor_cooling_rate: number;
       indoor_heating_samples: number;
       indoor_cooling_samples: number;
       confidence: string;
+      reason?: string | null;
     };
   };
   model_params: {
@@ -82,13 +83,24 @@ interface PlannedAction {
 }
 
 interface IndoorForecastData {
-  current_indoor: number;
-  outdoor_temp: number;
-  forecast?: { hour: number; predicted_indoor_temp: number }[];
-  forecast_with_plan?: { hour: number; predicted_indoor_temp: number }[];
-  forecast_no_heating?: { hour: number; predicted_indoor_temp: number }[];
-  target_schedule?: { hour: number; target: number; comfort_hour: boolean }[];
-  planned_actions?: PlannedAction[];
+  current_indoor: number | null;
+  outdoor_temp: number | null;
+  forecast: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null }[];
+  forecast_with_plan: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null; space_heating_fraction?: number | null }[];
+  forecast_no_heating: { hour: number; ts?: string; predicted_indoor_temp: number }[];
+  target_schedule: { hour: number; ts?: string; target: number; comfort_hour: boolean }[];
+  planned_actions: PlannedAction[];
+  forecast_status?: "available" | "unavailable";
+  forecast_unavailable_reason?: string | null;
+  comfort_assessment?: {
+    state: "on_target" | "at_risk" | "unavailable";
+    summary: string;
+    controllability?: { status: string; cutoff_c?: number };
+    first_miss?: { ts?: string; predicted_c: number; target_c: number; shortfall_c: number; outdoor_temp_c?: number | null; model_source?: string | null; prediction_interval_status?: string | null };
+    worst_miss?: { shortfall_c: number };
+    recommendations?: { title: string; summary: string; manual_only: boolean; current_value_c?: number; minimum_candidate_value_c?: number; expected_effect?: string; confidence?: string; verification_required?: boolean }[];
+  };
+  forecast_provenance?: { current_live_indoor_c?: number | null; plan_start_indoor_c?: number | null; plan_created_at?: string; control_input?: { reference_sensor_label?: string | null; observed_at?: string | null; confidence?: string | null } };
 }
 
 interface IndoorTempReading {
@@ -152,16 +164,28 @@ export function ThermalPredictionChart() {
     try {
       const res = await fetch("/api/optimize-now", { method: "POST" });
       const data = await res.json();
-      if (data.status === "ok") {
-        setOptimizeResult(
-          `Plan #${data.plan_id} created (${data.version}, ${data.actions} actions)`
-        );
-        await fetchData();
-      } else {
-        setOptimizeResult(data.message || "No plan generated");
+      if (data.status !== "queued" || typeof data.request_id !== "number") {
+        throw new Error(data.message || "Could not queue optimization");
       }
-    } catch {
-      setOptimizeResult("Network error");
+      setOptimizeResult("Re-plan queued — waiting for the optimizer service");
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+        const requestRes = await fetch(`/api/optimize-now/${data.request_id}`);
+        if (!requestRes.ok) throw new Error("Could not read optimization status");
+        const request = await requestRes.json();
+        if (request.status === "completed") {
+          setOptimizeResult(`Plan #${request.plan_id} activated`);
+          await fetchData();
+          return;
+        }
+        if (request.status === "failed") {
+          setOptimizeResult(request.error || "No executable plan was generated");
+          return;
+        }
+      }
+      setOptimizeResult("Re-plan is still queued; it will continue in the background");
+    } catch (error) {
+      setOptimizeResult(error instanceof Error ? error.message : "Network error");
     } finally {
       setOptimizing(false);
     }
@@ -198,7 +222,8 @@ export function ThermalPredictionChart() {
       if (temps && temps.length > 0) {
         const avg = temps.reduce((a, b) => a + b, 0) / temps.length;
         historyPoints.push({
-          hour: `${h}h`,
+      hour: `${h}h`,
+          ts: undefined as string | undefined,
           actualIndoor: parseFloat(avg.toFixed(1)),
           indoorWithPlan: undefined as number | undefined,
           indoorNoHeating: undefined as number | undefined,
@@ -208,19 +233,25 @@ export function ThermalPredictionChart() {
     }
 
     // Build forecast points (positive hours)
-    const managedForecast = indoorForecast.forecast_with_plan ?? indoorForecast.forecast ?? [];
-    const noHeatingForecast = indoorForecast.forecast_no_heating ?? [];
-    const targets = indoorForecast.target_schedule ?? [];
-    const forecastPoints = managedForecast.map((f, i) => ({
+    const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => ({
       hour: `+${f.hour}h`,
+      ts: f.ts,
       actualIndoor: undefined as number | undefined,
       indoorWithPlan: f.predicted_indoor_temp,
-      indoorNoHeating: noHeatingForecast[i]?.predicted_indoor_temp,
-      comfortTarget: targets[i]?.target,
+      indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
+      comfortTarget: indoorForecast.target_schedule[i]?.target,
     }));
 
     return [...historyPoints, ...forecastPoints];
   })();
+
+  const comfortAssessment = indoorForecast?.comfort_assessment;
+  const forecastProvenance = indoorForecast?.forecast_provenance;
+  const firstComfortMiss = comfortAssessment?.first_miss;
+  const missTime = firstComfortMiss?.ts
+    ? new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(firstComfortMiss.ts))
+    : null;
+  const manualAdvice = comfortAssessment?.recommendations?.[0];
 
   return (
     <div className="plan-section">
@@ -361,11 +392,53 @@ export function ThermalPredictionChart() {
       )}
 
       {/* Indoor temperature forecast chart */}
-      {indoorChartData.length > 0 && (
+      {indoorForecast?.forecast_status === "unavailable" && (
+        <div className="indoor-temp-card text-warning text-sm" style={{ marginTop: "1.5rem" }}>
+          Indoor forecast paused: {(indoorForecast.forecast_unavailable_reason || "no_trusted_indoor_observation").replace(/_/g, " ")}. A fresh trusted room reading is required; no default temperature is used.
+        </div>
+      )}
+      {indoorForecast?.forecast_status !== "unavailable" && indoorChartData.length > 0 && (
         <>
           <h3 style={{ color: "var(--text-muted)", fontSize: "0.95rem", marginTop: "1.5rem", marginBottom: "0.5rem" }}>
             Indoor Temperature Forecast
           </h3>
+          {comfortAssessment && (
+            <div
+              className={comfortAssessment.state === "at_risk" ? "indoor-temp-card text-warning text-sm" : "indoor-temp-card text-muted text-sm"}
+              style={{ marginBottom: "0.75rem" }}
+            >
+              <strong>{comfortAssessment.state === "at_risk" ? "Comfort risk" : "Comfort outlook"}</strong>
+              <div>{comfortAssessment.summary}</div>
+              {firstComfortMiss && (
+                <div>
+                  {missTime ? `${missTime}: ` : ""}{firstComfortMiss.predicted_c.toFixed(1)}°C forecast vs {firstComfortMiss.target_c.toFixed(1)}°C scheduled target ({firstComfortMiss.shortfall_c.toFixed(1)}°C below)
+                  {firstComfortMiss.outdoor_temp_c != null ? ` · outdoor ${firstComfortMiss.outdoor_temp_c.toFixed(1)}°C` : ""}.
+                </div>
+              )}
+              {comfortAssessment.controllability?.status === "mode_only_no_space_heat" && (
+                <div>Normal/Eco changes the operating mode, but no space-heating effect is expected for this period.</div>
+              )}
+              {manualAdvice && (
+                <div style={{ marginTop: "0.4rem" }}>
+                  <strong>What would be required:</strong> {manualAdvice.title}. Current cutoff {manualAdvice.current_value_c?.toFixed(1)}°C; candidate minimum {manualAdvice.minimum_candidate_value_c?.toFixed(1)}°C. This is manual only and must be verified from measured outcome before another change.
+                </div>
+              )}
+              {firstComfortMiss && !firstComfortMiss.prediction_interval_status && (
+                <div className="text-muted text-xs" style={{ marginTop: "0.3rem" }}>
+                  This is a point forecast without a calibrated uncertainty interval; treat any manual change as a bounded trial, not a guaranteed result.
+                </div>
+              )}
+            </div>
+          )}
+          {forecastProvenance?.control_input?.reference_sensor_label && (
+            <div className="text-muted text-xs" style={{ marginBottom: "0.5rem" }}>
+              Plan input: {forecastProvenance.control_input.reference_sensor_label}
+              {forecastProvenance.control_input.observed_at ? ` · observed ${new Date(forecastProvenance.control_input.observed_at).toLocaleString()}` : ""}.
+              {forecastProvenance.current_live_indoor_c != null && forecastProvenance.plan_start_indoor_c != null
+                ? ` Live ${forecastProvenance.current_live_indoor_c.toFixed(1)}°C vs plan start ${forecastProvenance.plan_start_indoor_c.toFixed(1)}°C.`
+                : ""}
+            </div>
+          )}
           <ResponsiveContainer width="100%" height={250}>
             <LineChart data={indoorChartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -398,7 +471,7 @@ export function ThermalPredictionChart() {
                 strokeWidth={1.5}
                 strokeDasharray="4 4"
                 dot={false}
-                name="Comfort Target"
+                name="Scheduled indoor target"
               />
               <Line
                 type="monotone"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   BarChart,
   Bar,
@@ -25,14 +25,26 @@ interface ConsumptionPoint {
 export function ConsumptionChart() {
   const [data, setData] = useState<ConsumptionPoint[]>([]);
   const [showHotWater, setShowHotWater] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const timeFormat = useTimeFormat();
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoading(true);
     fetch("/api/consumption/history?hours=24")
-      .then((r) => r.json())
-      .then(setData)
-      .catch(() => {});
+      .then((r) => {
+        if (!r.ok) throw new Error(`Consumption API returned ${r.status}`);
+        return r.json();
+      })
+      .then((value) => {
+        setData(value);
+        setError(null);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load consumption"))
+      .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   const chartData = data.map((d) => ({
     time: formatTime(new Date(d.ts), timeFormat.hour12),
@@ -42,18 +54,31 @@ export function ConsumptionChart() {
     total: d.total_kwh || 0,
   }));
 
-  if (chartData.length === 0) {
+  if (loading && chartData.length === 0) {
     return (
       <div className="chart-container" role="region" aria-label="Energy consumption chart">
         <div className="chart-title">Energy Consumption — 24h</div>
         <div className="chart-skeleton-wrapper">
           <div className="chart-skeleton" />
           <div className="chart-skeleton" style={{ width: "55%" }} />
-          <p className="text-muted text-center">No consumption data yet. Data will appear after device polling.</p>
+          <p className="text-muted text-center">Loading consumption…</p>
         </div>
       </div>
     );
   }
+
+  if (error && chartData.length === 0) {
+    return (
+      <div className="chart-container" role="alert">
+        <div className="chart-title">Heating Energy — 24h</div>
+        <p className="text-danger">{error}</p>
+        <button className="btn btn-sm" onClick={load}>Retry</button>
+      </div>
+    );
+  }
+
+  const hasSpaceEnergy = chartData.some((point) => point.heat > 0 || point.cool > 0);
+  const hasHotWaterEnergy = chartData.some((point) => point.tank > 0);
 
   return (
     <div className="chart-container" role="region" aria-label="Energy consumption chart">
@@ -72,6 +97,12 @@ export function ConsumptionChart() {
         Space heating and cooling electricity over the last 24 hours.
         {showHotWater ? " Hot-water electricity is included." : " Hot-water electricity is hidden to keep the comfort view focused."}
       </div>
+      {!hasSpaceEnergy && !showHotWater ? (
+        <div className="energy-zero-state" role="status">
+          <strong>No room-heating or cooling electricity in the last 24 hours.</strong>
+          <span>{hasHotWaterEnergy ? "Hot-water energy is available but hidden." : "The chart will expand when controllable room energy appears."}</span>
+        </div>
+      ) : (
       <ResponsiveContainer width="100%" height={220}>
         <BarChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -111,6 +142,7 @@ export function ConsumptionChart() {
           />
         </BarChart>
       </ResponsiveContainer>
+      )}
     </div>
   );
 }

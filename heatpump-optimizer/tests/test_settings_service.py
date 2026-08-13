@@ -2,8 +2,6 @@
 
 import datetime as dt
 
-import pytest
-
 from packages.core.settings_service import (
     SETTINGS_SCHEMA,
     SETTING_SPECS,
@@ -100,3 +98,27 @@ class TestLearningModeSettings:
 
     def test_learning_mode_since_defaults_empty(self):
         assert SETTING_SPECS["learning_mode_since"].default == ""
+
+
+class TestOperationalLearningSettings:
+    def test_seasonal_campaign_and_alert_settings_registered(self):
+        for key in (
+            "seasonal_calibration_auto_train",
+            "seasonal_calibration_auto_exit",
+            "operational_alerts_enabled",
+            "operational_alert_webhook_url",
+        ):
+            assert key in SETTINGS_SCHEMA
+
+    def test_new_boolean_settings_default_to_safe_values(self):
+        assert SETTING_SPECS["seasonal_calibration_auto_train"].parse("true") is True
+        assert SETTING_SPECS["seasonal_calibration_auto_exit"].parse("true") is True
+        assert SETTING_SPECS["operational_alerts_enabled"].parse("true") is True
+
+
+class TestManualTrialSettings:
+    def test_manual_trial_settings_are_registered_and_disabled_by_default(self):
+        assert "outcome_experiments_enabled" in SETTINGS_SCHEMA
+        assert "outcome_experiment_max_curve_step_c" in SETTINGS_SCHEMA
+        assert SETTING_SPECS["outcome_experiments_enabled"].parse("false") is False
+        assert SETTING_SPECS["outcome_experiment_max_curve_step_c"].parse("0.5") == 0.5

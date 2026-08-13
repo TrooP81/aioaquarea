@@ -76,7 +76,8 @@ class AquareaClient:  # Renamed Client to AquareaClient
         self._password = password
         self._refresh_login = refresh_login
         self._logger = logger or logging.getLogger("aioaquarea")
-        self._last_login: dt.datetime = dt.datetime.min
+        self._last_login: dt.datetime = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        self._login_generation = 0
         self._environment = environment
         self._base_url = (
             AQUAREA_SERVICE_BASE
@@ -157,10 +158,10 @@ class AquareaClient:  # Renamed Client to AquareaClient
 
     async def login(self) -> None:
         """Login to Aquarea and stores a token in the session."""
-        intent = dt.datetime.now()
+        intent_generation = self._login_generation
         await self._login_lock.acquire()
         try:
-            if self._last_login > intent:
+            if self._login_generation != intent_generation:
                 return
 
             # Initialize app version on first login
@@ -169,8 +170,8 @@ class AquareaClient:  # Renamed Client to AquareaClient
             if self._environment is AquareaEnvironment.DEMO:
                 # In a real scenario, this would be handled by the Authenticator
                 _ = await self._api_client.request("GET", "", referer=self._base_url)
-                self._api_client.token_expiration = dt.datetime.astimezone(
-                    dt.datetime.utcnow(), tz=dt.timezone.utc
+                self._api_client.token_expiration = dt.datetime.now(
+                    dt.timezone.utc
                 ) + dt.timedelta(days=1)
             else:
                 if self._username and self._password:
@@ -180,11 +181,17 @@ class AquareaClient:  # Renamed Client to AquareaClient
                 else:
                     _LOGGER.error("Missing User name and/or password, cannot login")
 
-            self._last_login = dt.datetime.now()
-            self._api_client.access_token = self._settings.access_token
-            self._api_client.token_expiration = dt.datetime.fromtimestamp(
-                self._settings.expires_at, tz=dt.timezone.utc
-            )
+            self._last_login = dt.datetime.now(dt.timezone.utc)
+            self._login_generation += 1
+            # Production authentication stores tokens in PanasonicSettings;
+            # demo requests update the API client directly. Do not overwrite a
+            # valid demo token with the empty production settings object.
+            if self._settings.access_token is not None:
+                self._api_client.access_token = self._settings.access_token
+            if self._settings.expires_at is not None:
+                self._api_client.token_expiration = dt.datetime.fromtimestamp(
+                    self._settings.expires_at, tz=dt.timezone.utc
+                )
             # Removed await self._device_manager.get_groups() as it's not a public method and device fetching handles it.
         finally:
             self._login_lock.release()

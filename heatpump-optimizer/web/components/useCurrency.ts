@@ -19,6 +19,8 @@ export interface CurrencyInfo {
   priceLabel: string;
   /** True once the API response has been received. */
   loaded: boolean;
+  /** Provider currency is shown when no safe conversion is available. */
+  warning?: string | null;
 }
 
 /**
@@ -34,13 +36,15 @@ const LOADING: CurrencyInfo = {
   loaded: false,
 };
 
-function parseCurrencyResponse(data: any): CurrencyInfo {
+function parseCurrencyResponse(data: unknown): CurrencyInfo {
+  const payload = data && typeof data === "object" ? data as Record<string, unknown> : {};
   return {
-    code: data.code ?? "EUR",
-    prefix: data.prefix ?? "",
-    suffix: data.suffix ?? "",
-    multiplier: data.multiplier ?? 1,
-    priceLabel: data.price_label ?? "/kWh",
+    code: typeof payload.code === "string" ? payload.code : "EUR",
+    prefix: typeof payload.prefix === "string" ? payload.prefix : "",
+    suffix: typeof payload.suffix === "string" ? payload.suffix : "",
+    multiplier: typeof payload.multiplier === "number" ? payload.multiplier : 1,
+    priceLabel: typeof payload.price_label === "string" ? payload.price_label : "/kWh",
+    warning: typeof payload.warning === "string" ? payload.warning : null,
     loaded: true,
   };
 }
@@ -96,8 +100,8 @@ export function formatCost(
   cost: number | null | undefined,
   c: CurrencyInfo,
 ): string {
-  if (!c.loaded) return "—";
-  const v = cost ?? 0;
+  if (!c.loaded || cost == null) return "—";
+  const v = cost;
   return `${c.prefix}${v.toFixed(2)}${c.suffix}`;
 }
 

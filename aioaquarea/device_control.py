@@ -32,7 +32,9 @@ class AquareaDeviceControl:
         self._base_url = base_url
 
     @staticmethod
-    def _build_transfer_request(long_id: str, **body_params: object) -> dict[str, object]:
+    def _build_transfer_request(
+        long_id: str, **body_params: object
+    ) -> dict[str, object]:
         return {
             "apiName": AquareaDeviceControl._TRANSFER_API_NAME,
             "requestMethod": "POST",
@@ -112,8 +114,9 @@ class AquareaDeviceControl:
         zones: dict[int, OperationStatus],
         operation_status: OperationStatus,
         tank_operation_status: OperationStatus,
-        zone_temperature_updates: list[ZoneTemperatureSetUpdate]
-        | None = None,  # New parameter
+        zone_temperature_updates: (
+            list[ZoneTemperatureSetUpdate] | None
+        ) = None,  # New parameter
     ) -> None:
         """Post device operation update."""
         # Construct zoneStatus list based on provided zones and optional temperature updates
@@ -243,9 +246,7 @@ class AquareaDeviceControl:
 
     async def post_device_request_defrost(self, long_id: str) -> None:
         """Post forcedefrost command."""
-        await self._post_transfer(
-            self._build_transfer_request(long_id, forcedefrost=1)
-        )
+        await self._post_transfer(self._build_transfer_request(long_id, forcedefrost=1))
 
     async def post_device_set_powerful_time(
         self, long_id: str, powerful_time: PowerfulTime

@@ -22,9 +22,9 @@ def upgrade() -> None:
     conn = op.get_bind()
 
     # Check if TimescaleDB is available
-    result = conn.execute(text(
-        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')"
-    ))
+    result = conn.execute(
+        text("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')")
+    )
     has_timescale = result.scalar()
 
     if not has_timescale:
@@ -42,35 +42,43 @@ def upgrade() -> None:
     for table, interval in policies:
         # Check if the table is a hypertable before adding a policy;
         # a failed SQL in PostgreSQL aborts the whole transaction.
-        is_hypertable = conn.execute(text(
-            "SELECT EXISTS("
-            "  SELECT 1 FROM timescaledb_information.hypertables"
-            "  WHERE hypertable_name = :tbl"
-            ")"
-        ), {"tbl": table}).scalar()
+        is_hypertable = conn.execute(
+            text(
+                "SELECT EXISTS("
+                "  SELECT 1 FROM timescaledb_information.hypertables"
+                "  WHERE hypertable_name = :tbl"
+                ")"
+            ),
+            {"tbl": table},
+        ).scalar()
 
         if is_hypertable:
-            conn.execute(text(
-                f"SELECT add_retention_policy('{table}', INTERVAL '{interval}', if_not_exists => true)"
-            ))
+            conn.execute(
+                text(
+                    f"SELECT add_retention_policy('{table}', INTERVAL '{interval}', if_not_exists => true)"
+                )
+            )
 
 
 def downgrade() -> None:
     conn = op.get_bind()
 
-    result = conn.execute(text(
-        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')"
-    ))
+    result = conn.execute(
+        text("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')")
+    )
     if not result.scalar():
         return
 
     for table in ("device_status", "weather", "indoor_temp_reading", "prices", "consumption"):
-        is_hypertable = conn.execute(text(
-            "SELECT EXISTS("
-            "  SELECT 1 FROM timescaledb_information.hypertables"
-            "  WHERE hypertable_name = :tbl"
-            ")"
-        ), {"tbl": table}).scalar()
+        is_hypertable = conn.execute(
+            text(
+                "SELECT EXISTS("
+                "  SELECT 1 FROM timescaledb_information.hypertables"
+                "  WHERE hypertable_name = :tbl"
+                ")"
+            ),
+            {"tbl": table},
+        ).scalar()
 
         if is_hypertable:
             conn.execute(text(f"SELECT remove_retention_policy('{table}', if_exists => true)"))

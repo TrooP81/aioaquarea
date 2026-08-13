@@ -10,17 +10,30 @@ from sqlalchemy import desc, select
 
 from packages.api.schemas import TestConnectionRequest, TestConnectionResponse
 from packages.core.database import get_session
-from packages.core.models import AppLogRecord, AuditLogRecord
+from packages.core.pricing import get_active_price_context
+from packages.core.models import (
+    AppLogRecord,
+    AuditLogRecord,
+    DeviceStatusRecord,
+    IndoorTempReading,
+)
 from packages.core.settings_service import (
     SETTINGS_SCHEMA,
     get_all_settings,
     get_comfort_schedule,
     get_effective_schedule,
+    get_float_setting,
     get_learned_usage,
     get_setting,
     get_string_setting,
     set_setting,
     set_settings_bulk,
+    set_heat_curve_verification_state,
+)
+from packages.core.heat_curve import (
+    HEAT_CURVE_SETTING_KEYS,
+    HeatCurveConfig,
+    start_heat_curve_verification,
 )
 
 router = APIRouter()
@@ -53,6 +66,8 @@ async def get_settings():
     values = await get_all_settings()
     result = {}
     for key, schema in SETTINGS_SCHEMA.items():
+        if key.startswith("_"):
+            continue
         val = values.get(key, "")
         if schema.get("type") == "secret" and val:
             display_val = val[:1] + "***" + val[-1:] if len(val) > 8 else "***"
@@ -73,7 +88,51 @@ async def update_settings(body: SettingsUpdate):
     if invalid_keys:
         raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
 
+    heat_curve_changed = any(key in HEAT_CURVE_SETTING_KEYS for key in body.settings)
+    previous_curve: HeatCurveConfig | None = None
+    applied_curve: HeatCurveConfig | None = None
+    # Validate the curve as one unit.  A valid individual number can still
+    # produce an impossible curve (for example, a warm point below the cold
+    # point), so save neither half of a bad manual controller record.
+    if heat_curve_changed:
+        values = await get_all_settings()
+        previous_curve = HeatCurveConfig.from_settings(values)
+        values.update(body.settings)
+        try:
+            applied_curve = HeatCurveConfig.from_settings(values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     await set_settings_bulk(body.settings)
+
+    if heat_curve_changed and applied_curve is not None:
+        async with get_session() as session:
+            status = (
+                await session.execute(
+                    select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
+                )
+            ).scalar_one_or_none()
+            indoor_temp = (
+                await session.execute(
+                    select(IndoorTempReading.temperature)
+                    .order_by(IndoorTempReading.timestamp.desc())
+                    .limit(1)
+                )
+            ).scalar()
+        await set_heat_curve_verification_state(
+            start_heat_curve_verification(
+                started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                previous_curve=previous_curve,
+                applied_curve=applied_curve,
+                baseline_indoor_temp=float(indoor_temp) if indoor_temp is not None else None,
+                baseline_outdoor_temp=(
+                    float(status.outdoor_temp)
+                    if status is not None and status.outdoor_temp is not None
+                    else None
+                ),
+                comfort_target=await get_float_setting("comfort_temp_target"),
+            )
+        )
 
     async with get_session() as session:
         session.add(
@@ -90,7 +149,11 @@ async def update_settings(body: SettingsUpdate):
             )
         )
 
-    return {"status": "updated", "count": len(body.settings)}
+    return {
+        "status": "updated",
+        "count": len(body.settings),
+        "heat_curve_verification_started": heat_curve_changed,
+    }
 
 
 @router.get("/api/comfort-schedule")
@@ -125,7 +188,10 @@ async def update_schedule(body: ComfortScheduleUpdate):
 @router.get("/api/comfort-schedule/learned")
 async def get_learned_schedule(days: int = Query(14, ge=1, le=90)):
     learned = await get_learned_usage(days=days)
-    return {day_type: {str(h): score for h, score in hours.items()} for day_type, hours in learned.items()}
+    return {
+        day_type: {str(h): score for h, score in hours.items()}
+        for day_type, hours in learned.items()
+    }
 
 
 @router.post("/api/comfort-schedule/apply-learned")
@@ -149,7 +215,9 @@ async def apply_learned_schedule(threshold: float = Query(0.3, ge=0.1, le=0.9)):
 @router.get("/api/audit", response_model=list[dict])
 async def get_audit_log(limit: int = Query(50, ge=1, le=200)):
     async with get_session() as session:
-        result = await session.execute(select(AuditLogRecord).order_by(desc(AuditLogRecord.ts)).limit(limit))
+        result = await session.execute(
+            select(AuditLogRecord).order_by(desc(AuditLogRecord.ts)).limit(limit)
+        )
         rows = result.scalars().all()
 
     return [
@@ -199,7 +267,11 @@ async def get_app_logs(
 
 @router.get("/api/currency")
 async def get_currency():
-    code = await get_string_setting("currency")
+    configured_code = (await get_string_setting("currency") or "EUR").upper()
+    context = await get_active_price_context()
+    # Displaying an amount in a different currency without an exchange rate is
+    # worse than declining the conversion: it silently corrupts plan costs.
+    code = context.currency
     meta = CURRENCY_META.get(code, {"prefix": code + " ", "suffix": "", "sub": "", "multiplier": 1})
     m = meta["multiplier"]
     if m == 100:
@@ -212,6 +284,14 @@ async def get_currency():
         "suffix": meta["suffix"],
         "multiplier": m,
         "price_label": price_label,
+        "source": context.source,
+        "configured_code": configured_code,
+        "conversion_available": configured_code == code,
+        "warning": (
+            f"Prices are supplied in {code}; displaying source currency until an FX rate is configured."
+            if configured_code != code
+            else None
+        ),
     }
 
 
@@ -244,7 +324,9 @@ async def _test_aquarea(username: Optional[str], password: Optional[str]) -> Tes
         password = await get_setting("aquarea_password")
 
     if not username or not password:
-        return TestConnectionResponse(service="aquarea", success=False, message="Username and password are required")
+        return TestConnectionResponse(
+            service="aquarea", success=False, message="Username and password are required"
+        )
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -267,7 +349,9 @@ async def _test_aquarea(username: Optional[str], password: Optional[str]) -> Tes
             details={"device_count": device_count},
         )
     except Exception as e:
-        return TestConnectionResponse(service="aquarea", success=False, message=f"Authentication failed: {str(e)}")
+        return TestConnectionResponse(
+            service="aquarea", success=False, message=f"Authentication failed: {str(e)}"
+        )
 
 
 async def _test_entsoe(api_token: Optional[str], area: Optional[str]) -> TestConnectionResponse:
@@ -279,7 +363,9 @@ async def _test_entsoe(api_token: Optional[str], area: Optional[str]) -> TestCon
         area = await get_setting("entsoe_area")
 
     if not api_token:
-        return TestConnectionResponse(service="entsoe", success=False, message="ENTSO-E API token is required")
+        return TestConnectionResponse(
+            service="entsoe", success=False, message="ENTSO-E API token is required"
+        )
 
     now = dt.datetime.now(dt.timezone.utc)
     period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -298,7 +384,9 @@ async def _test_entsoe(api_token: Optional[str], area: Optional[str]) -> TestCon
             resp = await client.get("https://web-api.tp.entsoe.eu/api", params=params)
 
         if resp.status_code == 401:
-            return TestConnectionResponse(service="entsoe", success=False, message="Invalid API token (401 Unauthorized)")
+            return TestConnectionResponse(
+                service="entsoe", success=False, message="Invalid API token (401 Unauthorized)"
+            )
         if resp.status_code == 400:
             return TestConnectionResponse(
                 service="entsoe",
@@ -315,9 +403,13 @@ async def _test_entsoe(api_token: Optional[str], area: Optional[str]) -> TestCon
             details={"status_code": resp.status_code, "area": area},
         )
     except httpx.TimeoutException:
-        return TestConnectionResponse(service="entsoe", success=False, message="Connection timed out after 30s")
+        return TestConnectionResponse(
+            service="entsoe", success=False, message="Connection timed out after 30s"
+        )
     except Exception as e:
-        return TestConnectionResponse(service="entsoe", success=False, message=f"Connection failed: {str(e)}")
+        return TestConnectionResponse(
+            service="entsoe", success=False, message=f"Connection failed: {str(e)}"
+        )
 
 
 async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
@@ -327,7 +419,9 @@ async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
         api_token = await get_setting("tibber_api_token")
 
     if not api_token:
-        return TestConnectionResponse(service="tibber", success=False, message="Tibber API token is required")
+        return TestConnectionResponse(
+            service="tibber", success=False, message="Tibber API token is required"
+        )
 
     query = """
     {
@@ -352,7 +446,9 @@ async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
             )
 
         if resp.status_code == 403:
-            return TestConnectionResponse(service="tibber", success=False, message="Invalid API token (403 Forbidden)")
+            return TestConnectionResponse(
+                service="tibber", success=False, message="Invalid API token (403 Forbidden)"
+            )
 
         resp.raise_for_status()
         data = resp.json()
@@ -373,9 +469,13 @@ async def _test_tibber(api_token: Optional[str]) -> TestConnectionResponse:
             details={"name": viewer.get("name"), "home_count": len(homes)},
         )
     except httpx.TimeoutException:
-        return TestConnectionResponse(service="tibber", success=False, message="Connection timed out after 30s")
+        return TestConnectionResponse(
+            service="tibber", success=False, message="Connection timed out after 30s"
+        )
     except Exception as e:
-        return TestConnectionResponse(service="tibber", success=False, message=f"Connection failed: {str(e)}")
+        return TestConnectionResponse(
+            service="tibber", success=False, message=f"Connection failed: {str(e)}"
+        )
 
 
 async def _test_smartthings(pat: Optional[str]) -> TestConnectionResponse:
@@ -414,6 +514,10 @@ async def _test_smartthings(pat: Optional[str]) -> TestConnectionResponse:
             details={"device_count": len(devices), "devices": names},
         )
     except SmartThingsAuthError as e:
-        return TestConnectionResponse(service="smartthings", success=False, message=f"Authentication failed: {str(e)}")
+        return TestConnectionResponse(
+            service="smartthings", success=False, message=f"Authentication failed: {str(e)}"
+        )
     except Exception as e:
-        return TestConnectionResponse(service="smartthings", success=False, message=f"Connection failed: {str(e)}")
+        return TestConnectionResponse(
+            service="smartthings", success=False, message=f"Connection failed: {str(e)}"
+        )

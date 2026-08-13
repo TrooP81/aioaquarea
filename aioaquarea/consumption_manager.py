@@ -29,10 +29,13 @@ class AquareaConsumptionManager:
         """Get device consumption."""
         try:
             # Format timezone offset
-            offset_seconds = self._timezone.utcoffset(dt.datetime.now()).total_seconds()
-            offset_hours = int(offset_seconds / 3600)
-            offset_minutes = int((offset_seconds % 3600) / 60)
-            timezone_str = f"{offset_hours:+03d}:{offset_minutes:02d}"
+            now = dt.datetime.now(self._timezone)
+            offset = now.utcoffset() or dt.timedelta(0)
+            offset_minutes = int(offset.total_seconds() // 60)
+            sign = "+" if offset_minutes >= 0 else "-"
+            absolute_minutes = abs(offset_minutes)
+            offset_hours, minutes = divmod(absolute_minutes, 60)
+            timezone_str = f"{sign}{offset_hours:02d}:{minutes:02d}"
 
             data_mode_map = {
                 DateType.DAY: 0,

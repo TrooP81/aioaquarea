@@ -254,9 +254,15 @@ class Authenticator:
 
     async def refresh_token(self):
         self._logger.debug("Refreshing token")
-        # do before, so that timestamp is older rather than newer
-        now = dt.datetime.now()
-        unix_time_token_received = time.mktime(now.timetuple())
+        if not self._settings.refresh_token:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Refresh token is missing from settings.",
+            )
+
+        # Capture an absolute instant before the request. ``mktime`` interprets
+        # naive local time and can shift expiration across DST transitions.
+        unix_time_token_received = time.time()
 
         response = await self._sess.post(
             f"{BASE_PATH_AUTH}/oauth/token",
@@ -268,6 +274,7 @@ class Authenticator:
                 "scope": self._settings.scope,
                 "client_id": APP_CLIENT_ID,
                 "grant_type": "refresh_token",
+                "refresh_token": self._settings.refresh_token,
             },
             allow_redirects=False,
         )
@@ -413,9 +420,9 @@ class Authenticator:
 
     async def _request_new_token(self, code, code_verifier):
         self._logger.debug("Requesting a new token")
-        # do before, so that timestamp is older rather than newer
-        now = dt.datetime.now()
-        unix_time_token_received = time.mktime(now.timetuple())
+        # Capture an absolute instant before the request so token lifetime is
+        # independent of the host's timezone and daylight-saving rules.
+        unix_time_token_received = time.time()
 
         response = await self._sess.post(
             f"{BASE_PATH_AUTH}/oauth/token",
@@ -441,9 +448,9 @@ class Authenticator:
     def _set_token(self, token_response, unix_time_token_received):
         self._settings.set_token(
             token_response["access_token"],
-            token_response["refresh_token"],
+            token_response.get("refresh_token") or self._settings.refresh_token,
             unix_time_token_received + token_response["expires_in"],
-            token_response["scope"],
+            token_response.get("scope", self._settings.scope),
         )
 
     async def _retrieve_client_acc(self):

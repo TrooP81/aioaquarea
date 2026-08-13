@@ -6,7 +6,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from packages.api.main import app
-from packages.core.version import APP_VERSION
+from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,4 +28,4 @@ async def test_version_endpoint_reports_running_api_version():
         response = await client.get("/api/version")
 
     assert response.status_code == 200
-    assert response.json() == {"version": APP_VERSION}
+    assert response.json() == {"version": APP_VERSION, "api_contract": API_CONTRACT_VERSION}

@@ -9,14 +9,29 @@ interface DashboardProps {
     current_status: {
       mode: string | null;
       outdoor_temp: number | null;
+      heat_pump_outdoor_temp?: number | null;
+      weather_outdoor_temp?: number | null;
+      outdoor_temp_source?: string | null;
+      outdoor_temp_provider?: string | null;
+      outdoor_temp_compensation_c?: number | null;
+      outdoor_temp_fallback_reason?: string | null;
       tank_temp: number | null;
       tank_target_temp: number | null;
       zone1_temp: number | null;
       quiet_mode: number | null;
+      operation_status?: number | null;
+      device_action?: string | null;
+      direction?: string | null;
+      space_heating_active: boolean | null;
     } | null;
     current_price: number | null;
     today_kwh: number;
-    today_cost_eur: number;
+    today_cost_eur: number | null;
+    today_cost_priced_kwh: number;
+    today_cost_unpriced_kwh: number;
+    today_cost_priced_amount: number;
+    today_cost_coverage_pct: number;
+    today_cost_complete: boolean;
   } | null;
   indoorTemp: number | null;
   indoorSensorCount: number;
@@ -29,6 +44,7 @@ interface OptimizerBrief {
   cop_trained: boolean;
   demand_trained: boolean;
   thermal_calibrated: boolean;
+  planningData: { control_allowed: boolean; reasons: string[] } | null;
 }
 
 function formatRelativeTime(iso: string | null): string {
@@ -52,6 +68,25 @@ function formatMode(mode: string | null | undefined): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+type PumpStatus = NonNullable<NonNullable<DashboardProps["data"]>["current_status"]>;
+
+function formatPumpState(status: PumpStatus | null | undefined): string {
+  if (!status) return "Unknown";
+  const action = status.device_action?.toUpperCase();
+  const labels: Record<string, string> = {
+    OFF: "Off",
+    IDLE: "Standby",
+    HEATING: "Room heating",
+    COOLING: "Cooling",
+    HEATING_WATER: "Heating hot water",
+  };
+  if (action && labels[action]) return labels[action];
+  if (status.space_heating_active) return "Room heating";
+  if (status.operation_status === 0) return "Standby";
+  if (status.operation_status === 1) return "Running";
+  return /^\d+$/.test(status.mode ?? "") ? "Status available" : formatMode(status.mode);
+}
+
 export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReading, latestReading }: DashboardProps) {
   const currency = useCurrency();
   const status = data?.current_status;
@@ -67,6 +102,7 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
             cop_trained: d.cop_model?.trained ?? false,
             demand_trained: d.demand_model?.trained ?? false,
             thermal_calibrated: d.thermal_model?.calibrated ?? false,
+            planningData: d.planning_data_quality ?? null,
           });
         }
       })
@@ -75,6 +111,7 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
 
   return (
     <>
+      {currency.warning && <p className="text-warning text-sm">⚠ {currency.warning}</p>}
       {/* ── Live readings ── */}
       <h3 className="card-group-label">Live readings</h3>
       <div className="grid">
@@ -95,7 +132,28 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           <div className="card-value temp">
             {status?.outdoor_temp != null ? `${status.outdoor_temp.toFixed(1)}°C` : "—"}
           </div>
-          <div className="card-subtitle">Current</div>
+          <div className="card-subtitle">
+            {status?.outdoor_temp_source === "weather"
+              ? `Weather report · ${status.outdoor_temp_provider?.toUpperCase() ?? "provider"}`
+              : status?.outdoor_temp_source === "heat_pump"
+                ? "Heat-pump sensor selected"
+                : status?.outdoor_temp_source === "heat_pump_fallback"
+                  ? "Heat-pump fallback · weather unavailable"
+                  : "Current effective value"}
+          </div>
+          {status?.heat_pump_outdoor_temp != null && status.outdoor_temp_source !== "heat_pump" && (
+            <div className="card-subtitle text-sm">
+              Pump sensor: {status.heat_pump_outdoor_temp.toFixed(1)}°C
+              {status.outdoor_temp_compensation_c != null
+                ? ` · compensated ${status.outdoor_temp_compensation_c > 0 ? "+" : ""}${status.outdoor_temp_compensation_c.toFixed(1)}°C`
+                : ""}
+            </div>
+          )}
+          {status?.outdoor_temp_fallback_reason && (
+            <div className="card-subtitle text-warning text-sm">
+              ⚠ {status.outdoor_temp_fallback_reason.replace(/_/g, " ")}
+            </div>
+          )}
         </div>
 
         <div className="card">
@@ -141,14 +199,21 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
 
         <div className="card">
           <div className="card-header">
-            <span className="card-title">Today's Consumption</span>
+            <span className="card-title">Today&apos;s Consumption</span>
           </div>
           <div className="card-value kwh">
             {data?.today_kwh?.toFixed(1) ?? "0"} kWh
           </div>
           <div className="card-subtitle">
-            Cost: {formatCost(data?.today_cost_eur, currency)}
+            {data?.today_cost_complete
+              ? `Cost: ${formatCost(data.today_cost_eur, currency)}`
+              : `Known cost: ${formatCost(data?.today_cost_priced_amount, currency)} · ${data?.today_cost_coverage_pct ?? 0}% priced`}
           </div>
+          {!data?.today_cost_complete && (data?.today_cost_unpriced_kwh ?? 0) > 0 && (
+            <div className="card-subtitle text-warning text-sm">
+              {(data?.today_cost_unpriced_kwh ?? 0).toFixed(1)} kWh awaiting price data
+            </div>
+          )}
         </div>
       </div>
 
@@ -160,11 +225,19 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
             <span className="card-title">Heat Pump</span>
           </div>
           <div className="card-value" style={{ fontSize: "1.5rem" }}>
-            {formatMode(status?.mode)}
+            {formatPumpState(status)}
           </div>
           <div className="card-subtitle">
             Quiet mode: {status?.quiet_mode === 1 ? "On" : "Off"}
           </div>
+          <div className="card-subtitle">
+            Space heating: {status?.space_heating_active ? "confirmed active" : "not active"}
+          </div>
+          {optBrief?.planningData && !optBrief.planningData.control_allowed && (
+            <div className="card-subtitle text-warning text-sm" title={optBrief.planningData.reasons.join(" ")}>
+              ⚠ New plans paused until fresh price and weather data is available
+            </div>
+          )}
         </div>
 
         <div className="card">

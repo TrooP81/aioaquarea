@@ -1,7 +1,7 @@
 import datetime as dt
 import logging
-import urllib.parse
 from typing import Optional
+import urllib.parse
 
 import aiohttp
 
@@ -167,4 +167,11 @@ class AquareaAPIClient:
 
     @token_expiration.setter
     def token_expiration(self, value: Optional[dt.datetime]):
+        # Older callers may still pass a naive UTC timestamp. Normalize it at
+        # the boundary so comparisons in AquareaClient are always aware/aware.
+        if value is not None:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=dt.timezone.utc)
+            else:
+                value = value.astimezone(dt.timezone.utc)
         self._token_expiration = value

@@ -64,7 +64,11 @@ export function TemperatureChart() {
       tank: d.tank_temp,
       tankTarget: d.tank_target_temp,
       zone1: d.zone1_temp,
-      zone1Target: d.zone1_target_temp,
+      // Panasonic emits -5°C while the weather-compensated heat curve owns
+      // the target. It is a sentinel, not a temperature line to chart.
+      zone1Target: d.zone1_target_temp != null && d.zone1_target_temp >= 15 && d.zone1_target_temp <= 65
+        ? d.zone1_target_temp
+        : null,
       outdoor: d.outdoor_temp,
       indoor: indoorByBucket.get(time) ?? null,
     };
@@ -135,7 +139,7 @@ export function TemperatureChart() {
             strokeWidth={1}
             strokeDasharray="5 5"
             dot={false}
-            name="Zone 1 Target"
+            name="Zone 1 target (when explicit)"
           />
           <Line
             type="monotone"

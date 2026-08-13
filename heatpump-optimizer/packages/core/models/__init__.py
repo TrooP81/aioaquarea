@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -33,6 +34,10 @@ class DeviceStatusRecord(Base):
     mode: Mapped[str | None] = mapped_column(String(32))
     operation_status: Mapped[int | None] = mapped_column(Integer)
     outdoor_temp: Mapped[float | None] = mapped_column(Float)
+    # Effective temperature used by planning/learning is stored above. Keep
+    # the physical Aquarea sensor and source separately for diagnostics.
+    heat_pump_outdoor_temp: Mapped[float | None] = mapped_column(Float)
+    outdoor_temp_source: Mapped[str | None] = mapped_column(String(32))
     tank_temp: Mapped[float | None] = mapped_column(Float)
     tank_target_temp: Mapped[int | None] = mapped_column(Integer)
     tank_operation_status: Mapped[int | None] = mapped_column(Integer)
@@ -46,8 +51,13 @@ class DeviceStatusRecord(Base):
     # Phase 1: compressor activity fields
     direction: Mapped[str | None] = mapped_column(String(16))  # IDLE/PUMP/WATER
     pump_duty: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
-    device_action: Mapped[str | None] = mapped_column(String(24))  # OFF/IDLE/HEATING/COOLING/HEATING_WATER
+    device_action: Mapped[str | None] = mapped_column(
+        String(24)
+    )  # OFF/IDLE/HEATING/COOLING/HEATING_WATER
     defrost_active: Mapped[bool | None] = mapped_column(Boolean)
+    # Explicit room-heating evidence. PUMP alone is not proof of compressor heat.
+    space_heating_active: Mapped[bool | None] = mapped_column(Boolean)
+    space_heating_evidence: Mapped[str | None] = mapped_column(String(48))
     force_dhw: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
     force_heater: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
     holiday_mode: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON
@@ -72,10 +82,12 @@ class ConsumptionRecord(Base):
     cool_kwh: Mapped[float | None] = mapped_column(Float)
     tank_kwh: Mapped[float | None] = mapped_column(Float)
     outdoor_temp: Mapped[float | None] = mapped_column(Float)
+    heat_pump_outdoor_temp: Mapped[float | None] = mapped_column(Float)
+    outdoor_temp_source: Mapped[str | None] = mapped_column(String(32))
 
 
 class PriceRecord(Base):
-    """Electricity spot price — hypertable on `ts`."""
+    """Electricity spot price in the currency reported by its source."""
 
     __tablename__ = "prices"
 
@@ -83,13 +95,25 @@ class PriceRecord(Base):
         DateTime(timezone=True), primary_key=True, server_default=func.now()
     )
     area: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # Legacy column name retained for database compatibility. The amount is in
+    # ``price_currency``; callers must never infer EUR from this name.
     price_eur_per_kwh: Mapped[float] = mapped_column(Float, nullable=False)
+    price_currency: Mapped[str] = mapped_column(
+        String(3), nullable=False, default="EUR", server_default="EUR"
+    )
+    price_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="legacy", server_default="legacy"
+    )
+    # When the provider response was retrieved. ``ts`` is the market hour,
+    # which can be in the future and therefore cannot prove feed freshness.
+    fetched_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class WeatherRecord(Base):
     """Weather observations/forecast — hypertable on `ts`."""
 
     __tablename__ = "weather"
+    __table_args__ = (Index("ix_weather_source_issued", "source", "forecast_issued_at"),)
 
     ts: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), primary_key=True, server_default=func.now()
@@ -102,12 +126,23 @@ class WeatherRecord(Base):
     cloud_cover: Mapped[float | None] = mapped_column(Float)
     # Precipitation amount for the forecast hour (mm/h).
     precipitation: Mapped[float | None] = mapped_column(Float)
+    # When this forecast was retrieved. ``ts`` is the forecasted hour, not the
+    # age of the weather information used by a plan.
+    forecast_issued_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PlanRecord(Base):
     """Optimizer plan output."""
 
     __tablename__ = "plans"
+    __table_args__ = (
+        Index(
+            "ux_plans_one_active",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     created_at: Mapped[dt.datetime] = mapped_column(
@@ -118,6 +153,27 @@ class PlanRecord(Base):
     plan_json: Mapped[str] = mapped_column(Text)
     optimizer_version: Mapped[str] = mapped_column(String(32), default="rules_v1")
     cost_estimate_eur: Mapped[float | None] = mapped_column(Float)
+    # Legacy cost field name retained for existing installations. The amount
+    # is denominated in this explicit source currency.
+    price_currency: Mapped[str] = mapped_column(
+        String(3), nullable=False, default="EUR", server_default="EUR"
+    )
+    price_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="legacy", server_default="legacy"
+    )
+    # Immutable non-secret record of the source data and model evidence that
+    # existed when this plan was created. The plan JSON retains hourly values;
+    # this field makes source and freshness visible without re-parsing it.
+    input_provenance_json: Mapped[str | None] = mapped_column(Text)
+    # Only one plan may be active at a time.  Keeping the lifecycle on the
+    # plan itself makes replacements explicit instead of leaving old pending
+    # actions executable after a re-optimisation.
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="active", server_default="active"
+    )
+    status_reason: Mapped[str | None] = mapped_column(String(256))
+    superseded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_by_plan_id: Mapped[int | None] = mapped_column(Integer)
 
 
 class PlanActionRecord(Base):
@@ -142,13 +198,46 @@ class PlanActionRecord(Base):
     result_json: Mapped[str | None] = mapped_column(Text)
 
 
+class OptimizationRequestRecord(Base):
+    """Durable request for the optimizer service to generate a new plan.
+
+    API processes never generate a plan themselves.  They enqueue a request
+    here and the singleton optimizer service claims it, which avoids competing
+    in-memory cooldowns and model instances across processes.
+    """
+
+    __tablename__ = "optimization_requests"
+    __table_args__ = (Index("ix_optimization_requests_status_requested", "status", "requested_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    requested_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_by: Mapped[str] = mapped_column(String(64), default="api")
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    plan_id: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class ServiceHeartbeatRecord(Base):
+    """Last successful heartbeat from a long-running control service."""
+
+    __tablename__ = "service_heartbeats"
+
+    service: Mapped[str] = mapped_column(String(32), primary_key=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    details_json: Mapped[str | None] = mapped_column(Text)
+
+
 class OverrideRecord(Base):
     """Manual user overrides that block the optimizer."""
 
     __tablename__ = "overrides"
-    __table_args__ = (
-        Index("ix_overrides_active_ts", "active", "ts_from", "ts_to"),
-    )
+    __table_args__ = (Index("ix_overrides_active_ts", "active", "ts_from", "ts_to"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
@@ -165,9 +254,7 @@ class AuditLogRecord(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     actor: Mapped[str] = mapped_column(String(64))
     action: Mapped[str] = mapped_column(String(64))
     target_device: Mapped[str | None] = mapped_column(String(128))
@@ -192,13 +279,12 @@ class FaultRecord(Base):
 
     __tablename__ = "faults"
     __table_args__ = (
+        Index("ix_faults_device_ts", "device_id", "ts"),
         Index("ix_faults_device_resolved", "device_id", "resolved_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     device_id: Mapped[str] = mapped_column(String(128))
     error_code: Mapped[str] = mapped_column(String(32))
     error_message: Mapped[str | None] = mapped_column(String(256))
@@ -226,6 +312,7 @@ class IndoorTempReading(Base):
     """Actual indoor air temperature from SmartThings sensors."""
 
     __tablename__ = "indoor_temp_reading"
+    __table_args__ = (Index("ix_indoor_temp_reading_device_ts", "device_id", "timestamp"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     timestamp: Mapped[dt.datetime] = mapped_column(
@@ -264,9 +351,7 @@ class AppLogRecord(Base):
     __table_args__ = (Index("ix_app_logs_ts", "ts"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     level: Mapped[str] = mapped_column(String(16))
     logger_name: Mapped[str | None] = mapped_column(String(128))
     event: Mapped[str] = mapped_column(String(256))

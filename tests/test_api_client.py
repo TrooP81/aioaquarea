@@ -51,7 +51,9 @@ async def test_request_updates_stored_access_token_and_expiration(api_client):
 
     assert returned is response
     assert api_client.access_token == "new-token"
-    assert api_client.token_expiration == dt.datetime(2026, 5, 8, 12, 34, 56, tzinfo=dt.timezone.utc)
+    assert api_client.token_expiration == dt.datetime(
+        2026, 5, 8, 12, 34, 56, tzinfo=dt.timezone.utc
+    )
 
 
 @pytest.mark.asyncio

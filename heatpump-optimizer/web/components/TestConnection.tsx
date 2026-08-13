@@ -26,7 +26,7 @@ export function TestConnection({ editValues }: TestConnectionProps) {
       return copy;
     });
 
-    let body: Record<string, string> = { service };
+    const body: Record<string, string> = { service };
 
     if (service === "aquarea") {
       const username = editValues["aquarea_username"] || "";
@@ -99,7 +99,6 @@ export function TestConnection({ editValues }: TestConnectionProps) {
     return result.success ? "var(--success)" : "var(--danger)";
   };
 
-  const activeServices = getActiveServices();
   const priceProvider = editValues["price_provider"] || "";
 
   return (

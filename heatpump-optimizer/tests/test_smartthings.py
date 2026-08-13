@@ -1,6 +1,7 @@
 """Tests for SmartThings API client and poller integration."""
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -149,9 +150,7 @@ class TestSmartThingsClient:
     async def test_get_temperature_out_of_range_returns_none(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "temperature": {"value": 999.0, "unit": "C"}
-        }
+        mock_response.json.return_value = {"temperature": {"value": 999.0, "unit": "C"}}
 
         with patch("packages.poller.smartthings.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -337,9 +336,7 @@ class TestStaleReadingHandling:
 
         invalidate_device_cache()
 
-        fresh_ts = (
-            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
-        ).isoformat()
+        fresh_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).isoformat()
 
         mock_session = MagicMock()
         mock_session.add = MagicMock()
@@ -419,26 +416,26 @@ class TestGetSelectedDeviceIds:
 
 
 class _RecordingResult:
-    def __init__(self, *, one=None, scalar=None):
-        self._one = one
+    def __init__(self, rows, scalar=None):
+        self._rows = rows
         self._scalar = scalar
 
-    def one(self):
-        return self._one
+    def scalars(self):
+        return self
 
-    def scalar(self):
+    def all(self):
+        return self._rows
+
+    def scalar_one_or_none(self):
         return self._scalar
 
 
 class _RecordingSession:
     """Captures executed statements and returns canned aggregate results."""
 
-    def __init__(self, agg_row, fresh_scalar):
+    def __init__(self, rows):
         self.statements = []
-        self._results = [
-            _RecordingResult(one=agg_row),
-            _RecordingResult(scalar=fresh_scalar),
-        ]
+        self._results = [_RecordingResult(rows), _RecordingResult([], scalar=None)]
 
     async def execute(self, stmt):
         self.statements.append(stmt)
@@ -461,8 +458,10 @@ class TestLatestIndoorTempFiltering:
     async def test_filters_by_selected_devices(self):
         from packages.api.routers.smartthings import get_latest_indoor_temp
 
-        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
-        session = _RecordingSession(agg_row=(26.7, now, 1), fresh_scalar=now)
+        now = dt.datetime.now(dt.timezone.utc)
+        session = _RecordingSession(
+            [SimpleNamespace(id=1, device_id="dev-living", temperature=26.7, timestamp=now)]
+        )
 
         with patch(
             "packages.poller.smartthings.get_selected_device_ids",
@@ -477,16 +476,22 @@ class TestLatestIndoorTempFiltering:
 
         assert result["avg_temperature"] == 26.7
         assert result["sensor_count"] == 1
-        # Both the aggregate and the freshness query must constrain device_id.
+        assert result["sample_count"] == 1
         assert len(session.statements) == 2
-        assert all("device_id" in str(stmt) for stmt in session.statements)
+        assert "device_id IN" in str(session.statements[0])
 
     @pytest.mark.asyncio
     async def test_no_selection_does_not_filter_devices(self):
         from packages.api.routers.smartthings import get_latest_indoor_temp
 
-        now = dt.datetime(2026, 6, 20, 11, 11, tzinfo=dt.timezone.utc)
-        session = _RecordingSession(agg_row=(22.0, now, 3), fresh_scalar=now)
+        now = dt.datetime.now(dt.timezone.utc)
+        session = _RecordingSession(
+            [
+                SimpleNamespace(id=1, device_id="dev-a", temperature=21.5, timestamp=now),
+                SimpleNamespace(id=2, device_id="dev-b", temperature=22.0, timestamp=now),
+                SimpleNamespace(id=3, device_id="dev-c", temperature=22.5, timestamp=now),
+            ]
+        )
 
         with patch(
             "packages.poller.smartthings.get_selected_device_ids",
@@ -500,5 +505,6 @@ class TestLatestIndoorTempFiltering:
                 result = await get_latest_indoor_temp()
 
         assert result["sensor_count"] == 3
-        # With no explicit selection the aggregate must not reference device_id.
-        assert "device_id" not in str(session.statements[0])
+        assert result["avg_temperature"] == 22.0
+        # With no explicit selection there must be no device-selection filter.
+        assert "device_id IN" not in str(session.statements[0])

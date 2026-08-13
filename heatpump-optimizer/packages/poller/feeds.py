@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 
 import defusedxml.ElementTree as ElementTree
 import httpx
 
 from packages.core.config import settings
-from packages.core.settings_service import get_setting
+from packages.core.settings_service import get_setting, get_string_setting
 from packages.core.solar import clear_sky_ghi, estimate_ghi
 
 # ENTSO-E Transparency Platform day-ahead prices
@@ -28,18 +29,44 @@ SMHI_URL = (
 )
 
 
-async def fetch_prices() -> list[tuple[dt.datetime, float]]:
+@dataclass(frozen=True, slots=True)
+class PriceFeed:
+    """Hourly prices together with the currency supplied by the provider."""
+
+    prices: list[tuple[dt.datetime, float]]
+    currency: str
+    source: str
+
+
+class ProviderPriceList(list[tuple[dt.datetime, float]]):
+    """List-compatible provider output carrying non-numeric price context."""
+
+    def __init__(self, values: list[tuple[dt.datetime, float]], *, currency: str, source: str):
+        super().__init__(values)
+        self.currency = currency
+        self.source = source
+
+
+async def fetch_price_feed() -> PriceFeed:
     """
     Fetch electricity prices from the configured provider.
-    Returns list of (timestamp_utc, EUR/kWh).
+    Amounts stay in the provider's original currency. This prevents a Tibber
+    SEK amount from being silently presented as EUR (or the reverse).
     """
     provider = await get_setting("price_provider")
 
     if provider == "manual":
-        return await _get_manual_prices()
+        currency = (await get_string_setting("manual_price_currency") or "EUR").upper()
+        return PriceFeed(await _get_manual_prices(), currency, "manual")
     elif provider == "tibber":
-        return await _fetch_prices_tibber()
-    return await _fetch_prices_entsoe()
+        prices = await _fetch_prices_tibber()
+        return PriceFeed(list(prices), prices.currency, prices.source)
+    return PriceFeed(await _fetch_prices_entsoe(), "EUR", "entsoe")
+
+
+async def fetch_prices() -> list[tuple[dt.datetime, float]]:
+    """Backward-compatible price-only access for callers that do not persist data."""
+    return (await fetch_price_feed()).prices
 
 
 async def _get_manual_prices() -> list[tuple[dt.datetime, float]]:
@@ -119,10 +146,11 @@ def _parse_entsoe_xml(xml_text: str, period_start: dt.datetime) -> list[tuple[dt
 
     return results
 
-async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
+
+async def _fetch_prices_tibber() -> ProviderPriceList:
     token = await get_setting("tibber_api_token")
     if not token:
-        return []
+        return ProviderPriceList([], currency="EUR", source="tibber")
 
     query = """
     {
@@ -132,10 +160,12 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
             priceInfo {
               today {
                 total
+                currency
                 startsAt
               }
               tomorrow {
                 total
+                currency
                 startsAt
               }
             }
@@ -156,18 +186,20 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
         data = resp.json()
 
     if data.get("errors"):
-        return []
+        return ProviderPriceList([], currency="EUR", source="tibber")
 
-    homes = (((data.get("data") or {}).get("viewer") or {}).get("homes") or [])
+    homes = ((data.get("data") or {}).get("viewer") or {}).get("homes") or []
     if not homes:
-        return []
+        return ProviderPriceList([], currency="EUR", source="tibber")
 
     price_entries: list[dict] = []
+    currency = "EUR"
     for home in homes:
         current_subscription = home.get("currentSubscription") or {}
         price_info = current_subscription.get("priceInfo") or {}
         price_entries = (price_info.get("today") or []) + (price_info.get("tomorrow") or [])
         if price_entries:
+            currency = str(price_entries[0].get("currency") or "EUR").upper()
             break
 
     results: list[tuple[dt.datetime, float]] = []
@@ -186,7 +218,7 @@ async def _fetch_prices_tibber() -> list[tuple[dt.datetime, float]]:
         results.append((ts, float(total)))
 
     results.sort(key=lambda x: x[0])
-    return results
+    return ProviderPriceList(results, currency=currency, source="tibber")
 
 
 async def fetch_weather() -> list[dict]:
@@ -196,60 +228,63 @@ async def fetch_weather() -> list[dict]:
     Returns list of dicts with ts, temperature, irradiance, wind_speed, humidity
     and precipitation (mm/h).
     """
-    provider = await get_setting("weather_provider")
+    provider = await get_setting("weather_provider") or "open-meteo"
     if provider == "manual":
-        return await _get_manual_weather()
-    if provider == "smhi":
-        return await _fetch_weather_smhi()
+        result = await _get_manual_weather()
+    elif provider == "smhi":
+        result = await _fetch_weather_smhi()
+    else:
+        provider = "open-meteo"
+        lat = await get_setting("latitude")
+        lng = await get_setting("longitude")
 
-    lat = await get_setting("latitude")
-    lng = await get_setting("longitude")
+        params = {
+            "latitude": float(lat) if lat else settings.latitude,
+            "longitude": float(lng) if lng else settings.longitude,
+            "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover,precipitation",
+            "forecast_days": 2,
+            "timezone": "UTC",
+        }
 
-    params = {
-        "latitude": float(lat) if lat else settings.latitude,
-        "longitude": float(lng) if lng else settings.longitude,
-        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover,precipitation",
-        "forecast_days": 2,
-        "timezone": "UTC",
-    }
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(OPEN_METEO_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(OPEN_METEO_URL, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        humidity = hourly.get("relative_humidity_2m", [])
+        wind = hourly.get("wind_speed_10m", [])
+        radiation = hourly.get("direct_radiation", [])
+        cloud = hourly.get("cloud_cover", [])
+        precipitation = hourly.get("precipitation", [])
 
-    hourly = data.get("hourly", {})
-    times = hourly.get("time", [])
-    temps = hourly.get("temperature_2m", [])
-    humidity = hourly.get("relative_humidity_2m", [])
-    wind = hourly.get("wind_speed_10m", [])
-    radiation = hourly.get("direct_radiation", [])
-    cloud = hourly.get("cloud_cover", [])
-    precipitation = hourly.get("precipitation", [])
+        result = []
+        for i, time_str in enumerate(times):
+            ts = dt.datetime.fromisoformat(time_str).replace(tzinfo=dt.timezone.utc)
+            result.append(
+                {
+                    "ts": ts,
+                    "temperature": temps[i] if i < len(temps) else None,
+                    "humidity": humidity[i] if i < len(humidity) else None,
+                    "wind_speed": wind[i] if i < len(wind) else None,
+                    "irradiance": radiation[i] if i < len(radiation) else None,
+                    # Open-Meteo reports cloud cover in percent; store as a fraction.
+                    "cloud_cover": (
+                        cloud[i] / 100.0 if i < len(cloud) and cloud[i] is not None else None
+                    ),
+                    # Open-Meteo precipitation is the amount falling during the
+                    # preceding forecast hour, expressed in mm.
+                    "precipitation": precipitation[i] if i < len(precipitation) else None,
+                }
+            )
 
-    results = []
-    for i, time_str in enumerate(times):
-        ts = dt.datetime.fromisoformat(time_str).replace(tzinfo=dt.timezone.utc)
-        results.append(
-            {
-                "ts": ts,
-                "temperature": temps[i] if i < len(temps) else None,
-                "humidity": humidity[i] if i < len(humidity) else None,
-                "wind_speed": wind[i] if i < len(wind) else None,
-                "irradiance": radiation[i] if i < len(radiation) else None,
-                # Open-Meteo reports cloud cover in percent; store as a fraction.
-                "cloud_cover": (
-                    cloud[i] / 100.0
-                    if i < len(cloud) and cloud[i] is not None
-                    else None
-                ),
-                # Open-Meteo precipitation is the amount falling during the
-                # preceding forecast hour, expressed in mm.
-                "precipitation": precipitation[i] if i < len(precipitation) else None,
-            }
-        )
-
-    return results
+    issued_at = dt.datetime.now(dt.timezone.utc)
+    for entry in result:
+        entry["source"] = provider
+        entry["forecast_issued_at"] = issued_at
+    return result
 
 
 def _parse_smhi_forecast(
@@ -275,9 +310,7 @@ def _parse_smhi_forecast(
         time_str = entry.get("time")
         if not time_str:
             continue
-        ts = dt.datetime.fromisoformat(time_str.replace("Z", "+00:00")).astimezone(
-            dt.timezone.utc
-        )
+        ts = dt.datetime.fromisoformat(time_str.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
         params = entry.get("data") or {}
         series.append((ts, params))
 
@@ -307,9 +340,7 @@ def _parse_smhi_forecast(
         precipitation = params.get("precipitation")
         # Total cloud cover in octas (0–8) → fraction (0–1).
         octas = params.get("cloud_area_fraction")
-        cloud_fraction = (
-            max(0.0, min(1.0, float(octas) / 8.0)) if octas is not None else None
-        )
+        cloud_fraction = max(0.0, min(1.0, float(octas) / 8.0)) if octas is not None else None
         # Reconstruct irradiance from solar geometry, attenuated by cloud cover
         # (assume clear sky when cloud data is missing).
         if cloud_fraction is not None:

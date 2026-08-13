@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { Dashboard } from "@/components/Dashboard";
 import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
@@ -15,8 +16,11 @@ import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { LearningModeCard } from "@/components/LearningModeCard";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
+import { OutcomeSummary } from "@/components/OutcomeSummary";
+import { OperationalAlerts } from "@/components/OperationalAlerts";
 import { AppVersionBadge } from "@/components/AppVersionBadge";
 import { TabNavigation } from "@/components/TabNavigation";
+import { DecisionSummary } from "@/components/DecisionSummary";
 import { SECTIONS, SectionId } from "@/lib/constants";
 import { useTimeFormat, formatTime } from "@/components/useTimeFormat";
 
@@ -33,14 +37,25 @@ interface DashboardData {
     zone1_target_temp: number | null;
     quiet_mode: number | null;
     powerful_mode: number | null;
+    device_action?: string | null;
+    direction?: string | null;
+    space_heating_active: boolean | null;
+    space_heating_evidence: string | null;
   } | null;
   current_price: number | null;
   today_kwh: number;
-  today_cost_eur: number;
+  today_cost_eur: number | null;
+  today_cost_priced_kwh: number;
+  today_cost_unpriced_kwh: number;
+  today_cost_priced_amount: number;
+  today_cost_coverage_pct: number;
+  today_cost_complete: boolean;
   active_plan: {
     id: number;
     optimizer_version: string;
     cost_estimate_eur: number | null;
+    price_currency?: string;
+    price_source?: string;
     actions_count: number;
     horizon_start?: string;
     horizon_end?: string;
@@ -53,6 +68,11 @@ interface DashboardData {
 interface PollResult {
   success: boolean;
   message: string;
+}
+
+interface PollStepResult {
+  success?: boolean;
+  message?: string;
 }
 
 interface IndoorTempData {
@@ -82,6 +102,13 @@ export default function Home() {
   const [showRawChartDetails, setShowRawChartDetails] = useState(false);
   const [showHotWaterDetails, setShowHotWaterDetails] = useState(false);
   const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
+
+  const selectSection = (section: SectionId) => {
+    setActiveSection(section);
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", section);
+    window.history.pushState({ view: section }, "", url);
+  };
 
   const fetchData = async () => {
     try {
@@ -121,6 +148,18 @@ export default function Home() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const applyLocation = () => {
+      const requested = new URLSearchParams(window.location.search).get("view");
+      if (SECTIONS.some((section) => section.id === requested)) {
+        setActiveSection(requested as SectionId);
+      }
+    };
+    applyLocation();
+    window.addEventListener("popstate", applyLocation);
+    return () => window.removeEventListener("popstate", applyLocation);
+  }, []);
+
   /* ── Auto-dismiss a successful poll banner after a few seconds ── */
   useEffect(() => {
     if (pollResult?.success) {
@@ -138,9 +177,10 @@ export default function Home() {
       if (json.status === "ok") {
         setPollResult({ success: true, message: "All data fetched successfully" });
       } else {
-        const msgs = Object.entries(json.results || {})
-          .filter(([, v]: [string, any]) => !v?.success)
-          .map(([k, v]: [string, any]) => `${k}: ${v?.message}`)
+        const results = (json.results ?? {}) as Record<string, PollStepResult>;
+        const msgs = Object.entries(results)
+          .filter(([, result]) => !result.success)
+          .map(([name, result]) => `${name}: ${result.message ?? "failed"}`)
           .join("; ");
         setPollResult({ success: false, message: msgs || "Partial success" });
       }
@@ -188,7 +228,7 @@ export default function Home() {
         ariaLabel="Dashboard views"
         idPrefix="dashboard"
         items={SECTIONS}
-        onChange={setActiveSection}
+        onChange={selectSection}
       />
 
       <div className="header">
@@ -208,7 +248,7 @@ export default function Home() {
           >
             {polling ? "Polling..." : "Poll Now"}
           </button>
-          <a href="/settings" className="btn">Settings</a>
+          <Link href="/settings" className="btn">Settings</Link>
           <span
             className={`status-badge ${data?.current_status ? "online" : "offline"}`}
             title={data?.current_status ? "Receiving live data from the heat pump" : "No recent data from the heat pump"}
@@ -275,84 +315,63 @@ export default function Home() {
         </div>
       )}
 
-      <section
-        id="dashboard-panel-overview"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-overview"
-        hidden={activeSection !== "overview"}
-      >
-        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
-        <NextActionCard plan={data?.active_plan ?? null} />
-      </section>
+      {activeSection === "overview" && (
+        <section id="dashboard-panel-overview" className="workspace-panel" role="tabpanel" aria-labelledby="dashboard-tab-overview">
+          <DecisionSummary plan={data?.active_plan ?? null} indoorTemp={indoorTemp?.avg_temperature ?? null} />
+          <OperationalAlerts />
+          <div className="overview-secondary">
+            <NextActionCard plan={data?.active_plan ?? null} />
+          </div>
+          <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
+          <OutcomeSummary />
+        </section>
+      )}
 
-      <section
-        id="dashboard-panel-controls"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-controls"
-        hidden={activeSection !== "controls"}
-      >
-        <Controls />
-        <LearningModeCard onChange={fetchLearningMode} />
-      </section>
+      {activeSection === "controls" && (
+        <section id="dashboard-panel-controls" className="workspace-panel" role="tabpanel" aria-labelledby="dashboard-tab-controls">
+          <Controls />
+          <LearningModeCard onChange={fetchLearningMode} />
+        </section>
+      )}
 
-      <section
-        id="dashboard-panel-plan"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-plan"
-        hidden={activeSection !== "plan"}
-      >
-        <PlanView plan={data?.active_plan ?? null} />
-        <PlanActivityTimeline />
-        <PlanHistory />
-      </section>
+      {activeSection === "plan" && (
+        <section id="dashboard-panel-plan" className="workspace-panel" role="tabpanel" aria-labelledby="dashboard-tab-plan">
+          <PlanView plan={data?.active_plan ?? null} />
+          <PlanActivityTimeline />
+          <PlanHistory />
+        </section>
+      )}
 
-      <section
-        id="dashboard-panel-charts"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-charts"
-        hidden={activeSection !== "charts"}
-      >
-        <ComfortImpactChart />
-        <ConsumptionChart />
-        <details
-          className="chart-details"
-          onToggle={(event) => setShowRawChartDetails(event.currentTarget.open)}
-        >
-          <summary>Show raw weather, price and temperature history</summary>
-          {showRawChartDetails && (
-            <div className="chart-detail-content">
-              <TemperatureChart />
-              <ForecastChart />
-              <PriceChart />
-            </div>
-          )}
-        </details>
-        <details
-          className="chart-details chart-details--hot-water"
-          onToggle={(event) => setShowHotWaterDetails(event.currentTarget.open)}
-        >
-          <summary>Show hot-water and tank details</summary>
-          {showHotWaterDetails && (
-            <div className="chart-detail-content">
-              <ThermalPredictionChart />
-            </div>
-          )}
-        </details>
-      </section>
+      {activeSection === "charts" && (
+        <section id="dashboard-panel-charts" className="workspace-panel" role="tabpanel" aria-labelledby="dashboard-tab-charts">
+          <ComfortImpactChart />
+          <ConsumptionChart />
+          <details className="chart-details" onToggle={(event) => setShowRawChartDetails(event.currentTarget.open)}>
+            <summary>Show raw weather, price and temperature history</summary>
+            {showRawChartDetails && (
+              <div className="chart-detail-content">
+                <TemperatureChart />
+                <ForecastChart />
+                <PriceChart />
+              </div>
+            )}
+          </details>
+          <details className="chart-details chart-details--hot-water" onToggle={(event) => setShowHotWaterDetails(event.currentTarget.open)}>
+            <summary>Show hot-water and tank details</summary>
+            {showHotWaterDetails && (
+              <div className="chart-detail-content">
+                <ThermalPredictionChart />
+              </div>
+            )}
+          </details>
+        </section>
+      )}
 
-      <section
-        id="dashboard-panel-status"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-status"
-        hidden={activeSection !== "status"}
-      >
-        <OptimizerStatus />
-      </section>
+      {activeSection === "status" && (
+        <section id="dashboard-panel-status" className="workspace-panel" role="tabpanel" aria-labelledby="dashboard-tab-status">
+          <OptimizerStatus />
+        </section>
+      )}
     </div>
   );
 }

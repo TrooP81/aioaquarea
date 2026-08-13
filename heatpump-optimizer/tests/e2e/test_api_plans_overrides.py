@@ -67,7 +67,9 @@ class TestOverrides:
         assert resp.status_code == 200
         assert resp.json()["status"] == "created"
 
-    async def test_create_override_appears_in_dashboard(self, client: AsyncClient, seed_device_status):
+    async def test_create_override_appears_in_dashboard(
+        self, client: AsyncClient, seed_device_status
+    ):
         now = dt.datetime.now(dt.timezone.utc)
         payload = {
             "ts_from": (now - dt.timedelta(minutes=5)).isoformat(),

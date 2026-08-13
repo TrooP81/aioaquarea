@@ -8,7 +8,14 @@ from sqlalchemy import and_, desc, select
 from packages.api._helpers import get_price_area
 from packages.api.schemas import PriceResponse, WeatherResponse
 from packages.core.database import get_session
-from packages.core.models import COPRecord, DeviceStatusRecord, FaultRecord, PriceRecord, WeatherRecord
+from packages.core.models import (
+    COPRecord,
+    DeviceStatusRecord,
+    FaultRecord,
+    PriceRecord,
+    WeatherRecord,
+)
+from packages.core.settings_service import get_setting
 
 router = APIRouter()
 
@@ -34,7 +41,16 @@ async def get_prices(hours: int = Query(48, ge=1, le=168)):
         )
         rows = result.scalars().all()
 
-    return [PriceResponse(ts=r.ts, price_eur_per_kwh=r.price_eur_per_kwh) for r in rows]
+    return [
+        PriceResponse(
+            ts=r.ts,
+            price_eur_per_kwh=r.price_eur_per_kwh,
+            price_currency=r.price_currency,
+            price_source=r.price_source,
+            fetched_at=r.fetched_at,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/api/weather", response_model=list[WeatherResponse])
@@ -43,10 +59,17 @@ async def get_weather(hours: int = Query(48, ge=1, le=168)):
     since = now - dt.timedelta(hours=12)
     until = now + dt.timedelta(hours=hours)
 
+    provider = (await get_setting("weather_provider")) or "open-meteo"
     async with get_session() as session:
         result = await session.execute(
             select(WeatherRecord)
-            .where(and_(WeatherRecord.ts >= since, WeatherRecord.ts <= until))
+            .where(
+                and_(
+                    WeatherRecord.ts >= since,
+                    WeatherRecord.ts <= until,
+                    WeatherRecord.source == provider,
+                )
+            )
             .order_by(WeatherRecord.ts)
         )
         rows = result.scalars().all()
@@ -60,6 +83,8 @@ async def get_weather(hours: int = Query(48, ge=1, le=168)):
             cloud_cover=r.cloud_cover,
             irradiance=r.irradiance,
             precipitation=r.precipitation,
+            source=r.source,
+            forecast_issued_at=r.forecast_issued_at,
         )
         for r in rows
     ]

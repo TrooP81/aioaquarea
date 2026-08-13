@@ -52,7 +52,7 @@ export function SmartThingsOAuth() {
       }
       const { authorize_url } = await res.json();
       window.location.href = authorize_url;
-    } catch (e) {
+    } catch {
       setError("Failed to start OAuth flow");
     } finally {
       setConnecting(false);

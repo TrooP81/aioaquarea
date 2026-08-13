@@ -14,6 +14,12 @@ class DeviceStatusResponse(BaseModel):
     mode: Optional[str] = None
     operation_status: Optional[int] = None
     outdoor_temp: Optional[float] = None
+    heat_pump_outdoor_temp: Optional[float] = None
+    weather_outdoor_temp: Optional[float] = None
+    outdoor_temp_source: Optional[str] = None
+    outdoor_temp_provider: Optional[str] = None
+    outdoor_temp_compensation_c: Optional[float] = None
+    outdoor_temp_fallback_reason: Optional[str] = None
     tank_temp: Optional[float] = None
     tank_target_temp: Optional[int] = None
     zone1_temp: Optional[float] = None
@@ -23,6 +29,8 @@ class DeviceStatusResponse(BaseModel):
     direction: Optional[str] = None
     device_action: Optional[str] = None
     defrost_active: Optional[bool] = None
+    space_heating_active: Optional[bool] = None
+    space_heating_evidence: Optional[str] = None
     force_dhw: Optional[int] = None
     force_heater: Optional[int] = None
     holiday_mode: Optional[int] = None
@@ -51,9 +59,13 @@ class DeviceSettingsResponse(BaseModel):
     force_heater: Optional[int] = None
     holiday_mode: Optional[int] = None
     outdoor_temp: Optional[float] = None
+    heat_pump_outdoor_temp: Optional[float] = None
+    outdoor_temp_source: Optional[str] = None
     direction: Optional[str] = None
     device_action: Optional[str] = None
     defrost_active: Optional[bool] = None
+    space_heating_active: Optional[bool] = None
+    space_heating_evidence: Optional[str] = None
     pump_duty: Optional[int] = None
 
 
@@ -69,6 +81,9 @@ class ConsumptionResponse(BaseModel):
 class PriceResponse(BaseModel):
     ts: dt.datetime
     price_eur_per_kwh: float
+    price_currency: str = "EUR"
+    price_source: str = "legacy"
+    fetched_at: Optional[dt.datetime] = None
 
 
 class WeatherResponse(BaseModel):
@@ -79,6 +94,8 @@ class WeatherResponse(BaseModel):
     cloud_cover: Optional[float] = None
     irradiance: Optional[float] = None
     precipitation: Optional[float] = None
+    source: Optional[str] = None
+    forecast_issued_at: Optional[dt.datetime] = None
 
 
 class PlanResponse(BaseModel):
@@ -88,11 +105,20 @@ class PlanResponse(BaseModel):
     horizon_end: dt.datetime
     optimizer_version: str
     cost_estimate_eur: Optional[float] = None
+    price_currency: str = "EUR"
+    price_source: str = "legacy"
     actions_count: int = 0
+    status: str = "active"
+    status_reason: Optional[str] = None
+    superseded_at: Optional[dt.datetime] = None
+    superseded_by_plan_id: Optional[int] = None
 
 
 class PlanDetailResponse(PlanResponse):
     actions: list[dict]
+    outcome: dict = Field(default_factory=dict)
+    change_summary: dict = Field(default_factory=dict)
+    provenance: dict = Field(default_factory=dict)
 
 
 class PlanActivityResponse(BaseModel):
@@ -106,6 +132,7 @@ class PlanActivityResponse(BaseModel):
     action_type: str
     status: str
     executed_at: Optional[dt.datetime] = None
+    lateness_seconds: Optional[int] = None
     payload: dict = Field(default_factory=dict)
     result: Optional[dict] = None
 
@@ -129,8 +156,18 @@ class StatsResponse(BaseModel):
 class DashboardResponse(BaseModel):
     current_status: Optional[DeviceStatusResponse] = None
     current_price: Optional[float] = None
+    price_currency: str = "EUR"
+    price_source: str = "legacy"
     today_kwh: float = 0
-    today_cost_eur: float = 0
+    # Legacy name retained for wire compatibility. A value is supplied only
+    # when every measured consumption interval has a compatible spot price.
+    today_cost_eur: Optional[float] = None
+    today_cost_currency: str = "EUR"
+    today_cost_priced_kwh: float = 0
+    today_cost_unpriced_kwh: float = 0
+    today_cost_priced_amount: float = 0
+    today_cost_coverage_pct: float = 0
+    today_cost_complete: bool = False
     active_plan: Optional[PlanResponse] = None
     has_override: bool = False
     override_id: Optional[int] = None
@@ -168,3 +205,78 @@ class TestConnectionResponse(BaseModel):
     success: bool
     message: str
     details: Optional[dict] = None
+
+
+class IndoorForecastPointResponse(BaseModel):
+    hour: int
+    predicted_indoor_temp: float
+    ts: dt.datetime | None = None
+    source: str | None = None
+    model_source: str | None = None
+    space_heating_fraction: float | None = Field(default=None, ge=0, le=1)
+    prediction_lower_c: float | None = None
+    prediction_upper_c: float | None = None
+    prediction_interval_status: str | None = None
+
+
+class IndoorForecastTargetResponse(BaseModel):
+    hour: int
+    ts: dt.datetime | None = None
+    target: float
+    comfort_hour: bool
+
+
+class IndoorForecastWeatherResponse(BaseModel):
+    """Hourly weather conditions used to calculate the indoor forecast."""
+
+    ts: dt.datetime
+    hour: int = Field(ge=0, le=23)
+    outdoor_temp: float | None = None
+    wind_speed: float | None = None
+    irradiance: float | None = None
+    precipitation: float | None = None
+    input_status: str = "observed"
+    imputed_fields: list[str] = Field(default_factory=list)
+
+
+class IndoorForecastPriceResponse(BaseModel):
+    """Price in the same optimizer slot as the weather and temperature forecast."""
+
+    ts: dt.datetime
+    price_eur_per_kwh: float | None = None
+    # Neutral alias for new consumers. The legacy EUR-named field remains for
+    # compatibility even when the configured market uses SEK.
+    price_per_kwh: float | None = None
+    currency: str | None = None
+
+
+class IndoorForecastActionResponse(BaseModel):
+    hour: int
+    action_type: str
+    status: str
+    payload: dict = Field(default_factory=dict)
+
+
+class IndoorForecastResponse(BaseModel):
+    """The versioned, self-contained forecast contract used by all forecast UIs."""
+
+    current_indoor: float | None = None
+    outdoor_temp: float | None = None
+    forecast: list[IndoorForecastPointResponse]
+    forecast_with_plan: list[IndoorForecastPointResponse]
+    forecast_no_heating: list[IndoorForecastPointResponse]
+    target_schedule: list[IndoorForecastTargetResponse]
+    weather_forecast: list[IndoorForecastWeatherResponse]
+    price_forecast: list[IndoorForecastPriceResponse]
+    planned_actions: list[IndoorForecastActionResponse]
+    forecast_source: str
+    forecast_status: str = "available"
+    forecast_unavailable_reason: str | None = None
+    plan_id: int | None = None
+    plan_created_at: dt.datetime | None = None
+    comfort_assessment: dict = Field(default_factory=dict)
+    forecast_provenance: dict = Field(default_factory=dict)
+    display_status: str = "fresh"
+    plan_age_seconds: int | None = None
+    sensor_age_seconds: int | None = None
+    current_vs_plan_delta_c: float | None = None

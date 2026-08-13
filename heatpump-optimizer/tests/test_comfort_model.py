@@ -1,10 +1,12 @@
 """Tests for the comfort model (indoor air temperature prediction)."""
 
 import datetime as dt
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
 from packages.ml.comfort_model import ComfortModel, MIN_TRAINING_ROWS
 
 
@@ -24,31 +26,145 @@ class TestComfortModelUntrained:
         assert result is None
 
 
+class TestPassiveDirectForecastReadiness:
+    def test_direct_passive_forecast_can_be_ready_without_heating_control(self):
+        model = ComfortModel()
+        model._model = MagicMock()
+        model._direct_models = {60: MagicMock()}
+        model._metrics = {
+            "direct_horizons": {"60": {"status": "trained", "mae": 0.6}},
+            # No active heating evidence: full heating control remains blocked.
+            "active_heating_rows": 0,
+        }
+
+        assert model.is_ready_for_control is False
+        assert model.passive_forecast_readiness(60) == {
+            "ready": True,
+            "horizon_minutes": 60,
+            "mae": 0.6,
+        }
+
+    def test_direct_passive_forecast_rejects_poor_validation(self):
+        model = ComfortModel()
+        model._model = MagicMock()
+        model._direct_models = {60: MagicMock()}
+        model._metrics = {"direct_horizons": {"60": {"status": "trained", "mae": 1.2}}}
+
+        readiness = model.passive_forecast_readiness(60)
+        assert readiness["ready"] is False
+        assert readiness["reason"] == "direct_forecast_mae_above_threshold"
+
+
+class TestComfortControlReadiness:
+    def test_requires_active_heating_evidence_and_baseline_improvement(self):
+        model = ComfortModel()
+        model._model = object()
+        model._metrics = {
+            "validated": True,
+            "mae": 0.3,
+            "r2": 0.5,
+            "active_heating_rows": 0,
+            "baseline_mae": 0.5,
+        }
+
+        assert model.control_readiness["reason"] == "insufficient_active_heating_evidence"
+
+        model._metrics["active_heating_rows"] = 20
+        model._metrics["baseline_mae"] = 0.3
+        assert model.control_readiness["reason"] == "not_better_than_persistence_baseline"
+
+        model._metrics["baseline_mae"] = 0.4
+        assert model.is_ready_for_control is True
+
+    def test_control_margin_is_bounded_by_validated_mae(self):
+        model = ComfortModel()
+        model._model = object()
+        model._metrics = {
+            "validated": True,
+            "mae": 0.6,
+            "r2": 0.3,
+            "active_heating_rows": 30,
+            "baseline_mae": 0.8,
+        }
+
+        assert model.is_ready_for_control is True
+        assert model.control_margin_c == 0.45
+
+
 class TestComfortModelFeatures:
+    def test_panasonic_sentinel_target_uses_weather_compensated_curve(self):
+        curve = HeatCurveConfig()
+
+        assert effective_zone_target_temperature(-5.0, 5.0, config=curve) == 47.0
+        assert effective_zone_target_temperature(-5.0, 20.0, config=curve) == 20.0
+        assert effective_zone_target_temperature(42.0, 5.0, config=curve) == 42.0
+
     def test_make_features_shape(self):
         features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
-        assert features.shape == (8,)
+        assert features.shape == (14,)
 
     def test_make_features_indoor_temp(self):
         # When indoor_temp is provided, it should be used as the final feature.
-        features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12, indoor_temp=21.0, precipitation=1.5)
-        assert features[7] == 21.0
-        assert features[4] == 1.5
+        features = ComfortModel._make_features(
+            35.0,
+            5.0,
+            3.0,
+            100.0,
+            12,
+            indoor_temp=21.0,
+            precipitation=1.5,
+            humidity=82.0,
+            cloud_cover=0.75,
+        )
+        assert features[12] == 21.0
+        assert features[7] == 1.5
+        assert features[8] == 82.0
+        assert features[9] == 0.75
 
     def test_make_features_indoor_temp_fallback(self):
         # When indoor_temp is None, falls back to outdoor_temp
         features = ComfortModel._make_features(35.0, 5.0, 3.0, 100.0, 12)
-        assert features[7] == 5.0  # outdoor_temp
+        assert features[12] == 5.0  # outdoor_temp
 
     def test_make_features_cyclical_hour(self):
         features_0 = ComfortModel._make_features(35.0, 5.0, 3.0, 0.0, 0)
         features_12 = ComfortModel._make_features(35.0, 5.0, 3.0, 0.0, 12)
         # Hour 0: sin=0, cos=1
-        assert abs(features_0[5]) < 0.01  # sin(0) ≈ 0
-        assert abs(features_0[6] - 1.0) < 0.01  # cos(0) ≈ 1
+        assert abs(features_0[10]) < 0.01  # sin(0) ≈ 0
+        assert abs(features_0[11] - 1.0) < 0.01  # cos(0) ≈ 1
         # Hour 12: sin=0, cos=-1
-        assert abs(features_12[5]) < 0.01  # sin(π) ≈ 0
-        assert abs(features_12[6] + 1.0) < 0.01  # cos(π) ≈ -1
+        assert abs(features_12[10]) < 0.01  # sin(π) ≈ 0
+        assert abs(features_12[11] + 1.0) < 0.01  # cos(π) ≈ -1
+
+    def test_make_features_keeps_heating_evidence_separate_from_water_temp(self):
+        no_heat = ComfortModel._make_features(
+            40.0,
+            5.0,
+            3.0,
+            0.0,
+            12,
+            zone_target_temp=45.0,
+            space_heating_fraction=0.0,
+            recent_heat_fraction=0.25,
+            indoor_trend_c_per_hour=-0.4,
+        )
+        active = ComfortModel._make_features(
+            40.0,
+            5.0,
+            3.0,
+            0.0,
+            12,
+            zone_target_temp=45.0,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=0.75,
+            indoor_trend_c_per_hour=0.4,
+        )
+
+        assert no_heat[1] == active[1] == 45.0
+        assert no_heat[2:4].tolist() == [0.0, 0.25]
+        assert active[2:4].tolist() == [1.0, 0.75]
+        assert no_heat[13] == -0.4
+        assert active[13] == 0.4
 
 
 class TestComfortModelTrained:
@@ -69,20 +185,30 @@ class TestComfortModelTrained:
         wind = rng.uniform(0, 10, n)
         irradiance = rng.uniform(0, 500, n)
         precipitation = rng.uniform(0, 5, n)
+        humidity = rng.uniform(30, 95, n)
+        cloud_cover = rng.uniform(0, 1, n)
         hours = rng.randint(0, 24, n)
         # Previous indoor temp — slightly correlated with target
         prev_indoor = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 2.0, n)
 
-        X = np.column_stack([
-            water_temps,
-            outdoor_temps,
-            wind,
-            irradiance,
-            precipitation,
-            np.sin(2.0 * np.pi * hours / 24.0),
-            np.cos(2.0 * np.pi * hours / 24.0),
-            prev_indoor,
-        ])
+        X = np.column_stack(
+            [
+                water_temps,
+                water_temps,
+                np.ones(n),
+                np.ones(n),
+                outdoor_temps,
+                wind,
+                irradiance,
+                precipitation,
+                humidity,
+                cloud_cover,
+                np.sin(2.0 * np.pi * hours / 24.0),
+                np.cos(2.0 * np.pi * hours / 24.0),
+                prev_indoor,
+                np.zeros(n),
+            ]
+        )
         # Simplified thermal relationship
         y = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 0.5, n)
 
@@ -90,12 +216,17 @@ class TestComfortModelTrained:
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
 
-        pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("gbr", GradientBoostingRegressor(
-                n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
-            )),
-        ])
+        pipeline = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "gbr",
+                    GradientBoostingRegressor(
+                        n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
+                    ),
+                ),
+            ]
+        )
         pipeline.fit(X, y)
 
         model._model = pipeline
@@ -162,11 +293,30 @@ class TestComfortModelTraining:
         assert result["required"] == MIN_TRAINING_ROWS
         assert model.is_trained is False
 
+    @pytest.mark.asyncio
+    async def test_retraining_never_replaces_a_worse_checkpoint(self, monkeypatch):
+        model = ComfortModel()
+        previous_checkpoint = object()
+        model._model = previous_checkpoint
+        X = np.tile(np.arange(14, dtype=float), (MIN_TRAINING_ROWS, 1))
+        y = np.linspace(20.0, 30.0, MIN_TRAINING_ROWS)
+
+        async def mock_build(*args, **kwargs):
+            return X, y, len(X)
+
+        model._build_dataset = mock_build
+        monkeypatch.setattr("packages.ml.comfort_model.read_mae_baseline", lambda name: 0.0)
+
+        result = await model.train(thermal_lag_minutes=60)
+
+        assert result["status"] == "regressed"
+        assert model._model is previous_checkpoint
+
 
 class TestThermalLag:
     def test_default_thermal_lag(self):
         model = ComfortModel()
-        assert model._thermal_lag_minutes == 30
+        assert model._thermal_lag_minutes == 60
 
     @pytest.mark.asyncio
     async def test_custom_thermal_lag_propagated(self):
@@ -211,18 +361,28 @@ def _inverted_dataset(n=300, seed=0):
     wind = rng.uniform(0, 8, n)
     irradiance = rng.uniform(0, 400, n)
     precipitation = rng.uniform(0, 5, n)
+    humidity = rng.uniform(30, 95, n)
+    cloud_cover = rng.uniform(0, 1, n)
     hours = rng.randint(0, 24, n)
     prev_indoor = rng.uniform(19, 27, n)
-    X = np.column_stack([
-        water,
-        outdoor,
-        wind,
-        irradiance,
-        precipitation,
-        np.sin(2.0 * np.pi * hours / 24.0),
-        np.cos(2.0 * np.pi * hours / 24.0),
-        prev_indoor,
-    ])
+    X = np.column_stack(
+        [
+            water,
+            water,
+            np.ones(n),
+            np.ones(n),
+            outdoor,
+            wind,
+            irradiance,
+            precipitation,
+            humidity,
+            cloud_cover,
+            np.sin(2.0 * np.pi * hours / 24.0),
+            np.cos(2.0 * np.pi * hours / 24.0),
+            prev_indoor,
+            np.zeros(n),
+        ]
+    )
     # Inverted relationship: higher water temp -> lower indoor temp.
     y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n)
     return X, y, n

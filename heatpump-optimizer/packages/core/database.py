@@ -40,6 +40,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 def retry_on_transient(max_retries: int = 3, backoff: float = 0.5):
     """Decorator that retries an async function on transient DB errors (OperationalError)."""
+
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -50,5 +51,7 @@ def retry_on_transient(max_retries: int = 3, backoff: float = 0.5):
                     if attempt == max_retries - 1:
                         raise
                     await asyncio.sleep(backoff * (attempt + 1))
+
         return wrapper
+
     return decorator

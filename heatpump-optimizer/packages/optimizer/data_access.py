@@ -41,9 +41,16 @@ async def get_weather(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[tuple[dt.datetime, float]]:
     """Fetch weather forecast (temperature only) from DB."""
+    provider = (await get_setting("weather_provider")) or "open-meteo"
     result = await session.execute(
         select(WeatherRecord.ts, WeatherRecord.temperature)
-        .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
+        .where(
+            and_(
+                WeatherRecord.ts >= start,
+                WeatherRecord.ts < end,
+                WeatherRecord.source == provider,
+            )
+        )
         .order_by(WeatherRecord.ts)
     )
     return [(row.ts, row.temperature) for row in result.all()]
@@ -52,7 +59,8 @@ async def get_weather(
 async def get_weather_full(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[dict]:
-    """Fetch full weather data (temp, wind, irradiance, precipitation) from DB."""
+    """Fetch full weather data for the indoor model from DB."""
+    provider = (await get_setting("weather_provider")) or "open-meteo"
     result = await session.execute(
         select(
             WeatherRecord.ts,
@@ -60,8 +68,18 @@ async def get_weather_full(
             WeatherRecord.wind_speed,
             WeatherRecord.irradiance,
             WeatherRecord.precipitation,
+            WeatherRecord.humidity,
+            WeatherRecord.cloud_cover,
+            WeatherRecord.source,
+            WeatherRecord.forecast_issued_at,
         )
-        .where(and_(WeatherRecord.ts >= start, WeatherRecord.ts < end))
+        .where(
+            and_(
+                WeatherRecord.ts >= start,
+                WeatherRecord.ts < end,
+                WeatherRecord.source == provider,
+            )
+        )
         .order_by(WeatherRecord.ts)
     )
     return [
@@ -71,6 +89,10 @@ async def get_weather_full(
             "wind_speed": row.wind_speed,
             "irradiance": row.irradiance,
             "precipitation": row.precipitation,
+            "humidity": row.humidity,
+            "cloud_cover": row.cloud_cover,
+            "source": getattr(row, "source", None),
+            "forecast_issued_at": getattr(row, "forecast_issued_at", None),
         }
         for row in result.all()
     ]

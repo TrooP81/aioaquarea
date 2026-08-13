@@ -3,7 +3,7 @@
 
 services:
   test-db:
-    image: timescale/timescaledb:latest-pg16
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
     ports:
       - "5433:5432"
     environment:
@@ -19,7 +19,7 @@ services:
       - /var/lib/postgresql/data  # RAM disk for speed
 
   test-redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
     ports:
       - "6380:6379"
     healthcheck:

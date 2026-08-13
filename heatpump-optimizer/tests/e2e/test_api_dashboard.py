@@ -26,9 +26,7 @@ class TestDashboard:
         assert data["active_plan"] is None
         assert data["has_override"] is False
 
-    async def test_dashboard_with_device_status(
-        self, client: AsyncClient, seed_device_status
-    ):
+    async def test_dashboard_with_device_status(self, client: AsyncClient, seed_device_status):
         """Dashboard shows current device status."""
         resp = await client.get("/api/dashboard")
         assert resp.status_code == 200
@@ -56,7 +54,12 @@ class TestDashboard:
         resp = await client.get("/api/dashboard")
         data = resp.json()
         assert data["today_kwh"] > 0
-        assert data["today_cost_eur"] >= 0
+        # The first cumulative meter sample has no attributable market hour;
+        # cost must be marked partial instead of silently priced at a default.
+        assert data["today_cost_eur"] is None
+        assert data["today_cost_complete"] is False
+        assert data["today_cost_unpriced_kwh"] > 0
+        assert data["today_cost_priced_amount"] >= 0
 
     async def test_dashboard_with_active_plan(
         self, client: AsyncClient, seed_device_status, seed_plan
@@ -75,3 +78,14 @@ class TestDashboard:
         resp = await client.get("/api/dashboard")
         data = resp.json()
         assert data["has_override"] is True
+
+    async def test_outcome_summary_uses_measured_period_data(
+        self, client: AsyncClient, seed_consumption, seed_prices
+    ):
+        resp = await client.get("/api/outcomes/summary?days=1")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["days"] == 1
+        assert data["cost"]["measured_kwh"] >= 0
+        assert "baseline_method" in data

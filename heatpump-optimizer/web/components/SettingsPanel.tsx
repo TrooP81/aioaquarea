@@ -36,6 +36,8 @@ interface DeviceSettings {
   direction: string | null;
   device_action: string | null;
   defrost_active: boolean | null;
+  space_heating_active: boolean | null;
+  space_heating_evidence: string | null;
   pump_duty: number | null;
 }
 
@@ -62,6 +64,14 @@ const GROUPS: { title: string; keys: string[] }[] = [
     title: "Polling & Integrations",
     keys: ["poll_interval_seconds", "smartthings_enabled", "use_comfort_model"],
   },
+  {
+    title: "Seasonal Learning",
+    keys: ["seasonal_calibration_enabled", "seasonal_calibration_max_outdoor_c", "seasonal_calibration_window_days", "seasonal_calibration_auto_train", "seasonal_calibration_auto_exit"],
+  },
+  {
+    title: "Operational Alerts",
+    keys: ["operational_alerts_enabled"],
+  },
 ];
 
 const DISPLAY_LABELS: Record<string, string> = {
@@ -82,6 +92,12 @@ const DISPLAY_LABELS: Record<string, string> = {
   poll_interval_seconds: "Poll interval",
   smartthings_enabled: "SmartThings",
   use_comfort_model: "ML comfort model",
+  seasonal_calibration_enabled: "Seasonal observe-only calibration",
+  seasonal_calibration_max_outdoor_c: "Heating-season threshold",
+  seasonal_calibration_window_days: "Observation window",
+  seasonal_calibration_auto_train: "Train when ready",
+  seasonal_calibration_auto_exit: "End when trained",
+  operational_alerts_enabled: "In-app alerts",
 };
 
 const UNIT_SUFFIXES: Record<string, string> = {
@@ -94,6 +110,8 @@ const UNIT_SUFFIXES: Record<string, string> = {
   price_comfort_override_pct: "th pctl",
   price_eco_upgrade_pct: "th pctl",
   poll_interval_seconds: "s",
+  seasonal_calibration_max_outdoor_c: "°C",
+  seasonal_calibration_window_days: " days",
 };
 
 function formatValue(key: string, entry: SettingEntry, hour12: boolean): string {
@@ -175,6 +193,19 @@ function temp(v: number | null): string {
   return `${v}°C`;
 }
 
+function spaceHeatingLabel(active: boolean | null, evidence: string | null): string {
+  if (active === true) return "Confirmed active";
+  const labels: Record<string, string> = {
+    device_off: "No — unit is off",
+    domestic_hot_water: "No — hot water only",
+    cooling: "No — cooling",
+    defrost: "No — defrost",
+    idle: "No — idle",
+    not_confirmed: "No — not confirmed",
+  };
+  return labels[evidence ?? ""] ?? "—";
+}
+
 function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
   const mins = Math.round(diff / 60_000);
@@ -196,6 +227,7 @@ function buildDeviceRows(d: DeviceSettings): { title: string; rows: DeviceRow[] 
       { label: "Mode", value: MODE_LABELS[d.mode ?? ""] ?? d.mode ?? "—" },
       { label: "Power", value: d.operation_status === 1 ? "On" : d.operation_status === 0 ? "Off" : "—" },
       { label: "Activity", value: ACTION_LABELS[d.device_action ?? ""] ?? d.device_action ?? "—" },
+      { label: "Space heating", value: spaceHeatingLabel(d.space_heating_active, d.space_heating_evidence) },
       { label: "Outdoor temp", value: temp(d.outdoor_temp) },
       { label: "Defrost", value: d.defrost_active === true ? "Active" : d.defrost_active === false ? "No" : "—" },
       { label: "Compressor", value: d.pump_duty === 1 ? "Running" : d.pump_duty === 0 ? "Off" : "—" },
@@ -217,7 +249,12 @@ function buildDeviceRows(d: DeviceSettings): { title: string; rows: DeviceRow[] 
   // Zone 1
   const z1Rows: DeviceRow[] = [
     { label: "Temperature", value: temp(d.zone1_temp) },
-    { label: "Target", value: temp(d.zone1_target_temp) },
+    {
+      label: "Target",
+      value: d.zone1_target_temp != null && (d.zone1_target_temp < 15 || d.zone1_target_temp > 65)
+        ? "Weather-compensated curve (no explicit target)"
+        : temp(d.zone1_target_temp),
+    },
     { label: "Active", value: onOff(d.zone1_operation_status) },
   ];
   groups.push({ title: "Zone 1", rows: z1Rows });

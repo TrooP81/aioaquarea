@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import pickle
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from packages.core.config import settings
@@ -23,7 +24,9 @@ def _validate_path(path: Path) -> Path:
     """Resolve path and ensure it stays within the configured model directory."""
     model_dir = Path(settings.model_dir).resolve()
     resolved = path.resolve()
-    if not str(resolved).startswith(str(model_dir)):
+    try:
+        resolved.relative_to(model_dir)
+    except ValueError:
         raise ValueError(f"Path {path} resolves outside model directory {model_dir}")
     return resolved
 
@@ -34,8 +37,20 @@ def safe_dump(obj: Any, path: Path) -> None:
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     mac = hmac.new(_get_signing_key(), data, hashlib.sha256).digest()
 
-    # Write 32-byte HMAC prefix then pickled data
-    resolved.write_bytes(mac + data)
+    # Write then atomically replace so a reader in another service never sees
+    # a partial model during a concurrent calibration.
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="wb", dir=resolved.parent, prefix=f".{resolved.name}.", delete=False
+        ) as temp:
+            temp.write(mac + data)
+            temp.flush()
+            temp_path = Path(temp.name)
+        temp_path.replace(resolved)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def safe_load(path: Path) -> Any:

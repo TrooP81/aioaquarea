@@ -80,7 +80,7 @@ test.describe("Reset data card", () => {
   test("select all chooses every scope", async ({ page }) => {
     await mockSettings(page);
 
-    let resetBody: any = null;
+    let resetBody: { scopes: string[] } = { scopes: [] };
     await page.route("**/api/admin/reset", async (route) => {
       resetBody = route.request().postDataJSON();
       await route.fulfill({
@@ -88,7 +88,7 @@ test.describe("Reset data card", () => {
         contentType: "application/json",
         body: JSON.stringify({
           status: "ok",
-          scopes: resetBody?.scopes ?? [],
+          scopes: resetBody.scopes,
           deleted_rows: {},
           total_rows_deleted: 0,
           models_reset: true,
@@ -110,6 +110,6 @@ test.describe("Reset data card", () => {
     await page.getByRole("button", { name: "Reset Selected Data" }).click();
 
     await expect(page.getByText(/Deleted 0 record\(s\)/)).toBeVisible();
-    expect(resetBody?.scopes.length).toBe(7);
+    expect(resetBody.scopes.length).toBe(7);
   });
 });

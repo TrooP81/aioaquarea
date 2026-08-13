@@ -85,6 +85,7 @@ class DirectionAwareCOP:
     def _tank_kwh_per_degree() -> float:
         """Tank thermal capacity from configured volume."""
         from packages.core.config import settings
+
         return settings.tank_kwh_per_degree
 
     async def compute_cop_intervals(self, hours: int = 24) -> list[dict]:
@@ -124,7 +125,7 @@ class DirectionAwareCOP:
             prev = records[i - 1]
             curr = records[i]
 
-            action = getattr(curr, 'device_action', None)
+            action = getattr(curr, "device_action", None)
             if not action or action in ("OFF", "IDLE"):
                 continue
 
@@ -133,7 +134,7 @@ class DirectionAwareCOP:
                 continue
 
             # Skip defrost — not real heating
-            if getattr(curr, 'defrost_active', None):
+            if getattr(curr, "defrost_active", None):
                 continue
 
             outdoor = curr.outdoor_temp if curr.outdoor_temp is not None else 5.0
@@ -179,16 +180,18 @@ class DirectionAwareCOP:
 
             # Sanity check: COP should be between 1 and 8 for heat pumps
             if 0.5 < cop < 10.0:
-                cop_intervals.append({
-                    "ts": curr.ts,
-                    "device_id": curr.device_id,
-                    "mode": action,
-                    "cop": round(cop, 2),
-                    "outdoor_temp": outdoor,
-                    "electrical_kwh": round(electrical_kwh, 4),
-                    "thermal_kwh": round(thermal_kwh, 4),
-                    "confidence": confidence,
-                })
+                cop_intervals.append(
+                    {
+                        "ts": curr.ts,
+                        "device_id": curr.device_id,
+                        "mode": action,
+                        "cop": round(cop, 2),
+                        "outdoor_temp": outdoor,
+                        "electrical_kwh": round(electrical_kwh, 4),
+                        "thermal_kwh": round(thermal_kwh, 4),
+                        "confidence": confidence,
+                    }
+                )
 
         # Persist COP records
         if cop_intervals:

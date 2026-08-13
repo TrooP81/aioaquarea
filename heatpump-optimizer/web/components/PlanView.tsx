@@ -9,7 +9,6 @@ import {
   LAYER_LABELS,
   LAYER_TOOLTIPS,
   STATUS_DISPLAY,
-  PAYLOAD_LABELS,
   formatRelativeTime,
   formatTime,
   formatPayload,
@@ -20,6 +19,8 @@ interface PlanProps {
     id: number;
     optimizer_version: string;
     cost_estimate_eur: number | null;
+    price_currency?: string;
+    price_source?: string;
     actions_count: number;
     horizon_start?: string;
     horizon_end?: string;
@@ -112,6 +113,16 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
   );
 }
 
+function formatPlanHorizon(start: string | undefined, end: string | undefined, hour12: boolean): string {
+  if (!start || !end) return "24-hour horizon";
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return "24-hour horizon";
+
+  const dateFormat: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" };
+  return `${startDate.toLocaleDateString([], dateFormat)} ${formatTime(start, hour12)} – ${endDate.toLocaleDateString([], dateFormat)} ${formatTime(end, hour12)}`;
+}
+
 function ActionRow({
   action,
   isNext,
@@ -198,6 +209,12 @@ export function PlanView({ plan }: PlanProps) {
   const pendingCount = actions.filter(
     (a) => a.status === "pending" && new Date(a.scheduled_ts) >= now
   ).length;
+  const sendingCount = actions.filter(
+    (a) => a.status === "executing" || a.status === "dispatched"
+  ).length;
+  // The action endpoint can arrive before the dashboard refresh after a plan
+  // replacement. Never render an impossible denominator during that short gap.
+  const totalActions = Math.max(plan?.actions_count ?? 0, actions.length);
 
   const nextAction = actions.find(
     (a) => a.status === "pending" && new Date(a.scheduled_ts) > now
@@ -238,16 +255,25 @@ export function PlanView({ plan }: PlanProps) {
               {/* Meta row */}
               <div className="plan-meta-row">
                 <span>
-                  {formatTime(plan.horizon_start, timeFormat.hour12)} – {formatTime(plan.horizon_end, timeFormat.hour12)}
+                  {formatPlanHorizon(plan.horizon_start, plan.horizon_end, timeFormat.hour12)}
                 </span>
                 <span className="plan-meta-sep" aria-hidden="true">·</span>
+                {plan.price_source && (
+                  <>
+                    <span title="Price source captured when this plan was created">
+                      {plan.price_source} · {plan.price_currency || currency.code}
+                    </span>
+                    <span className="plan-meta-sep" aria-hidden="true">·</span>
+                  </>
+                )}
                 <span>
                   {completedCount} done{pendingCount > 0 ? `, ${pendingCount} scheduled` : ""}
+                  {sendingCount > 0 ? `, ${sendingCount} sending` : ""}
                   {skippedCount > 0 ? `, ${skippedCount} skipped` : ""}
                 </span>
               </div>
 
-              <ProgressBar completed={completedCount} total={plan.actions_count} />
+              <ProgressBar completed={completedCount} total={totalActions} />
             </>
           ) : (
             <p className="plan-empty-msg">

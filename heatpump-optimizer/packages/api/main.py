@@ -18,7 +18,7 @@ from packages.api.routers.settings import router as settings_router
 from packages.api.routers.smartthings import router as smartthings_router
 from packages.core.config import settings
 from packages.core.logging import configure_logging
-from packages.core.version import APP_VERSION
+from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 
 configure_logging("api")
 
@@ -41,7 +41,7 @@ app.add_middleware(
 @app.get("/api/version")
 async def version():
     """Return the version of the running API service."""
-    return {"version": APP_VERSION}
+    return {"version": APP_VERSION, "api_contract": API_CONTRACT_VERSION}
 
 
 @app.middleware("http")

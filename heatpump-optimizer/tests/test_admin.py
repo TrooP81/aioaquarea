@@ -1,5 +1,5 @@
 import datetime as dt
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -75,9 +75,10 @@ class TestResetEndpoint:
     @pytest.mark.asyncio
     async def test_non_model_scope_does_not_reset_models(self):
         session = _FakeSession(count=3)
-        with _patch_session(session), patch.object(
-            admin, "reset_ml_models", return_value=[]
-        ) as mock_reset:
+        with (
+            _patch_session(session),
+            patch.object(admin, "reset_ml_models", return_value=[]) as mock_reset,
+        ):
             result = await reset_data(ResetRequest(scopes=["prices"]))
         mock_reset.assert_not_called()
         assert result["models_reset"] is False
@@ -86,9 +87,10 @@ class TestResetEndpoint:
     @pytest.mark.asyncio
     async def test_model_feeding_scope_resets_models(self):
         session = _FakeSession(count=10)
-        with _patch_session(session), patch.object(
-            admin, "reset_ml_models", return_value=["cop_model_x.pkl"]
-        ) as mock_reset:
+        with (
+            _patch_session(session),
+            patch.object(admin, "reset_ml_models", return_value=["cop_model_x.pkl"]) as mock_reset,
+        ):
             result = await reset_data(ResetRequest(scopes=["indoor_temp"]))
         mock_reset.assert_called_once()
         assert result["models_reset"] is True
@@ -98,21 +100,15 @@ class TestResetEndpoint:
     @pytest.mark.asyncio
     async def test_reset_models_false_skips_models(self):
         session = _FakeSession()
-        with _patch_session(session), patch.object(
-            admin, "reset_ml_models"
-        ) as mock_reset:
-            result = await reset_data(
-                ResetRequest(scopes=["indoor_temp"], reset_models=False)
-            )
+        with _patch_session(session), patch.object(admin, "reset_ml_models") as mock_reset:
+            result = await reset_data(ResetRequest(scopes=["indoor_temp"], reset_models=False))
         mock_reset.assert_not_called()
         assert result["models_reset"] is False
 
     @pytest.mark.asyncio
     async def test_audit_log_written_after_reset(self):
         session = _FakeSession()
-        with _patch_session(session), patch.object(
-            admin, "reset_ml_models", return_value=[]
-        ):
+        with _patch_session(session), patch.object(admin, "reset_ml_models", return_value=[]):
             await reset_data(ResetRequest(scopes=["weather"]))
         assert len(session.added) == 1
         assert session.added[0].action == "reset_data"
@@ -168,19 +164,22 @@ class TestModelResetMethods:
         assert m.params.tank_heating_rate == ThermalParams().tank_heating_rate
 
     def test_reset_ml_models_deletes_files(self, tmp_path):
-        cop = (tmp_path / "cop_model_1.pkl")
+        cop = tmp_path / "cop_model_1.pkl"
         cop.write_text("x")
-        demand = (tmp_path / "demand_model_1.pkl")
+        demand = tmp_path / "demand_model_1.pkl"
         demand.write_text("x")
-        comfort = (tmp_path / "comfort_model_1.pkl")
+        comfort = tmp_path / "comfort_model_1.pkl"
         comfort.write_text("x")
-        keep = (tmp_path / "other.pkl")
+        thermal = tmp_path / "thermal_params_v1.pkl"
+        thermal.write_text("x")
+        keep = tmp_path / "other.pkl"
         keep.write_text("x")
 
-        with patch("packages.ml.models_common.MODEL_DIR", tmp_path), patch(
-            "packages.ml.cop_model_core.MODEL_DIR", tmp_path
-        ), patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path), patch(
-            "packages.ml.comfort_model.MODEL_DIR", tmp_path
+        with (
+            patch("packages.ml.models_common.MODEL_DIR", tmp_path),
+            patch("packages.ml.cop_model_core.MODEL_DIR", tmp_path),
+            patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path),
+            patch("packages.ml.comfort_model.MODEL_DIR", tmp_path),
         ):
             deleted = admin.reset_ml_models()
 
@@ -188,6 +187,8 @@ class TestModelResetMethods:
             "cop_model_1.pkl",
             "demand_model_1.pkl",
             "comfort_model_1.pkl",
+            "thermal_params_v1.pkl",
         }
         assert not cop.exists()
+        assert not thermal.exists()
         assert keep.exists()
