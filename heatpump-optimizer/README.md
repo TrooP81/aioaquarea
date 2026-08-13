@@ -235,6 +235,27 @@ scheduled backup. For machine-loss protection, set
 is AES-256-CBC encrypted with PBKDF2 and stored with a SHA-256 checksum. It is
 off by default; use a secret manager rather than committing the key to `.env`.
 
+### Frontend end-to-end tests
+
+The dashboard has two Playwright suites under `web/`:
+
+```bash
+cd web
+
+# Mocked UI tests — every API call is stubbed and Playwright starts its own
+# dev server. Fast, deterministic, good for CI. (web/e2e/)
+npm run test:e2e
+
+# Live-stack tests — drive the real running system (web :4444 + API :8500 +
+# DB + optimizer) with NO mocking, asserting real data and physical invariants
+# (e.g. the indoor forecast must drift gradually toward outdoor, never snap).
+# Requires the Docker stack to be up first (`docker compose up -d`). (web/e2e-live/)
+npm run test:e2e:live
+
+# Override targets when not on the default ports:
+#   E2E_BASE_URL=http://host:4444 E2E_API_URL=http://host:8500 npm run test:e2e:live
+```
+
 ## Safety
 
 - Manual override **always wins** over the optimizer
