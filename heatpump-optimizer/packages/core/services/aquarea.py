@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
@@ -29,6 +30,7 @@ class AquareaWrapper:
         self._redis: redis.Redis | None = None
         self._device = None
         self._device_info: DeviceInfo | None = None
+        self._device_lock = asyncio.Lock()
         self._read_limiter = RateLimiter(max_tokens=30, refill_per_second=30 / 3600)
         self._write_limiter = RateLimiter(max_tokens=20, refill_per_second=20 / 3600)
         self._circuit_breaker = CircuitBreaker()
@@ -82,19 +84,23 @@ class AquareaWrapper:
         if self._device is not None:
             return self._device
 
-        await self._read_limiter.acquire()
-        devices = await self._client.get_devices()
-        if not devices:
-            raise RuntimeError("No devices found on account")
-        self._device_info = devices[0]
-        from datetime import timedelta
+        async with self._device_lock:
+            if self._device is not None:
+                return self._device
 
-        self._device = await self._client.get_device(
-            device_info=self._device_info,
-            consumption_refresh_interval=timedelta(minutes=5),
-        )
-        self._require_live_status(self._device)
-        return self._device
+            await self._read_limiter.acquire()
+            devices = await self._client.get_devices()
+            if not devices:
+                raise RuntimeError("No devices found on account")
+            self._device_info = devices[0]
+            from datetime import timedelta
+
+            self._device = await self._client.get_device(
+                device_info=self._device_info,
+                consumption_refresh_interval=timedelta(minutes=5),
+            )
+            self._require_live_status(self._device)
+            return self._device
 
     async def refresh_device(self):
         """Refresh device data using one logical Panasonic read token.

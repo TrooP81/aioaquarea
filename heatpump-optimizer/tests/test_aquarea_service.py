@@ -1,5 +1,6 @@
 """Panasonic wrapper request-budget regression tests."""
 
+import asyncio
 import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -46,6 +47,35 @@ async def test_initial_device_load_consumes_one_read_token() -> None:
         device_info=device_info,
         consumption_refresh_interval=dt.timedelta(minutes=5),
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_device_loads_share_one_panasonic_request() -> None:
+    wrapper = _wrapper()
+    device_info = SimpleNamespace(device_id="device-1")
+    device = SimpleNamespace(status_data_mode=StatusDataMode.LIVE)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def slow_get_devices():
+        request_started.set()
+        await release_request.wait()
+        return [device_info]
+
+    wrapper._client.get_devices.side_effect = slow_get_devices
+    wrapper._client.get_device.return_value = device
+
+    first = asyncio.create_task(wrapper.get_device())
+    await request_started.wait()
+    second = asyncio.create_task(wrapper.get_device())
+    release_request.set()
+
+    first_device, second_device = await asyncio.gather(first, second)
+
+    assert first_device is second_device is device
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    wrapper._client.get_devices.assert_awaited_once()
+    wrapper._client.get_device.assert_awaited_once()
 
 
 @pytest.mark.asyncio
