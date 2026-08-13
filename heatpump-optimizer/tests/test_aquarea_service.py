@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -145,8 +146,12 @@ async def test_extended_panasonic_commands_share_write_budget(
     value: PowerfulTime | ForceHeater | HolidayTimer,
 ) -> None:
     wrapper = _wrapper()
-    device = SimpleNamespace(**{device_method: AsyncMock()})
+    device = SimpleNamespace(
+        status_data_mode=StatusDataMode.LIVE,
+        **{device_method: AsyncMock()},
+    )
     wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
 
     await getattr(wrapper, method_name)(value)
 
@@ -157,10 +162,72 @@ async def test_extended_panasonic_commands_share_write_budget(
 @pytest.mark.asyncio
 async def test_defrost_command_uses_write_budget_and_device_guardrail() -> None:
     wrapper = _wrapper()
-    device = SimpleNamespace(request_defrost=AsyncMock())
+    device = SimpleNamespace(request_defrost=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
     wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
 
     await wrapper.request_defrost()
 
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.request_defrost.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_command_preflight_refreshes_live_status() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        refresh_data=AsyncMock(),
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_heater=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = 0.0
+
+    await wrapper.set_force_heater(ForceHeater.OFF)
+
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)
+
+
+@pytest.mark.asyncio
+async def test_cached_command_preflight_does_not_spend_write_budget() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        refresh_data=AsyncMock(),
+        status_data_mode=StatusDataMode.CACHED,
+        set_force_heater=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCachedStatusError, match="cloud-cached"):
+        await wrapper.set_force_heater(ForceHeater.ON)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_force_heater.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_write_wait_rechecks_status_before_command() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        refresh_data=AsyncMock(),
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_heater=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    async def age_status_during_wait() -> None:
+        wrapper._last_live_status_at = 0.0
+
+    wrapper._write_limiter.acquire.side_effect = age_status_during_wait
+
+    await wrapper.set_force_heater(ForceHeater.OFF)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
+    device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)

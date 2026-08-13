@@ -13,6 +13,7 @@ from packages.api.routers.dashboard import router as dashboard_router
 from packages.api.routers.feeds import router as feeds_router
 from packages.api.routers.models_router import router as models_router
 from packages.api.routers.optimizer import router as optimizer_router
+from packages.api.routers.panasonic import router as panasonic_router
 from packages.api.routers.polling import router as polling_router
 from packages.api.routers.settings import router as settings_router
 from packages.api.routers.smartthings import router as smartthings_router
@@ -70,6 +71,7 @@ for router in (
     dashboard_router,
     feeds_router,
     optimizer_router,
+    panasonic_router,
     settings_router,
     smartthings_router,
     models_router,
