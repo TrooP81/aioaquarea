@@ -8,11 +8,16 @@ import aiohttp
 import redis.asyncio as redis
 
 from aioaquarea import AquareaEnvironment, Client, DeviceInfo
+from aioaquarea.data import StatusDataMode
 
 from ..config import settings
 from ..resilience import CircuitBreaker, RateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+class PanasonicCachedStatusError(RuntimeError):
+    """Raised when Panasonic returns cloud cache instead of live adaptor data."""
 
 
 class AquareaWrapper:
@@ -88,6 +93,7 @@ class AquareaWrapper:
             device_info=self._device_info,
             consumption_refresh_interval=timedelta(minutes=5),
         )
+        self._require_live_status(self._device)
         return self._device
 
     async def refresh_device(self):
@@ -102,7 +108,15 @@ class AquareaWrapper:
 
         await self._read_limiter.acquire()
         await self._device.refresh_data()
+        self._require_live_status(self._device)
         return self._device
+
+    @staticmethod
+    def _require_live_status(device) -> None:
+        if device.status_data_mode == StatusDataMode.CACHED:
+            raise PanasonicCachedStatusError(
+                "Panasonic adaptor unavailable; refusing cloud-cached device status"
+            )
 
     async def set_mode(self, mode) -> None:
         await self._write_limiter.acquire()
