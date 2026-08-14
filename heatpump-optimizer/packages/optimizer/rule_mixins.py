@@ -23,7 +23,7 @@ class SharedRuleHelpersMixin:
         current_zone_heat_max: int | None,
         offset: int = 2,
     ) -> tuple[int, int] | None:
-        """Freeze a target pair inside Panasonic's currently observed range."""
+        """Freeze a positive target pair inside Panasonic's observed range."""
         values = (current_zone_target_temp, current_zone_heat_min, current_zone_heat_max)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             return None
@@ -39,8 +39,10 @@ class SharedRuleHelpersMixin:
             or not minimum <= baseline <= maximum
         ):
             return None
-        boost = baseline + offset
-        if not minimum <= boost <= maximum:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset <= 0:
+            return None
+        boost = min(baseline + offset, maximum)
+        if boost <= baseline:
             return None
         return baseline, boost
 
@@ -336,12 +338,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         current_zone_heat_max: int | None = None,
     ) -> list[dict]:
         actions = []
-        boost_targets = self._zone_boost_targets(
-            current_zone_target_temp,
-            current_zone_heat_min,
-            current_zone_heat_max,
-        )
-        if not weather or boost_targets is None:
+        if not weather:
             return actions
 
         passive_indoor = self._passive_indoor_forecast(
@@ -395,6 +392,17 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         if target_zone_boost <= current_water_temp:
             return actions
 
+        water_deficit = target_zone_boost - current_water_temp
+        requested_offset = 1 if water_deficit <= 1.0 else 2
+        boost_targets = self._zone_boost_targets(
+            current_zone_target_temp,
+            current_zone_heat_min,
+            current_zone_heat_max,
+            offset=requested_offset,
+        )
+        if boost_targets is None:
+            return actions
+
         prediction = thermal_model.predict_zone_heating_time(
             current_temp=current_water_temp,
             target_temp=target_zone_boost,
@@ -434,7 +442,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
                     "payload": {
-                        "offset": +2,
+                        "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
                         "temperature": boost_temperature,
                         "reason": "thermal_preheat_before_cold",
@@ -478,12 +486,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         current_zone_heat_max: int | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
-        boost_targets = self._zone_boost_targets(
-            current_zone_target_temp,
-            current_zone_heat_min,
-            current_zone_heat_max,
-        )
-        if not weather or boost_targets is None:
+        if not weather:
             return actions
 
         hours = min(24, len(weather))
@@ -567,6 +570,16 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 else None
             )
             slot_start = best_slot[0][0] if best_slot else hour_ts
+            indoor_deficit = target - predicted_indoor
+            requested_offset = 1 if indoor_deficit <= 0.5 else 2
+            boost_targets = self._zone_boost_targets(
+                current_zone_target_temp,
+                current_zone_heat_min,
+                current_zone_heat_max,
+                offset=requested_offset,
+            )
+            if boost_targets is None:
+                return actions
             baseline_temperature, boost_temperature = boost_targets
 
             actions.append(
@@ -574,7 +587,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
                     "payload": {
-                        "offset": +2,
+                        "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
                         "temperature": boost_temperature,
                         "reason": "indoor_guardrail",
@@ -614,13 +627,21 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 outdoor_temp=current_outdoor_temp,
             )
             if 0 < cooling_pred.estimated_minutes < 120:
+                boost_targets = self._zone_boost_targets(
+                    current_zone_target_temp,
+                    current_zone_heat_min,
+                    current_zone_heat_max,
+                    offset=2,
+                )
+                if boost_targets is None:
+                    return actions
                 baseline_temperature, boost_temperature = boost_targets
                 actions.append(
                     {
                         "ts": horizon_start.isoformat(),
                         "type": str(ActionType.ZONE_TEMP_BOOST),
                         "payload": {
-                            "offset": +2,
+                            "offset": boost_temperature - baseline_temperature,
                             "baseline_temperature": baseline_temperature,
                             "temperature": boost_temperature,
                             "reason": "indoor_cooling_imminent",

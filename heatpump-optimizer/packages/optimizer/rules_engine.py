@@ -42,7 +42,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     6. Detects holiday mode and suspends actions
     """
 
-    VERSION = "rules_v4"
+    VERSION = "rules_v5"
 
     @staticmethod
     def _action_timestamp(action: dict[str, Any]) -> dt.datetime | None:
