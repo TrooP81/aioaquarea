@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+from packages.core.panasonic_diagnostics import project_panasonic_adapter_state
+
 _POLLER_MAX_AGE = dt.timedelta(minutes=3)
 
 
@@ -25,6 +27,7 @@ def build_panasonic_capabilities(
     latest_status: Any | None,
     poller_heartbeat: Any | None,
     poll_interval_seconds: int,
+    adapter_state: dict[str, object] | None = None,
     now: dt.datetime | None = None,
 ) -> dict[str, object]:
     """Describe mapped commands without opening another Panasonic session."""
@@ -33,15 +36,24 @@ def build_panasonic_capabilities(
     stale_after_seconds = max(int(poll_interval_seconds), 60)
     status_at = _as_utc(getattr(latest_status, "ts", None))
     heartbeat_at = _as_utc(getattr(poller_heartbeat, "updated_at", None))
+    adapter = project_panasonic_adapter_state(
+        adapter_state,
+        now=now,
+        stale_after_seconds=max(int(poll_interval_seconds) * 3, 15 * 60),
+    )
 
-    if status_at is None:
-        reason = "no_live_status"
-    elif status_at < now - dt.timedelta(seconds=stale_after_seconds):
-        reason = "live_status_stale"
-    elif heartbeat_at is None:
+    if heartbeat_at is None:
         reason = "poller_heartbeat_missing"
     elif heartbeat_at < now - _POLLER_MAX_AGE:
         reason = "poller_heartbeat_stale"
+    elif adapter["state_fresh"] and adapter["status"] == "unavailable":
+        reason = "adapter_unavailable"
+    elif adapter["state_fresh"] and adapter["status"] == "backoff":
+        reason = "adapter_backoff"
+    elif status_at is None:
+        reason = "no_live_status"
+    elif status_at < now - dt.timedelta(seconds=stale_after_seconds):
+        reason = "live_status_stale"
     else:
         reason = "available"
 
@@ -121,6 +133,7 @@ def build_panasonic_capabilities(
             "age_seconds": (round((now - status_at).total_seconds()) if status_at else None),
             "stale_after_seconds": stale_after_seconds,
         },
+        "adapter": adapter,
         "device": {
             "id": getattr(latest_status, "device_id", None),
             "observed": observed_device,

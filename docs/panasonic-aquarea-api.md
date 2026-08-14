@@ -62,6 +62,19 @@ tank/zones, safety policy, and current command availability. It reads the last
 poller-owned live observation and poller heartbeat from the database; it never
 opens a second Panasonic session or spends the cloud request budget.
 
+The response also includes an `adapter` block sourced from the poller heartbeat:
+`status` (`available`, `unavailable`, `backoff`, or `unknown`), consecutive
+failures, observation age, and the absolute next retry time. Provider error text
+is reduced to stable reason codes such as `adaptor_communication_failed` before
+it reaches the shared database state or API. A fresh outage state changes the
+availability reason to `adapter_unavailable` or `adapter_backoff`; an old or
+malformed state is exposed as stale and cannot override a fresh live observation.
+
+Operational alerts use the same projected state. A known adaptor outage replaces
+the generic stale-device warning with one actionable alert while automatic
+commands remain paused. Regular poller heartbeats preserve this diagnostic state,
+and the next successful live status refresh resets it to `available`.
+
 Every wrapper write also requires a live adaptor status no older than 60
 seconds. A stale object is refreshed first, and a cloud-cached response blocks
 the command before a write-rate-limit token is consumed.

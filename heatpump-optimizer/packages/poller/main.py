@@ -28,12 +28,44 @@ from packages.poller.smartthings import poll_smartthings_temps
 from packages.core.settings_service import get_bool_setting, get_int_setting, get_string_setting
 from packages.core.heating_evidence import classify_space_heating
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
+from packages.core.panasonic_diagnostics import (
+    build_panasonic_adapter_state,
+    classify_panasonic_adapter_reason,
+)
+from packages.core.service_health import record_service_heartbeat
 from packages.optimizer.shower_mode import ShowerDetector
 
 logger = structlog.get_logger()
 
 # Module-level shower detector instance (reused across polls)
 _shower_detector = ShowerDetector()
+
+
+async def _record_panasonic_adapter_state(
+    *,
+    status: str,
+    device_id: str | None,
+    reason: str | None = None,
+    consecutive_failures: int = 0,
+    retry_after_seconds: int = 0,
+) -> None:
+    """Publish adaptor diagnostics without making status polling depend on them."""
+
+    state = build_panasonic_adapter_state(
+        status=status,
+        device_id=device_id,
+        reason=classify_panasonic_adapter_reason(reason),
+        consecutive_failures=consecutive_failures,
+        retry_after_seconds=retry_after_seconds,
+    )
+    try:
+        await record_service_heartbeat(
+            "poller",
+            poll_interval_seconds=settings.poll_interval_seconds,
+            panasonic_adapter=state,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not stop polling
+        logger.warning("panasonic_adapter_diagnostics_failed", error=str(exc))
 
 
 async def poll_device_status(wrapper: AquareaWrapper) -> None:
@@ -124,7 +156,18 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
         if device.is_on_error and device.current_error:
             await _record_fault(device)
 
+        await _record_panasonic_adapter_state(
+            status="available",
+            device_id=record.device_id,
+        )
     except PanasonicAdapterBackoffError as exc:
+        await _record_panasonic_adapter_state(
+            status="backoff",
+            device_id=exc.device_id,
+            reason=exc.reason,
+            consecutive_failures=exc.consecutive_failures,
+            retry_after_seconds=exc.retry_after_seconds,
+        )
         logger.info(
             "panasonic_adapter_backoff",
             device_id=exc.device_id,
@@ -133,6 +176,13 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
             reason=exc.reason,
         )
     except PanasonicAdapterUnavailableError as exc:
+        await _record_panasonic_adapter_state(
+            status="unavailable",
+            device_id=exc.device_id,
+            reason=exc.reason,
+            consecutive_failures=exc.consecutive_failures,
+            retry_after_seconds=exc.retry_after_seconds,
+        )
         logger.warning(
             "panasonic_adapter_unavailable",
             device_id=exc.device_id,
@@ -429,7 +479,6 @@ async def deliver_operational_alerts() -> None:
 async def main() -> None:
     """Main entry point for the poller service."""
     from packages.core.logging import configure_logging
-    from packages.core.service_health import record_service_heartbeat
 
     configure_logging("poller")
 
