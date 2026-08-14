@@ -161,6 +161,11 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         current_water_temp = (
             last_status.zone1_temp if last_status and last_status.zone1_temp is not None else 35.0
         )
+        current_zone_target_temp = (
+            last_status.zone1_target_temp
+            if last_status and last_status.zone1_target_temp is not None
+            else None
+        )
         tank_target = (
             last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
         )
@@ -225,6 +230,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     comfort_temp_min=comfort_temp_min,
                     tz_name=tz_name,
                     weather_full=weather_full,
+                    current_zone_target_temp=current_zone_target_temp,
                 )
             )
         actions.extend(self._plan_peak_avoidance(prices, weather, horizon_start))
@@ -270,6 +276,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     heat_curve=heat_curve,
                     tz_name=tz_name,
                     weather_full=weather_full,
+                    current_zone_target_temp=current_zone_target_temp,
                 )
             )
 
