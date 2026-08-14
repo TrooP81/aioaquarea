@@ -738,6 +738,7 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         weather_full: list[dict] | None = None,
         special_status_supported: bool = False,
         current_special_status: int | None = None,
+        zone_control_windows: list[tuple[dt.datetime, dt.datetime]] | None = None,
     ) -> list[dict]:
         actions = []
         if not prices or special_status_supported is not True:
@@ -774,6 +775,14 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         )
         mild_outdoor_threshold = 5.0
         for ts, price in prices:
+            comparable_ts = (
+                ts.replace(tzinfo=dt.timezone.utc)
+                if ts.tzinfo is None
+                else ts.astimezone(dt.timezone.utc)
+            )
+            if any(start <= comparable_ts <= end for start, end in (zone_control_windows or [])):
+                continue
+
             scheduled_comfort = is_comfort_hour(comfort_schedule, ts, tz_name=tz_name)
             outdoor_temp = temp_by_ts.get(ts.isoformat())
             predicted_indoor = passive_indoor.get(ts)

@@ -307,6 +307,85 @@ class TestRulesOptimizer:
         assert normalised[0]["type"] == "quiet_mode_on"
         assert normalised[0]["payload"]["reason"] == "night_quiet_schedule"
 
+    def test_zone_control_windows_merge_overlapping_and_touching_pairs(self):
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        actions = [
+            {"ts": base.isoformat(), "type": "zone_temp_boost", "payload": {}},
+            {
+                "ts": (base + dt.timedelta(hours=1)).isoformat(),
+                "type": "zone_temp_restore",
+                "payload": {},
+            },
+            {
+                "ts": (base + dt.timedelta(hours=1)).isoformat(),
+                "type": "zone_temp_boost",
+                "payload": {},
+            },
+            {
+                "ts": (base + dt.timedelta(hours=2)).isoformat(),
+                "type": "zone_temp_restore",
+                "payload": {},
+            },
+        ]
+
+        assert RulesOptimizer._zone_control_windows(actions) == [
+            (base, base + dt.timedelta(hours=2))
+        ]
+
+    def test_normalise_actions_blocks_special_status_at_zone_window_boundaries(self):
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        actions = [
+            {"ts": base.isoformat(), "type": "zone_temp_boost", "payload": {}},
+            {"ts": base.isoformat(), "type": "eco_mode_on", "payload": {}},
+            {
+                "ts": (base + dt.timedelta(hours=1)).isoformat(),
+                "type": "comfort_mode_on",
+                "payload": {},
+            },
+            {
+                "ts": (base + dt.timedelta(hours=2)).isoformat(),
+                "type": "zone_temp_restore",
+                "payload": {},
+            },
+            {
+                "ts": (base + dt.timedelta(hours=2)).isoformat(),
+                "type": "normal_mode_on",
+                "payload": {},
+            },
+            {
+                "ts": (base + dt.timedelta(hours=3)).isoformat(),
+                "type": "eco_mode_on",
+                "payload": {},
+            },
+        ]
+
+        normalised = RulesOptimizer._normalise_actions(actions)
+
+        assert [action["type"] for action in normalised] == [
+            "zone_temp_boost",
+            "zone_temp_restore",
+            "eco_mode_on",
+        ]
+
+    def test_eco_comfort_resumes_after_zone_control_window(self, sample_prices):
+        optimizer = RulesOptimizer()
+        flat_prices = [(ts, 0.1) for ts, _ in sample_prices]
+        base = flat_prices[0][0]
+
+        actions = optimizer._plan_eco_comfort(
+            flat_prices,
+            [(ts, 0.0) for ts, _ in flat_prices],
+            base,
+            {"weekday": [], "weekend": []},
+            special_status_supported=True,
+            current_special_status=None,
+            zone_control_windows=[(base, base + dt.timedelta(hours=1))],
+        )
+
+        assert len(actions) == 1
+        assert actions[0]["type"] == "eco_mode_on"
+        assert actions[0]["ts"] == (base + dt.timedelta(hours=2)).isoformat()
+
     def test_plan_preheat_before_cold(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
         actions = optimizer._plan_preheat(
