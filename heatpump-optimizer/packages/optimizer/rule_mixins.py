@@ -637,7 +637,10 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": ts.isoformat(),
                     "type": str(ActionType.QUIET_MODE_ON),
-                    "payload": {"reason": f"peak_price_{price:.4f}_eur_kwh"},
+                    "payload": {
+                        "reason": f"peak_price_{price:.4f}_eur_kwh",
+                        "level": 1,
+                    },
                 }
             )
             actions.append(

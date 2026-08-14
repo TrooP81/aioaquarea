@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aioaquarea import QuietMode
 
 from packages.optimizer.actions import ACTION_REGISTRY, ActionType, VerifyResult
 from packages.optimizer.executor import (
@@ -73,6 +74,36 @@ class TestRegistry:
 
 
 class TestExecuteAction:
+    @pytest.mark.asyncio
+    async def test_quiet_mode_dispatches_requested_panasonic_level(self, mock_wrapper):
+        result = await ACTION_REGISTRY[ActionType.QUIET_MODE_ON].dispatch(
+            mock_wrapper, {"level": 2}
+        )
+
+        assert result == {"quiet_mode": "LEVEL2"}
+        mock_wrapper.set_quiet_mode.assert_awaited_once_with(QuietMode.LEVEL2)
+
+    @pytest.mark.asyncio
+    async def test_quiet_mode_rejects_invalid_level(self, mock_wrapper):
+        result = await ACTION_REGISTRY[ActionType.QUIET_MODE_ON].dispatch(
+            mock_wrapper, {"level": 4}
+        )
+
+        assert result == {
+            "skip": True,
+            "reason": "quiet_mode_level_invalid",
+            "requested_quiet_level": 4,
+        }
+        mock_wrapper.set_quiet_mode.assert_not_awaited()
+
+    def test_quiet_mode_verification_requires_exact_level(self):
+        handler = ACTION_REGISTRY[ActionType.QUIET_MODE_ON]
+
+        assert handler.verify(_device(quiet_mode=2), {}, {"quiet_mode": "LEVEL2"}).ok
+        mismatch = handler.verify(_device(quiet_mode=1), {}, {"quiet_mode": "LEVEL2"})
+        assert not mismatch.ok
+        assert mismatch.expected_value == 2
+
     @pytest.mark.asyncio
     async def test_force_dhw_on_dispatches_and_verifies(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
@@ -329,7 +360,7 @@ class TestVerification:
         expectations = {
             ActionType.FORCE_DHW_ON: (_device(force_dhw=1), {"force_dhw": "ON"}),
             ActionType.FORCE_DHW_OFF: (_device(force_dhw=0), {"force_dhw": "OFF"}),
-            ActionType.QUIET_MODE_ON: (_device(quiet_mode=1), {"quiet_mode": "LEVEL1"}),
+            ActionType.QUIET_MODE_ON: (_device(quiet_mode=2), {"quiet_mode": "LEVEL2"}),
             ActionType.QUIET_MODE_OFF: (_device(quiet_mode=0), {"quiet_mode": "OFF"}),
             ActionType.ZONE_TEMP_BOOST: (_device(zone_temp=37), {"temperature": 37}),
             ActionType.ZONE_TEMP_RESTORE: (_device(zone_temp=21), {"temperature": 21}),
