@@ -32,6 +32,7 @@ from packages.core.panasonic_diagnostics import (
     build_panasonic_adapter_state,
     classify_panasonic_adapter_reason,
 )
+from packages.core.panasonic_special_status import optimizer_special_status_supported
 from packages.core.service_health import record_service_heartbeat
 from packages.optimizer.shower_mode import ShowerDetector
 
@@ -116,6 +117,7 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
             quiet_mode=device.quiet_mode.value,
             powerful_mode=device.powerful_time.value,
             special_status=device.special_status.value if device.special_status else None,
+            special_status_supported=optimizer_special_status_supported(device),
             # New compressor/activity fields
             direction=direction,
             pump_duty=device.pump_duty,

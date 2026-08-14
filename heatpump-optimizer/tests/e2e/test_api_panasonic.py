@@ -45,6 +45,7 @@ async def test_capabilities_use_database_observation_without_cloud_probe(
     assert data["device"]["id"] == seed_device_status.device_id
     assert data["device"]["has_tank"] is True
     assert data["commands"]["force_dhw"]["available"] is True
+    assert data["commands"]["set_special_status"]["available"] is True
     assert data["commands"]["set_zone_heat_temperature"]["available"] is True
     assert data["commands"]["set_zone_heat_temperature"]["constraints"] == {
         "observed_ranges": {"1": {"minimum": 18, "maximum": 45}},

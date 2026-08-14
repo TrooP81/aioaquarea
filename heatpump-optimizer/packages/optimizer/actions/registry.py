@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from packages.core.panasonic_special_status import optimizer_special_status_supported
+
 from .types import ActionType, VerifyResult
 
 DispatchFn = Callable[[Any, dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -270,16 +272,22 @@ async def _dispatch_set_zone_heat_temperature(
 
 
 async def _dispatch_eco_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not optimizer_special_status_supported(await wrapper.get_device()):
+        return {"skip": True, "reason": "special_status_not_safely_supported"}
     await wrapper.set_special_status("ECO")
     return {"special_status": "ECO"}
 
 
 async def _dispatch_clear_special_status(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not optimizer_special_status_supported(await wrapper.get_device()):
+        return {"skip": True, "reason": "special_status_not_safely_supported"}
     await wrapper.clear_special_status()
     return {"special_status": None}
 
 
 async def _dispatch_comfort_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not optimizer_special_status_supported(await wrapper.get_device()):
+        return {"skip": True, "reason": "special_status_not_safely_supported"}
     await wrapper.set_special_status("COMFORT")
     return {"special_status": "COMFORT"}
 
@@ -327,22 +335,6 @@ def _verify_special_status(
 ) -> VerifyResult:
     observed = _special_status_name(device)
     target = expected.get("special_status") if expected else None
-
-    # The aioaquarea library does not surface the device's active special status
-    # (DeviceStatus.special_status is hard-coded to None), so ECO/COMFORT can
-    # never be read back via a refresh. When a special mode was requested and the
-    # device reports nothing, accept the successful dispatch as applied instead
-    # of failing verification forever — which otherwise spams
-    # `action_verification_failed` errors and burns API read budget on 12 futile
-    # polls. This stays forward-compatible: if the library ever populates
-    # special_status, a real mismatch (observed non-None) still fails below.
-    if target is not None and observed is None:
-        return VerifyResult(
-            ok=True,
-            observed_value=observed,
-            expected_value=target,
-            reason="special_status_unverifiable",
-        )
 
     ok = observed == target
     return VerifyResult(

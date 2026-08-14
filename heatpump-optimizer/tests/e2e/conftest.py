@@ -102,6 +102,7 @@ async def seed_device_status(db_session: AsyncSession):
         zone1_heat_max=45,
         quiet_mode=0,
         powerful_mode=0,
+        special_status_supported=True,
     )
     db_session.add(record)
     await db_session.commit()

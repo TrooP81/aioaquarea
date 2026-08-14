@@ -176,6 +176,13 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             if last_status and last_status.zone1_heat_max is not None
             else None
         )
+        special_status_supported = (
+            last_status is not None
+            and getattr(last_status, "special_status_supported", None) is True
+        )
+        current_special_status = (
+            getattr(last_status, "special_status", None) if last_status is not None else None
+        )
         tank_target = (
             last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
         )
@@ -271,6 +278,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 comfort_temp_target=comfort_temp_target,
                 comfort_temp_min=comfort_temp_min,
                 weather_full=weather_full,
+                special_status_supported=special_status_supported,
+                current_special_status=current_special_status,
             )
         )
         if control_temperature.is_usable:

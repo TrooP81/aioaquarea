@@ -28,6 +28,8 @@ class DeviceStatusResponse(BaseModel):
     zone1_heat_max: Optional[int] = None
     quiet_mode: Optional[int] = None
     powerful_mode: Optional[int] = None
+    special_status: Optional[int] = None
+    special_status_supported: Optional[bool] = None
     direction: Optional[str] = None
     device_action: Optional[str] = None
     defrost_active: Optional[bool] = None
@@ -61,6 +63,7 @@ class DeviceSettingsResponse(BaseModel):
     quiet_mode: Optional[int] = None
     powerful_mode: Optional[int] = None
     special_status: Optional[int] = None
+    special_status_supported: Optional[bool] = None
     force_dhw: Optional[int] = None
     force_heater: Optional[int] = None
     holiday_mode: Optional[int] = None

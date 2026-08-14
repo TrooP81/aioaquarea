@@ -8,6 +8,7 @@ from packages.api._helpers import get_price_area
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, PriceRecord, WeatherRecord
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
+from packages.core.panasonic_special_status import optimizer_special_status_supported
 
 router = APIRouter()
 
@@ -85,6 +86,7 @@ async def poll_now():
                         special_status=device.special_status.value
                         if device.special_status
                         else None,
+                        special_status_supported=optimizer_special_status_supported(device),
                         direction=direction,
                         pump_duty=device.pump_duty,
                         device_action=device_action,

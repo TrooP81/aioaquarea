@@ -15,7 +15,7 @@ from aioaquarea import (
     PowerfulTime,
     QuietMode,
 )
-from aioaquarea.data import StatusDataMode
+from aioaquarea.data import SpecialStatus, StatusDataMode
 
 from packages.core.services.aquarea import (
     AquareaWrapper,
@@ -610,3 +610,77 @@ async def test_zone_temperature_rejects_missing_live_range() -> None:
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_temperature.assert_not_awaited()
+
+
+def _special_status_device(status=None, *, supports: bool = True, eco_heat=-2):
+    zone = SimpleNamespace(
+        supports_special_status=True,
+        heat_target_temperature=-5,
+        cool_target_temperature=None,
+        temperature_modifiers={
+            SpecialStatus.ECO: SimpleNamespace(heat=eco_heat, cool=None),
+            SpecialStatus.COMFORT: SimpleNamespace(heat=2, cool=None),
+        },
+    )
+    return SimpleNamespace(
+        support_special_status=supports,
+        special_status=status,
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_special_status=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_special_status_skips_already_applied_mode() -> None:
+    wrapper = _wrapper()
+    device = _special_status_device(SpecialStatus.ECO)
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_special_status("ECO")
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_special_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_special_status_writes_valid_changed_mode_once() -> None:
+    wrapper = _wrapper()
+    device = _special_status_device(None)
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_special_status("COMFORT")
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_special_status.assert_awaited_once_with(SpecialStatus.COMFORT)
+
+
+@pytest.mark.asyncio
+async def test_special_status_rejects_unsafe_or_unknown_mode() -> None:
+    wrapper = _wrapper()
+    device = _special_status_device(None, eco_heat=2)
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCommandValidationError, match="safe ECO/COMFORT"):
+        await wrapper.set_special_status("ECO")
+    with pytest.raises(PanasonicCommandValidationError, match="Unsupported"):
+        await wrapper.set_special_status("BOOST")
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_special_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_special_status_skips_when_already_normal() -> None:
+    wrapper = _wrapper()
+    device = _special_status_device(None)
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.clear_special_status()
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_special_status.assert_not_awaited()
