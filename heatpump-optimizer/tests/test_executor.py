@@ -204,6 +204,41 @@ class TestVerification:
 
         assert mock_session.execute.await_count >= 1
 
+    def test_force_dhw_on_accepts_panasonic_auto_stop_at_tank_target(self):
+        device = SimpleNamespace(
+            force_dhw=SimpleNamespace(value=0),
+            tank=SimpleNamespace(temperature=52.0, target_temperature=52.0),
+        )
+
+        result = ACTION_REGISTRY[ActionType.FORCE_DHW_ON].verify(device, {}, {"force_dhw": "ON"})
+
+        assert result.ok
+        assert result.reason == "tank_target_reached"
+
+    def test_force_dhw_on_still_fails_below_tank_target(self):
+        device = SimpleNamespace(
+            force_dhw=SimpleNamespace(value=0),
+            tank=SimpleNamespace(temperature=49.0, target_temperature=52.0),
+        )
+
+        result = ACTION_REGISTRY[ActionType.FORCE_DHW_ON].verify(device, {}, {"force_dhw": "ON"})
+
+        assert not result.ok
+        assert result.reason == "force_dhw_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_force_dhw_retry_at_target_does_not_send_another_command(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = SimpleNamespace(
+            tank=SimpleNamespace(temperature=52.0, target_temperature=52.0)
+        )
+
+        result = await ACTION_REGISTRY[ActionType.FORCE_DHW_ON].redispatch_expected(
+            mock_wrapper, {}, {"force_dhw": "ON"}
+        )
+
+        assert result == {"force_dhw": "ON"}
+        mock_wrapper.force_dhw.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_zone_boost_retry_reuses_original_absolute_target(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.ZONE_TEMP_BOOST), {"offset": 2, "zone_id": 0})

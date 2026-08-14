@@ -338,7 +338,17 @@ class AquareaWrapper:
         logger.info("Set quiet mode to %s", mode)
 
     async def force_dhw(self, state) -> None:
-        device = await self._prepare_write()
+        device = await self._get_writable_device()
+        if getattr(device, "force_dhw", None) == state:
+            logger.info("Force DHW already %s; skipping Panasonic write", state)
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        if getattr(device, "force_dhw", None) == state:
+            logger.info("Force DHW became %s while waiting; skipping write", state)
+            return
+
         await device.set_force_dhw(state)
         logger.info("Set force DHW to %s", state)
 
