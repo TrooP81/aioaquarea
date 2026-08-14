@@ -17,6 +17,8 @@ from packages.core.models import (
     ServiceHeartbeatRecord,
 )
 from packages.core.planning_data_quality import get_planning_data_quality
+from packages.core.panasonic_diagnostics import project_panasonic_adapter_state
+from packages.core.service_health import service_heartbeat_details
 from packages.core.settings_service import (
     get_bool_setting,
     get_int_setting,
@@ -49,6 +51,28 @@ def _alert(
         "action_id": action_id,
         "href": href,
     }
+
+
+def _panasonic_adapter_alert(adapter: dict[str, object]) -> dict[str, object] | None:
+    """Build one actionable outage alert from fresh projected diagnostics."""
+
+    if not adapter.get("state_fresh") or adapter.get("status") not in {
+        "unavailable",
+        "backoff",
+    }:
+        return None
+    failures = int(adapter.get("consecutive_failures") or 0)
+    detail = f"The Panasonic adaptor has failed {failures} consecutive live-status attempt(s)."
+    retry_at = adapter.get("retry_at")
+    if retry_at:
+        detail += f" Next retry is scheduled for {retry_at}."
+    return _alert(
+        "panasonic_adapter_unavailable",
+        "warning",
+        "Panasonic adaptor is unavailable",
+        detail,
+        action="Check the adaptor power and network connection; automatic commands remain paused.",
+    )
 
 
 async def get_operational_alerts(
@@ -102,9 +126,9 @@ async def get_operational_alerts(
         )
 
     alerts: list[dict[str, object]] = []
-    by_service = {row.service: row.updated_at for row in heartbeat_rows}
+    by_service = {row.service: row for row in heartbeat_rows}
     for service in ("poller", "optimizer"):
-        heartbeat = by_service.get(service)
+        heartbeat = getattr(by_service.get(service), "updated_at", None)
         if heartbeat is None or heartbeat < service_cutoff:
             alerts.append(
                 _alert(
@@ -115,7 +139,16 @@ async def get_operational_alerts(
                     action="Check the service container and its logs.",
                 )
             )
-    if latest_device is None or latest_device < device_cutoff:
+    poller_details = service_heartbeat_details(by_service.get("poller"))
+    adapter = project_panasonic_adapter_state(
+        poller_details.get("panasonic_adapter"),
+        now=now,
+        stale_after_seconds=max(poll_interval * 3, 15 * 60),
+    )
+    adapter_alert = _panasonic_adapter_alert(adapter)
+    if adapter_alert:
+        alerts.append(adapter_alert)
+    if (latest_device is None or latest_device < device_cutoff) and adapter_alert is None:
         alerts.append(
             _alert(
                 "device_data_stale",

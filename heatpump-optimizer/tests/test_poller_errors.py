@@ -9,7 +9,31 @@ from packages.core.services import (
     PanasonicAdapterUnavailableError,
 )
 from packages.poller.feeds import PriceFeed
-from packages.poller.main import poll_device_status, poll_indoor_temp, poll_prices, poll_weather
+from packages.poller.main import (
+    _record_panasonic_adapter_state,
+    poll_device_status,
+    poll_indoor_temp,
+    poll_prices,
+    poll_weather,
+)
+
+
+@pytest.mark.asyncio
+async def test_adapter_heartbeat_uses_sanitized_reason_code():
+    with patch(
+        "packages.poller.main.record_service_heartbeat", new_callable=AsyncMock
+    ) as record_heartbeat:
+        await _record_panasonic_adapter_state(
+            status="unavailable",
+            device_id="device-1",
+            reason="API error: unknown_error_code - Failed communication with adaptor",
+            consecutive_failures=1,
+            retry_after_seconds=300,
+        )
+
+    adapter = record_heartbeat.await_args.kwargs["panasonic_adapter"]
+    assert adapter["reason"] == "adaptor_communication_failed"
+    assert adapter["retry_at"] is not None
 
 
 class TestPollDeviceStatusErrors:
@@ -23,9 +47,22 @@ class TestPollDeviceStatusErrors:
             retry_after_seconds=600,
         )
 
-        with patch("packages.poller.main.logger") as mock_logger:
+        with (
+            patch("packages.poller.main.logger") as mock_logger,
+            patch(
+                "packages.poller.main._record_panasonic_adapter_state",
+                new_callable=AsyncMock,
+            ) as record_state,
+        ):
             await poll_device_status(wrapper)
 
+        record_state.assert_awaited_once_with(
+            status="unavailable",
+            device_id="device-1",
+            reason="adaptor offline",
+            consecutive_failures=2,
+            retry_after_seconds=600,
+        )
         mock_logger.warning.assert_called_once_with(
             "panasonic_adapter_unavailable",
             device_id="device-1",
@@ -45,9 +82,22 @@ class TestPollDeviceStatusErrors:
             retry_after_seconds=299,
         )
 
-        with patch("packages.poller.main.logger") as mock_logger:
+        with (
+            patch("packages.poller.main.logger") as mock_logger,
+            patch(
+                "packages.poller.main._record_panasonic_adapter_state",
+                new_callable=AsyncMock,
+            ) as record_state,
+        ):
             await poll_device_status(wrapper)
 
+        record_state.assert_awaited_once_with(
+            status="backoff",
+            device_id="device-1",
+            reason="adaptor offline",
+            consecutive_failures=2,
+            retry_after_seconds=299,
+        )
         mock_logger.info.assert_called_once_with(
             "panasonic_adapter_backoff",
             device_id="device-1",

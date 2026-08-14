@@ -120,3 +120,44 @@ def test_stale_poller_heartbeat_blocks_otherwise_fresh_device() -> None:
     assert result["availability"]["reason"] == "poller_heartbeat_stale"
     assert result["availability"]["commands_allowed"] is False
     assert all(not command["available"] for command in result["commands"].values())
+
+
+def test_fresh_adapter_outage_is_exposed_and_blocks_commands() -> None:
+    now = dt.datetime(2026, 8, 14, 9, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, ts=now - dt.timedelta(minutes=20)),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        adapter_state={
+            "status": "backoff",
+            "device_id": "device-1",
+            "reason": "offline",
+            "consecutive_failures": 3,
+            "retry_after_seconds": 1200,
+            "observed_at": now.isoformat(),
+            "retry_at": (now + dt.timedelta(minutes=20)).isoformat(),
+        },
+        now=now,
+    )
+
+    assert result["availability"]["reason"] == "adapter_backoff"
+    assert result["availability"]["commands_allowed"] is False
+    assert result["adapter"]["consecutive_failures"] == 3
+    assert result["adapter"]["retry_at"] == "2026-08-14T09:20:00+00:00"
+
+
+def test_stale_adapter_outage_does_not_override_live_availability() -> None:
+    now = dt.datetime(2026, 8, 14, 9, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        adapter_state={
+            "status": "unavailable",
+            "observed_at": (now - dt.timedelta(hours=1)).isoformat(),
+        },
+        now=now,
+    )
+
+    assert result["availability"]["reason"] == "available"
+    assert result["adapter"]["state_fresh"] is False
