@@ -42,16 +42,104 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     6. Detects holiday mode and suspends actions
     """
 
-    VERSION = "rules_v3"
+    VERSION = "rules_v4"
 
     @staticmethod
-    def _normalise_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove duplicate command transitions while preserving plan intent.
+    def _action_timestamp(action: dict[str, Any]) -> dt.datetime | None:
+        try:
+            timestamp = dt.datetime.fromisoformat(str(action["ts"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        return timestamp.astimezone(dt.timezone.utc)
 
-        Multiple rule sources can request different quiet levels. Collapse only
-        identical levels, while preserving legitimate LEVEL1 -> LEVEL2 changes.
+    @classmethod
+    def _zone_control_windows(
+        cls,
+        actions: list[dict[str, Any]],
+        *,
+        horizon_end: dt.datetime | None = None,
+    ) -> list[tuple[dt.datetime, dt.datetime]]:
+        """Merge overlapping boost/restore pairs that own the zone target."""
+
+        events: dict[dt.datetime, list[int]] = {}
+        timestamps: list[dt.datetime] = []
+        for action in actions:
+            action_type = str(action.get("type", ""))
+            if action_type not in {"zone_temp_boost", "zone_temp_restore"}:
+                continue
+            timestamp = cls._action_timestamp(action)
+            if timestamp is None:
+                continue
+            timestamps.append(timestamp)
+            counts = events.setdefault(timestamp, [0, 0])
+            counts[0 if action_type == "zone_temp_boost" else 1] += 1
+
+        depth = 0
+        active_start: dt.datetime | None = None
+        windows: list[tuple[dt.datetime, dt.datetime]] = []
+        for timestamp in sorted(events):
+            boosts, restores = events[timestamp]
+            if depth == 0 and boosts:
+                active_start = timestamp
+            depth += boosts
+            depth = max(0, depth - restores)
+            if depth == 0 and active_start is not None:
+                windows.append((active_start, timestamp))
+                active_start = None
+
+        if depth and active_start is not None:
+            end = horizon_end or (max(timestamps) if timestamps else active_start)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=dt.timezone.utc)
+            windows.append((active_start, max(active_start, end.astimezone(dt.timezone.utc))))
+
+        return windows
+
+    @classmethod
+    def _is_in_zone_control_window(
+        cls,
+        action: dict[str, Any],
+        windows: list[tuple[dt.datetime, dt.datetime]],
+    ) -> bool:
+        timestamp = cls._action_timestamp(action)
+        return timestamp is not None and any(start <= timestamp <= end for start, end in windows)
+
+    @classmethod
+    def _normalise_actions(cls, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Resolve command ownership and duplicates while preserving plan intent.
+
+        Zone boost windows exclusively own their Panasonic target. Multiple
+        rule sources can also request different quiet levels; collapse only
+        identical levels while preserving legitimate LEVEL1 -> LEVEL2 changes.
         """
         ordered = sorted(actions, key=lambda action: str(action.get("ts", "")))
+
+        # Panasonic special status and absolute zone boosts both write the same
+        # zone target. Never allow a mode transition to invalidate a frozen
+        # boost/restore pair, including at either boundary of the interval.
+        parsed_timestamps = [
+            timestamp
+            for action in ordered
+            if (timestamp := cls._action_timestamp(action)) is not None
+        ]
+        zone_control_windows = cls._zone_control_windows(
+            ordered,
+            horizon_end=max(parsed_timestamps) if parsed_timestamps else None,
+        )
+        special_status_actions = {
+            "eco_mode_on",
+            "eco_mode_off",
+            "normal_mode_on",
+            "comfort_mode_on",
+        }
+        ordered = [
+            action
+            for action in ordered
+            if str(action.get("type", "")) not in special_status_actions
+            or not cls._is_in_zone_control_window(action, zone_control_windows)
+        ]
 
         # A peak-avoidance window can end on the exact hour that scheduled
         # quiet time begins. Exposing OFF then ON is both noisy and misleading,
@@ -260,28 +348,6 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             self._plan_quiet_mode(horizon_start, quiet_start, quiet_end, tz_name=tz_name)
         )
 
-        comfort_override_pct = await get_int_setting("price_comfort_override_pct")
-        eco_upgrade_pct = await get_int_setting("price_eco_upgrade_pct")
-        actions.extend(
-            self._plan_eco_comfort(
-                prices,
-                weather,
-                horizon_start,
-                comfort_schedule,
-                comfort_override_pct,
-                eco_upgrade_pct,
-                tz_name=tz_name,
-                current_indoor_temp=current_indoor_temp,
-                current_outdoor_temp=current_outdoor_temp,
-                current_water_temp=current_water_temp,
-                heat_curve=heat_curve,
-                comfort_temp_target=comfort_temp_target,
-                comfort_temp_min=comfort_temp_min,
-                weather_full=weather_full,
-                special_status_supported=special_status_supported,
-                current_special_status=current_special_status,
-            )
-        )
         if control_temperature.is_usable:
             actions.extend(
                 self._plan_indoor_guardrails(
@@ -302,6 +368,31 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     current_zone_heat_max=current_zone_heat_max,
                 )
             )
+
+        comfort_override_pct = await get_int_setting("price_comfort_override_pct")
+        eco_upgrade_pct = await get_int_setting("price_eco_upgrade_pct")
+        zone_control_windows = self._zone_control_windows(actions, horizon_end=horizon_end)
+        actions.extend(
+            self._plan_eco_comfort(
+                prices,
+                weather,
+                horizon_start,
+                comfort_schedule,
+                comfort_override_pct,
+                eco_upgrade_pct,
+                tz_name=tz_name,
+                current_indoor_temp=current_indoor_temp,
+                current_outdoor_temp=current_outdoor_temp,
+                current_water_temp=current_water_temp,
+                heat_curve=heat_curve,
+                comfort_temp_target=comfort_temp_target,
+                comfort_temp_min=comfort_temp_min,
+                weather_full=weather_full,
+                special_status_supported=special_status_supported,
+                current_special_status=current_special_status,
+                zone_control_windows=zone_control_windows,
+            )
+        )
 
         if not actions:
             return None
