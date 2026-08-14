@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from packages.core.config import settings
-
 from .types import ActionType, VerifyResult
 
 ZONE_WATER_TARGET_MIN_C = 20
@@ -130,7 +128,36 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
             "reason": "zone_target_not_a_safe_water_setpoint",
             "observed_zone_target": current_target,
         }
-    new_temp = int((current_target or 20) + offset)
+
+    planned_baseline = payload.get("baseline_temperature")
+    planned_target = payload.get("temperature")
+    has_frozen_plan = planned_baseline is not None or planned_target is not None
+    if has_frozen_plan:
+        if not _is_valid_zone_water_target(planned_baseline) or not _is_valid_zone_water_target(
+            planned_target
+        ):
+            return {
+                "skip": True,
+                "reason": "zone_boost_plan_not_safe",
+                "observed_zone_target": current_target,
+                "planned_baseline": planned_baseline,
+                "requested_zone_target": planned_target,
+            }
+        if current_target != planned_baseline:
+            return {
+                "skip": True,
+                "reason": "zone_target_changed_since_plan",
+                "observed_zone_target": current_target,
+                "planned_baseline": planned_baseline,
+                "requested_zone_target": planned_target,
+            }
+        new_temp = int(planned_target)
+    else:
+        # Backward compatibility for boosts saved before plans froze their
+        # absolute baseline and target. Restore actions intentionally do not
+        # have an equivalent fallback because guessing a water target is unsafe.
+        new_temp = int(current_target + offset)
+
     if not _is_valid_zone_water_target(new_temp):
         return {
             "skip": True,
@@ -159,9 +186,14 @@ async def _redispatch_zone_temp_boost(
 
 async def _dispatch_zone_temp_restore(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     zone_id = int(payload.get("zone_id", 0))
-    target = int(
-        payload.get("temperature") or ((settings.comfort_temp_min + settings.comfort_temp_max) // 2)
-    )
+    target = payload.get("temperature")
+    if target is None:
+        return {
+            "skip": True,
+            "reason": "zone_restore_target_missing",
+            "requested_zone_target": None,
+        }
+
     device = await wrapper.get_device()
     zone = _zone_from_device(device)
     observed_target = getattr(zone, "heat_target_temperature", None)
@@ -172,6 +204,18 @@ async def _dispatch_zone_temp_restore(wrapper: Any, payload: dict[str, Any]) -> 
             "observed_zone_target": observed_target,
             "requested_zone_target": target,
         }
+    boost_target = payload.get("boost_temperature")
+    if boost_target is not None and (
+        not _is_valid_zone_water_target(boost_target) or observed_target != boost_target
+    ):
+        return {
+            "skip": True,
+            "reason": "zone_restore_target_changed_since_boost",
+            "observed_zone_target": observed_target,
+            "expected_boost_target": boost_target,
+            "requested_zone_target": target,
+        }
+    target = int(target)
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
 

@@ -132,6 +132,62 @@ class TestExecuteAction:
         mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 37)
 
     @pytest.mark.asyncio
+    async def test_zone_boost_uses_frozen_plan_target(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=35)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
+            mock_wrapper,
+            {"offset": 2, "baseline_temperature": 35, "temperature": 37, "zone_id": 0},
+        )
+
+        assert result == {"zone_id": 0, "temperature": 37}
+        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 37)
+
+    @pytest.mark.asyncio
+    async def test_zone_boost_skips_when_target_changed_after_plan(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=36)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
+            mock_wrapper,
+            {"offset": 2, "baseline_temperature": 35, "temperature": 37, "zone_id": 0},
+        )
+
+        assert result["reason"] == "zone_target_changed_since_plan"
+        mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zone_restore_without_water_target_is_safe_noop(self, mock_wrapper):
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_RESTORE].dispatch(
+            mock_wrapper, {"reason": "legacy_restore"}
+        )
+
+        assert result["reason"] == "zone_restore_target_missing"
+        mock_wrapper.get_device.assert_not_awaited()
+        mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zone_restore_returns_to_frozen_baseline(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=37)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_RESTORE].dispatch(
+            mock_wrapper, {"temperature": 35, "boost_temperature": 37, "zone_id": 0}
+        )
+
+        assert result == {"zone_id": 0, "temperature": 35}
+        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 35)
+
+    @pytest.mark.asyncio
+    async def test_zone_restore_preserves_target_changed_after_boost(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=38)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_RESTORE].dispatch(
+            mock_wrapper, {"temperature": 35, "boost_temperature": 37, "zone_id": 0}
+        )
+
+        assert result["reason"] == "zone_restore_target_changed_since_boost"
+        mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_set_tank_temp_dispatches(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.SET_TANK_TEMP), {"temperature": 52})
         mock_wrapper.refresh_device.return_value = _device(tank_temp=52)
