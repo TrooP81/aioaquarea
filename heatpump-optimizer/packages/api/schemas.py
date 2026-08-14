@@ -24,6 +24,8 @@ class DeviceStatusResponse(BaseModel):
     tank_target_temp: Optional[int] = None
     zone1_temp: Optional[float] = None
     zone1_target_temp: Optional[float] = None
+    zone1_heat_min: Optional[int] = None
+    zone1_heat_max: Optional[int] = None
     quiet_mode: Optional[int] = None
     powerful_mode: Optional[int] = None
     direction: Optional[str] = None
@@ -48,9 +50,13 @@ class DeviceSettingsResponse(BaseModel):
     tank_operation_status: Optional[int] = None
     zone1_temp: Optional[float] = None
     zone1_target_temp: Optional[float] = None
+    zone1_heat_min: Optional[int] = None
+    zone1_heat_max: Optional[int] = None
     zone1_operation_status: Optional[int] = None
     zone2_temp: Optional[float] = None
     zone2_target_temp: Optional[float] = None
+    zone2_heat_min: Optional[int] = None
+    zone2_heat_max: Optional[int] = None
     zone2_operation_status: Optional[int] = None
     quiet_mode: Optional[int] = None
     powerful_mode: Optional[int] = None

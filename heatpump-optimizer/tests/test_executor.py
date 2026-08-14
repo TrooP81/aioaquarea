@@ -17,12 +17,23 @@ from packages.optimizer.executor import (
 )
 
 
-def _zone(temp: int | None = None):
-    return SimpleNamespace(heat_target_temperature=temp)
+def _zone(temp: int | None = None, heat_min: int | None = 20, heat_max: int | None = 65):
+    return SimpleNamespace(
+        heat_target_temperature=temp,
+        heat_min=heat_min,
+        heat_max=heat_max,
+    )
 
 
 def _device(
-    *, force_dhw=None, quiet_mode=None, special_status=None, tank_temp=None, zone_temp=None
+    *,
+    force_dhw=None,
+    quiet_mode=None,
+    special_status=None,
+    tank_temp=None,
+    zone_temp=None,
+    zone_min=20,
+    zone_max=65,
 ):
     return SimpleNamespace(
         force_dhw=SimpleNamespace(value=force_dhw) if force_dhw is not None else None,
@@ -31,7 +42,9 @@ def _device(
         tank=SimpleNamespace(target_temperature=tank_temp)
         if tank_temp is not None
         else SimpleNamespace(target_temperature=None),
-        zones={0: _zone(zone_temp)} if zone_temp is not None else {0: _zone(None)},
+        zones={0: _zone(zone_temp, zone_min, zone_max)}
+        if zone_temp is not None
+        else {0: _zone(None, zone_min, zone_max)},
     )
 
 
@@ -71,6 +84,23 @@ class TestRegistry:
         for handler in ACTION_REGISTRY.values():
             assert callable(handler.dispatch)
             assert callable(handler.verify)
+
+    def test_zone_verification_uses_requested_zone(self):
+        device = SimpleNamespace(
+            zones={
+                1: _zone(30),
+                2: _zone(37),
+            }
+        )
+        handler = ACTION_REGISTRY[ActionType.SET_ZONE_HEAT_TEMPERATURE]
+
+        result = handler.verify(
+            device,
+            {"zone_id": 2, "temperature": 37},
+            {"zone_id": 2, "temperature": 37},
+        )
+
+        assert result.ok
 
 
 class TestExecuteAction:
@@ -141,14 +171,25 @@ class TestExecuteAction:
         assert mock_session.execute.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_zone_boost_skips_curve_mode_sentinel(self, mock_wrapper):
-        mock_wrapper.get_device.return_value = _device(zone_temp=-5)
+    async def test_zone_boost_uses_live_curve_shift_range(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=-5, zone_min=-5, zone_max=5)
 
         result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
             mock_wrapper, {"offset": 2, "zone_id": 0}
         )
 
-        assert result["reason"] == "zone_target_not_a_safe_water_setpoint"
+        assert result == {"zone_id": 0, "temperature": -3}
+        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, -3)
+
+    @pytest.mark.asyncio
+    async def test_zone_boost_skips_when_live_range_is_missing(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=-5, zone_min=None, zone_max=None)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
+            mock_wrapper, {"offset": 2, "zone_id": 0}
+        )
+
+        assert result["reason"] == "zone_target_or_range_unavailable"
         mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
 
     @pytest.mark.asyncio

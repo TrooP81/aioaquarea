@@ -116,6 +116,8 @@ class TestRulesOptimizer:
                 current_outdoor_temp=0.0,
                 current_water_temp=30.0,
                 current_zone_target_temp=36.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
                 comfort_temp_target=20.5,
                 comfort_temp_min=18.0,
             )
@@ -315,6 +317,8 @@ class TestRulesOptimizer:
             current_outdoor_temp=5.0,
             current_water_temp=35.0,
             current_zone_target_temp=34.0,
+            current_zone_heat_min=20,
+            current_zone_heat_max=65,
         )
 
         boost_actions = [a for a in actions if a["type"] == "zone_temp_boost"]
@@ -327,7 +331,7 @@ class TestRulesOptimizer:
         assert restore_actions[0]["payload"]["temperature"] == 34
         assert restore_actions[0]["payload"]["boost_temperature"] == 36
 
-    def test_preheat_skips_panasonic_curve_mode_target(self, sample_prices, sample_weather):
+    def test_preheat_uses_panasonic_curve_shift_range(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
 
         actions = optimizer._plan_preheat(
@@ -338,9 +342,16 @@ class TestRulesOptimizer:
             current_outdoor_temp=5.0,
             current_water_temp=35.0,
             current_zone_target_temp=-5.0,
+            current_zone_heat_min=-5,
+            current_zone_heat_max=5,
         )
 
-        assert actions == []
+        boost = next(action for action in actions if action["type"] == "zone_temp_boost")
+        restore = next(action for action in actions if action["type"] == "zone_temp_restore")
+        assert boost["payload"]["baseline_temperature"] == -5
+        assert boost["payload"]["temperature"] == -3
+        assert restore["payload"]["temperature"] == -5
+        assert restore["payload"]["boost_temperature"] == -3
 
     def test_preheat_does_not_heat_an_already_warm_home(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
@@ -351,6 +362,9 @@ class TestRulesOptimizer:
             current_indoor_temp=28.0,
             current_outdoor_temp=5.0,
             current_water_temp=35.0,
+            current_zone_target_temp=35.0,
+            current_zone_heat_min=20,
+            current_zone_heat_max=65,
             comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
             comfort_temp_target=21.0,
             comfort_temp_min=18.0,
@@ -583,6 +597,8 @@ class TestRulesOptimizer:
                 current_outdoor_temp=2.0,
                 current_water_temp=35.0,
                 current_zone_target_temp=33.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
                 comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
                 comfort_temp_target=21.0,
                 comfort_temp_min=18.0,
@@ -617,6 +633,8 @@ class TestRulesOptimizer:
                 current_outdoor_temp=2.0,
                 current_water_temp=35.0,
                 current_zone_target_temp=32.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
                 comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
                 comfort_temp_target=21.0,
                 comfort_temp_min=18.0,

@@ -7,9 +7,6 @@ from typing import Any, Awaitable, Callable
 
 from .types import ActionType, VerifyResult
 
-ZONE_WATER_TARGET_MIN_C = 20
-ZONE_WATER_TARGET_MAX_C = 65
-
 DispatchFn = Callable[[Any, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 RedispatchFn = Callable[[Any, dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None]]
 VerifyFn = Callable[[Any, dict[str, Any], dict[str, Any] | None], VerifyResult]
@@ -33,17 +30,36 @@ class ActionHandler:
         return await self.dispatch(wrapper, payload)
 
 
-def _zone_from_device(device: Any):
-    if not getattr(device, "zones", None):
+def _zone_from_device(device: Any, zone_id: int = 0):
+    zones = getattr(device, "zones", None)
+    if not zones:
         return None
-    return device.zones.get(0) or device.zones.get(1) or next(iter(device.zones.values()), None)
+    if zone_id:
+        return zones.get(zone_id)
+    return zones.get(0) or zones.get(1) or next(iter(zones.values()), None)
 
 
-def _is_valid_zone_water_target(value: Any) -> bool:
+def _is_whole_number(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
-        and ZONE_WATER_TARGET_MIN_C <= value <= ZONE_WATER_TARGET_MAX_C
+        and not isinstance(value, bool)
+        and float(value).is_integer()
     )
+
+
+def _zone_temperature_range(zone: Any) -> tuple[int, int] | None:
+    minimum = getattr(zone, "heat_min", None)
+    maximum = getattr(zone, "heat_max", None)
+    if not _is_whole_number(minimum) or not _is_whole_number(maximum):
+        return None
+    minimum = int(minimum)
+    maximum = int(maximum)
+    return (minimum, maximum) if minimum <= maximum else None
+
+
+def _is_valid_zone_target(value: Any, zone: Any) -> bool:
+    limits = _zone_temperature_range(zone)
+    return bool(limits and _is_whole_number(value) and limits[0] <= value <= limits[1])
 
 
 def _special_status_name(device: Any) -> str | None:
@@ -129,12 +145,12 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
     offset = int(payload.get("offset", 2))
     zone_id = int(payload.get("zone_id", 0))
     device = await wrapper.get_device()
-    zone = _zone_from_device(device)
+    zone = _zone_from_device(device, zone_id)
     current_target = getattr(zone, "heat_target_temperature", None)
-    if not _is_valid_zone_water_target(current_target):
+    if not _is_valid_zone_target(current_target, zone):
         return {
             "skip": True,
-            "reason": "zone_target_not_a_safe_water_setpoint",
+            "reason": "zone_target_or_range_unavailable",
             "observed_zone_target": current_target,
         }
 
@@ -142,12 +158,12 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
     planned_target = payload.get("temperature")
     has_frozen_plan = planned_baseline is not None or planned_target is not None
     if has_frozen_plan:
-        if not _is_valid_zone_water_target(planned_baseline) or not _is_valid_zone_water_target(
-            planned_target
+        if not _is_valid_zone_target(planned_baseline, zone) or not _is_valid_zone_target(
+            planned_target, zone
         ):
             return {
                 "skip": True,
-                "reason": "zone_boost_plan_not_safe",
+                "reason": "zone_boost_plan_outside_live_range",
                 "observed_zone_target": current_target,
                 "planned_baseline": planned_baseline,
                 "requested_zone_target": planned_target,
@@ -167,10 +183,10 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
         # have an equivalent fallback because guessing a water target is unsafe.
         new_temp = int(current_target + offset)
 
-    if not _is_valid_zone_water_target(new_temp):
+    if not _is_valid_zone_target(new_temp, zone):
         return {
             "skip": True,
-            "reason": "zone_boost_outside_safe_water_range",
+            "reason": "zone_boost_outside_live_range",
             "observed_zone_target": current_target,
             "requested_zone_target": new_temp,
         }
@@ -186,8 +202,8 @@ async def _redispatch_zone_temp_boost(
     """Retry the first absolute boost target instead of compounding its offset."""
     zone_id = int(expected.get("zone_id", payload.get("zone_id", 0)))
     target = expected.get("temperature")
-    if not _is_valid_zone_water_target(target):
-        raise ValueError("Zone boost retry is missing a safe absolute target")
+    if not _is_whole_number(target):
+        raise ValueError("Zone boost retry is missing a whole-degree absolute target")
     target = int(target)
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
@@ -204,18 +220,18 @@ async def _dispatch_zone_temp_restore(wrapper: Any, payload: dict[str, Any]) -> 
         }
 
     device = await wrapper.get_device()
-    zone = _zone_from_device(device)
+    zone = _zone_from_device(device, zone_id)
     observed_target = getattr(zone, "heat_target_temperature", None)
-    if not _is_valid_zone_water_target(observed_target) or not _is_valid_zone_water_target(target):
+    if not _is_valid_zone_target(observed_target, zone) or not _is_valid_zone_target(target, zone):
         return {
             "skip": True,
-            "reason": "zone_restore_not_safe_in_curve_mode",
+            "reason": "zone_restore_outside_live_range",
             "observed_zone_target": observed_target,
             "requested_zone_target": target,
         }
     boost_target = payload.get("boost_temperature")
     if boost_target is not None and (
-        not _is_valid_zone_water_target(boost_target) or observed_target != boost_target
+        not _is_valid_zone_target(boost_target, zone) or observed_target != boost_target
     ):
         return {
             "skip": True,
@@ -239,13 +255,16 @@ async def _dispatch_set_zone_heat_temperature(
     wrapper: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:
     zone_id = int(payload.get("zone_id", 0))
-    target = int(payload["temperature"])
-    if not _is_valid_zone_water_target(target):
+    target = payload["temperature"]
+    device = await wrapper.get_device()
+    zone = _zone_from_device(device, zone_id)
+    if not _is_valid_zone_target(target, zone):
         return {
             "skip": True,
-            "reason": "zone_target_outside_safe_water_range",
+            "reason": "zone_target_outside_live_range",
             "requested_zone_target": target,
         }
+    target = int(target)
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
 
@@ -351,7 +370,8 @@ def _verify_tank_temp(
 def _verify_zone_temp(
     device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
 ) -> VerifyResult:
-    zone = _zone_from_device(device)
+    zone_id = int((expected or {}).get("zone_id", payload.get("zone_id", 0)))
+    zone = _zone_from_device(device, zone_id)
     observed = getattr(zone, "heat_target_temperature", None)
     target = expected.get("temperature") if expected else None
     ok = observed == target

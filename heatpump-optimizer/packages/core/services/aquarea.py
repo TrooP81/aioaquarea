@@ -389,8 +389,8 @@ class AquareaWrapper:
     async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
         resolved_zone_id = zone_id or 1
         device = await self._get_writable_device()
-        zone = getattr(device, "zones", {}).get(resolved_zone_id)
-        if zone is not None and zone.heat_target_temperature == temperature:
+        zone = self._validate_zone_heat_temperature(device, resolved_zone_id, temperature)
+        if zone.heat_target_temperature == temperature:
             logger.info(
                 "Zone %s heat target already %sC; skipping Panasonic write",
                 resolved_zone_id,
@@ -400,8 +400,8 @@ class AquareaWrapper:
 
         await self._write_limiter.acquire()
         device = await self._get_writable_device()
-        zone = getattr(device, "zones", {}).get(resolved_zone_id)
-        if zone is not None and zone.heat_target_temperature == temperature:
+        zone = self._validate_zone_heat_temperature(device, resolved_zone_id, temperature)
+        if zone.heat_target_temperature == temperature:
             logger.info(
                 "Zone %s heat target became %sC while waiting; skipping write",
                 resolved_zone_id,
@@ -411,6 +411,35 @@ class AquareaWrapper:
 
         await device.set_temperature(temperature, zone_id=resolved_zone_id)
         logger.info("Set zone %s heat target to %sC", resolved_zone_id, temperature)
+
+    @staticmethod
+    def _validate_zone_heat_temperature(device, zone_id: int, temperature: int):
+        zone = getattr(device, "zones", {}).get(zone_id)
+        if zone is None:
+            raise PanasonicCommandValidationError(
+                f"Panasonic device has no writable heating zone {zone_id}"
+            )
+
+        minimum = getattr(zone, "heat_min", None)
+        maximum = getattr(zone, "heat_max", None)
+        if not isinstance(minimum, (int, float)) or not isinstance(maximum, (int, float)):
+            raise PanasonicCommandValidationError(
+                f"Panasonic zone {zone_id} did not report writable temperature limits"
+            )
+        if minimum > maximum:
+            raise PanasonicCommandValidationError(
+                f"Panasonic zone {zone_id} reported an invalid temperature range"
+            )
+        if isinstance(temperature, bool) or not isinstance(temperature, int):
+            raise PanasonicCommandValidationError(
+                "Panasonic zone target must be a whole number of degrees Celsius"
+            )
+        if not minimum <= temperature <= maximum:
+            raise PanasonicCommandValidationError(
+                f"Panasonic zone target {temperature}C is outside the live "
+                f"device range {minimum}-{maximum}C"
+            )
+        return zone
 
     async def set_special_status(self, status: str) -> None:
         from aioaquarea.data import SpecialStatus

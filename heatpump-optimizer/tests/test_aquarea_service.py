@@ -524,7 +524,7 @@ async def test_tank_temperature_rejects_live_out_of_range_target() -> None:
 @pytest.mark.asyncio
 async def test_zone_temperature_skips_already_applied_target() -> None:
     wrapper = _wrapper()
-    zone = SimpleNamespace(heat_target_temperature=37)
+    zone = SimpleNamespace(heat_target_temperature=37, heat_min=20, heat_max=65)
     device = SimpleNamespace(
         zones={1: zone},
         status_data_mode=StatusDataMode.LIVE,
@@ -542,7 +542,7 @@ async def test_zone_temperature_skips_already_applied_target() -> None:
 @pytest.mark.asyncio
 async def test_zone_temperature_writes_changed_target_once() -> None:
     wrapper = _wrapper()
-    zone = SimpleNamespace(heat_target_temperature=35)
+    zone = SimpleNamespace(heat_target_temperature=35, heat_min=20, heat_max=65)
     device = SimpleNamespace(
         zones={1: zone},
         status_data_mode=StatusDataMode.LIVE,
@@ -555,3 +555,58 @@ async def test_zone_temperature_writes_changed_target_once() -> None:
 
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_temperature.assert_awaited_once_with(37, zone_id=1)
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_accepts_live_curve_shift_range() -> None:
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=-5, heat_min=-5, heat_max=5)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_zone_heat_temperature(1, -3)
+
+    device.set_temperature.assert_awaited_once_with(-3, zone_id=1)
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_rejects_target_outside_live_range() -> None:
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=-5, heat_min=-5, heat_max=5)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCommandValidationError, match="outside.*-5-5"):
+        await wrapper.set_zone_heat_temperature(1, 6)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_temperature.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_rejects_missing_live_range() -> None:
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=-5, heat_min=None, heat_max=None)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    with pytest.raises(PanasonicCommandValidationError, match="did not report"):
+        await wrapper.set_zone_heat_temperature(1, -3)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_temperature.assert_not_awaited()

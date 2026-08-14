@@ -98,6 +98,8 @@ async def seed_device_status(db_session: AsyncSession):
         tank_target_temp=50,
         zone1_temp=21.0,
         zone1_target_temp=22,
+        zone1_heat_min=18,
+        zone1_heat_max=45,
         quiet_mode=0,
         powerful_mode=0,
     )

@@ -18,9 +18,13 @@ def _status(now: dt.datetime, **overrides):
         "zone1_temp": 21,
         "zone1_target_temp": 22,
         "zone1_operation_status": 1,
+        "zone1_heat_min": 18,
+        "zone1_heat_max": 45,
         "zone2_temp": None,
         "zone2_target_temp": None,
         "zone2_operation_status": None,
+        "zone2_heat_min": None,
+        "zone2_heat_max": None,
         "mode": "heat",
         "quiet_mode": 0,
         "powerful_mode": 0,
@@ -55,6 +59,11 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         "observed_range": {"minimum_celsius": 40, "maximum_celsius": 65},
         "whole_degrees_only": True,
     }
+    assert result["commands"]["set_zone_heat_temperature"]["constraints"] == {
+        "observed_ranges": {"1": {"minimum": 18, "maximum": 45}},
+        "whole_degrees_only": True,
+    }
+    assert result["commands"]["set_zone_heat_temperature"]["available"] is True
     assert result["commands"]["request_defrost"]["policy"] == "manual_only"
     assert result["commands"]["set_special_status"]["device_supported"] is None
 
@@ -87,6 +96,21 @@ def test_missing_tank_limits_blocks_target_write_but_keeps_tank_support() -> Non
     assert command["device_supported"] is True
     assert command["available"] is False
     assert command["constraints"]["observed_range"] is None
+
+
+def test_missing_zone_limits_blocks_target_write_but_keeps_zone_support() -> None:
+    now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, zone1_heat_min=None, zone1_heat_max=None),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        now=now,
+    )
+
+    command = result["commands"]["set_zone_heat_temperature"]
+    assert command["device_supported"] is True
+    assert command["available"] is False
+    assert command["constraints"]["observed_ranges"] == {}
 
 
 def test_missing_observation_reports_unknown_device_support() -> None:
