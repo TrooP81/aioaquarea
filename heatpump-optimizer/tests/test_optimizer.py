@@ -120,7 +120,12 @@ class TestRulesOptimizer:
             )
 
         boost = next(action for action in actions if action["type"] == "zone_temp_boost")
+        restore = next(action for action in actions if action["type"] == "zone_temp_restore")
         assert boost["ts"] == (base + dt.timedelta(hours=1)).isoformat()
+        assert boost["payload"]["baseline_temperature"] == 30
+        assert boost["payload"]["temperature"] == 32
+        assert restore["payload"]["temperature"] == 30
+        assert restore["payload"]["boost_temperature"] == 32
 
     def test_dhw_slot_uses_effective_price_after_cop(self):
         optimizer = RulesOptimizer()
@@ -266,8 +271,14 @@ class TestRulesOptimizer:
         )
 
         boost_actions = [a for a in actions if a["type"] == "zone_temp_boost"]
+        restore_actions = [a for a in actions if a["type"] == "zone_temp_restore"]
         # Should have pre-heat actions since we have sub-zero temps
         assert len(boost_actions) > 0
+        assert len(restore_actions) == len(boost_actions)
+        assert boost_actions[0]["payload"]["baseline_temperature"] == 35
+        assert boost_actions[0]["payload"]["temperature"] == 37
+        assert restore_actions[0]["payload"]["temperature"] == 35
+        assert restore_actions[0]["payload"]["boost_temperature"] == 37
 
     def test_preheat_does_not_heat_an_already_warm_home(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
@@ -487,6 +498,73 @@ class TestRulesOptimizer:
         )
 
         assert actions == []
+
+    def test_guardrail_preserves_zone_water_baseline(self, sample_prices):
+        optimizer = RulesOptimizer()
+        cold_weather = [(ts, 2.0) for ts, _ in sample_prices[:4]]
+
+        with (
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 17.0}] * 4,
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_heating_time",
+                return_value=SimpleNamespace(estimated_hours=0.5, estimated_minutes=30.0),
+            ),
+        ):
+            actions = optimizer._plan_indoor_guardrails(
+                sample_prices[:4],
+                cold_weather,
+                sample_prices[0][0],
+                current_indoor_temp=18.0,
+                current_outdoor_temp=2.0,
+                current_water_temp=35.0,
+                comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
+                comfort_temp_target=21.0,
+                comfort_temp_min=18.0,
+                tz_name="UTC",
+            )
+
+        boost, restore = actions
+        assert boost["payload"]["baseline_temperature"] == 35
+        assert boost["payload"]["temperature"] == 37
+        assert restore["payload"]["temperature"] == 35
+        assert restore["payload"]["boost_temperature"] == 37
+
+    def test_emergency_guardrail_preserves_zone_water_baseline(self, sample_prices):
+        optimizer = RulesOptimizer()
+        cold_weather = [(ts, 2.0) for ts, _ in sample_prices[:4]]
+
+        with (
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * 4,
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_cooling_time",
+                return_value=SimpleNamespace(estimated_minutes=60.0),
+            ),
+        ):
+            actions = optimizer._plan_indoor_guardrails(
+                sample_prices[:4],
+                cold_weather,
+                sample_prices[0][0],
+                current_indoor_temp=20.0,
+                current_outdoor_temp=2.0,
+                current_water_temp=35.0,
+                comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
+                comfort_temp_target=21.0,
+                comfort_temp_min=18.0,
+                tz_name="UTC",
+            )
+
+        boost, restore = actions
+        assert boost["payload"]["reason"] == "indoor_cooling_imminent"
+        assert boost["payload"]["baseline_temperature"] == 35
+        assert boost["payload"]["temperature"] == 37
+        assert restore["payload"]["temperature"] == 35
+        assert restore["payload"]["boost_temperature"] == 37
 
     def test_guardrail_does_not_start_emergency_heat_above_comfort_target(self, sample_prices):
         optimizer = RulesOptimizer()

@@ -17,6 +17,12 @@ class SharedRuleHelpersMixin:
     COMFORT_SATISFIED_MARGIN_C = 0.3
 
     @staticmethod
+    def _zone_boost_targets(current_water_temp: float, offset: int = 2) -> tuple[int, int]:
+        """Freeze the live water target used by a paired boost and restore."""
+        baseline = int(round(current_water_temp))
+        return baseline, baseline + offset
+
+    @staticmethod
     def _find_cheapest_slot(
         prices: list[tuple[dt.datetime, float]], hours_needed: int
     ) -> list[tuple[dt.datetime, float]] | None:
@@ -392,12 +398,17 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         )
         if best_slot:
             slot_start = best_slot[0][0]
+            baseline_temperature, boost_temperature = self._zone_boost_targets(
+                current_water_temp
+            )
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
                     "payload": {
                         "offset": +2,
+                        "baseline_temperature": baseline_temperature,
+                        "temperature": boost_temperature,
                         "reason": "thermal_preheat_before_cold",
                         "predicted_minutes": round(prediction.estimated_minutes),
                         "heating_rate": round(prediction.heating_rate_per_hour, 2),
@@ -408,7 +419,11 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
-                    "payload": {"reason": "preheat_complete"},
+                    "payload": {
+                        "temperature": baseline_temperature,
+                        "boost_temperature": boost_temperature,
+                        "reason": "preheat_complete",
+                    },
                 }
             )
 
@@ -516,6 +531,9 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 else None
             )
             slot_start = best_slot[0][0] if best_slot else hour_ts
+            baseline_temperature, boost_temperature = self._zone_boost_targets(
+                current_water_temp
+            )
 
             actions.append(
                 {
@@ -523,6 +541,8 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     "type": str(ActionType.ZONE_TEMP_BOOST),
                     "payload": {
                         "offset": +2,
+                        "baseline_temperature": baseline_temperature,
+                        "temperature": boost_temperature,
                         "reason": "indoor_guardrail",
                         "predicted_indoor": round(predicted_indoor, 1),
                         "target": target,
@@ -534,7 +554,11 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
-                    "payload": {"reason": "indoor_guardrail_complete"},
+                    "payload": {
+                        "temperature": baseline_temperature,
+                        "boost_temperature": boost_temperature,
+                        "reason": "indoor_guardrail_complete",
+                    },
                 }
             )
             break
@@ -556,12 +580,17 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 outdoor_temp=current_outdoor_temp,
             )
             if 0 < cooling_pred.estimated_minutes < 120:
+                baseline_temperature, boost_temperature = self._zone_boost_targets(
+                    current_water_temp
+                )
                 actions.append(
                     {
                         "ts": horizon_start.isoformat(),
                         "type": str(ActionType.ZONE_TEMP_BOOST),
                         "payload": {
                             "offset": +2,
+                            "baseline_temperature": baseline_temperature,
+                            "temperature": boost_temperature,
                             "reason": "indoor_cooling_imminent",
                             "minutes_until_cold": round(cooling_pred.estimated_minutes),
                             "current_indoor": round(current_indoor_temp, 1),
@@ -573,7 +602,11 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
                         "type": str(ActionType.ZONE_TEMP_RESTORE),
-                        "payload": {"reason": "indoor_cooling_boost_complete"},
+                        "payload": {
+                            "temperature": baseline_temperature,
+                            "boost_temperature": boost_temperature,
+                            "reason": "indoor_cooling_boost_complete",
+                        },
                     }
                 )
 
