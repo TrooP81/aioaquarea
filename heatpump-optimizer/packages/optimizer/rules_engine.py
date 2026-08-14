@@ -48,20 +48,33 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     def _normalise_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Remove duplicate command transitions while preserving plan intent.
 
-        Multiple rule sources can request quiet mode. Sending ON twice without
-        an intervening OFF is noise in the plan history and an unnecessary API
-        command, so collapse it after all rule sources have contributed.
+        Multiple rule sources can request different quiet levels. Collapse only
+        identical levels, while preserving legitimate LEVEL1 -> LEVEL2 changes.
         """
         ordered = sorted(actions, key=lambda action: str(action.get("ts", "")))
+
         # A peak-avoidance window can end on the exact hour that scheduled
-        # quiet time begins.  The final state is ON; exposing OFF then ON is
-        # both noisy and misleading. Keep only the final transition at a
-        # timestamp before applying the normal state-machine collapse.
+        # quiet time begins. Exposing OFF then ON is both noisy and misleading,
+        # so keep the strongest requested level at a timestamp before applying
+        # the normal state-machine collapse.
+        def quiet_level(action: dict[str, Any]) -> int:
+            if str(action.get("type", "")) == "quiet_mode_off":
+                return 0
+            level = action.get("payload", {}).get("level", 1)
+            return (
+                level
+                if isinstance(level, int) and not isinstance(level, bool) and 1 <= level <= 3
+                else 1
+            )
+
         quiet_at_timestamp: dict[str, dict[str, Any]] = {}
         non_quiet: list[dict[str, Any]] = []
         for action in ordered:
             if str(action.get("type", "")) in {"quiet_mode_on", "quiet_mode_off"}:
-                quiet_at_timestamp[str(action.get("ts", ""))] = action
+                timestamp = str(action.get("ts", ""))
+                current = quiet_at_timestamp.get(timestamp)
+                if current is None or quiet_level(action) >= quiet_level(current):
+                    quiet_at_timestamp[timestamp] = action
             else:
                 non_quiet.append(action)
         ordered = sorted(
@@ -70,7 +83,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         )
         normalised: list[dict[str, Any]] = []
         seen_exact: set[tuple[str, str, str]] = set()
-        quiet_enabled: bool | None = None
+        active_quiet_level: int | None = None
 
         for action in ordered:
             action_type = str(action.get("type", ""))
@@ -83,13 +96,14 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             seen_exact.add(exact_key)
 
             if action_type == "quiet_mode_on":
-                if quiet_enabled is True:
+                requested_level = quiet_level(action)
+                if active_quiet_level == requested_level:
                     continue
-                quiet_enabled = True
+                active_quiet_level = requested_level
             elif action_type == "quiet_mode_off":
-                if quiet_enabled is False:
+                if active_quiet_level == 0:
                     continue
-                quiet_enabled = False
+                active_quiet_level = 0
 
             normalised.append(action)
 

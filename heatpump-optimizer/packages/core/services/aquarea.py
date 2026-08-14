@@ -333,7 +333,17 @@ class AquareaWrapper:
         return tank
 
     async def set_quiet_mode(self, mode) -> None:
-        device = await self._prepare_write()
+        device = await self._get_writable_device()
+        if getattr(device, "quiet_mode", None) == mode:
+            logger.info("Quiet mode already %s; skipping Panasonic write", mode)
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        if getattr(device, "quiet_mode", None) == mode:
+            logger.info("Quiet mode became %s while waiting; skipping write", mode)
+            return
+
         await device.set_quiet_mode(mode)
         logger.info("Set quiet mode to %s", mode)
 

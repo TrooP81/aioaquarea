@@ -7,7 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aioaquarea import DeviceUnavailableError, ForceDHW, ForceHeater, HolidayTimer, PowerfulTime
+from aioaquarea import (
+    DeviceUnavailableError,
+    ForceDHW,
+    ForceHeater,
+    HolidayTimer,
+    PowerfulTime,
+    QuietMode,
+)
 from aioaquarea.data import StatusDataMode
 
 from packages.core.services.aquarea import (
@@ -388,6 +395,62 @@ async def test_force_dhw_rechecks_state_after_write_wait() -> None:
 
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_force_dhw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_skips_already_applied_level() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        quiet_mode=QuietMode.LEVEL2,
+        status_data_mode=StatusDataMode.LIVE,
+        set_quiet_mode=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_quiet_mode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_writes_changed_level_once() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        quiet_mode=QuietMode.LEVEL1,
+        status_data_mode=StatusDataMode.LIVE,
+        set_quiet_mode=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_quiet_mode.assert_awaited_once_with(QuietMode.LEVEL2)
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_rechecks_level_after_write_wait() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        quiet_mode=QuietMode.LEVEL1,
+        status_data_mode=StatusDataMode.LIVE,
+        set_quiet_mode=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    async def apply_level_during_wait() -> None:
+        device.quiet_mode = QuietMode.LEVEL2
+
+    wrapper._write_limiter.acquire.side_effect = apply_level_during_wait
+
+    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_quiet_mode.assert_not_awaited()
 
 
 @pytest.mark.asyncio

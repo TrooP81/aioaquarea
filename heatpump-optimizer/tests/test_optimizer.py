@@ -203,6 +203,7 @@ class TestRulesOptimizer:
         quiet_on = [a for a in actions if a["type"] == "quiet_mode_on"]
         # Should activate quiet mode during expensive hours
         assert len(quiet_on) > 0
+        assert all(action["payload"]["level"] == 1 for action in quiet_on)
 
     def test_normalise_actions_collapses_repeated_quiet_transitions(self):
         base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
@@ -237,6 +238,50 @@ class TestRulesOptimizer:
             base.isoformat(),
             (base + dt.timedelta(hours=3)).isoformat(),
         ]
+
+    def test_normalise_actions_preserves_quiet_level_changes(self):
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        normalised = RulesOptimizer._normalise_actions(
+            [
+                {
+                    "ts": base.isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 1, "reason": "peak"},
+                },
+                {
+                    "ts": (base + dt.timedelta(hours=1)).isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 2, "reason": "night"},
+                },
+                {
+                    "ts": (base + dt.timedelta(hours=2)).isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 2, "reason": "still_night"},
+                },
+            ]
+        )
+
+        assert [action["payload"]["level"] for action in normalised] == [1, 2]
+
+    def test_normalise_actions_prefers_stronger_quiet_level_at_same_timestamp(self):
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        normalised = RulesOptimizer._normalise_actions(
+            [
+                {
+                    "ts": base.isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 2, "reason": "night"},
+                },
+                {
+                    "ts": base.isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 1, "reason": "peak"},
+                },
+            ]
+        )
+
+        assert len(normalised) == 1
+        assert normalised[0]["payload"]["level"] == 2
 
     def test_normalise_actions_keeps_final_quiet_state_at_same_timestamp(self):
         base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)

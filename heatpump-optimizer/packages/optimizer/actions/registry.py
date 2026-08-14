@@ -105,8 +105,17 @@ async def _dispatch_force_dhw_off(wrapper: Any, payload: dict[str, Any]) -> dict
 async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     from aioaquarea import QuietMode
 
-    await wrapper.set_quiet_mode(QuietMode.LEVEL1)
-    return {"quiet_mode": "LEVEL1"}
+    level = payload.get("level", 1)
+    if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
+        return {
+            "skip": True,
+            "reason": "quiet_mode_level_invalid",
+            "requested_quiet_level": level,
+        }
+
+    mode = QuietMode(level)
+    await wrapper.set_quiet_mode(mode)
+    return {"quiet_mode": mode.name}
 
 
 async def _dispatch_quiet_mode_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -284,13 +293,12 @@ def _verify_quiet_mode(
 ) -> VerifyResult:
     observed = getattr(getattr(device, "quiet_mode", None), "value", None)
     target = expected.get("quiet_mode") if expected else None
-    ok = (target == "OFF" and observed == 0) or (
-        target == "LEVEL1" and observed is not None and observed >= 1
-    )
+    expected_value = {"OFF": 0, "LEVEL1": 1, "LEVEL2": 2, "LEVEL3": 3}.get(target)
+    ok = expected_value is not None and observed == expected_value
     return VerifyResult(
         ok=ok,
         observed_value=observed,
-        expected_value=target,
+        expected_value=expected_value,
         reason=None if ok else "quiet_mode_mismatch",
     )
 
