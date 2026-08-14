@@ -324,7 +324,14 @@ class PlanExecutor:
                     expected=last_result.expected_value,
                     reason=last_result.reason,
                 )
-                expected_state = await handler.dispatch(self._wrapper, payload) or expected_state
+                # Relative actions (notably a zone boost) must retry the exact
+                # target calculated on first dispatch. Re-running ``current +
+                # offset`` can otherwise compound the boost when Panasonic's
+                # read-after-write status is delayed or changed concurrently.
+                expected_state = (
+                    await handler.redispatch_expected(self._wrapper, payload, expected_state)
+                    or expected_state
+                )
 
         await self._mark_failed(action, attempts, last_result)
 

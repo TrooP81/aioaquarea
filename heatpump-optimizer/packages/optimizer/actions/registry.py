@@ -13,6 +13,7 @@ ZONE_WATER_TARGET_MIN_C = 20
 ZONE_WATER_TARGET_MAX_C = 65
 
 DispatchFn = Callable[[Any, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+RedispatchFn = Callable[[Any, dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None]]
 VerifyFn = Callable[[Any, dict[str, Any], dict[str, Any] | None], VerifyResult]
 
 
@@ -20,6 +21,18 @@ VerifyFn = Callable[[Any, dict[str, Any], dict[str, Any] | None], VerifyResult]
 class ActionHandler:
     dispatch: DispatchFn
     verify: VerifyFn
+    redispatch: RedispatchFn | None = None
+
+    async def redispatch_expected(
+        self,
+        wrapper: Any,
+        payload: dict[str, Any],
+        expected: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Repeat a command without changing its already-calculated target."""
+        if self.redispatch is not None:
+            return await self.redispatch(wrapper, payload, expected)
+        return await self.dispatch(wrapper, payload)
 
 
 def _zone_from_device(device: Any):
@@ -106,6 +119,21 @@ async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> di
         }
     await wrapper.set_zone_heat_temperature(zone_id, new_temp)
     return {"zone_id": zone_id, "temperature": new_temp}
+
+
+async def _redispatch_zone_temp_boost(
+    wrapper: Any,
+    payload: dict[str, Any],
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry the first absolute boost target instead of compounding its offset."""
+    zone_id = int(expected.get("zone_id", payload.get("zone_id", 0)))
+    target = expected.get("temperature")
+    if not _is_valid_zone_water_target(target):
+        raise ValueError("Zone boost retry is missing a safe absolute target")
+    target = int(target)
+    await wrapper.set_zone_heat_temperature(zone_id, target)
+    return {"zone_id": zone_id, "temperature": target}
 
 
 async def _dispatch_zone_temp_restore(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -258,7 +286,11 @@ ACTION_REGISTRY: dict[ActionType, ActionHandler] = {
     ActionType.FORCE_DHW_OFF: ActionHandler(_dispatch_force_dhw_off, _verify_force_dhw),
     ActionType.QUIET_MODE_ON: ActionHandler(_dispatch_quiet_mode_on, _verify_quiet_mode),
     ActionType.QUIET_MODE_OFF: ActionHandler(_dispatch_quiet_mode_off, _verify_quiet_mode),
-    ActionType.ZONE_TEMP_BOOST: ActionHandler(_dispatch_zone_temp_boost, _verify_zone_temp),
+    ActionType.ZONE_TEMP_BOOST: ActionHandler(
+        _dispatch_zone_temp_boost,
+        _verify_zone_temp,
+        redispatch=_redispatch_zone_temp_boost,
+    ),
     ActionType.ZONE_TEMP_RESTORE: ActionHandler(_dispatch_zone_temp_restore, _verify_zone_temp),
     ActionType.SET_TANK_TEMP: ActionHandler(_dispatch_set_tank_temp, _verify_tank_temp),
     ActionType.SET_ZONE_HEAT_TEMPERATURE: ActionHandler(
