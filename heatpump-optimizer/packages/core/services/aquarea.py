@@ -367,9 +367,30 @@ class AquareaWrapper:
         logger.info("Requested defrost")
 
     async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
-        device = await self._prepare_write()
-        await device.set_temperature(temperature, zone_id=zone_id or 1)
-        logger.info("Set zone %s heat target to %sC", zone_id, temperature)
+        resolved_zone_id = zone_id or 1
+        device = await self._get_writable_device()
+        zone = getattr(device, "zones", {}).get(resolved_zone_id)
+        if zone is not None and zone.heat_target_temperature == temperature:
+            logger.info(
+                "Zone %s heat target already %sC; skipping Panasonic write",
+                resolved_zone_id,
+                temperature,
+            )
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        zone = getattr(device, "zones", {}).get(resolved_zone_id)
+        if zone is not None and zone.heat_target_temperature == temperature:
+            logger.info(
+                "Zone %s heat target became %sC while waiting; skipping write",
+                resolved_zone_id,
+                temperature,
+            )
+            return
+
+        await device.set_temperature(temperature, zone_id=resolved_zone_id)
+        logger.info("Set zone %s heat target to %sC", resolved_zone_id, temperature)
 
     async def set_special_status(self, status: str) -> None:
         from aioaquarea.data import SpecialStatus

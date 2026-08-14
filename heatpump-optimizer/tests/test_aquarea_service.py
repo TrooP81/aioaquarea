@@ -400,3 +400,39 @@ async def test_tank_temperature_rejects_live_out_of_range_target() -> None:
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     tank.set_target_temperature.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_skips_already_applied_target() -> None:
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=37)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_zone_heat_temperature(1, 37)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_temperature.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_writes_changed_target_once() -> None:
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=35)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_zone_heat_temperature(1, 37)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_temperature.assert_awaited_once_with(37, zone_id=1)

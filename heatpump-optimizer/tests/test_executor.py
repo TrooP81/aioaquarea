@@ -121,6 +121,17 @@ class TestExecuteAction:
         mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_zone_boost_calculates_one_absolute_target(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=35)
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
+            mock_wrapper, {"offset": 2, "zone_id": 0}
+        )
+
+        assert result == {"zone_id": 0, "temperature": 37}
+        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 37)
+
+    @pytest.mark.asyncio
     async def test_set_tank_temp_dispatches(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.SET_TANK_TEMP), {"temperature": 52})
         mock_wrapper.refresh_device.return_value = _device(tank_temp=52)
@@ -192,6 +203,35 @@ class TestVerification:
             await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
 
         assert mock_session.execute.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_zone_boost_retry_reuses_original_absolute_target(self, executor, mock_wrapper):
+        action = _make_action(str(ActionType.ZONE_TEMP_BOOST), {"offset": 2, "zone_id": 0})
+        # A concurrent/read-after-write value of 38C made the old retry path
+        # calculate 40C instead of repeating the original 37C command.
+        mock_wrapper.get_device.return_value = _device(zone_temp=38)
+        failed = VerifyResult(ok=False, observed_value=38, expected_value=37, reason="mismatch")
+        succeeded = VerifyResult(ok=True, observed_value=37, expected_value=37)
+
+        with (
+            patch.object(
+                executor,
+                "_poll_until_verified",
+                side_effect=[(failed, 1), (succeeded, 2)],
+            ),
+            patch("packages.optimizer.executor.get_session") as mock_gs,
+        ):
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await executor._verify_with_retry(
+                action,
+                {"offset": 2, "zone_id": 0},
+                {"zone_id": 0, "temperature": 37},
+            )
+
+        mock_wrapper.get_device.assert_not_awaited()
+        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 37)
 
     @pytest.mark.asyncio
     async def test_every_action_type_has_verifier_coverage(self, mock_wrapper):
