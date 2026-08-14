@@ -398,9 +398,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         )
         if best_slot:
             slot_start = best_slot[0][0]
-            baseline_temperature, boost_temperature = self._zone_boost_targets(
-                current_water_temp
-            )
+            baseline_temperature, boost_temperature = self._zone_boost_targets(current_water_temp)
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
@@ -531,9 +529,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 else None
             )
             slot_start = best_slot[0][0] if best_slot else hour_ts
-            baseline_temperature, boost_temperature = self._zone_boost_targets(
-                current_water_temp
-            )
+            baseline_temperature, boost_temperature = self._zone_boost_targets(current_water_temp)
 
             actions.append(
                 {
