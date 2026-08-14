@@ -282,7 +282,7 @@ async def test_stale_command_preflight_refreshes_live_status() -> None:
         set_force_heater=AsyncMock(),
     )
     wrapper._device = device
-    wrapper._last_live_status_at = 0.0
+    wrapper._last_live_status_at = time.monotonic() - 61.0
 
     await wrapper.set_force_heater(ForceHeater.OFF)
 
@@ -322,7 +322,7 @@ async def test_write_wait_rechecks_status_before_command() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     async def age_status_during_wait() -> None:
-        wrapper._last_live_status_at = 0.0
+        wrapper._last_live_status_at = time.monotonic() - 61.0
 
     wrapper._write_limiter.acquire.side_effect = age_status_during_wait
 
