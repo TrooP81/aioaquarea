@@ -15,12 +15,28 @@ from packages.optimizer.actions import ActionType
 
 class SharedRuleHelpersMixin:
     COMFORT_SATISFIED_MARGIN_C = 0.3
+    ZONE_WATER_TARGET_MIN_C = 20
+    ZONE_WATER_TARGET_MAX_C = 65
 
-    @staticmethod
-    def _zone_boost_targets(current_water_temp: float, offset: int = 2) -> tuple[int, int]:
-        """Freeze the live water target used by a paired boost and restore."""
-        baseline = int(round(current_water_temp))
-        return baseline, baseline + offset
+    @classmethod
+    def _zone_boost_targets(
+        cls, current_zone_target_temp: float | None, offset: int = 2
+    ) -> tuple[int, int] | None:
+        """Freeze a safe Panasonic water target for a paired boost and restore."""
+        if (
+            not isinstance(current_zone_target_temp, (int, float))
+            or isinstance(current_zone_target_temp, bool)
+            or not cls.ZONE_WATER_TARGET_MIN_C
+            <= current_zone_target_temp
+            <= cls.ZONE_WATER_TARGET_MAX_C
+        ):
+            return None
+
+        baseline = int(round(current_zone_target_temp))
+        boost = baseline + offset
+        if not cls.ZONE_WATER_TARGET_MIN_C <= boost <= cls.ZONE_WATER_TARGET_MAX_C:
+            return None
+        return baseline, boost
 
     @staticmethod
     def _find_cheapest_slot(
@@ -309,9 +325,11 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         comfort_temp_min: float = 18.0,
         tz_name: str | None = None,
         weather_full: list[dict] | None = None,
+        current_zone_target_temp: float | None = None,
     ) -> list[dict]:
         actions = []
-        if not weather:
+        boost_targets = self._zone_boost_targets(current_zone_target_temp)
+        if not weather or boost_targets is None:
             return actions
 
         passive_indoor = self._passive_indoor_forecast(
@@ -398,7 +416,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         )
         if best_slot:
             slot_start = best_slot[0][0]
-            baseline_temperature, boost_temperature = self._zone_boost_targets(current_water_temp)
+            baseline_temperature, boost_temperature = boost_targets
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
@@ -443,9 +461,11 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         heat_curve: HeatCurveConfig | None = None,
         tz_name: str | None = None,
         weather_full: list[dict] | None = None,
+        current_zone_target_temp: float | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
-        if not weather:
+        boost_targets = self._zone_boost_targets(current_zone_target_temp)
+        if not weather or boost_targets is None:
             return actions
 
         hours = min(24, len(weather))
@@ -529,7 +549,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 else None
             )
             slot_start = best_slot[0][0] if best_slot else hour_ts
-            baseline_temperature, boost_temperature = self._zone_boost_targets(current_water_temp)
+            baseline_temperature, boost_temperature = boost_targets
 
             actions.append(
                 {
@@ -576,9 +596,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 outdoor_temp=current_outdoor_temp,
             )
             if 0 < cooling_pred.estimated_minutes < 120:
-                baseline_temperature, boost_temperature = self._zone_boost_targets(
-                    current_water_temp
-                )
+                baseline_temperature, boost_temperature = boost_targets
                 actions.append(
                     {
                         "ts": horizon_start.isoformat(),
