@@ -52,6 +52,7 @@ class DeviceStatusRecord(Base):
     quiet_mode: Mapped[int | None] = mapped_column(Integer)
     powerful_mode: Mapped[int | None] = mapped_column(Integer)
     special_status: Mapped[int | None] = mapped_column(Integer)
+    special_status_supported: Mapped[bool | None] = mapped_column(Boolean)
     # Phase 1: compressor activity fields
     direction: Mapped[str | None] = mapped_column(String(16))  # IDLE/PUMP/WATER
     pump_duty: Mapped[int | None] = mapped_column(Integer)  # 0=OFF, 1=ON

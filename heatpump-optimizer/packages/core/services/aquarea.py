@@ -22,6 +22,7 @@ from aioaquarea import (
 from aioaquarea.data import StatusDataMode
 
 from ..config import settings
+from ..panasonic_special_status import optimizer_special_status_supported
 from ..resilience import CircuitBreaker, RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -444,15 +445,50 @@ class AquareaWrapper:
     async def set_special_status(self, status: str) -> None:
         from aioaquarea.data import SpecialStatus
 
-        device = await self._prepare_write()
-        mode = SpecialStatus.ECO if status == "ECO" else SpecialStatus.COMFORT
+        modes = {"ECO": SpecialStatus.ECO, "COMFORT": SpecialStatus.COMFORT}
+        mode = modes.get(status)
+        if mode is None:
+            raise PanasonicCommandValidationError(f"Unsupported Panasonic special status: {status}")
+
+        device = await self._get_writable_device()
+        self._validate_special_status_support(device)
+        if device.special_status == mode:
+            logger.info("Special status already %s; skipping Panasonic write", status)
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        self._validate_special_status_support(device)
+        if device.special_status == mode:
+            logger.info("Special status became %s while waiting; skipping write", status)
+            return
+
         await device.set_special_status(mode)
         logger.info("Set special status to %s", status)
 
     async def clear_special_status(self) -> None:
-        device = await self._prepare_write()
+        device = await self._get_writable_device()
+        self._validate_special_status_support(device)
+        if device.special_status is None:
+            logger.info("Special status already clear; skipping Panasonic write")
+            return
+
+        await self._write_limiter.acquire()
+        device = await self._get_writable_device()
+        self._validate_special_status_support(device)
+        if device.special_status is None:
+            logger.info("Special status became clear while waiting; skipping write")
+            return
+
         await device.set_special_status(None)
         logger.info("Cleared special status")
+
+    @staticmethod
+    def _validate_special_status_support(device) -> None:
+        if not optimizer_special_status_supported(device):
+            raise PanasonicCommandValidationError(
+                "Panasonic device did not report safe ECO/COMFORT heating modifiers"
+            )
 
     async def get_consumption(self, date_type="date"):
         await self._read_limiter.acquire()

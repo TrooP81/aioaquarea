@@ -736,9 +736,20 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         comfort_temp_target: float | None = None,
         comfort_temp_min: float | None = None,
         weather_full: list[dict] | None = None,
+        special_status_supported: bool = False,
+        current_special_status: int | None = None,
     ) -> list[dict]:
         actions = []
-        if not prices:
+        if not prices or special_status_supported is not True:
+            return actions
+
+        if current_special_status is None:
+            current_mode = "normal"
+        elif current_special_status == 1:
+            current_mode = "eco"
+        elif current_special_status == 2:
+            current_mode = "comfort"
+        else:
             return actions
 
         price_values = sorted(p for _, p in prices)
@@ -762,8 +773,6 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
             else {}
         )
         mild_outdoor_threshold = 5.0
-        current_mode = None
-
         for ts, price in prices:
             scheduled_comfort = is_comfort_hour(comfort_schedule, ts, tz_name=tz_name)
             outdoor_temp = temp_by_ts.get(ts.isoformat())

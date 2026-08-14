@@ -140,6 +140,9 @@ def build_panasonic_capabilities(
         "whole_degrees_only": True,
     }
     zone_temperature_command["available"] = commands_allowed and bool(zones) and bool(zone_ranges)
+    special_status_supported = (
+        getattr(latest_status, "special_status_supported", None) if observed_device else None
+    )
 
     return {
         "api": {
@@ -203,7 +206,7 @@ def build_panasonic_capabilities(
             "set_special_status": command(
                 policy="automatic_with_plan",
                 values=["normal", "eco", "comfort"],
-                device_supported=None,
+                device_supported=special_status_supported,
             ),
         },
     }

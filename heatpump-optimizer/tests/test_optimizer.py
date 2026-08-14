@@ -387,6 +387,7 @@ class TestRulesOptimizer:
             heat_curve=HeatCurveConfig(heating_off_outdoor_c=13),
             comfort_temp_target=21.0,
             tz_name="UTC",
+            special_status_supported=True,
         )
 
         assert all(action["type"] != "normal_mode_on" for action in actions)
@@ -408,6 +409,7 @@ class TestRulesOptimizer:
             comfort_temp_target=21.0,
             comfort_temp_min=18.0,
             tz_name="UTC",
+            special_status_supported=True,
         )
 
         assert all(action["type"] != "normal_mode_on" for action in actions)
@@ -429,11 +431,40 @@ class TestRulesOptimizer:
             heat_curve=HeatCurveConfig(heating_off_outdoor_c=13),
             comfort_temp_target=21.0,
             tz_name="UTC",
+            special_status_supported=True,
         )
 
         assert all(
             action["type"] not in {"normal_mode_on", "comfort_mode_on"} for action in actions
         )
+
+    def test_eco_comfort_skips_device_without_safe_panasonic_support(self, sample_prices):
+        optimizer = RulesOptimizer()
+
+        actions = optimizer._plan_eco_comfort(
+            sample_prices,
+            [(ts, 0.0) for ts, _ in sample_prices],
+            sample_prices[0][0],
+            {"weekday": [], "weekend": []},
+            special_status_supported=False,
+        )
+
+        assert actions == []
+
+    def test_eco_comfort_does_not_repeat_observed_eco_mode(self, sample_prices):
+        optimizer = RulesOptimizer()
+        flat_prices = [(ts, 0.1) for ts, _ in sample_prices]
+
+        actions = optimizer._plan_eco_comfort(
+            flat_prices,
+            [(ts, 0.0) for ts, _ in sample_prices],
+            sample_prices[0][0],
+            {"weekday": [], "weekend": []},
+            special_status_supported=True,
+            current_special_status=1,
+        )
+
+        assert actions == []
 
     def test_no_plan_without_prices(self, sample_weather):
         optimizer = RulesOptimizer()
@@ -746,6 +777,7 @@ class TestFlatPriceOptimizer:
             sample_weather,
             flat_prices[0][0],
             comfort_schedule,
+            special_status_supported=True,
         )
         # With flat prices, no price-based overrides should occur
         for a in actions:

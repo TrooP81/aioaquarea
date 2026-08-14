@@ -32,6 +32,7 @@ def _status(now: dt.datetime, **overrides):
         "holiday_mode": 0,
         "defrost_active": False,
         "special_status": None,
+        "special_status_supported": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -65,7 +66,8 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
     }
     assert result["commands"]["set_zone_heat_temperature"]["available"] is True
     assert result["commands"]["request_defrost"]["policy"] == "manual_only"
-    assert result["commands"]["set_special_status"]["device_supported"] is None
+    assert result["commands"]["set_special_status"]["device_supported"] is True
+    assert result["commands"]["set_special_status"]["available"] is True
 
 
 def test_stale_status_blocks_every_command_without_hiding_capabilities() -> None:
@@ -111,6 +113,20 @@ def test_missing_zone_limits_blocks_target_write_but_keeps_zone_support() -> Non
     assert command["device_supported"] is True
     assert command["available"] is False
     assert command["constraints"]["observed_ranges"] == {}
+
+
+def test_unsafe_special_status_metadata_blocks_optimizer_command() -> None:
+    now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, special_status_supported=False),
+        poller_heartbeat=SimpleNamespace(updated_at=now),
+        poll_interval_seconds=300,
+        now=now,
+    )
+
+    command = result["commands"]["set_special_status"]
+    assert command["device_supported"] is False
+    assert command["available"] is False
 
 
 def test_missing_observation_reports_unknown_device_support() -> None:

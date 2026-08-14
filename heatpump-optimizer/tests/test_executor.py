@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aioaquarea import QuietMode
+from aioaquarea.data import SpecialStatus
 
 from packages.optimizer.actions import ACTION_REGISTRY, ActionType, VerifyResult
 from packages.optimizer.executor import (
@@ -20,8 +21,14 @@ from packages.optimizer.executor import (
 def _zone(temp: int | None = None, heat_min: int | None = 20, heat_max: int | None = 65):
     return SimpleNamespace(
         heat_target_temperature=temp,
+        cool_target_temperature=None,
         heat_min=heat_min,
         heat_max=heat_max,
+        supports_special_status=True,
+        temperature_modifiers={
+            SpecialStatus.ECO: SimpleNamespace(heat=-2, cool=None),
+            SpecialStatus.COMFORT: SimpleNamespace(heat=2, cool=None),
+        },
     )
 
 
@@ -34,8 +41,10 @@ def _device(
     zone_temp=None,
     zone_min=20,
     zone_max=65,
+    special_status_supported=True,
 ):
     return SimpleNamespace(
+        support_special_status=special_status_supported,
         force_dhw=SimpleNamespace(value=force_dhw) if force_dhw is not None else None,
         quiet_mode=SimpleNamespace(value=quiet_mode) if quiet_mode is not None else None,
         special_status=SimpleNamespace(name=special_status) if special_status is not None else None,
@@ -125,6 +134,22 @@ class TestExecuteAction:
             "requested_quiet_level": 4,
         }
         mock_wrapper.set_quiet_mode.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_eco_mode_dispatch_requires_safe_device_support(self, mock_wrapper):
+        mock_wrapper.get_device.return_value = _device(zone_temp=35, special_status_supported=False)
+
+        result = await ACTION_REGISTRY[ActionType.ECO_MODE_ON].dispatch(mock_wrapper, {})
+
+        assert result == {"skip": True, "reason": "special_status_not_safely_supported"}
+        mock_wrapper.set_special_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_eco_mode_dispatches_for_safe_device_metadata(self, mock_wrapper):
+        result = await ACTION_REGISTRY[ActionType.ECO_MODE_ON].dispatch(mock_wrapper, {})
+
+        assert result == {"special_status": "ECO"}
+        mock_wrapper.set_special_status.assert_awaited_once_with("ECO")
 
     def test_quiet_mode_verification_requires_exact_level(self):
         handler = ACTION_REGISTRY[ActionType.QUIET_MODE_ON]
@@ -420,30 +445,24 @@ class TestVerification:
             result = ACTION_REGISTRY[action_type].verify(device, {}, expected)
             assert result.ok, action_type
 
-    def test_eco_mode_unobservable_special_status_passes(self):
-        """Regression: aioaquarea never reports special_status (always None), so
-        setting ECO must not fail verification forever — it's accepted as applied.
-        """
-        device = _device(special_status=None)  # library always yields None
+    def test_eco_mode_requires_observed_special_status(self):
+        device = _device(special_status=None)
         result = ACTION_REGISTRY[ActionType.ECO_MODE_ON].verify(
             device, {}, {"special_status": "ECO"}
         )
-        assert result.ok
-        assert result.reason == "special_status_unverifiable"
+        assert not result.ok
+        assert result.reason == "special_status_mismatch"
         assert result.observed_value is None
 
-    def test_comfort_mode_unobservable_special_status_passes(self):
+    def test_comfort_mode_requires_observed_special_status(self):
         device = _device(special_status=None)
         result = ACTION_REGISTRY[ActionType.COMFORT_MODE_ON].verify(
             device, {}, {"special_status": "COMFORT"}
         )
-        assert result.ok
-        assert result.reason == "special_status_unverifiable"
+        assert not result.ok
+        assert result.reason == "special_status_mismatch"
 
     def test_special_status_real_mismatch_still_fails(self):
-        """Forward-compatible: if the library ever reports a real (non-None)
-        status that disagrees with the target, verification must still fail.
-        """
         device = _device(special_status="COMFORT")
         result = ACTION_REGISTRY[ActionType.ECO_MODE_ON].verify(
             device, {}, {"special_status": "ECO"}
@@ -452,7 +471,6 @@ class TestVerification:
         assert result.reason == "special_status_mismatch"
 
     def test_clear_special_status_still_verifies(self):
-        """Clearing (target None) with an unreported status remains verified."""
         device = _device(special_status=None)
         result = ACTION_REGISTRY[ActionType.NORMAL_MODE_ON].verify(
             device, {}, {"special_status": None}
