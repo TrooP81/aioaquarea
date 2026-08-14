@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aioaquarea import DeviceUnavailableError, ForceHeater, HolidayTimer, PowerfulTime
+from aioaquarea import DeviceUnavailableError, ForceDHW, ForceHeater, HolidayTimer, PowerfulTime
 from aioaquarea.data import StatusDataMode
 
 from packages.core.services.aquarea import (
@@ -332,6 +332,62 @@ async def test_write_wait_rechecks_status_before_command() -> None:
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
     device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)
+
+
+@pytest.mark.asyncio
+async def test_force_dhw_skips_already_applied_state() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        force_dhw=ForceDHW.ON,
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_dhw=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.force_dhw(ForceDHW.ON)
+
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_force_dhw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_force_dhw_writes_changed_state_once() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        force_dhw=ForceDHW.OFF,
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_dhw=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.force_dhw(ForceDHW.ON)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_force_dhw.assert_awaited_once_with(ForceDHW.ON)
+
+
+@pytest.mark.asyncio
+async def test_force_dhw_rechecks_state_after_write_wait() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        force_dhw=ForceDHW.OFF,
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_dhw=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    async def apply_state_during_wait() -> None:
+        device.force_dhw = ForceDHW.ON
+
+    wrapper._write_limiter.acquire.side_effect = apply_state_during_wait
+
+    await wrapper.force_dhw(ForceDHW.ON)
+
+    wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_force_dhw.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -53,18 +53,24 @@ def _special_status_name(device: Any) -> str | None:
     return getattr(status, "name", None)
 
 
+def _tank_target_reached(device: Any) -> tuple[bool, Any, Any]:
+    tank = getattr(device, "tank", None)
+    current_temp = getattr(tank, "temperature", None)
+    target_temp = getattr(tank, "target_temperature", None)
+    reached = (
+        isinstance(current_temp, (int, float))
+        and isinstance(target_temp, (int, float))
+        and current_temp >= target_temp - 0.5
+    )
+    return reached, current_temp, target_temp
+
+
 async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     from aioaquarea import ForceDHW
 
     device = await wrapper.get_device()
-    tank = getattr(device, "tank", None)
-    current_temp = getattr(tank, "temperature", None)
-    target_temp = getattr(tank, "target_temperature", None)
-    if (
-        isinstance(current_temp, (int, float))
-        and isinstance(target_temp, (int, float))
-        and current_temp >= target_temp - 0.5
-    ):
+    reached, current_temp, target_temp = _tank_target_reached(device)
+    if reached:
         return {
             "skip": True,
             "reason": "tank_at_target",
@@ -73,6 +79,21 @@ async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[
         }
 
     await wrapper.force_dhw(ForceDHW.ON)
+    return {"force_dhw": "ON"}
+
+
+async def _redispatch_force_dhw_on(
+    wrapper: Any,
+    _payload: dict[str, Any],
+    _expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Avoid re-forcing DHW after Panasonic has already reached the tank target."""
+    from aioaquarea import ForceDHW
+
+    device = await wrapper.get_device()
+    reached, _, _ = _tank_target_reached(device)
+    if not reached:
+        await wrapper.force_dhw(ForceDHW.ON)
     return {"force_dhw": "ON"}
 
 
@@ -196,6 +217,15 @@ def _verify_force_dhw(
 ) -> VerifyResult:
     observed = getattr(getattr(device, "force_dhw", None), "value", None)
     expected_value = 1 if expected and expected.get("force_dhw") == "ON" else 0
+    if expected_value == 1 and observed != expected_value:
+        reached, _, _ = _tank_target_reached(device)
+        if reached:
+            return VerifyResult(
+                ok=True,
+                observed_value=observed,
+                expected_value=expected_value,
+                reason="tank_target_reached",
+            )
     ok = observed == expected_value
     return VerifyResult(
         ok=ok,
@@ -282,7 +312,11 @@ def _verify_zone_temp(
 
 
 ACTION_REGISTRY: dict[ActionType, ActionHandler] = {
-    ActionType.FORCE_DHW_ON: ActionHandler(_dispatch_force_dhw_on, _verify_force_dhw),
+    ActionType.FORCE_DHW_ON: ActionHandler(
+        _dispatch_force_dhw_on,
+        _verify_force_dhw,
+        redispatch=_redispatch_force_dhw_on,
+    ),
     ActionType.FORCE_DHW_OFF: ActionHandler(_dispatch_force_dhw_off, _verify_force_dhw),
     ActionType.QUIET_MODE_ON: ActionHandler(_dispatch_quiet_mode_on, _verify_quiet_mode),
     ActionType.QUIET_MODE_OFF: ActionHandler(_dispatch_quiet_mode_off, _verify_quiet_mode),
