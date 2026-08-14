@@ -15,26 +15,32 @@ from packages.optimizer.actions import ActionType
 
 class SharedRuleHelpersMixin:
     COMFORT_SATISFIED_MARGIN_C = 0.3
-    ZONE_WATER_TARGET_MIN_C = 20
-    ZONE_WATER_TARGET_MAX_C = 65
 
-    @classmethod
+    @staticmethod
     def _zone_boost_targets(
-        cls, current_zone_target_temp: float | None, offset: int = 2
+        current_zone_target_temp: float | None,
+        current_zone_heat_min: int | None,
+        current_zone_heat_max: int | None,
+        offset: int = 2,
     ) -> tuple[int, int] | None:
-        """Freeze a safe Panasonic water target for a paired boost and restore."""
-        if (
-            not isinstance(current_zone_target_temp, (int, float))
-            or isinstance(current_zone_target_temp, bool)
-            or not cls.ZONE_WATER_TARGET_MIN_C
-            <= current_zone_target_temp
-            <= cls.ZONE_WATER_TARGET_MAX_C
-        ):
+        """Freeze a target pair inside Panasonic's currently observed range."""
+        values = (current_zone_target_temp, current_zone_heat_min, current_zone_heat_max)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             return None
 
-        baseline = int(round(current_zone_target_temp))
+        baseline = int(current_zone_target_temp)
+        minimum = int(current_zone_heat_min)
+        maximum = int(current_zone_heat_max)
+        if (
+            current_zone_target_temp != baseline
+            or current_zone_heat_min != minimum
+            or current_zone_heat_max != maximum
+            or minimum > maximum
+            or not minimum <= baseline <= maximum
+        ):
+            return None
         boost = baseline + offset
-        if not cls.ZONE_WATER_TARGET_MIN_C <= boost <= cls.ZONE_WATER_TARGET_MAX_C:
+        if not minimum <= boost <= maximum:
             return None
         return baseline, boost
 
@@ -326,9 +332,15 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         tz_name: str | None = None,
         weather_full: list[dict] | None = None,
         current_zone_target_temp: float | None = None,
+        current_zone_heat_min: int | None = None,
+        current_zone_heat_max: int | None = None,
     ) -> list[dict]:
         actions = []
-        boost_targets = self._zone_boost_targets(current_zone_target_temp)
+        boost_targets = self._zone_boost_targets(
+            current_zone_target_temp,
+            current_zone_heat_min,
+            current_zone_heat_max,
+        )
         if not weather or boost_targets is None:
             return actions
 
@@ -462,9 +474,15 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         tz_name: str | None = None,
         weather_full: list[dict] | None = None,
         current_zone_target_temp: float | None = None,
+        current_zone_heat_min: int | None = None,
+        current_zone_heat_max: int | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
-        boost_targets = self._zone_boost_targets(current_zone_target_temp)
+        boost_targets = self._zone_boost_targets(
+            current_zone_target_temp,
+            current_zone_heat_min,
+            current_zone_heat_max,
+        )
         if not weather or boost_targets is None:
             return actions
 

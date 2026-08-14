@@ -166,6 +166,16 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             if last_status and last_status.zone1_target_temp is not None
             else None
         )
+        current_zone_heat_min = (
+            last_status.zone1_heat_min
+            if last_status and last_status.zone1_heat_min is not None
+            else None
+        )
+        current_zone_heat_max = (
+            last_status.zone1_heat_max
+            if last_status and last_status.zone1_heat_max is not None
+            else None
+        )
         tank_target = (
             last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
         )
@@ -231,6 +241,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     tz_name=tz_name,
                     weather_full=weather_full,
                     current_zone_target_temp=current_zone_target_temp,
+                    current_zone_heat_min=current_zone_heat_min,
+                    current_zone_heat_max=current_zone_heat_max,
                 )
             )
         actions.extend(self._plan_peak_avoidance(prices, weather, horizon_start))
@@ -277,6 +289,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     tz_name=tz_name,
                     weather_full=weather_full,
                     current_zone_target_temp=current_zone_target_temp,
+                    current_zone_heat_min=current_zone_heat_min,
+                    current_zone_heat_max=current_zone_heat_max,
                 )
             )
 
