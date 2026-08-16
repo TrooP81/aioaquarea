@@ -319,6 +319,42 @@ class TestRulesOptimizer:
         assert len(quiet_on) > 0
         assert all(action["payload"]["level"] == 1 for action in quiet_on)
 
+    def test_peak_avoidance_covers_multiple_peaks_when_curve_is_spiky(
+        self, sample_prices, sample_weather
+    ):
+        """A single peak-hour cap misses obvious multi-hour price spikes.
+
+        With sample_prices the top three hours (0.30, 0.28, 0.25 EUR/kWh) are
+        all well above 1.3 * median. The new rule enters quiet mode for each
+        of them, giving more electricity savings during the daily peak.
+        """
+        optimizer = RulesOptimizer()
+
+        actions = optimizer._plan_peak_avoidance(
+            sample_prices, sample_weather, sample_prices[0][0]
+        )
+
+        quiet_on = [a for a in actions if a["type"] == "quiet_mode_on"]
+        assert len(quiet_on) >= 3
+        assert all(a["payload"]["level"] == 1 for a in quiet_on)
+
+    def test_peak_avoidance_ignores_marginal_high_hours(self):
+        """When the top hour is only slightly above median, no peak fires.
+
+        Prevents entering quiet mode on nearly-flat pricing days where the
+        heat-pump throttle would save little but add compressor cycling.
+        """
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        # Median 0.10; top price 0.12 (only 1.20x median, below 1.30 gate)
+        prices = [(base + dt.timedelta(hours=h), 0.10) for h in range(24)]
+        prices[10] = (base + dt.timedelta(hours=10), 0.12)
+        weather = [(ts, 5.0) for ts, _ in prices]
+
+        actions = optimizer._plan_peak_avoidance(prices, weather, base)
+
+        assert actions == []
+
     def test_normalise_actions_collapses_repeated_quiet_transitions(self):
         base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
         actions = [

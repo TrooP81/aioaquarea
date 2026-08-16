@@ -457,7 +457,9 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             outdoor_temp=outdoor_at_cold,
         )
         hours_needed = max(1, int(prediction.estimated_hours + 0.9))
-        preheat_window_start = max(first_cold - dt.timedelta(hours=hours_needed + 4), horizon_start)
+        # Widen the look-back so the picker can reach overnight off-peak
+        # troughs before an early-morning cold hour, matching the DHW rule.
+        preheat_window_start = max(first_cold - dt.timedelta(hours=hours_needed + 8), horizon_start)
         weather_by_ts = {ts: temp for ts, temp in weather}
 
         def controller_can_heat(ts: dt.datetime) -> bool:
@@ -715,6 +717,13 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
 
 
 class ModeRulesMixin(SharedRuleHelpersMixin):
+    # Only treat an hour as a peak if it is materially above the horizon
+    # median; a flat curve with a marginal high hour should not force quiet
+    # mode. Bounded to a small fraction of the horizon so a genuine
+    # multi-peak day still leaves the compressor useful hours to catch up.
+    PEAK_MEDIAN_MULTIPLIER = 1.30
+    PEAK_MAX_FRACTION = 6  # at most 1/6 (~4h out of 24)
+
     def _plan_peak_avoidance(
         self,
         prices: list[tuple[dt.datetime, float]],
@@ -729,9 +738,14 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         if len(unique_prices) <= 1:
             return actions
 
+        price_values = sorted(p for _, p in prices)
+        median_price = price_values[len(price_values) // 2]
+        threshold = median_price * self.PEAK_MEDIAN_MULTIPLIER
+        max_hours = max(1, len(prices) // self.PEAK_MAX_FRACTION)
         sorted_prices = sorted(prices, key=lambda x: x[1], reverse=True)
-        n_expensive = max(1, len(sorted_prices) // 20)
-        expensive_hours = sorted_prices[:n_expensive]
+        expensive_hours = [
+            (ts, price) for ts, price in sorted_prices[:max_hours] if price >= threshold
+        ]
         weather_dict = {ts: t for ts, t in weather} if weather else {}
 
         for ts, price in expensive_hours:
