@@ -9,6 +9,7 @@ from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
 from packages.ml.cop_model_core import COPModel
 from packages.ml.comfort_model import comfort_model
+from packages.ml.models import cop_model as trained_cop_model
 from packages.ml.thermal import thermal_model
 from packages.optimizer.actions import ActionType
 
@@ -93,13 +94,26 @@ class SharedRuleHelpersMixin:
         weather: list[tuple[dt.datetime, float]],
         hours_needed: int,
         fallback_outdoor_temp: float,
+        tank_target: int | None = None,
     ) -> list[tuple[dt.datetime, float]] | None:
-        """Choose heat-pump hours by electricity cost per delivered thermal kWh."""
+        """Choose heat-pump hours by electricity cost per delivered thermal kWh.
+
+        When the ML COP model is trained and a tank target is known, it is
+        preferred over the default linear curve. The ML model captures COP
+        response to tank target and time-of-day, which the default curve
+        cannot, so DHW slot picks reflect the real cost per kWh rather than
+        an outdoor-only proxy.
+        """
+        use_ml = tank_target is not None and trained_cop_model.is_trained
+
         effective_prices = []
         original_prices = {ts: price for ts, price in prices}
         for ts, price in prices:
             outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
-            cop = COPModel._default_cop_curve(outdoor_temp)
+            if use_ml:
+                cop = trained_cop_model.predict_cop(outdoor_temp, int(tank_target), ts.hour)
+            else:
+                cop = COPModel._default_cop_curve(outdoor_temp)
             effective_prices.append((ts, price / cop))
 
         selected = self._find_cheapest_slot(effective_prices, hours_needed)
@@ -189,6 +203,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         weather: list[tuple[dt.datetime, float]],
         hours_needed: int,
         fallback_outdoor_temp: float,
+        tank_target: int | None = None,
     ) -> list[tuple[dt.datetime, float]] | None:
         """Choose a DHW slot by electricity cost per unit of delivered heat.
 
@@ -196,12 +211,15 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         is warmer. Comparing raw spot prices alone can therefore select a cold
         hour that costs more and consumes more electricity for the same tank
         recharge. ``price / COP`` is the effective price per thermal kWh.
+        When available, the trained COP model provides a tank-target-aware
+        estimate rather than the default outdoor-only curve.
         """
         return self._find_lowest_heat_energy_cost_slot(
             prices,
             weather,
             hours_needed,
             fallback_outdoor_temp,
+            tank_target=tank_target,
         )
 
     @staticmethod
@@ -262,12 +280,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         )
         if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
             return actions
-        hours_needed = max(1, int(prediction.estimated_hours + 0.9))
-        thermal_model.predict_tank_cooling_time(
-            current_temp=float(tank_target),
-            min_temp=current_tank_temp,
-            outdoor_temp=current_outdoor_temp,
-        )
+        base_hours_needed = max(1, int(prediction.estimated_hours + 0.9))
         for deadline, ready_hour in self._local_dhw_deadlines_in_horizon(
             comfort_schedule, horizon_start, tz_name
         ):
@@ -278,7 +291,11 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 outdoor_temp=self._get_outdoor_at(weather, deadline, current_outdoor_temp),
                 is_tank=True,
             )
-            window_start = max(latest_start - dt.timedelta(hours=4), horizon_start)
+            # Widen the search window enough to capture overnight off-peak
+            # troughs. The old 4h look-back missed the cheapest hours of the
+            # night when the deadline was in the morning shortly after
+            # off-peak ends.
+            window_start = max(latest_start - dt.timedelta(hours=8), horizon_start)
             window_prices = [(ts, p) for ts, p in prices if window_start <= ts < deadline]
             if not window_prices:
                 continue
@@ -286,22 +303,53 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             best_slot = self._find_lowest_dhw_energy_cost_slot(
                 window_prices,
                 weather,
-                hours_needed,
+                base_hours_needed,
                 current_outdoor_temp,
+                tank_target=tank_target,
             )
             if not best_slot:
                 continue
 
             slot_start = best_slot[0][0]
+            # Standby loss between now and slot start means the tank will be
+            # cooler at slot start than it is now, so more heating time is
+            # needed. Size the top-up against the projected temperature.
+            delay_hours = max(
+                0.0,
+                (slot_start - horizon_start).total_seconds() / 3600.0,
+            )
+            projected_tank_temp = current_tank_temp
+            if delay_hours > 0.0:
+                loss_outdoor = self._get_outdoor_at(
+                    weather, slot_start, current_outdoor_temp
+                )
+                loss_rate_per_h = thermal_model._tank_loss_rate(loss_outdoor)
+                projected_tank_temp = max(
+                    0.0, current_tank_temp + loss_rate_per_h * delay_hours
+                )
+            slot_outdoor = self._get_outdoor_at(
+                weather, slot_start, current_outdoor_temp
+            )
+            projected_prediction = thermal_model.predict_tank_heating_time(
+                current_temp=projected_tank_temp,
+                target_temp=float(tank_target),
+                outdoor_temp=slot_outdoor,
+            )
+            hours_needed = max(
+                base_hours_needed,
+                int(projected_prediction.estimated_hours + 0.9),
+            )
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.FORCE_DHW_ON),
                     "payload": {
                         "reason": f"thermal_optimized_before_{ready_hour}:00",
-                        "predicted_minutes": round(prediction.estimated_minutes),
-                        "heating_rate": round(prediction.heating_rate_per_hour, 2),
-                        "confidence": prediction.confidence,
+                        "predicted_minutes": round(projected_prediction.estimated_minutes),
+                        "heating_rate": round(
+                            projected_prediction.heating_rate_per_hour, 2
+                        ),
+                        "confidence": projected_prediction.confidence,
                     },
                 }
             )

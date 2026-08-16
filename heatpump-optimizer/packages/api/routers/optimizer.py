@@ -648,7 +648,19 @@ async def get_optimizer_status():
         },
         "thermal_model": {
             "calibrated": thermal_model.params.last_calibrated is not None,
-            "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),
+            # Effective, outdoor-adjusted and clamped rate. The raw stored
+            # intercept can be negative if calibration data only covered one
+            # season, which is confusing when surfaced to the dashboard.
+            "tank_heating_rate": round(
+                thermal_model._tank_heating_rate(outdoor_c if outdoor_c is not None else 10.0),
+                2,
+            ),
+            "tank_heating_rate_intercept_c0": round(
+                thermal_model.params.tank_heating_rate, 2
+            ),
+            "tank_heating_outdoor_factor": round(
+                thermal_model.params.tank_heating_outdoor_factor, 3
+            ),
             "confidence": thermal_model.confidence_for("tank_heating"),
             "indoor_heating_confidence": thermal_model.confidence_for("indoor_heating"),
             "indoor_heating_samples": thermal_model.params.indoor_heating_samples,

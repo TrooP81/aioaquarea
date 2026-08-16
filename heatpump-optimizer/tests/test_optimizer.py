@@ -226,6 +226,65 @@ class TestRulesOptimizer:
 
         assert slot == [prices[0]]
 
+    def test_dhw_slot_uses_trained_cop_model_when_tank_target_known(self):
+        """When the ML COP model is trained, DHW slot picks reflect the tank
+        target instead of the outdoor-only default curve. That opens the door
+        to real savings on hours where the ML model predicts a materially
+        different COP than the linear default.
+        """
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.10),
+            (base + dt.timedelta(hours=1), 0.10),
+        ]
+        weather = [
+            (base, 5.0),
+            (base + dt.timedelta(hours=1), 5.0),
+        ]
+
+        # ML model reports a much higher COP at hour 1 (e.g. warmer supply
+        # side, better setpoint alignment) than at hour 0. Same raw price, but
+        # hour 1 wins on cost per delivered kWh.
+        def _predict_cop(outdoor, target, hour):
+            return 5.0 if hour == 1 else 2.5
+
+        mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
+        with patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop):
+            slot = optimizer._find_lowest_dhw_energy_cost_slot(
+                prices,
+                weather,
+                hours_needed=1,
+                fallback_outdoor_temp=5.0,
+                tank_target=52,
+            )
+
+        assert slot == [prices[1]]
+
+    def test_dhw_slot_falls_back_to_default_cop_without_tank_target(self):
+        """The trained COP model must not be used when the tank target is
+        unknown, since predict_cop needs it. The default curve stays in play
+        for shared preheat callers that don't have a tank target.
+        """
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.10), (base + dt.timedelta(hours=1), 0.10)]
+        weather = [(base, 5.0), (base + dt.timedelta(hours=1), 5.0)]
+
+        called = []
+
+        def _predict_cop(outdoor, target, hour):
+            called.append((outdoor, target, hour))
+            return 5.0
+
+        mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
+        with patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop):
+            optimizer._find_lowest_dhw_energy_cost_slot(
+                prices, weather, hours_needed=1, fallback_outdoor_temp=5.0
+            )
+
+        assert called == []
+
     def test_plan_dhw_picks_cheapest_hours(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
         comfort_schedule = {
@@ -676,11 +735,85 @@ class TestRulesOptimizer:
 
         dhw_on = [action for action in actions if action["type"] == "force_dhw_on"]
         assert len(dhw_on) == 1
-        action_time = dt.datetime.fromisoformat(dhw_on[0]["ts"]).astimezone(
-            dt.timezone(dt.timedelta(hours=2))
+        action_time = dt.datetime.fromisoformat(dhw_on[0]["ts"])
+        local_deadline = dt.datetime(
+            2026, 7, 13, 7, tzinfo=dt.timezone(dt.timedelta(hours=2))
         )
-        assert action_time.hour < 7
+        assert action_time < local_deadline.astimezone(dt.timezone.utc)
         assert dhw_on[0]["payload"]["reason"] == "thermal_optimized_before_7:00"
+
+    def test_plan_dhw_uses_widened_lookback_window(self):
+        """A cheap hour more than 4h before the latest start must be reachable.
+
+        The prior 4h look-back missed overnight troughs when the deadline was
+        in the morning. The widened 8h window opens up those cheap hours to
+        the slot picker.
+        """
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        # 10 hours of prices with a distinct cheap hour at index 1 and a
+        # slightly more expensive stretch closer to the deadline. Everything
+        # is priced above index 1 so the widened window is the only way to
+        # reach it.
+        hourly = [0.20, 0.03, 0.15, 0.16, 0.17, 0.18, 0.19, 0.19, 0.19, 0.19]
+        prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
+        weather = [(base + dt.timedelta(hours=h), 8.0) for h in range(len(hourly))]
+        # Deadline at 07:00 Amsterdam = 05:00 UTC in summer, i.e. hour 5.
+        # optimal_start_time with 2°C delta (48→50) at outdoor 8°C is well
+        # under 1h, so the old 4h window would only expose hours 0-4.
+        schedule = {"weekday": [7, 8], "weekend": [7, 8]}
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=48.0,
+            tank_target=50,
+            current_outdoor_temp=8.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        dhw_on = [a for a in actions if a["type"] == "force_dhw_on"]
+        assert len(dhw_on) == 1
+        assert dhw_on[0]["ts"] == prices[1][0].isoformat()
+
+    def test_plan_dhw_sizes_top_up_for_projected_standby_loss(self):
+        """A slot several hours ahead must include tank cooling in its sizing.
+
+        A tank at 48°C now with target 52°C looks like a 1h top-up. But if
+        the cheapest slot starts 6h out, standby loss will have dropped the
+        tank another few °C, so the on-off pair must span more than one hour
+        to reach target.
+        """
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        # Cheap slot pinned at hour 6 with a valley of 0.02 EUR, ambient
+        # prices at 0.20 EUR everywhere else so the picker cannot avoid it.
+        hourly = [0.20] * 12
+        hourly[6] = 0.02
+        prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
+        weather = [(base + dt.timedelta(hours=h), 5.0) for h in range(len(hourly))]
+        schedule = {"weekday": [9, 10], "weekend": [9, 10]}
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=48.0,
+            tank_target=52,
+            current_outdoor_temp=5.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        on_action = next(a for a in actions if a["type"] == "force_dhw_on")
+        off_action = next(a for a in actions if a["type"] == "force_dhw_off")
+        on_ts = dt.datetime.fromisoformat(on_action["ts"])
+        off_ts = dt.datetime.fromisoformat(off_action["ts"])
+        # Standby loss between horizon start (t=0) and the slot start (t≈6h)
+        # extends the required heating window beyond the naive one hour.
+        assert (off_ts - on_ts) >= dt.timedelta(hours=2)
 
     def test_rules_snapshot_without_zone_heat_matches_no_heating(
         self, sample_prices, sample_weather
