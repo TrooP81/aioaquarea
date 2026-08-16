@@ -16,6 +16,10 @@ from packages.core.control_temperature import get_control_temperature
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
 from packages.core.models import ConsumptionRecord, ShowerEventRecord
 from packages.core.time_slots import next_hour_boundary
+from packages.core.panasonic_control_state import (
+    panasonic_tank_heating_available,
+    panasonic_zone_heating_available,
+)
 from packages.core.settings_service import (
     get_effective_schedule,
     get_float_setting,
@@ -42,7 +46,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     6. Detects holiday mode and suspends actions
     """
 
-    VERSION = "rules_v5"
+    VERSION = "rules_v6"
 
     @staticmethod
     def _action_timestamp(action: dict[str, Any]) -> dt.datetime | None:
@@ -271,6 +275,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         current_special_status = (
             getattr(last_status, "special_status", None) if last_status is not None else None
         )
+        tank_heating_available = panasonic_tank_heating_available(last_status)
+        zone_heating_available = panasonic_zone_heating_available(last_status)
         tank_target = (
             last_status.tank_target_temp if last_status and last_status.tank_target_temp else 52
         )
@@ -301,26 +307,26 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         comfort_temp_target = await get_float_setting("comfort_temp_target")
         comfort_temp_min = await get_float_setting("comfort_temp_min")
 
-        async with get_session() as session:
-            shower_row = await session.execute(
-                select(ShowerEventRecord).where(ShowerEventRecord.status == "active").limit(1)
+        if tank_heating_available:
+            async with get_session() as session:
+                shower_row = await session.execute(
+                    select(ShowerEventRecord).where(ShowerEventRecord.status == "active").limit(1)
+                )
+                shower_active = shower_row.scalar_one_or_none() is not None
+            actions.extend(
+                self._plan_dhw(
+                    prices,
+                    weather,
+                    horizon_start,
+                    current_tank_temp,
+                    tank_target,
+                    current_outdoor_temp,
+                    comfort_schedule,
+                    suppress_dhw_off=shower_active,
+                    tz_name=tz_name,
+                )
             )
-            shower_active = shower_row.scalar_one_or_none() is not None
-
-        actions.extend(
-            self._plan_dhw(
-                prices,
-                weather,
-                horizon_start,
-                current_tank_temp,
-                tank_target,
-                current_outdoor_temp,
-                comfort_schedule,
-                suppress_dhw_off=shower_active,
-                tz_name=tz_name,
-            )
-        )
-        if control_temperature.is_usable:
+        if control_temperature.is_usable and zone_heating_available:
             actions.extend(
                 self._plan_preheat(
                     prices,
@@ -348,7 +354,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             self._plan_quiet_mode(horizon_start, quiet_start, quiet_end, tz_name=tz_name)
         )
 
-        if control_temperature.is_usable:
+        if control_temperature.is_usable and zone_heating_available:
             actions.extend(
                 self._plan_indoor_guardrails(
                     prices,
@@ -371,28 +377,29 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
 
         comfort_override_pct = await get_int_setting("price_comfort_override_pct")
         eco_upgrade_pct = await get_int_setting("price_eco_upgrade_pct")
-        zone_control_windows = self._zone_control_windows(actions, horizon_end=horizon_end)
-        actions.extend(
-            self._plan_eco_comfort(
-                prices,
-                weather,
-                horizon_start,
-                comfort_schedule,
-                comfort_override_pct,
-                eco_upgrade_pct,
-                tz_name=tz_name,
-                current_indoor_temp=current_indoor_temp,
-                current_outdoor_temp=current_outdoor_temp,
-                current_water_temp=current_water_temp,
-                heat_curve=heat_curve,
-                comfort_temp_target=comfort_temp_target,
-                comfort_temp_min=comfort_temp_min,
-                weather_full=weather_full,
-                special_status_supported=special_status_supported,
-                current_special_status=current_special_status,
-                zone_control_windows=zone_control_windows,
+        if zone_heating_available:
+            zone_control_windows = self._zone_control_windows(actions, horizon_end=horizon_end)
+            actions.extend(
+                self._plan_eco_comfort(
+                    prices,
+                    weather,
+                    horizon_start,
+                    comfort_schedule,
+                    comfort_override_pct,
+                    eco_upgrade_pct,
+                    tz_name=tz_name,
+                    current_indoor_temp=current_indoor_temp,
+                    current_outdoor_temp=current_outdoor_temp,
+                    current_water_temp=current_water_temp,
+                    heat_curve=heat_curve,
+                    comfort_temp_target=comfort_temp_target,
+                    comfort_temp_min=comfort_temp_min,
+                    weather_full=weather_full,
+                    special_status_supported=special_status_supported,
+                    current_special_status=current_special_status,
+                    zone_control_windows=zone_control_windows,
+                )
             )
-        )
 
         if not actions:
             return None

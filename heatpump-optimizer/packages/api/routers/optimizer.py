@@ -609,7 +609,7 @@ async def get_optimizer_status():
     return {
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
-        "fallback_layer": "rules_v5",
+        "fallback_layer": "rules_v6",
         "last_plan": last_plan_info,
         "data_freshness": {
             "latest_device_status": latest_device_status.isoformat()
