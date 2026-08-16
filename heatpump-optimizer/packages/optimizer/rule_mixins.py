@@ -196,6 +196,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
     # top-ups are better left to the heat pump's own thermostat than turned
     # into a one-hour force-on/force-off pair.
     MIN_FORCE_DHW_MINUTES = 10
+    # Opportunistic tank banking during exceptionally cheap slots. Requires a
+    # material tank headroom so the arbitrage does not just wall-clock trip
+    # the thermostat, and a price meaningfully below the horizon median so a
+    # gently varying day cannot force an extra compressor cycle.
+    OPPORTUNISTIC_HEADROOM_C = 3
+    OPPORTUNISTIC_PRICE_FRACTION = 0.6
 
     def _find_lowest_dhw_energy_cost_slot(
         self,
@@ -363,6 +369,114 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     }
                 )
 
+        # Opportunistic banking: when the horizon contains an exceptionally
+        # cheap hour and the tank has real headroom, schedule an extra top-up
+        # in that slot. The classic case is a wind or solar oversupply valley
+        # in the middle of the day that the deadline loop cannot see because
+        # it stays inside the [latest_start - 8h, deadline) window.
+        opportunistic = self._plan_dhw_opportunistic_top_up(
+            prices,
+            weather,
+            horizon_start,
+            current_tank_temp,
+            tank_target,
+            current_outdoor_temp,
+            actions,
+            suppress_dhw_off=suppress_dhw_off,
+        )
+        actions.extend(opportunistic)
+
+        return actions
+
+    def _plan_dhw_opportunistic_top_up(
+        self,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        horizon_start: dt.datetime,
+        current_tank_temp: float,
+        tank_target: int,
+        current_outdoor_temp: float,
+        existing_actions: list[dict],
+        suppress_dhw_off: bool,
+    ) -> list[dict]:
+        """Schedule a bonus DHW cycle in an ultra-cheap slot, when it pays off.
+
+        Skipped when the tank is already near target (banking has no room),
+        when the horizon prices are near-flat (no meaningful arbitrage), or
+        when the cheapest slot overlaps a top-up already scheduled by the
+        deadline loop.
+        """
+        if not prices:
+            return []
+        if tank_target - current_tank_temp < self.OPPORTUNISTIC_HEADROOM_C:
+            return []
+
+        price_values = sorted(p for _, p in prices)
+        if len(set(price_values)) <= 1:
+            return []
+        median_price = price_values[len(price_values) // 2]
+        threshold = median_price * self.OPPORTUNISTIC_PRICE_FRACTION
+        candidates = [(ts, p) for ts, p in prices if p < threshold]
+        if not candidates:
+            return []
+
+        # Do not double up with a top-up the deadline loop already placed.
+        scheduled_hours = {
+            action["ts"][:13]
+            for action in existing_actions
+            if action.get("type") == str(ActionType.FORCE_DHW_ON)
+            and isinstance(action.get("ts"), str)
+        }
+        available = [
+            (ts, p) for ts, p in candidates if ts.isoformat()[:13] not in scheduled_hours
+        ]
+        if not available:
+            return []
+
+        slot_start, slot_price = min(available, key=lambda item: item[1])
+        delay_hours = max(
+            0.0, (slot_start - horizon_start).total_seconds() / 3600.0
+        )
+        projected_tank_temp = current_tank_temp
+        if delay_hours > 0.0:
+            loss_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
+            loss_rate_per_h = thermal_model._tank_loss_rate(loss_outdoor)
+            projected_tank_temp = max(
+                0.0, current_tank_temp + loss_rate_per_h * delay_hours
+            )
+        slot_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
+        prediction = thermal_model.predict_tank_heating_time(
+            current_temp=projected_tank_temp,
+            target_temp=float(tank_target),
+            outdoor_temp=slot_outdoor,
+        )
+        if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
+            return []
+
+        hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        actions: list[dict] = [
+            {
+                "ts": slot_start.isoformat(),
+                "type": str(ActionType.FORCE_DHW_ON),
+                "payload": {
+                    "reason": (
+                        f"opportunistic_cheap_slot_{slot_price:.4f}_eur"
+                    ),
+                    "predicted_minutes": round(prediction.estimated_minutes),
+                    "heating_rate": round(prediction.heating_rate_per_hour, 2),
+                    "confidence": prediction.confidence,
+                    "median_price": round(median_price, 4),
+                },
+            }
+        ]
+        if not suppress_dhw_off:
+            actions.append(
+                {
+                    "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
+                    "type": str(ActionType.FORCE_DHW_OFF),
+                    "payload": {"reason": "opportunistic_top_up_complete"},
+                }
+            )
         return actions
 
 

@@ -305,9 +305,16 @@ class TestRulesOptimizer:
         dhw_on_actions = [a for a in actions if a["type"] == "force_dhw_on"]
         assert len(dhw_on_actions) > 0
 
-        # Every action carries the local readiness deadline it was selected to
-        # meet. The exact price varies with how close the deadline is.
-        for action in dhw_on_actions:
+        # Every deadline-driven action carries the local readiness deadline it
+        # was selected to meet. Opportunistic banking is a separate branch and
+        # allowed to appear alongside deadline-driven top-ups.
+        deadline_actions = [
+            a
+            for a in dhw_on_actions
+            if not a["payload"].get("reason", "").startswith("opportunistic_")
+        ]
+        assert deadline_actions
+        for action in deadline_actions:
             assert action["payload"]["reason"].startswith("thermal_optimized_before_")
 
     def test_plan_peak_avoidance(self, sample_prices, sample_weather):
@@ -843,13 +850,108 @@ class TestRulesOptimizer:
             tz_name="Europe/Amsterdam",
         )
 
-        on_action = next(a for a in actions if a["type"] == "force_dhw_on")
-        off_action = next(a for a in actions if a["type"] == "force_dhw_off")
+        on_action = next(
+            a for a in actions if a["type"] == "force_dhw_on" and "opportunistic" not in a["payload"]["reason"]
+        )
+        off_action = next(
+            a for a in actions if a["type"] == "force_dhw_off" and a["payload"]["reason"] == "dhw_target_reached"
+        )
         on_ts = dt.datetime.fromisoformat(on_action["ts"])
         off_ts = dt.datetime.fromisoformat(off_action["ts"])
         # Standby loss between horizon start (t=0) and the slot start (t≈6h)
         # extends the required heating window beyond the naive one hour.
         assert (off_ts - on_ts) >= dt.timedelta(hours=2)
+
+    def test_plan_dhw_banks_energy_in_ultra_cheap_slot(self):
+        """A cheap valley far from any deadline should trigger opportunistic
+        banking. The deadline-driven top-up still fires; the arbitrage adds
+        an extra top-up in the cheap slot."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        hourly = [0.20] * 24
+        # Ultra-cheap valley at hour 2 (0.02 EUR, well below 0.6 * median 0.20 = 0.12)
+        hourly[2] = 0.02
+        prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
+        weather = [(ts, 5.0) for ts, _ in prices]
+        # Morning DHW deadline at 07:00 local (05:00 UTC in summer)
+        schedule = {"weekday": [7, 8], "weekend": [7, 8]}
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=45.0,  # ≥3°C headroom below target 50
+            tank_target=50,
+            current_outdoor_temp=5.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        opportunistic_ons = [
+            a
+            for a in actions
+            if a["type"] == "force_dhw_on"
+            and a["payload"].get("reason", "").startswith("opportunistic_cheap_slot_")
+        ]
+        assert len(opportunistic_ons) == 1
+        # The banking slot should be the cheapest hour (hour 2)
+        assert opportunistic_ons[0]["ts"] == prices[2][0].isoformat()
+
+    def test_plan_dhw_no_arbitrage_when_tank_full(self):
+        """A near-target tank has no headroom to bank cheap kWh."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        hourly = [0.20] * 24
+        hourly[2] = 0.02
+        prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
+        weather = [(ts, 5.0) for ts, _ in prices]
+        schedule = {"weekday": [7, 8], "weekend": [7, 8]}
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=49.0,  # only 1°C below target -> no headroom
+            tank_target=50,
+            current_outdoor_temp=5.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        opportunistic = [
+            a
+            for a in actions
+            if a["type"] == "force_dhw_on"
+            and a["payload"].get("reason", "").startswith("opportunistic_cheap_slot_")
+        ]
+        assert opportunistic == []
+
+    def test_plan_dhw_no_arbitrage_on_flat_prices(self):
+        """Flat pricing offers no arbitrage opportunity."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        prices = [(base + dt.timedelta(hours=h), 0.10) for h in range(24)]
+        weather = [(ts, 5.0) for ts, _ in prices]
+        schedule = {"weekday": [7, 8], "weekend": [7, 8]}
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=45.0,
+            tank_target=50,
+            current_outdoor_temp=5.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        opportunistic = [
+            a
+            for a in actions
+            if a["type"] == "force_dhw_on"
+            and a["payload"].get("reason", "").startswith("opportunistic_cheap_slot_")
+        ]
+        assert opportunistic == []
 
     def test_rules_snapshot_without_zone_heat_matches_no_heating(
         self, sample_prices, sample_weather
