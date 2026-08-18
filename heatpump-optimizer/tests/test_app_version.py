@@ -22,6 +22,16 @@ def test_release_version_is_consistent_across_services():
     assert app.version == APP_VERSION
 
 
+def test_release_version_is_embedded_in_container_builds():
+    """Backend and dashboard images must retain the release version as OCI metadata."""
+    dockerfiles = [PROJECT_ROOT / "Dockerfile", PROJECT_ROOT / "web" / "Dockerfile"]
+
+    for dockerfile in dockerfiles:
+        contents = dockerfile.read_text(encoding="utf-8")
+        assert f"ARG APP_VERSION={APP_VERSION}" in contents
+        assert 'org.opencontainers.image.version="${APP_VERSION}"' in contents
+
+
 @pytest.mark.asyncio
 async def test_version_endpoint_reports_running_api_version():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

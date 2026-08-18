@@ -17,6 +17,17 @@ export interface ReleaseNote {
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
+    released: "2026-08-18",
+    title: "Safer cost-aware heat planning",
+    changes: [
+      "DHW planning now projects earlier heating cycles across later ready-by deadlines, accounts for standby losses, and avoids redundant banking cycles.",
+      "Heat slots are ranked by delivered-heat cost and must cover the full requested runtime with contiguous published prices.",
+      "The trained DHW COP model is shared with active rules without being misapplied to space-heating supply temperatures.",
+      "Demand forecasts align with forecast timestamps, while warm-weather MILP fallback no longer reserves unnecessary space heat."
+    ],
+  },
+  {
+    version: "0.12.0",
     released: "2026-07-28",
     title: "Weather-based outdoor temperature compensation",
     changes: [
