@@ -224,6 +224,44 @@ class TestMILPSolver:
             [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
         ) == [0.0, 0.0, 0.0, 12.0, 0.0]
 
+    def test_demand_weather_is_aligned_to_horizon_timestamps(self):
+        """Out-of-order full weather rows must not shift demand features by an hour."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        weather = [(base, 1.0), (base + dt.timedelta(hours=1), 2.0)]
+        weather_full = [
+            {
+                "ts": base + dt.timedelta(hours=1),
+                "temperature": 11.0,
+                "wind_speed": 9.0,
+                "irradiance": 200.0,
+            },
+            {
+                "ts": base,
+                "temperature": 10.0,
+                "wind_speed": 8.0,
+                "irradiance": 100.0,
+            },
+            {
+                "ts": base + dt.timedelta(hours=5),
+                "temperature": 99.0,
+                "wind_speed": 99.0,
+                "irradiance": 999.0,
+            },
+        ]
+        demand = MagicMock(is_trained=True)
+        demand.predict_hourly.return_value = [1.0, 2.0]
+
+        result = MILPOptimizer(demand_model=demand)._build_demand_estimates(weather, weather_full)
+
+        assert result == [1.0, 2.0]
+        forecast, hours = demand.predict_hourly.call_args.args
+        assert hours == 2
+        assert [row["ts"] for row in forecast] == [weather[0][0], weather[1][0]]
+        assert [row["temperature"] for row in forecast] == [10.0, 11.0]
+        assert [row["wind_speed"] for row in forecast] == [8.0, 9.0]
+
     def test_comfort_rates_use_all_forecast_weather_features(self):
         """Wind and sun learned by the comfort model must reach the MILP."""
         from packages.optimizer.milp import MILPOptimizer

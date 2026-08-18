@@ -240,6 +240,46 @@ class TestDemandModel:
         assert features[4] == 82.0  # humidity
         assert features[5] == 0.75  # cloud cover
 
+    def test_prediction_time_features_use_forecast_timestamps(self):
+        """Prediction hour and weekday must follow the forecast, not wall-clock now."""
+        from packages.ml.models import DemandModel
+
+        captured = []
+
+        class CapturingModel:
+            def predict(self, features):
+                captured.append(features[0].copy())
+                return [1.0]
+
+        model = DemandModel()
+        model._model = CapturingModel()
+        monday = dt.datetime(2026, 1, 5, 23, 0, tzinfo=dt.timezone.utc)
+        tuesday = monday + dt.timedelta(hours=1)
+
+        model.predict_hourly(
+            [
+                {"ts": monday, "temperature": 5.0},
+                {"ts": tuesday, "temperature": 5.0},
+            ],
+            hours=2,
+        )
+
+        expected_monday = DemandModel._make_features(5.0, 3.0, 0.0, 23, 0)
+        expected_tuesday = DemandModel._make_features(5.0, 3.0, 0.0, 0, 1)
+        assert captured[0] == pytest.approx(expected_monday)
+        assert captured[1] == pytest.approx(expected_tuesday)
+
+        captured.clear()
+        model.predict_hourly_quantiles(
+            [
+                {"ts": monday, "temperature": 5.0},
+                {"ts": tuesday, "temperature": 5.0},
+            ],
+            hours=2,
+        )
+        assert captured[0] == pytest.approx(expected_monday)
+        assert captured[1] == pytest.approx(expected_tuesday)
+
     @pytest.mark.asyncio
     async def test_prepare_data_uses_interval_rate_not_cumulative(self):
         """Target must be per-interval hourly RATE, never the cumulative counter."""

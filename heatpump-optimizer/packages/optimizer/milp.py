@@ -332,27 +332,15 @@ class MILPOptimizer:
         """Return hourly demand estimates (kW) for the horizon."""
         if self._demand_model and self._demand_model.is_trained:
             logger.info("milp_using_ml_demand_model")
-            if weather_full:
-
-                def value(point: dict, key: str, default: float) -> float:
-                    raw = point.get(key)
-                    return float(default if raw is None else raw)
-
-                weather_dicts = [
-                    {
-                        "temperature": value(w, "temperature", 5.0),
-                        "wind_speed": value(w, "wind_speed", 3.0),
-                        "irradiance": value(w, "irradiance", 0.0),
-                        "precipitation": value(w, "precipitation", 0.0),
-                        "humidity": value(w, "humidity", 60.0),
-                        "cloud_cover": value(w, "cloud_cover", 0.5),
-                    }
-                    for w in weather_full
-                ]
-            else:
-                weather_dicts = [
-                    {"temperature": t, "wind_speed": 3.0, "irradiance": 0.0} for _, t in weather
-                ]
+            weather_dicts = []
+            for timestamp, temperature in weather:
+                fallback_temperature = float(temperature) if temperature is not None else 5.0
+                conditions = self._forecast_conditions(
+                    weather_full,
+                    timestamp,
+                    fallback_temperature=fallback_temperature,
+                )
+                weather_dicts.append({"ts": timestamp, **conditions})
             return self._demand_model.predict_hourly(weather_dicts, len(weather))
 
         # Fallback: use SH power from config as a rough estimate

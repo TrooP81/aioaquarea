@@ -190,8 +190,11 @@ class DemandModel:
         predictions = []
         now = dt.datetime.now(dt.timezone.utc)
         for h in range(hours):
-            ts = now + dt.timedelta(hours=h)
             weather = weather_forecast[h] if h < len(weather_forecast) else {}
+            forecast_ts = weather.get("ts")
+            ts = (
+                forecast_ts if isinstance(forecast_ts, dt.datetime) else now + dt.timedelta(hours=h)
+            )
             temp = weather.get("temperature", 5.0)
             wind = weather.get("wind_speed", 3.0)
             irradiance = weather.get("irradiance", 0.0)
@@ -226,8 +229,11 @@ class DemandModel:
         results: list[dict] = []
         now = dt.datetime.now(dt.timezone.utc)
         for h in range(hours):
-            ts = now + dt.timedelta(hours=h)
             weather = weather_forecast[h] if h < len(weather_forecast) else {}
+            forecast_ts = weather.get("ts")
+            ts = (
+                forecast_ts if isinstance(forecast_ts, dt.datetime) else now + dt.timedelta(hours=h)
+            )
             temp = weather.get("temperature", 5.0)
             wind = weather.get("wind_speed", 3.0)
             irradiance = weather.get("irradiance", 0.0)
