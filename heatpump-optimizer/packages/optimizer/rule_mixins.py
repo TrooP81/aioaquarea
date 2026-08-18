@@ -220,6 +220,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
     # top-ups are better left to the heat pump's own thermostat than turned
     # into a one-hour force-on/force-off pair.
     MIN_FORCE_DHW_MINUTES = 10
+    MAX_DHW_DEADLINE_COAST_C = 1.0
     # Opportunistic tank banking during exceptionally cheap slots. Requires a
     # material tank headroom so the arbitrage does not just wall-clock trip
     # the thermostat, and a price meaningfully below the horizon median so a
@@ -290,6 +291,79 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
 
         return sorted(deadlines, key=lambda item: item[0])
 
+    def _project_tank_temperature(
+        self,
+        current_temp: float,
+        horizon_start: dt.datetime,
+        target_time: dt.datetime,
+        tank_target: int,
+        weather: list[tuple[dt.datetime, float]],
+        fallback_outdoor_temp: float,
+        actions: list[dict],
+    ) -> float:
+        """Project tank state through standby loss and prior forced cycles."""
+        if target_time <= horizon_start:
+            return current_temp
+
+        events: list[tuple[dt.datetime, int, bool]] = []
+        for action in actions:
+            action_type = action.get("type")
+            if action_type not in {
+                str(ActionType.FORCE_DHW_ON),
+                str(ActionType.FORCE_DHW_OFF),
+            }:
+                continue
+            try:
+                timestamp = dt.datetime.fromisoformat(str(action["ts"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+            timestamp = timestamp.astimezone(dt.timezone.utc)
+            if not horizon_start <= timestamp < target_time:
+                continue
+            is_on = action_type == str(ActionType.FORCE_DHW_ON)
+            events.append((timestamp, 1 if is_on else 0, is_on))
+
+        temperature = current_temp
+        cursor = horizon_start
+        heating = False
+        for event_time, _, is_on in sorted(events):
+            while cursor < event_time:
+                step_end = min(event_time, cursor + dt.timedelta(hours=1))
+                elapsed_hours = (step_end - cursor).total_seconds() / 3600.0
+                outdoor = self._get_outdoor_at(weather, cursor, fallback_outdoor_temp)
+                if heating:
+                    temperature = min(
+                        float(tank_target),
+                        temperature + thermal_model._tank_heating_rate(outdoor) * elapsed_hours,
+                    )
+                else:
+                    temperature = max(
+                        0.0,
+                        temperature + thermal_model._tank_loss_rate(outdoor) * elapsed_hours,
+                    )
+                cursor = step_end
+            heating = is_on
+
+        while cursor < target_time:
+            step_end = min(target_time, cursor + dt.timedelta(hours=1))
+            elapsed_hours = (step_end - cursor).total_seconds() / 3600.0
+            outdoor = self._get_outdoor_at(weather, cursor, fallback_outdoor_temp)
+            if heating:
+                temperature = min(
+                    float(tank_target),
+                    temperature + thermal_model._tank_heating_rate(outdoor) * elapsed_hours,
+                )
+            else:
+                temperature = max(
+                    0.0,
+                    temperature + thermal_model._tank_loss_rate(outdoor) * elapsed_hours,
+                )
+            cursor = step_end
+
+        return temperature
+
     def _plan_dhw(
         self,
         prices: list[tuple[dt.datetime, float]],
@@ -341,28 +415,43 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 continue
 
             slot_start = best_slot[0][0]
-            # Standby loss between now and slot start means the tank will be
-            # cooler at slot start than it is now, so more heating time is
-            # needed. Size the top-up against the projected temperature.
-            delay_hours = max(
-                0.0,
-                (slot_start - horizon_start).total_seconds() / 3600.0,
-            )
-            projected_tank_temp = current_tank_temp
-            if delay_hours > 0.0:
-                loss_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
-                loss_rate_per_h = thermal_model._tank_loss_rate(loss_outdoor)
-                projected_tank_temp = max(0.0, current_tank_temp + loss_rate_per_h * delay_hours)
-            slot_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
-            projected_prediction = thermal_model.predict_tank_heating_time(
-                current_temp=projected_tank_temp,
-                target_temp=float(tank_target),
-                outdoor_temp=slot_outdoor,
-            )
-            hours_needed = max(
-                base_hours_needed,
-                int(projected_prediction.estimated_hours + 0.9),
-            )
+            for _ in range(4):
+                projected_tank_temp = self._project_tank_temperature(
+                    current_tank_temp,
+                    horizon_start,
+                    slot_start,
+                    tank_target,
+                    weather,
+                    current_outdoor_temp,
+                    actions,
+                )
+                slot_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
+                projected_prediction = thermal_model.predict_tank_heating_time(
+                    current_temp=projected_tank_temp,
+                    target_temp=float(tank_target),
+                    outdoor_temp=slot_outdoor,
+                )
+                hours_needed = max(
+                    1,
+                    int(projected_prediction.estimated_hours + 0.9),
+                )
+                off_time = slot_start + dt.timedelta(hours=hours_needed)
+                coast_hours = max(0.0, (deadline - off_time).total_seconds() / 3600.0)
+                deadline_outdoor = self._get_outdoor_at(weather, deadline, current_outdoor_temp)
+                coast_loss = abs(thermal_model._tank_loss_rate(deadline_outdoor)) * coast_hours
+                if off_time <= deadline and coast_loss <= self.MAX_DHW_DEADLINE_COAST_C:
+                    break
+
+                adjusted_start = max(
+                    horizon_start,
+                    deadline - dt.timedelta(hours=hours_needed),
+                )
+                if adjusted_start == slot_start:
+                    break
+                slot_start = adjusted_start
+
+            if projected_prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
+                continue
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
@@ -375,7 +464,6 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     },
                 }
             )
-            off_time = slot_start + dt.timedelta(hours=hours_needed)
             if not suppress_dhw_off:
                 actions.append(
                     {

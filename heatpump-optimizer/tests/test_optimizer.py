@@ -781,25 +781,49 @@ class TestRulesOptimizer:
         assert action_time < local_deadline.astimezone(dt.timezone.utc)
         assert dhw_on[0]["payload"]["reason"] == "thermal_optimized_before_7:00"
 
-    def test_plan_dhw_uses_widened_lookback_window(self):
-        """A cheap hour more than 4h before the latest start must be reachable.
-
-        The prior 4h look-back missed overnight troughs when the deadline was
-        in the morning. The widened 8h window opens up those cheap hours to
-        the slot picker.
-        """
+    def test_multiple_dhw_deadlines_project_the_prior_cycle(self):
+        """Evening sizing must start from the morning cycle, not the stale live reading."""
         optimizer = RulesOptimizer()
         base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
-        # 10 hours of prices with a distinct cheap hour at index 1 and a
-        # slightly more expensive stretch closer to the deadline. Everything
-        # is priced above index 1 so the widened window is the only way to
-        # reach it.
+        prices = [(base + dt.timedelta(hours=hour), 0.10 + (hour % 3) * 0.01) for hour in range(24)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        schedule = {
+            "weekday": [7, 8, 9, 17, 18, 19],
+            "weekend": [7, 8, 9, 17, 18, 19],
+        }
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=45.0,
+            tank_target=50,
+            current_outdoor_temp=5.0,
+            comfort_schedule=schedule,
+            tz_name="Europe/Amsterdam",
+        )
+
+        dhw_ons = [action for action in actions if action["type"] == "force_dhw_on"]
+        assert len(dhw_ons) == 2
+        assert dhw_ons[0]["payload"]["reason"] == "thermal_optimized_before_7:00"
+        assert dhw_ons[1]["payload"]["reason"] == "thermal_optimized_before_17:00"
+        assert dhw_ons[1]["payload"]["predicted_minutes"] < 90
+
+        evening_start = dt.datetime.fromisoformat(dhw_ons[1]["ts"])
+        evening_deadline = dt.datetime(2026, 4, 30, 15, tzinfo=dt.timezone.utc)
+        assert evening_start >= evening_deadline - dt.timedelta(hours=2)
+
+    def test_plan_dhw_rejects_cheap_slot_that_cools_before_deadline(self):
+        """A cheap early slot must not win when its heat is lost before ready-by time."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        # The old planner selected hour 1 solely on price, then stopped three
+        # hours before the deadline. The tank cannot bank above its target, so
+        # that early heat cools away and causes another thermostat cycle.
         hourly = [0.20, 0.03, 0.15, 0.16, 0.17, 0.18, 0.19, 0.19, 0.19, 0.19]
         prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
         weather = [(base + dt.timedelta(hours=h), 8.0) for h in range(len(hourly))]
         # Deadline at 07:00 Amsterdam = 05:00 UTC in summer, i.e. hour 5.
-        # optimal_start_time with 2°C delta (48→50) at outdoor 8°C is well
-        # under 1h, so the old 4h window would only expose hours 0-4.
         schedule = {"weekday": [7, 8], "weekend": [7, 8]}
 
         actions = optimizer._plan_dhw(
@@ -815,7 +839,7 @@ class TestRulesOptimizer:
 
         dhw_on = [a for a in actions if a["type"] == "force_dhw_on"]
         assert len(dhw_on) == 1
-        assert dhw_on[0]["ts"] == prices[1][0].isoformat()
+        assert dhw_on[0]["ts"] == prices[4][0].isoformat()
 
     def test_plan_dhw_sizes_top_up_for_projected_standby_loss(self):
         """A slot several hours ahead must include tank cooling in its sizing.
