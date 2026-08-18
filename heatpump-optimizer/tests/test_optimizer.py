@@ -953,6 +953,141 @@ class TestRulesOptimizer:
         ]
         assert opportunistic == []
 
+    def test_weather_heat_loss_factor_scales_with_wind_and_rain(self):
+        """Wind and rain must push the loss factor above 1.0 but stay bounded."""
+        optimizer = RulesOptimizer()
+        ts = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+
+        # Calm: exactly 1.0
+        calm = optimizer._weather_heat_loss_factor(
+            ts, [{"ts": ts, "wind_speed": 2.0, "precipitation": 0.0}]
+        )
+        assert calm == 1.0
+
+        # Windy but dry
+        windy = optimizer._weather_heat_loss_factor(
+            ts, [{"ts": ts, "wind_speed": 10.0, "precipitation": 0.0}]
+        )
+        assert 1.0 < windy < optimizer._WEATHER_LOSS_MAX_FACTOR
+
+        # Storm: clamped
+        storm = optimizer._weather_heat_loss_factor(
+            ts, [{"ts": ts, "wind_speed": 30.0, "precipitation": 20.0}]
+        )
+        assert storm == optimizer._WEATHER_LOSS_MAX_FACTOR
+
+        # No weather data -> passthrough
+        assert optimizer._weather_heat_loss_factor(ts, None) == 1.0
+        assert optimizer._weather_heat_loss_factor(ts, []) == 1.0
+
+    def test_preheat_uses_trained_cop_for_supply_water(self):
+        """Preheat cost-per-kWh should route through the trained COP model
+        with the supply water target as the tank_target proxy."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.10),
+            (base + dt.timedelta(hours=1), 0.10),
+            (base + dt.timedelta(hours=2), 0.50),
+        ]
+        weather = [
+            (base, 5.0),
+            (base + dt.timedelta(hours=1), 5.0),
+            (base + dt.timedelta(hours=2), -5.0),
+        ]
+        passive = {
+            base: 21.0,
+            base + dt.timedelta(hours=1): 21.0,
+            base + dt.timedelta(hours=2): 19.0,
+        }
+        seen_targets: list[int] = []
+
+        def _predict_cop(outdoor, target, hour):
+            seen_targets.append(int(target))
+            return 4.0
+
+        mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
+
+        with (
+            patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
+            patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
+                return_value=SimpleNamespace(
+                    estimated_hours=0.5,
+                    estimated_minutes=30.0,
+                    heating_rate_per_hour=4.0,
+                ),
+            ),
+        ):
+            optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=21.0,
+                current_outdoor_temp=5.0,
+                current_water_temp=30.0,
+                current_zone_target_temp=36.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_target=20.5,
+                comfort_temp_min=18.0,
+            )
+
+        # Preheat must have consulted the trained COP model at least once,
+        # and always with a plausible zone-water target (not a DHW default).
+        assert seen_targets
+        assert all(20 <= target <= 60 for target in seen_targets)
+
+    def test_preheat_scales_hours_needed_in_windy_weather(self):
+        """A storm at the cold hour should reserve more heating runtime."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base + dt.timedelta(hours=h), 0.10) for h in range(6)]
+        weather = [(base + dt.timedelta(hours=h), 5.0) for h in range(6)]
+        weather[3] = (base + dt.timedelta(hours=3), -5.0)
+        weather_full = [
+            {
+                "ts": base + dt.timedelta(hours=3),
+                "wind_speed": 15.0,
+                "precipitation": 5.0,
+                "temperature": -5.0,
+            }
+        ]
+        passive = {ts: 19.0 for ts, _ in prices}
+        passive[base] = 21.0
+
+        with (
+            patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
+                return_value=SimpleNamespace(
+                    estimated_hours=1.0,
+                    estimated_minutes=60.0,
+                    heating_rate_per_hour=4.0,
+                ),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=21.0,
+                current_outdoor_temp=5.0,
+                current_water_temp=30.0,
+                current_zone_target_temp=36.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                weather_full=weather_full,
+            )
+
+        boost = next(a for a in actions if a["type"] == "zone_temp_boost")
+        restore = next(a for a in actions if a["type"] == "zone_temp_restore")
+        boost_ts = dt.datetime.fromisoformat(boost["ts"])
+        restore_ts = dt.datetime.fromisoformat(restore["ts"])
+        # Baseline hours_needed=1h; storm penalty must extend it beyond that.
+        assert (restore_ts - boost_ts) >= dt.timedelta(hours=2)
+
     def test_rules_snapshot_without_zone_heat_matches_no_heating(
         self, sample_prices, sample_weather
     ):

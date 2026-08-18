@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from zoneinfo import ZoneInfo
 
 from packages.core.heat_curve import HeatCurveConfig
@@ -149,6 +150,29 @@ class SharedRuleHelpersMixin:
             "precipitation": value("precipitation", 0.0, non_negative=True),
             "hour": timestamp.hour,
         }
+
+    # Wind and rain increase envelope heat loss beyond what an outdoor-only
+    # rate predicts. Scale hours_needed so the preheat still reaches target
+    # before the cold hour instead of finishing short. Values chosen from
+    # ASHRAE-style infiltration multipliers, bounded so a stormy day cannot
+    # double the runtime and hog the horizon.
+    _WIND_LOSS_SCALE = 0.04  # per (m/s above 3 m/s)
+    _RAIN_LOSS_SCALE = 0.10  # per (mm/h above 0)
+    _WEATHER_LOSS_MAX_FACTOR = 1.35
+
+    def _weather_heat_loss_factor(
+        self,
+        timestamp: dt.datetime,
+        weather_full: list[dict] | None,
+    ) -> float:
+        """Return a >=1.0 multiplier for expected heat loss at ``timestamp``."""
+        if not weather_full:
+            return 1.0
+        conditions = self._weather_conditions_at(timestamp, weather_full, 0.0)
+        wind_over = max(0.0, conditions["wind_speed"] - 3.0)
+        rain = max(0.0, conditions["precipitation"])
+        factor = 1.0 + wind_over * self._WIND_LOSS_SCALE + rain * self._RAIN_LOSS_SCALE
+        return max(1.0, min(self._WEATHER_LOSS_MAX_FACTOR, factor))
 
     def _passive_indoor_forecast(
         self,
@@ -571,6 +595,12 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             outdoor_temp=outdoor_at_cold,
         )
         hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        # Wind-driven infiltration and evaporative cooling from rain hurt the
+        # heat pump's effective output. Widen the reserved runtime so the
+        # preheat still arrives at the target boost before the cold hour.
+        weather_penalty = self._weather_heat_loss_factor(first_cold, weather_full)
+        if weather_penalty > 1.0:
+            hours_needed = max(hours_needed, math.ceil(hours_needed * weather_penalty))
         # Widen the look-back so the picker can reach overnight off-peak
         # troughs before an early-morning cold hour, matching the DHW rule.
         preheat_window_start = max(first_cold - dt.timedelta(hours=hours_needed + 8), horizon_start)
@@ -597,6 +627,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             weather,
             hours_needed,
             current_outdoor_temp,
+            tank_target=int(round(target_zone_boost)),
         )
         if best_slot:
             slot_start = best_slot[0][0]
@@ -707,7 +738,12 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 outdoor_temp=weather_forecast[h]["outdoor_temp"],
             )
             hours_needed = max(1, int(heating_pred.estimated_hours + 0.9))
-            window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 2))
+            weather_penalty = self._weather_heat_loss_factor(hour_ts, weather_full)
+            if weather_penalty > 1.0:
+                hours_needed = max(hours_needed, math.ceil(hours_needed * weather_penalty))
+            # Widen the look-back so the picker can catch overnight off-peak
+            # troughs before the guardrail hour, matching DHW and preheat.
+            window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 6))
             weather_by_ts = {ts: temp for ts, temp in weather}
 
             def controller_can_heat(ts: dt.datetime) -> bool:
@@ -723,12 +759,17 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 for ts, p in prices
                 if window_start <= ts <= hour_ts and controller_can_heat(ts)
             ]
+            # A boost target is a supply water temperature; give the trained
+            # COP model that number so cost/kWh reflects the actual load
+            # instead of the outdoor-only default curve.
+            boost_supply_temp = int(round(curve_supply_temps[h])) if h < len(curve_supply_temps) else None
             best_slot = (
                 self._find_lowest_heat_energy_cost_slot(
                     window_prices,
                     weather,
                     hours_needed,
                     current_outdoor_temp,
+                    tank_target=boost_supply_temp,
                 )
                 if window_prices
                 else None
