@@ -52,7 +52,7 @@ class SharedRuleHelpersMixin:
         prices: list[tuple[dt.datetime, float]], hours_needed: int
     ) -> list[tuple[dt.datetime, float]] | None:
         if len(prices) < hours_needed:
-            return prices if prices else None
+            return None
 
         sorted_prices = sorted(prices, key=lambda x: x[0])
         best_cost = float("inf")
@@ -70,10 +70,6 @@ class SharedRuleHelpersMixin:
             if cost < best_cost:
                 best_cost = cost
                 best_slot = slot
-
-        if best_slot is None:
-            sorted_by_price = sorted(prices, key=lambda x: x[1])
-            best_slot = sorted_by_price[:hours_needed]
 
         return best_slot
 

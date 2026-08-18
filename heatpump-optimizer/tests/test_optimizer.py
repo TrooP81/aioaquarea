@@ -285,6 +285,30 @@ class TestRulesOptimizer:
 
         assert called == []
 
+    def test_heat_slot_rejects_fragmented_price_hours(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.05), (base + dt.timedelta(hours=2), 0.04)]
+        weather = [(ts, 5.0) for ts, _ in prices]
+
+        slot = optimizer._find_lowest_heat_energy_cost_slot(
+            prices, weather, hours_needed=2, fallback_outdoor_temp=5.0
+        )
+
+        assert slot is None
+
+    def test_heat_slot_rejects_incomplete_runtime(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.05)]
+        weather = [(base, 5.0)]
+
+        slot = optimizer._find_lowest_heat_energy_cost_slot(
+            prices, weather, hours_needed=2, fallback_outdoor_temp=5.0
+        )
+
+        assert slot is None
+
     def test_plan_dhw_picks_cheapest_hours(self, sample_prices, sample_weather):
         optimizer = RulesOptimizer()
         comfort_schedule = {
