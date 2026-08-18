@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 from typing import Any
 
 try:
@@ -47,6 +48,7 @@ class MILPOptimizer:
 
     VERSION = "milp_v1"
     SOLVER_TIMEOUT_SECONDS = 30
+    FALLBACK_DESIGN_OUTDOOR_C = -15.0
 
     # Objective penalty per degree-hour below the indoor comfort target. It is
     # deliberately far above any realistic energy saving, but keeps the model
@@ -148,8 +150,17 @@ class MILPOptimizer:
         # Build COP function: prefer ML model, fall back to default curve
         cop_fn = self._build_cop_function(last_status, weather_full)
 
-        # Build demand estimates: prefer ML model, fall back to constant
-        demand_per_hour = self._build_demand_estimates(weather, weather_full)
+        # Use the same controller cutoff for fallback demand and supply-water
+        # planning so manual MILP mode cannot reserve space-heating energy after
+        # the Panasonic heat curve has switched heating off.
+        heat_curve = await get_heat_curve_config()
+
+        # Build demand estimates: prefer ML model, fall back to degree-day load.
+        demand_per_hour = self._build_demand_estimates(
+            weather,
+            weather_full,
+            heating_off_outdoor_c=heat_curve.heating_off_outdoor_c,
+        )
 
         # Get comfort schedule to derive DHW deadlines
         comfort_schedule = await get_comfort_schedule()
@@ -212,7 +223,6 @@ class MILPOptimizer:
         # Use the Panasonic curve recorded in Settings as the NORMAL-mode
         # baseline for each forecast hour.  The live zone target is only a
         # momentary reading and should not be projected through tomorrow.
-        heat_curve = await get_heat_curve_config()
         heat_curve_water_temps = [
             heat_curve.planned_supply_temperature(
                 float(weather[h][1]) if h < len(weather) and weather[h][1] is not None else 5.0
@@ -328,7 +338,12 @@ class MILPOptimizer:
         logger.info("milp_using_default_cop_curve")
         return lambda outdoor_temp, hour=12: self._default_cop_curve(outdoor_temp)
 
-    def _build_demand_estimates(self, weather, weather_full=None) -> list[float]:
+    def _build_demand_estimates(
+        self,
+        weather,
+        weather_full=None,
+        heating_off_outdoor_c: float = 13.0,
+    ) -> list[float]:
         """Return hourly demand estimates (kW) for the horizon."""
         if self._demand_model and self._demand_model.is_trained:
             logger.info("milp_using_ml_demand_model")
@@ -343,8 +358,39 @@ class MILPOptimizer:
                 weather_dicts.append({"ts": timestamp, **conditions})
             return self._demand_model.predict_hourly(weather_dicts, len(weather))
 
-        # Fallback: use SH power from config as a rough estimate
-        return [settings.sh_max_power_kw * 0.25] * len(weather)
+        # Fallback: approximate building load from heating-degree demand. The
+        # previous constant 25% reserve forced 72 kWh/day with a 12 kW unit,
+        # even above the controller's heating-off threshold. Indoor-temperature
+        # constraints remain the primary comfort protection; this reserve only
+        # supplies a conservative weather-dependent baseline when ML is absent.
+        try:
+            cutoff = float(heating_off_outdoor_c)
+        except (TypeError, ValueError):
+            cutoff = 13.0
+        if not math.isfinite(cutoff):
+            cutoff = 13.0
+
+        design_outdoor = min(self.FALLBACK_DESIGN_OUTDOOR_C, cutoff - 1.0)
+        temperature_span = cutoff - design_outdoor
+        max_power_kw = max(0.0, float(settings.sh_max_power_kw))
+        profile = []
+        for _, raw_temperature in weather:
+            try:
+                temperature = float(raw_temperature)
+            except (TypeError, ValueError):
+                temperature = 5.0
+            if not math.isfinite(temperature):
+                temperature = 5.0
+            load_fraction = max(0.0, min(1.0, (cutoff - temperature) / temperature_span))
+            profile.append(max_power_kw * load_fraction)
+
+        logger.info(
+            "milp_using_degree_day_demand_fallback",
+            heating_off_outdoor_c=cutoff,
+            design_outdoor_c=design_outdoor,
+            forecast_sh_kwh=round(sum(profile), 2),
+        )
+        return profile
 
     @staticmethod
     def _normalise_demand_profile(

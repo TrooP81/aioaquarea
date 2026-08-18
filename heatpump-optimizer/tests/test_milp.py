@@ -224,6 +224,27 @@ class TestMILPSolver:
             [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
         ) == [0.0, 0.0, 0.0, 12.0, 0.0]
 
+    def test_untrained_demand_fallback_respects_heating_cutoff(self):
+        """Fallback reserve must stop in warm weather and scale safely in cold weather."""
+        from packages.optimizer.milp import MILPOptimizer
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        weather = [
+            (base, 15.0),
+            (base + dt.timedelta(hours=1), 13.0),
+            (base + dt.timedelta(hours=2), 5.0),
+            (base + dt.timedelta(hours=3), -15.0),
+            (base + dt.timedelta(hours=4), -25.0),
+            (base + dt.timedelta(hours=5), None),
+        ]
+
+        with patch("packages.optimizer.milp.settings") as mock_settings:
+            mock_settings.sh_max_power_kw = 12.0
+            profile = MILPOptimizer()._build_demand_estimates(weather, heating_off_outdoor_c=13.0)
+
+        assert profile == pytest.approx([0.0, 0.0, 24.0 / 7.0, 12.0, 12.0, 24.0 / 7.0])
+        assert all(0.0 <= demand <= 12.0 for demand in profile)
+
     def test_demand_weather_is_aligned_to_horizon_timestamps(self):
         """Out-of-order full weather rows must not shift demand features by an hour."""
         from packages.optimizer.milp import MILPOptimizer
