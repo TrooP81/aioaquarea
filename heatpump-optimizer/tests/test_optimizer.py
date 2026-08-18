@@ -250,14 +250,14 @@ class TestRulesOptimizer:
             return 5.0 if hour == 1 else 2.5
 
         mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
-        with patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop):
-            slot = optimizer._find_lowest_dhw_energy_cost_slot(
-                prices,
-                weather,
-                hours_needed=1,
-                fallback_outdoor_temp=5.0,
-                tank_target=52,
-            )
+        optimizer = RulesOptimizer(cop_model=mock_cop)
+        slot = optimizer._find_lowest_dhw_energy_cost_slot(
+            prices,
+            weather,
+            hours_needed=1,
+            fallback_outdoor_temp=5.0,
+            tank_target=52,
+        )
 
         assert slot == [prices[1]]
 
@@ -278,10 +278,10 @@ class TestRulesOptimizer:
             return 5.0
 
         mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
-        with patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop):
-            optimizer._find_lowest_dhw_energy_cost_slot(
-                prices, weather, hours_needed=1, fallback_outdoor_temp=5.0
-            )
+        optimizer = RulesOptimizer(cop_model=mock_cop)
+        optimizer._find_lowest_dhw_energy_cost_slot(
+            prices, weather, hours_needed=1, fallback_outdoor_temp=5.0
+        )
 
         assert called == []
 
@@ -1025,10 +1025,8 @@ class TestRulesOptimizer:
         assert optimizer._weather_heat_loss_factor(ts, None) == 1.0
         assert optimizer._weather_heat_loss_factor(ts, []) == 1.0
 
-    def test_preheat_uses_trained_cop_for_supply_water(self):
-        """Preheat cost-per-kWh should route through the trained COP model
-        with the supply water target as the tank_target proxy."""
-        optimizer = RulesOptimizer()
+    def test_preheat_does_not_use_dhw_cop_for_supply_water(self):
+        """A tank-trained COP model must not receive a zone supply target."""
         base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         prices = [
             (base, 0.10),
@@ -1052,10 +1050,10 @@ class TestRulesOptimizer:
             return 4.0
 
         mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
+        optimizer = RulesOptimizer(cop_model=mock_cop)
 
         with (
             patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
-            patch("packages.optimizer.rule_mixins.trained_cop_model", mock_cop),
             patch(
                 "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
                 return_value=SimpleNamespace(
@@ -1079,10 +1077,7 @@ class TestRulesOptimizer:
                 comfort_temp_min=18.0,
             )
 
-        # Preheat must have consulted the trained COP model at least once,
-        # and always with a plausible zone-water target (not a DHW default).
-        assert seen_targets
-        assert all(20 <= target <= 60 for target in seen_targets)
+        assert seen_targets == []
 
     def test_preheat_scales_hours_needed_in_windy_weather(self):
         """A storm at the cold hour should reserve more heating runtime."""

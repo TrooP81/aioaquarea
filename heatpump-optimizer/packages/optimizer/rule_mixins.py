@@ -10,7 +10,6 @@ from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
 from packages.ml.cop_model_core import COPModel
 from packages.ml.comfort_model import comfort_model
-from packages.ml.models import cop_model as trained_cop_model
 from packages.ml.thermal import thermal_model
 from packages.optimizer.actions import ActionType
 
@@ -95,24 +94,24 @@ class SharedRuleHelpersMixin:
         weather: list[tuple[dt.datetime, float]],
         hours_needed: int,
         fallback_outdoor_temp: float,
-        tank_target: int | None = None,
+        dhw_cop_model=None,
+        dhw_target: int | None = None,
     ) -> list[tuple[dt.datetime, float]] | None:
         """Choose heat-pump hours by electricity cost per delivered thermal kWh.
 
-        When the ML COP model is trained and a tank target is known, it is
-        preferred over the default linear curve. The ML model captures COP
-        response to tank target and time-of-day, which the default curve
-        cannot, so DHW slot picks reflect the real cost per kWh rather than
-        an outdoor-only proxy.
+        The trained COP artifact is DHW-specific, so callers must explicitly
+        supply both that model and a tank target. Space-heating callers use the
+        outdoor-temperature fallback until a separately measured SH COP model
+        exists.
         """
-        use_ml = tank_target is not None and trained_cop_model.is_trained
+        use_ml = dhw_target is not None and dhw_cop_model is not None and dhw_cop_model.is_trained
 
         effective_prices = []
         original_prices = {ts: price for ts, price in prices}
         for ts, price in prices:
             outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
             if use_ml:
-                cop = trained_cop_model.predict_cop(outdoor_temp, int(tank_target), ts.hour)
+                cop = dhw_cop_model.predict_cop(outdoor_temp, int(dhw_target), ts.hour)
             else:
                 cop = COPModel._default_cop_curve(outdoor_temp)
             effective_prices.append((ts, price / cop))
@@ -250,7 +249,8 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             weather,
             hours_needed,
             fallback_outdoor_temp,
-            tank_target=tank_target,
+            dhw_cop_model=getattr(self, "_dhw_cop_model", None),
+            dhw_target=tank_target,
         )
 
     @staticmethod
@@ -688,7 +688,6 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             weather,
             hours_needed,
             current_outdoor_temp,
-            tank_target=int(round(target_zone_boost)),
         )
         if best_slot:
             slot_start = best_slot[0][0]
@@ -820,19 +819,12 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 for ts, p in prices
                 if window_start <= ts <= hour_ts and controller_can_heat(ts)
             ]
-            # A boost target is a supply water temperature; give the trained
-            # COP model that number so cost/kWh reflects the actual load
-            # instead of the outdoor-only default curve.
-            boost_supply_temp = (
-                int(round(curve_supply_temps[h])) if h < len(curve_supply_temps) else None
-            )
             best_slot = (
                 self._find_lowest_heat_energy_cost_slot(
                     window_prices,
                     weather,
                     hours_needed,
                     current_outdoor_temp,
-                    tank_target=boost_supply_temp,
                 )
                 if window_prices
                 else None

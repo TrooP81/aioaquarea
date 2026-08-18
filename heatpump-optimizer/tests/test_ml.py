@@ -736,6 +736,20 @@ class TestOrchestratorFallback:
         assert type(optimizer).__name__ == "RulesOptimizer"
 
     @pytest.mark.asyncio
+    async def test_rules_receive_the_loaded_dhw_cop_model(self):
+        """Rules must share the checkpoint loaded by the optimizer process."""
+        from packages.optimizer.main import _cop_model, _select_optimizer
+
+        original_model = _cop_model._model
+        _cop_model._model = MagicMock()
+        try:
+            layer_name, optimizer = await _select_optimizer("rules_only")
+            assert layer_name == "rules"
+            assert optimizer._dhw_cop_model is _cop_model
+        finally:
+            _cop_model._model = original_model
+
+    @pytest.mark.asyncio
     async def test_milp_preferred_returns_milp(self):
         """milp_preferred should return MILP optimizer."""
         from packages.optimizer.main import _select_optimizer

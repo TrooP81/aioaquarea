@@ -48,6 +48,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
 
     VERSION = "rules_v6"
 
+    def __init__(self, cop_model=None):
+        self._dhw_cop_model = cop_model
+
     @staticmethod
     def _action_timestamp(action: dict[str, Any]) -> dt.datetime | None:
         try:

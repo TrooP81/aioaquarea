@@ -123,6 +123,11 @@ _cop_model = COPModel()
 _demand_model = DemandModel()
 
 
+def _new_rules_optimizer() -> RulesOptimizer:
+    """Build rules with the loaded DHW-specific COP model, when available."""
+    return RulesOptimizer(cop_model=_cop_model if _cop_model.is_trained else None)
+
+
 def _load_ml_models() -> None:
     """Load the latest ML model checkpoints from disk."""
     _cop_model.load_latest()
@@ -179,7 +184,7 @@ async def _select_optimizer(
         _load_ml_models()
 
     if layer == "rules_only":
-        return "rules", RulesOptimizer()
+        return "rules", _new_rules_optimizer()
 
     # milp_preferred or auto: build MILP with ML models if available
     milp = MILPOptimizer(
@@ -201,7 +206,7 @@ async def _select_optimizer(
                 reason="ML models trained but less than 14 days of data history",
             )
 
-    return "rules", RulesOptimizer()
+    return "rules", _new_rules_optimizer()
 
 
 async def _has_sufficient_ml_data() -> bool:
@@ -313,13 +318,13 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                         error=type(exc).__name__,
                         detail=str(exc),
                     )
-                    plan = await RulesOptimizer().generate_plan()
+                    plan = await _new_rules_optimizer().generate_plan()
                 except Exception as exc:
                     logger.error(
                         "milp_unexpected_error_fallback",
                         error=str(exc),
                     )
-                    plan = await RulesOptimizer().generate_plan()
+                    plan = await _new_rules_optimizer().generate_plan()
             else:
                 plan = await optimizer.generate_plan()
 
