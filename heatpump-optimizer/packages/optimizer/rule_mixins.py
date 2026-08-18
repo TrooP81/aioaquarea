@@ -350,16 +350,10 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             )
             projected_tank_temp = current_tank_temp
             if delay_hours > 0.0:
-                loss_outdoor = self._get_outdoor_at(
-                    weather, slot_start, current_outdoor_temp
-                )
+                loss_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
                 loss_rate_per_h = thermal_model._tank_loss_rate(loss_outdoor)
-                projected_tank_temp = max(
-                    0.0, current_tank_temp + loss_rate_per_h * delay_hours
-                )
-            slot_outdoor = self._get_outdoor_at(
-                weather, slot_start, current_outdoor_temp
-            )
+                projected_tank_temp = max(0.0, current_tank_temp + loss_rate_per_h * delay_hours)
+            slot_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
             projected_prediction = thermal_model.predict_tank_heating_time(
                 current_temp=projected_tank_temp,
                 target_temp=float(tank_target),
@@ -376,9 +370,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     "payload": {
                         "reason": f"thermal_optimized_before_{ready_hour}:00",
                         "predicted_minutes": round(projected_prediction.estimated_minutes),
-                        "heating_rate": round(
-                            projected_prediction.heating_rate_per_hour, 2
-                        ),
+                        "heating_rate": round(projected_prediction.heating_rate_per_hour, 2),
                         "confidence": projected_prediction.confidence,
                     },
                 }
@@ -393,11 +385,9 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     }
                 )
 
-        # Opportunistic banking: when the horizon contains an exceptionally
-        # cheap hour and the tank has real headroom, schedule an extra top-up
-        # in that slot. The classic case is a wind or solar oversupply valley
-        # in the middle of the day that the deadline loop cannot see because
-        # it stays inside the [latest_start - 8h, deadline) window.
+        # Opportunistic banking is only useful when no deadline cycle already
+        # heats to the same target. Adding another forced cycle cannot store
+        # energy beyond that target and only creates compressor/API churn.
         opportunistic = self._plan_dhw_opportunistic_top_up(
             prices,
             weather,
@@ -427,12 +417,14 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
 
         Skipped when the tank is already near target (banking has no room),
         when the horizon prices are near-flat (no meaningful arbitrage), or
-        when the cheapest slot overlaps a top-up already scheduled by the
-        deadline loop.
+        when a deadline top-up is already scheduled to reach the same target.
         """
         if not prices:
             return []
         if tank_target - current_tank_temp < self.OPPORTUNISTIC_HEADROOM_C:
+            return []
+
+        if any(action.get("type") == str(ActionType.FORCE_DHW_ON) for action in existing_actions):
             return []
 
         price_values = sorted(p for _, p in prices)
@@ -444,30 +436,13 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         if not candidates:
             return []
 
-        # Do not double up with a top-up the deadline loop already placed.
-        scheduled_hours = {
-            action["ts"][:13]
-            for action in existing_actions
-            if action.get("type") == str(ActionType.FORCE_DHW_ON)
-            and isinstance(action.get("ts"), str)
-        }
-        available = [
-            (ts, p) for ts, p in candidates if ts.isoformat()[:13] not in scheduled_hours
-        ]
-        if not available:
-            return []
-
-        slot_start, slot_price = min(available, key=lambda item: item[1])
-        delay_hours = max(
-            0.0, (slot_start - horizon_start).total_seconds() / 3600.0
-        )
+        slot_start, slot_price = min(candidates, key=lambda item: item[1])
+        delay_hours = max(0.0, (slot_start - horizon_start).total_seconds() / 3600.0)
         projected_tank_temp = current_tank_temp
         if delay_hours > 0.0:
             loss_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
             loss_rate_per_h = thermal_model._tank_loss_rate(loss_outdoor)
-            projected_tank_temp = max(
-                0.0, current_tank_temp + loss_rate_per_h * delay_hours
-            )
+            projected_tank_temp = max(0.0, current_tank_temp + loss_rate_per_h * delay_hours)
         slot_outdoor = self._get_outdoor_at(weather, slot_start, current_outdoor_temp)
         prediction = thermal_model.predict_tank_heating_time(
             current_temp=projected_tank_temp,
@@ -483,9 +458,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 "ts": slot_start.isoformat(),
                 "type": str(ActionType.FORCE_DHW_ON),
                 "payload": {
-                    "reason": (
-                        f"opportunistic_cheap_slot_{slot_price:.4f}_eur"
-                    ),
+                    "reason": (f"opportunistic_cheap_slot_{slot_price:.4f}_eur"),
                     "predicted_minutes": round(prediction.estimated_minutes),
                     "heating_rate": round(prediction.heating_rate_per_hour, 2),
                     "confidence": prediction.confidence,
@@ -762,7 +735,9 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             # A boost target is a supply water temperature; give the trained
             # COP model that number so cost/kWh reflects the actual load
             # instead of the outdoor-only default curve.
-            boost_supply_temp = int(round(curve_supply_temps[h])) if h < len(curve_supply_temps) else None
+            boost_supply_temp = (
+                int(round(curve_supply_temps[h])) if h < len(curve_supply_temps) else None
+            )
             best_slot = (
                 self._find_lowest_heat_energy_cost_slot(
                     window_prices,

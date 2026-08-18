@@ -337,9 +337,7 @@ class TestRulesOptimizer:
         """
         optimizer = RulesOptimizer()
 
-        actions = optimizer._plan_peak_avoidance(
-            sample_prices, sample_weather, sample_prices[0][0]
-        )
+        actions = optimizer._plan_peak_avoidance(sample_prices, sample_weather, sample_prices[0][0])
 
         quiet_on = [a for a in actions if a["type"] == "quiet_mode_on"]
         assert len(quiet_on) >= 3
@@ -779,9 +777,7 @@ class TestRulesOptimizer:
         dhw_on = [action for action in actions if action["type"] == "force_dhw_on"]
         assert len(dhw_on) == 1
         action_time = dt.datetime.fromisoformat(dhw_on[0]["ts"])
-        local_deadline = dt.datetime(
-            2026, 7, 13, 7, tzinfo=dt.timezone(dt.timedelta(hours=2))
-        )
+        local_deadline = dt.datetime(2026, 7, 13, 7, tzinfo=dt.timezone(dt.timedelta(hours=2)))
         assert action_time < local_deadline.astimezone(dt.timezone.utc)
         assert dhw_on[0]["payload"]["reason"] == "thermal_optimized_before_7:00"
 
@@ -851,10 +847,14 @@ class TestRulesOptimizer:
         )
 
         on_action = next(
-            a for a in actions if a["type"] == "force_dhw_on" and "opportunistic" not in a["payload"]["reason"]
+            a
+            for a in actions
+            if a["type"] == "force_dhw_on" and "opportunistic" not in a["payload"]["reason"]
         )
         off_action = next(
-            a for a in actions if a["type"] == "force_dhw_off" and a["payload"]["reason"] == "dhw_target_reached"
+            a
+            for a in actions
+            if a["type"] == "force_dhw_off" and a["payload"]["reason"] == "dhw_target_reached"
         )
         on_ts = dt.datetime.fromisoformat(on_action["ts"])
         off_ts = dt.datetime.fromisoformat(off_action["ts"])
@@ -862,10 +862,8 @@ class TestRulesOptimizer:
         # extends the required heating window beyond the naive one hour.
         assert (off_ts - on_ts) >= dt.timedelta(hours=2)
 
-    def test_plan_dhw_banks_energy_in_ultra_cheap_slot(self):
-        """A cheap valley far from any deadline should trigger opportunistic
-        banking. The deadline-driven top-up still fires; the arbitrage adds
-        an extra top-up in the cheap slot."""
+    def test_plan_dhw_does_not_add_banking_to_deadline_cycle(self):
+        """A deadline top-up to target must not get a redundant banking cycle."""
         optimizer = RulesOptimizer()
         base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
         hourly = [0.20] * 24
@@ -887,14 +885,37 @@ class TestRulesOptimizer:
             tz_name="Europe/Amsterdam",
         )
 
+        dhw_ons = [a for a in actions if a["type"] == "force_dhw_on"]
+        assert len(dhw_ons) == 1
+        assert dhw_ons[0]["payload"]["reason"] == "thermal_optimized_before_7:00"
+
+    def test_plan_dhw_can_bank_without_a_deadline_cycle(self):
+        """An ultra-cheap slot remains usable when no target cycle is planned."""
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 4, 30, 0, 0, tzinfo=dt.timezone.utc)
+        hourly = [0.20] * 24
+        hourly[2] = 0.02
+        prices = [(base + dt.timedelta(hours=h), p) for h, p in enumerate(hourly)]
+        weather = [(ts, 5.0) for ts, _ in prices]
+
+        actions = optimizer._plan_dhw(
+            prices,
+            weather,
+            base,
+            current_tank_temp=45.0,
+            tank_target=50,
+            current_outdoor_temp=5.0,
+            comfort_schedule={"weekday": [], "weekend": []},
+            tz_name="Europe/Amsterdam",
+        )
+
         opportunistic_ons = [
-            a
-            for a in actions
-            if a["type"] == "force_dhw_on"
-            and a["payload"].get("reason", "").startswith("opportunistic_cheap_slot_")
+            action
+            for action in actions
+            if action["type"] == "force_dhw_on"
+            and action["payload"].get("reason", "").startswith("opportunistic_cheap_slot_")
         ]
         assert len(opportunistic_ons) == 1
-        # The banking slot should be the cheapest hour (hour 2)
         assert opportunistic_ons[0]["ts"] == prices[2][0].isoformat()
 
     def test_plan_dhw_no_arbitrage_when_tank_full(self):
