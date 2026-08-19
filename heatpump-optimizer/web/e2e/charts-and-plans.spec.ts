@@ -211,6 +211,9 @@ test.describe("Price Chart", () => {
   });
 
   test("marks now and explains the price history and forecast window", async ({ page }) => {
+    const pageErrors: Error[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error));
+
     await page.goto("/");
     await page.getByRole("tab", { name: "Charts" }).click();
     await page.getByText("Show raw weather, price and temperature history").click();
@@ -234,6 +237,7 @@ test.describe("Price Chart", () => {
 
     const temperatureChart = page.getByRole("region", { name: "Temperature history chart" });
     await expect(temperatureChart.getByText("Temperature History — Past 24h")).toBeVisible();
+    expect(pageErrors.map((error) => error.message)).toEqual([]);
   });
 
   test("page renders all main sections", async ({ page }) => {

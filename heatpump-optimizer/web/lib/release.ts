@@ -18,6 +18,14 @@ export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
     released: "2026-08-19",
+    title: "Raw chart expansion hotfix",
+    changes: [
+      "Expanding raw weather, price, and temperature history no longer crashes when the current-time marker is visible."
+    ],
+  },
+  {
+    version: "0.13.1",
+    released: "2026-08-19",
     title: "Consistent time, cost, and live status",
     changes: [
       "Price and weather charts now show their historical context honestly and mark the exact current time.",

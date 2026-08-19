@@ -129,6 +129,7 @@ export function ForecastChart() {
           {showNowMarker && (
             <ReferenceLine
               x={now}
+              yAxisId="temp"
               isFront
               stroke="#f59e0b"
               strokeDasharray="4 4"
