@@ -70,7 +70,7 @@ class DeviceImpl(Device):
         status: DeviceStatus,
         client: "AquareaClient",
         consumption_refresh_interval: Optional[dt.timedelta] = None,
-        timezone: dt.timezone = dt.timezone.utc,
+        timezone: dt.tzinfo = dt.timezone.utc,
     ) -> None:
         # Create a DeviceInfo object from the individual arguments
         device_info = DeviceInfo(

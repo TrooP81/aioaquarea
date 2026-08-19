@@ -49,6 +49,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
         logger: Optional[logging.Logger] = None,
         environment: AquareaEnvironment = AquareaEnvironment.PRODUCTION,
         device_direct: bool = True,
+        timezone: dt.tzinfo = dt.timezone.utc,
     ):
         """
         Initializes a new instance of the `AquareaClient` class.
@@ -108,8 +109,8 @@ class AquareaClient:  # Renamed Client to AquareaClient
         )
         self._device_control = AquareaDeviceControl(self._api_client, self._base_url)
         self._consumption_manager = AquareaConsumptionManager(
-            self._api_client, self._base_url, dt.timezone.utc
-        )  # Pass timezone
+            self._api_client, self._base_url, timezone
+        )
         self._settings.username = username
         self._settings.password = password
         self._settings.access_token = self._api_client.access_token
@@ -216,7 +217,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
         device_info: DeviceInfo | None = None,
         device_id: str | None = None,
         consumption_refresh_interval: Optional[dt.timedelta] = None,
-        timezone: dt.timezone = dt.timezone.utc,
+        timezone: dt.tzinfo = dt.timezone.utc,
     ) -> Device:
         """Retrieve device."""
         if not device_info and not device_id:

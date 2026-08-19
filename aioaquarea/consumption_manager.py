@@ -17,7 +17,7 @@ class AquareaConsumptionManager:
     """Handles consumption data retrieval."""
 
     def __init__(
-        self, api_client: AquareaAPIClient, base_url: str, timezone: dt.timezone
+        self, api_client: AquareaAPIClient, base_url: str, timezone: dt.tzinfo
     ):
         self._api_client = api_client
         self._base_url = base_url

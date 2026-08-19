@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aioaquarea"
-version = "1.0.8"
+version = "1.0.9"
 authors = [
   { name="Carlos J. Aliaga", email="dev@cjaliaga.net" },
 ]

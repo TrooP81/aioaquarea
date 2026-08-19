@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -45,6 +46,18 @@ def test_non_utc_token_expiration_is_converted_to_utc() -> None:
     assert client.token_expiration == dt.datetime(
         2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc
     )
+
+
+def test_consumption_manager_uses_client_timezone() -> None:
+    timezone = ZoneInfo("Europe/Stockholm")
+    client = AquareaClient(
+        session=AsyncMock(),
+        username="user@example.test",
+        password="secret",
+        timezone=timezone,
+    )
+
+    assert client._consumption_manager._timezone is timezone
 
 
 @pytest.mark.asyncio
