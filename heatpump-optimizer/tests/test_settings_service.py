@@ -11,6 +11,8 @@ from packages.core.settings_service import (
     is_comfort_hour,
     is_masked_secret,
     dhw_deadlines_from_schedule,
+    local_date,
+    local_day_start_utc,
     validate_setting_value,
 )
 
@@ -51,6 +53,25 @@ class TestIsComfortHour:
         schedule = {}
         ts = dt.datetime(2026, 4, 29, 8, 0, tzinfo=dt.timezone.utc)
         assert is_comfort_hour(schedule, ts, tz_name=TZ) is False
+
+
+class TestLocalCalendarDay:
+    @pytest.mark.parametrize(
+        ("now", "expected_start"),
+        [
+            (
+                dt.datetime(2026, 8, 18, 22, 30, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 18, 22, 0, tzinfo=dt.timezone.utc),
+            ),
+            (
+                dt.datetime(2026, 1, 18, 23, 30, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 18, 23, 0, tzinfo=dt.timezone.utc),
+            ),
+        ],
+    )
+    def test_stockholm_day_starts_at_local_midnight(self, now, expected_start):
+        assert local_day_start_utc(now, "Europe/Stockholm") == expected_start
+        assert local_date(now, "Europe/Stockholm") == dt.date(2026, now.month, 19)
 
 
 class TestDhwDeadlines:

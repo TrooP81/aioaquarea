@@ -20,6 +20,8 @@ class TestDashboard:
         assert resp.status_code == 200
         data = resp.json()
         assert data["current_status"] is None
+        assert data["current_status_fresh"] is False
+        assert data["current_status_age_seconds"] is None
         assert data["current_price"] is None
         assert data["today_kwh"] == 0
         assert data["today_cost_eur"] == 0
@@ -36,6 +38,8 @@ class TestDashboard:
         assert data["current_status"]["mode"] == "heat"
         assert data["current_status"]["outdoor_temp"] == 5.0
         assert data["current_status"]["tank_temp"] == 48.5
+        assert data["current_status_fresh"] is True
+        assert data["current_status_age_seconds"] is not None
 
     async def test_dashboard_with_prices(
         self, client: AsyncClient, seed_device_status, seed_prices

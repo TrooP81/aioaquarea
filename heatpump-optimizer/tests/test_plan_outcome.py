@@ -30,6 +30,27 @@ def test_cumulative_intervals_skips_unknown_first_reading_and_day_resets():
     ]
 
 
+def test_cumulative_intervals_uses_local_day_reset_value():
+    records = [
+        SimpleNamespace(
+            ts=dt.datetime(2026, 7, 15, 21, 55, tzinfo=UTC),
+            heat_kwh=4.0,
+            cool_kwh=0.0,
+            tank_kwh=1.0,
+        ),
+        SimpleNamespace(
+            ts=dt.datetime(2026, 7, 15, 22, 5, tzinfo=UTC),
+            heat_kwh=0.2,
+            cool_kwh=0.0,
+            tank_kwh=0.1,
+        ),
+    ]
+
+    assert cumulative_intervals(records, "Europe/Stockholm") == [
+        (dt.datetime(2026, 7, 15, 22, 5, tzinfo=UTC), 0.3)
+    ]
+
+
 def test_cost_outcome_reports_price_shift_estimate_only_for_metered_energy():
     intervals = [
         (dt.datetime(2026, 7, 15, 9, 15, tzinfo=UTC), 1.0),

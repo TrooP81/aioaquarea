@@ -164,6 +164,8 @@ class StatsResponse(BaseModel):
 
 class DashboardResponse(BaseModel):
     current_status: Optional[DeviceStatusResponse] = None
+    current_status_fresh: bool = False
+    current_status_age_seconds: Optional[int] = None
     current_price: Optional[float] = None
     price_currency: str = "EUR"
     price_source: str = "legacy"

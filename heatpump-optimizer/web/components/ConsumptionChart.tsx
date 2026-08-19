@@ -57,7 +57,7 @@ export function ConsumptionChart() {
   if (loading && chartData.length === 0) {
     return (
       <div className="chart-container" role="region" aria-label="Energy consumption chart">
-        <div className="chart-title">Energy Consumption — 24h</div>
+        <div className="chart-title">Heating Energy — Past 24h</div>
         <div className="chart-skeleton-wrapper">
           <div className="chart-skeleton" />
           <div className="chart-skeleton" style={{ width: "55%" }} />
@@ -70,7 +70,7 @@ export function ConsumptionChart() {
   if (error && chartData.length === 0) {
     return (
       <div className="chart-container" role="alert">
-        <div className="chart-title">Heating Energy — 24h</div>
+        <div className="chart-title">Heating Energy — Past 24h</div>
         <p className="text-danger">{error}</p>
         <button className="btn btn-sm" onClick={load}>Retry</button>
       </div>
@@ -83,7 +83,7 @@ export function ConsumptionChart() {
   return (
     <div className="chart-container" role="region" aria-label="Energy consumption chart">
       <div className="chart-title-row">
-        <div className="chart-title">Heating Energy — 24h</div>
+        <div className="chart-title">Heating Energy — Past 24h</div>
         <button
           type="button"
           className="btn btn-sm"

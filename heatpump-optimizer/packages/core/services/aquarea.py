@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import time
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import redis.asyncio as redis
@@ -102,6 +103,7 @@ class AquareaWrapper:
         self._redis: redis.Redis | None = None
         self._device = None
         self._device_info: DeviceInfo | None = None
+        self._timezone = ZoneInfo("UTC")
         self._device_lock = asyncio.Lock()
         self._last_live_status_at: float | None = None
         self._adapter_failure_count = 0
@@ -115,8 +117,11 @@ class AquareaWrapper:
 
     async def start(self) -> None:
         """Initialize session, redis, and authenticate."""
+        from ..settings_service import get_user_tz
+
         self._session = aiohttp.ClientSession()
         self._redis = redis.from_url(settings.redis_url)
+        self._timezone = ZoneInfo(await get_user_tz())
 
         self._client = Client(
             session=self._session,
@@ -125,6 +130,7 @@ class AquareaWrapper:
             device_direct=True,
             refresh_login=True,
             environment=AquareaEnvironment.PRODUCTION,
+            timezone=self._timezone,
         )
 
         await self._authenticate()
@@ -175,6 +181,7 @@ class AquareaWrapper:
             self._device = await self._client.get_device(
                 device_info=self._device_info,
                 consumption_refresh_interval=timedelta(minutes=5),
+                timezone=self._timezone,
             )
             self._record_live_status(self._device)
             return self._device

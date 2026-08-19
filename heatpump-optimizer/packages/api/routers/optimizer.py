@@ -25,6 +25,7 @@ from packages.core.models import (
     PlanActionRecord,
     PlanRecord,
 )
+from packages.core.settings_service import get_user_tz
 
 router = APIRouter()
 
@@ -199,6 +200,7 @@ async def get_plan_detail(plan_id: int):
             price_area=price_area,
             comfort_min_c=comfort_min_c,
             comfort_max_c=comfort_max_c,
+            timezone_name=await get_user_tz(),
         )
 
     return PlanDetailResponse(
@@ -273,6 +275,7 @@ async def get_outcome_summary(days: int = Query(7, ge=1, le=30)):
             price_source=None,
             comfort_min_c=comfort_min_c,
             comfort_max_c=comfort_max_c,
+            timezone_name=await get_user_tz(),
         )
     return {
         "days": days,

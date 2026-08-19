@@ -42,9 +42,12 @@ interface DashboardData {
     space_heating_active: boolean | null;
     space_heating_evidence: string | null;
   } | null;
+  current_status_fresh: boolean;
+  current_status_age_seconds: number | null;
   current_price: number | null;
   today_kwh: number;
   today_cost_eur: number | null;
+  today_cost_currency: string;
   today_cost_priced_kwh: number;
   today_cost_unpriced_kwh: number;
   today_cost_priced_amount: number;
@@ -102,6 +105,8 @@ export default function Home() {
   const [showRawChartDetails, setShowRawChartDetails] = useState(false);
   const [showHotWaterDetails, setShowHotWaterDetails] = useState(false);
   const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
+  const hasCurrentStatus = data?.current_status != null;
+  const currentStatusFresh = hasCurrentStatus && data?.current_status_fresh !== false;
 
   const selectSection = (section: SectionId) => {
     setActiveSection(section);
@@ -237,7 +242,7 @@ export default function Home() {
           <AppVersionBadge />
           {lastUpdated && (
             <span className="last-updated">
-              Updated {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
+              Dashboard refreshed {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
             </span>
           )}
           <button
@@ -250,10 +255,16 @@ export default function Home() {
           </button>
           <Link href="/settings" className="btn">Settings</Link>
           <span
-            className={`status-badge ${data?.current_status ? "online" : "offline"}`}
-            title={data?.current_status ? "Receiving live data from the heat pump" : "No recent data from the heat pump"}
+            className={`status-badge ${currentStatusFresh ? "online" : hasCurrentStatus ? "stale" : "offline"}`}
+            title={
+              currentStatusFresh
+                ? "Receiving live data from the heat pump"
+                : hasCurrentStatus
+                  ? `Last heat-pump reading is ${data?.current_status_age_seconds ?? "an unknown number of"} seconds old`
+                  : "No heat-pump data available"
+            }
           >
-            {data?.current_status ? "● Connected" : "● Disconnected"}
+            {currentStatusFresh ? "● Connected" : hasCurrentStatus ? "● Stale" : "● Disconnected"}
           </span>
         </div>
       </div>

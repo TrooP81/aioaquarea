@@ -30,6 +30,22 @@ logger = structlog.get_logger()
 _WEBHOOK_THROTTLE = dt.timedelta(minutes=30)
 
 
+def device_status_is_fresh(
+    observed_at: dt.datetime | None,
+    *,
+    now: dt.datetime,
+    poll_interval_seconds: int,
+) -> bool:
+    """Return whether a device observation is recent enough to call live."""
+
+    if observed_at is None:
+        return False
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
+    cutoff = now - dt.timedelta(seconds=max(poll_interval_seconds * 3, 15 * 60))
+    return observed_at >= cutoff
+
+
 def _alert(
     alert_id: str,
     severity: str,
@@ -91,7 +107,6 @@ async def get_operational_alerts(
         return {"enabled": False, "generated_at": now.isoformat(), "alerts": []}
 
     poll_interval = await get_int_setting("poll_interval_seconds")
-    device_cutoff = now - dt.timedelta(seconds=max(poll_interval * 3, 15 * 60))
     service_cutoff = now - dt.timedelta(minutes=3)
     action_since = now - dt.timedelta(hours=24)
     async with get_session() as session:
@@ -148,7 +163,11 @@ async def get_operational_alerts(
     adapter_alert = _panasonic_adapter_alert(adapter)
     if adapter_alert:
         alerts.append(adapter_alert)
-    if (latest_device is None or latest_device < device_cutoff) and adapter_alert is None:
+    if not device_status_is_fresh(
+        latest_device,
+        now=now,
+        poll_interval_seconds=poll_interval,
+    ) and adapter_alert is None:
         alerts.append(
             _alert(
                 "device_data_stale",

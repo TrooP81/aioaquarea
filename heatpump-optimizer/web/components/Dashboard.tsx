@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useCurrency, formatPricePerKwh, formatCost } from "./useCurrency";
+import { useCurrency, formatPricePerKwh, formatCostInCurrency } from "./useCurrency";
 import { LAYER_LABELS, LAYER_TOOLTIPS } from "@/lib/constants";
 
 interface DashboardProps {
   data: {
     current_status: {
+      ts: string;
       mode: string | null;
       outdoor_temp: number | null;
       heat_pump_outdoor_temp?: number | null;
@@ -24,9 +25,12 @@ interface DashboardProps {
       direction?: string | null;
       space_heating_active: boolean | null;
     } | null;
+    current_status_fresh: boolean;
+    current_status_age_seconds: number | null;
     current_price: number | null;
     today_kwh: number;
     today_cost_eur: number | null;
+    today_cost_currency: string;
     today_cost_priced_kwh: number;
     today_cost_unpriced_kwh: number;
     today_cost_priced_amount: number;
@@ -90,6 +94,7 @@ function formatPumpState(status: PumpStatus | null | undefined): string {
 export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReading, latestReading }: DashboardProps) {
   const currency = useCurrency();
   const status = data?.current_status;
+  const statusFresh = status != null && data?.current_status_fresh !== false;
   const [optBrief, setOptBrief] = useState<OptimizerBrief | null>(null);
 
   useEffect(() => {
@@ -113,7 +118,12 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
     <>
       {currency.warning && <p className="text-warning text-sm">⚠ {currency.warning}</p>}
       {/* ── Live readings ── */}
-      <h3 className="card-group-label">Live readings</h3>
+      <h3 className="card-group-label">{statusFresh ? "Live readings" : "Latest readings"}</h3>
+      {status && !statusFresh && (
+        <p className="text-warning text-sm">
+          Heat-pump readings are stale · last device sample {formatRelativeTime(status.ts)}.
+        </p>
+      )}
       <div className="grid">
         <div className="card">
           <div className="card-header">
@@ -206,8 +216,8 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           </div>
           <div className="card-subtitle">
             {data?.today_cost_complete
-              ? `Cost: ${formatCost(data.today_cost_eur, currency)}`
-              : `Known cost: ${formatCost(data?.today_cost_priced_amount, currency)} · ${data?.today_cost_coverage_pct ?? 0}% priced`}
+              ? `Cost: ${formatCostInCurrency(data.today_cost_eur, data.today_cost_currency, currency)}`
+              : `Known cost: ${formatCostInCurrency(data?.today_cost_priced_amount, data?.today_cost_currency, currency)} · ${data?.today_cost_coverage_pct ?? 0}% priced`}
           </div>
           {!data?.today_cost_complete && (data?.today_cost_unpriced_kwh ?? 0) > 0 && (
             <div className="card-subtitle text-warning text-sm">

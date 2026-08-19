@@ -67,6 +67,40 @@ test.describe("Dashboard", () => {
     await expect(page.locator(".status-badge.offline")).toContainText("Disconnected");
   });
 
+  test("shows stale instead of connected for an old device sample", async ({ page }) => {
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          current_status: {
+            ts: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+            device_id: "test-device",
+            mode: "heat",
+            outdoor_temp: 5,
+            tank_temp: 48,
+            tank_target_temp: 50,
+            zone1_temp: 21,
+            quiet_mode: 0,
+            space_heating_active: false,
+          },
+          current_status_fresh: false,
+          current_status_age_seconds: 86400,
+          current_price: null,
+          today_kwh: 0,
+          today_cost_eur: 0,
+          active_plan: null,
+          has_override: false,
+        }),
+      })
+    );
+
+    await page.goto("/");
+    await expect(page.locator(".status-badge.stale")).toContainText("Stale");
+    await expect(page.getByText("Latest readings", { exact: true })).toBeVisible();
+    await expect(page.getByText(/Heat-pump readings are stale/)).toBeVisible();
+  });
+
   test("shows error banner on API failure", async ({ page }) => {
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({ status: 500 })

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { useCurrency, formatCost } from "./useCurrency";
+import { useCurrency, formatCostInCurrency } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
 import { PlanAction, usePlanActions } from "./usePlanActions";
 import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
@@ -302,7 +302,10 @@ export function PlanHistory() {
           const layerLabel = LAYER_LABELS[plan.optimizer_version] || plan.optimizer_version;
           const previousPlan = historyRows[rowIndex + 1]?.plan;
           const actionDelta = previousPlan ? plan.actions_count - previousPlan.actions_count : null;
-          const costDelta = previousPlan?.cost_estimate_eur != null && plan.cost_estimate_eur != null
+          const planCurrency = plan.price_currency || currency.code;
+          const previousCurrency = previousPlan?.price_currency || currency.code;
+          const sameCurrency = !previousPlan || planCurrency === previousCurrency;
+          const costDelta = sameCurrency && previousPlan?.cost_estimate_eur != null && plan.cost_estimate_eur != null
             ? plan.cost_estimate_eur - previousPlan.cost_estimate_eur
             : null;
           return (
@@ -320,7 +323,7 @@ export function PlanHistory() {
                 <span className={`status-badge ${plan.status === "active" ? "online" : "loading"}`}>
                   {plan.status === "superseded" ? `Replaced by #${plan.superseded_by_plan_id ?? "newer plan"}` : plan.status}
                 </span>
-                <span className="plan-history-cost">{formatCost(plan.cost_estimate_eur, currency)}</span>
+                <span className="plan-history-cost">{formatCostInCurrency(plan.cost_estimate_eur, planCurrency, currency)}</span>
                 <span className="plan-history-count">{plan.actions_count} actions</span>
                 <span className="plan-history-chevron" aria-hidden="true">
                   {isExpanded ? "▾" : "▸"}
@@ -332,7 +335,10 @@ export function PlanHistory() {
                   <span>{actionDelta === 0 ? "No action-count change" : `${Math.abs(actionDelta)} action${Math.abs(actionDelta) === 1 ? "" : "s"} ${actionDelta > 0 ? "added" : "removed"}`}</span>
                 )}
                 {costDelta != null && Math.abs(costDelta) >= 0.005 && (
-                  <span>Estimated cost {costDelta > 0 ? "+" : "−"}{formatCost(Math.abs(costDelta), currency)}</span>
+                  <span>Estimated cost {costDelta > 0 ? "+" : "−"}{formatCostInCurrency(Math.abs(costDelta), planCurrency, currency)}</span>
+                )}
+                {previousPlan && !sameCurrency && (
+                  <span>Currency changed {previousCurrency} → {planCurrency}</span>
                 )}
               </div>
 
@@ -384,12 +390,12 @@ export function PlanHistory() {
                           </span>
                           <span className="text-muted text-xs">
                             {outcome.measurement.cost?.measured_kwh?.toFixed(2) ?? "0.00"} kWh
-                            {outcome.measurement.cost?.actual_cost != null ? ` · ${formatCost(outcome.measurement.cost.actual_cost, currency)}` : " · awaiting complete price data"}
+                            {outcome.measurement.cost?.actual_cost != null ? ` · ${formatCostInCurrency(outcome.measurement.cost.actual_cost, planCurrency, currency)}` : " · awaiting complete price data"}
                             {outcome.measurement.cost?.coverage_pct != null ? ` (${outcome.measurement.cost.coverage_pct}% priced)` : ""}
                           </span>
                           {outcome.measurement.cost?.estimated_price_shift_savings != null && (
                             <span className="plan-action-status executed">
-                              Estimated price-shift saving {formatCost(outcome.measurement.cost.estimated_price_shift_savings, currency)}
+                              Estimated price-shift saving {formatCostInCurrency(outcome.measurement.cost.estimated_price_shift_savings, planCurrency, currency)}
                             </span>
                           )}
                           {outcome.measurement.comfort?.samples ? (

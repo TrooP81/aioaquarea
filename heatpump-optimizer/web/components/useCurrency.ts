@@ -105,6 +105,28 @@ export function formatCost(
   return `${c.prefix}${v.toFixed(2)}${c.suffix}`;
 }
 
+/** Format a stored amount in the currency captured with that record. */
+export function formatCostInCurrency(
+  cost: number | null | undefined,
+  currencyCode: string | null | undefined,
+  fallback: CurrencyInfo,
+): string {
+  if (cost == null) return "—";
+  const code = currencyCode?.trim().toUpperCase();
+  if (!code) return formatCost(cost, fallback);
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: code,
+      currencyDisplay: "code",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(cost);
+  } catch {
+    return `${cost.toFixed(2)} ${code}`;
+  }
+}
+
 /** Chart axis label — pre-built by the server. */
 export function priceAxisLabel(c: CurrencyInfo): string {
   return c.priceLabel;

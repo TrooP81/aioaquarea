@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useCurrency, formatCost } from "./useCurrency";
+import { useCurrency, formatCostInCurrency } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
 import { usePlanActions } from "./usePlanActions";
 import { ACTION_LABELS, LAYER_LABELS, LAYER_TOOLTIPS, formatRelativeTime, formatTime } from "@/lib/constants";
@@ -11,6 +11,7 @@ interface NextActionCardProps {
     id: number;
     optimizer_version: string;
     cost_estimate_eur: number | null;
+    price_currency?: string;
     actions_count: number;
     horizon_start?: string;
     horizon_end?: string;
@@ -75,7 +76,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
             </span>
           </div>
           <div className="card-subtitle">
-            at {formatTime(nextAction.scheduled_ts, timeFormat.hour12)} · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
+            at {formatTime(nextAction.scheduled_ts, timeFormat.hour12)} · Plan est. cost: {formatCostInCurrency(plan.cost_estimate_eur, plan.price_currency, currency)}
           </div>
         </>
       ) : (
@@ -84,7 +85,7 @@ export function NextActionCard({ plan }: NextActionCardProps) {
             All caught up
           </div>
           <div className="card-subtitle">
-            No pending actions · Plan est. cost: {formatCost(plan.cost_estimate_eur, currency)}
+            No pending actions · Plan est. cost: {formatCostInCurrency(plan.cost_estimate_eur, plan.price_currency, currency)}
           </div>
         </>
       )}

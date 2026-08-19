@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useCurrency, formatCost } from "./useCurrency";
+import { useCurrency, formatCostInCurrency } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
 import { PlanAction, usePlanActions } from "./usePlanActions";
 import {
@@ -248,7 +248,7 @@ export function PlanView({ plan }: PlanProps) {
             <>
               {/* Cost highlight */}
               <div className="plan-cost-highlight">
-                <span className="plan-cost-value">{formatCost(plan.cost_estimate_eur, currency)}</span>
+                <span className="plan-cost-value">{formatCostInCurrency(plan.cost_estimate_eur, plan.price_currency, currency)}</span>
                 <span className="plan-cost-label">estimated cost</span>
               </div>
 

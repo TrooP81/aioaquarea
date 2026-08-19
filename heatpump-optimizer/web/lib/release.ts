@@ -17,6 +17,17 @@ export interface ReleaseNote {
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
+    released: "2026-08-19",
+    title: "Consistent time, cost, and live status",
+    changes: [
+      "Price and weather charts now show their historical context honestly and mark the exact current time.",
+      "Daily energy and cost calculations follow the configured local timezone, including meter resets and daylight-saving transitions.",
+      "Overview distinguishes fresh, stale, and disconnected heat-pump readings instead of presenting old data as live.",
+      "Historical plans retain their source currency, and temperature readings are aligned by absolute timestamp."
+    ],
+  },
+  {
+    version: "0.13.0",
     released: "2026-08-18",
     title: "Safer cost-aware heat planning",
     changes: [

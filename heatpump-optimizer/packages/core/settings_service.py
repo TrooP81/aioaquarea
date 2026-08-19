@@ -654,6 +654,19 @@ def _to_local(ts: dt.datetime, tz_name: str | None = None) -> dt.datetime:
     return ts.astimezone(tz)
 
 
+def local_day_start_utc(ts: dt.datetime, tz_name: str | None = None) -> dt.datetime:
+    """Return the UTC timestamp at which the user's local calendar day started."""
+
+    local = _to_local(ts, tz_name)
+    return local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc)
+
+
+def local_date(ts: dt.datetime, tz_name: str | None = None) -> dt.date:
+    """Return the user's local calendar date for a timestamp."""
+
+    return _to_local(ts, tz_name).date()
+
+
 async def get_user_tz() -> str:
     """Return the user's configured IANA timezone string."""
     return await get_setting("timezone") or "Europe/Amsterdam"

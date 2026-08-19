@@ -14,6 +14,31 @@ const mockConsumption = Array.from({ length: 12 }, (_, i) => ({
   outdoor_temp: 5 + i * 0.5,
 }));
 
+const mockWeather = Array.from({ length: 60 }, (_, i) => ({
+  ts: new Date(Date.now() + (i - 12) * 3600000).toISOString(),
+  temperature: 8 + Math.sin(i / 6) * 4,
+  wind_speed: 3,
+  humidity: 70,
+  cloud_cover: 0.5,
+  irradiance: 0,
+  precipitation: 0,
+}));
+
+const mockStatusHistory = [24, 1, 0].map((hoursAgo) => ({
+  ts: new Date(Date.now() - hoursAgo * 3600000).toISOString(),
+  device_id: "test-device",
+  tank_temp: 48,
+  tank_target_temp: 50,
+  zone1_temp: 21,
+  zone1_target_temp: 22,
+  outdoor_temp: 5,
+}));
+
+const mockIndoorHistory = [
+  { timestamp: new Date(Date.now() - 24 * 3600000).toISOString(), temperature: 19 },
+  { timestamp: new Date().toISOString(), temperature: 21.5 },
+];
+
 const mockDashboard = {
   current_status: {
     ts: new Date().toISOString(),
@@ -35,6 +60,7 @@ const mockDashboard = {
     id: 42,
     optimizer_version: "rules_v1",
     cost_estimate_eur: 2.85,
+    price_currency: "EUR",
     actions_count: 3,
   },
   has_override: false,
@@ -98,6 +124,19 @@ test.describe("Price Chart", () => {
         contentType: "application/json",
         body: JSON.stringify(mockConsumption),
       })
+    );
+    await page.route("**/api/weather*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockWeather),
+      })
+    );
+    await page.route(/\/api\/status\/history(?:\?|$)/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockStatusHistory) })
+    );
+    await page.route(/\/api\/indoor-temp(?:\?|$)/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockIndoorHistory) })
     );
     await page.route("**/api/plans*", (route) =>
       route.fulfill({
@@ -171,6 +210,32 @@ test.describe("Price Chart", () => {
     await expect(page.getByRole("button", { name: "Show hot water" })).toBeVisible();
   });
 
+  test("marks now and explains the price history and forecast window", async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("tab", { name: "Charts" }).click();
+    await page.getByText("Show raw weather, price and temperature history").click();
+
+    const priceChart = page.getByRole("region", { name: "Electricity price chart" });
+    await expect(priceChart).toBeVisible();
+    await expect(
+      priceChart.getByText("Electricity Price (EUR c/kWh) — Past 24h / Next 24h"),
+    ).toBeVisible();
+    await expect(priceChart.getByText("Now", { exact: true })).toBeVisible();
+    await expect(priceChart).toContainText(
+      "Past prices are left of Now; forecast prices are right of it.",
+    );
+
+    const weatherChart = page.getByRole("region", { name: "Weather forecast chart" });
+    await expect(weatherChart.getByText("Weather — Past 12h / Next 48h")).toBeVisible();
+    await expect(weatherChart.getByText("Now", { exact: true })).toBeVisible();
+    await expect(weatherChart).toContainText(
+      "Past conditions are left of Now; forecast conditions are right of it.",
+    );
+
+    const temperatureChart = page.getByRole("region", { name: "Temperature history chart" });
+    await expect(temperatureChart.getByText("Temperature History — Past 24h")).toBeVisible();
+  });
+
   test("page renders all main sections", async ({ page }) => {
     await page.goto("/");
     // Wait for main content to load
@@ -211,6 +276,13 @@ test.describe("Plan View", () => {
     );
     await page.route("**/api/consumption*", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
+    );
+    await page.route("**/api/currency", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "SEK", prefix: "", suffix: " kr", multiplier: 1, price_label: "SEK/kWh" }),
+      })
     );
     await page.route("**/api/plans/**", (route) =>
       route.fulfill({
@@ -265,6 +337,8 @@ test.describe("Plan View", () => {
 
     // Active Plan section should show the plan header
     await expect(page.locator("text=Active Plan")).toBeVisible();
+    await expect(page.locator(".plan-cost-value")).toContainText("EUR");
+    await expect(page.locator(".plan-cost-value")).not.toContainText("kr");
 
     // Should show human-readable status "Scheduled" instead of raw "pending"
     await expect(page.locator("text=Scheduled").first()).toBeVisible({ timeout: 5000 });

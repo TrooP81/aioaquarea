@@ -1,4 +1,4 @@
-ARG APP_VERSION=0.13.0
+ARG APP_VERSION=0.13.1
 ARG BUILD_REVISION=unknown
 
 # python:3.12.13-slim-trixie, pinned by the official multi-architecture digest.

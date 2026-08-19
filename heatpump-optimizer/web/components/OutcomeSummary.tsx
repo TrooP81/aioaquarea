@@ -71,7 +71,7 @@ export function OutcomeSummary() {
               aria-pressed={days === value}
               onClick={() => setDays(value)}
             >
-              {value === 1 ? "Today" : `${value} days`}
+              {value === 1 ? "Last 24 hours" : `${value} days`}
             </button>
           ))}
         </div>

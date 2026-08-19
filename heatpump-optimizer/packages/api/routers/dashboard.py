@@ -24,6 +24,14 @@ from packages.core.models import (
     PlanActionRecord,
     PriceRecord,
 )
+from packages.core.operational_alerts import device_status_is_fresh
+from packages.core.plan_outcome import cumulative_counter_delta, hour_start
+from packages.core.settings_service import (
+    get_int_setting,
+    get_user_tz,
+    local_date,
+    local_day_start_utc,
+)
 
 router = APIRouter()
 
@@ -32,7 +40,9 @@ router = APIRouter()
 async def get_dashboard():
     """Get dashboard overview data."""
     now = dt.datetime.now(dt.timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    timezone_name = await get_user_tz()
+    today_start = local_day_start_utc(now, timezone_name)
+    poll_interval = await get_int_setting("poll_interval_seconds")
 
     async with get_session() as session:
         status_result = await session.execute(
@@ -105,7 +115,7 @@ async def get_dashboard():
             )
         )
         price_by_hour: dict[dt.datetime, tuple[float, str, str]] = {
-            ts.replace(minute=0, second=0, microsecond=0): (price, currency, source)
+            hour_start(ts): (price, currency, source)
             for ts, price, currency, source in prices_result.all()
         }
 
@@ -136,6 +146,20 @@ async def get_dashboard():
         )
         active_override_id = override_result.scalar_one_or_none()
 
+    status_fresh = device_status_is_fresh(
+        status.ts if status is not None else None,
+        now=now,
+        poll_interval_seconds=poll_interval,
+    )
+    status_timestamp = status.ts if status is not None else None
+    if status_timestamp is not None and status_timestamp.tzinfo is None:
+        status_timestamp = status_timestamp.replace(tzinfo=dt.timezone.utc)
+    status_age_seconds = (
+        max(0, round((now - status_timestamp).total_seconds()))
+        if status_timestamp is not None
+        else None
+    )
+
     today_kwh = 0.0
     if consumption_row and consumption_row[0] is not None:
         today_kwh = (
@@ -150,13 +174,15 @@ async def get_dashboard():
     unpriced_kwh = 0.0
     prev_record = None
     for record in consumption_records:
-        if prev_record is not None and record.ts.date() == prev_record.ts.date():
+        if prev_record is not None and local_date(
+            record.ts, timezone_name
+        ) == local_date(prev_record.ts, timezone_name):
             heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
             cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
             tank_delta = max(0.0, (record.tank_kwh or 0) - (prev_record.tank_kwh or 0))
             delta_kwh = heat_delta + cool_delta + tank_delta
             if delta_kwh > 0:
-                hour_key = record.ts.replace(minute=0, second=0, microsecond=0)
+                hour_key = hour_start(record.ts)
                 price_entry = price_by_hour.get(hour_key)
                 if (
                     price_entry is not None
@@ -215,6 +241,8 @@ async def get_dashboard():
         )
         if status
         else None,
+        current_status_fresh=status_fresh,
+        current_status_age_seconds=status_age_seconds,
         current_price=current_price,
         price_currency=price_currency,
         price_source=price_source,
@@ -347,7 +375,15 @@ async def get_device_settings():
 async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     """Get consumption history as per-interval deltas (not cumulative totals)."""
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    timezone_name = await get_user_tz()
     async with get_session() as session:
+        previous_result = await session.execute(
+            select(ConsumptionRecord)
+            .where(ConsumptionRecord.ts < since)
+            .order_by(desc(ConsumptionRecord.ts))
+            .limit(1)
+        )
+        previous = previous_result.scalar_one_or_none()
         result = await session.execute(
             select(ConsumptionRecord)
             .where(ConsumptionRecord.ts >= since)
@@ -356,12 +392,21 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
         rows = result.scalars().all()
 
     responses = []
-    prev = None
+    prev = previous
     for r in rows:
-        if prev is not None and r.ts.date() == prev.ts.date():
-            heat_delta = max(0.0, (r.heat_kwh or 0) - (prev.heat_kwh or 0))
-            cool_delta = max(0.0, (r.cool_kwh or 0) - (prev.cool_kwh or 0))
-            tank_delta = max(0.0, (r.tank_kwh or 0) - (prev.tank_kwh or 0))
+        if prev is not None:
+            day_changed = local_date(r.ts, timezone_name) != local_date(
+                prev.ts, timezone_name
+            )
+            heat_delta = cumulative_counter_delta(
+                r.heat_kwh or 0.0, prev.heat_kwh or 0.0, day_changed=day_changed
+            )
+            cool_delta = cumulative_counter_delta(
+                r.cool_kwh or 0.0, prev.cool_kwh or 0.0, day_changed=day_changed
+            )
+            tank_delta = cumulative_counter_delta(
+                r.tank_kwh or 0.0, prev.tank_kwh or 0.0, day_changed=day_changed
+            )
             responses.append(
                 ConsumptionResponse(
                     ts=r.ts,

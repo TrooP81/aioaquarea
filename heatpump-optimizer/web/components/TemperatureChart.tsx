@@ -45,22 +45,21 @@ export function TemperatureChart() {
   }, []);
 
   // Merge indoor temp data into the chart by matching to nearest 5-minute bucket
-  const indoorByBucket = new Map<string, number>();
+  const fiveMinuteBucket = (timestamp: string) =>
+    Math.round(new Date(timestamp).getTime() / 300_000) * 300_000;
+  const indoorByBucket = new Map<number, number[]>();
   indoorData.forEach((p) => {
-    const d = new Date(p.timestamp);
-    // Round to nearest 5 minutes
-    d.setMinutes(Math.round(d.getMinutes() / 5) * 5, 0, 0);
-    const key = formatTime(d, timeFormat.hour12);
-    indoorByBucket.set(key, p.temperature);
+    const key = fiveMinuteBucket(p.timestamp);
+    const values = indoorByBucket.get(key) ?? [];
+    values.push(p.temperature);
+    indoorByBucket.set(key, values);
   });
 
   const chartData = data.map((d) => {
-    const raw = new Date(d.ts);
-    // Round status timestamps to same 5-minute bucket
-    raw.setMinutes(Math.round(raw.getMinutes() / 5) * 5, 0, 0);
-    const time = formatTime(raw, timeFormat.hour12);
+    const timestamp = fiveMinuteBucket(d.ts);
+    const indoorValues = indoorByBucket.get(timestamp) ?? [];
     return {
-      time,
+      timestamp,
       tank: d.tank_temp,
       tankTarget: d.tank_target_temp,
       zone1: d.zone1_temp,
@@ -70,14 +69,27 @@ export function TemperatureChart() {
         ? d.zone1_target_temp
         : null,
       outdoor: d.outdoor_temp,
-      indoor: indoorByBucket.get(time) ?? null,
+      indoor: indoorValues.length > 0
+        ? indoorValues.reduce((total, value) => total + value, 0) / indoorValues.length
+        : null,
     };
   });
+  const formatTimestamp = (timestamp: number, includeDate = false) =>
+    includeDate
+      ? new Intl.DateTimeFormat(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: timeFormat.hour12,
+        }).format(new Date(timestamp))
+      : formatTime(new Date(timestamp), timeFormat.hour12);
 
   if (chartData.length === 0) {
     return (
       <div className="chart-container" role="region" aria-label="Temperature history chart">
-        <div className="chart-title">Temperature History — 24h</div>
+        <div className="chart-title">Temperature History — Past 24h</div>
         <div className="chart-skeleton-wrapper">
           <div className="chart-skeleton" />
           <div className="chart-skeleton" style={{ width: "60%" }} />
@@ -89,16 +101,26 @@ export function TemperatureChart() {
 
   return (
     <div className="chart-container" role="region" aria-label="Temperature history chart">
-      <div className="chart-title">Temperature History — 24h</div>
+      <div className="chart-title">Temperature History — Past 24h</div>
       <div className="chart-caption">
         Measured outdoor, tank and zone temperatures over the last 24 hours.
       </div>
       <ResponsiveContainer width="100%" height={280}>
         <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-          <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={3} />
+          <XAxis
+            dataKey="timestamp"
+            type="number"
+            scale="time"
+            domain={["dataMin", "dataMax"]}
+            stroke="#94a3b8"
+            fontSize={11}
+            tickCount={9}
+            tickFormatter={(timestamp) => formatTimestamp(Number(timestamp))}
+          />
           <YAxis stroke="#94a3b8" fontSize={11} unit="°C" />
           <Tooltip
+            labelFormatter={(timestamp) => formatTimestamp(Number(timestamp), true)}
             contentStyle={{
               background: "#1e293b",
               border: "1px solid #334155",

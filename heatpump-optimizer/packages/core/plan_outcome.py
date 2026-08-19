@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Iterable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,21 +43,41 @@ def counter_value(record: ConsumptionRecord) -> float:
     return float(record.heat_kwh or 0) + float(record.cool_kwh or 0) + float(record.tank_kwh or 0)
 
 
-def cumulative_intervals(records: Iterable[ConsumptionRecord]) -> list[tuple[dt.datetime, float]]:
+def cumulative_counter_delta(current: float, previous: float, *, day_changed: bool) -> float:
+    """Return a positive interval delta, accounting for a daily counter reset."""
+
+    if current >= previous:
+        return current - previous
+    return current if day_changed else 0.0
+
+
+def cumulative_intervals(
+    records: Iterable[ConsumptionRecord], timezone_name: str = "UTC"
+) -> list[tuple[dt.datetime, float]]:
     """Convert cumulative readings to positive interval kWh values.
 
-    Counters reset at a day boundary on several Aquarea installations.  A
-    cross-day subtraction is consequently not evidence of energy use and is
-    deliberately skipped.
+    Counters reset at a local day boundary on several Aquarea installations.
+    The first post-reset value is the energy accumulated since local midnight.
     """
 
+    timezone = ZoneInfo(timezone_name)
     intervals: list[tuple[dt.datetime, float]] = []
     previous: ConsumptionRecord | None = None
     for record in sorted(records, key=lambda row: row.ts):
-        if previous is not None and record.ts.date() == previous.ts.date():
+        if previous is not None:
+            day_changed = record.ts.astimezone(timezone).date() != previous.ts.astimezone(
+                timezone
+            ).date()
             # Meter counters arrive as floats; round only the interval to
             # prevent binary representation noise from leaking into costs/UI.
-            delta = round(max(0.0, counter_value(record) - counter_value(previous)), 6)
+            delta = round(
+                cumulative_counter_delta(
+                    counter_value(record),
+                    counter_value(previous),
+                    day_changed=day_changed,
+                ),
+                6,
+            )
             if delta > 0:
                 intervals.append((record.ts, delta))
         previous = record
@@ -217,6 +238,7 @@ async def measured_window_outcome(
     price_source: str | None,
     comfort_min_c: float,
     comfort_max_c: float,
+    timezone_name: str = "UTC",
 ) -> dict[str, object]:
     """Measure electricity price exposure and indoor comfort for one window."""
 
@@ -285,10 +307,10 @@ async def measured_window_outcome(
     # leading row may be before ``start`` and is only used as a baseline.
     intervals = [
         (timestamp, kwh)
-        for timestamp, kwh in cumulative_intervals(meter_rows)
+        for timestamp, kwh in cumulative_intervals(meter_rows, timezone_name)
         if start <= timestamp <= end
     ]
-    comparison_intervals = cumulative_intervals(comparison_meter_rows)
+    comparison_intervals = cumulative_intervals(comparison_meter_rows, timezone_name)
     return {
         "cost": cost_outcome(intervals, prices),
         "comfort": comfort_outcome(readings, comfort_min_c, comfort_max_c),
@@ -314,6 +336,7 @@ async def plan_measurement(
     comfort_min_c: float,
     comfort_max_c: float,
     now: dt.datetime | None = None,
+    timezone_name: str = "UTC",
 ) -> dict[str, object]:
     """Return the measured portion of one immutable plan."""
 
@@ -337,6 +360,7 @@ async def plan_measurement(
         price_source=plan.price_source,
         comfort_min_c=comfort_min_c,
         comfort_max_c=comfort_max_c,
+        timezone_name=timezone_name,
     )
     duration = max(1.0, (plan.horizon_end - plan.horizon_start).total_seconds())
     elapsed = min(duration, max(0.0, (end - plan.horizon_start).total_seconds()))
