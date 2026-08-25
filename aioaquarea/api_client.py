@@ -36,7 +36,15 @@ class AquareaAPIClient:
         )
         self._access_token: Optional[str] = None
         self._token_expiration: Optional[dt.datetime] = None
+        self._refresh_authentication: Callable[[], Awaitable[None]] | None = None
         self._reauthenticate: Callable[[], Awaitable[None]] | None = None
+
+    def set_refresh_authentication_callback(
+        self, callback: Callable[[], Awaitable[None]] | None
+    ) -> None:
+        """Register the owning client's serialized refresh-token callback."""
+
+        self._refresh_authentication = callback
 
     def set_reauthenticate_callback(
         self, callback: Callable[[], Awaitable[None]] | None
@@ -63,7 +71,7 @@ class AquareaAPIClient:
         headers: Optional[dict] = None,
         **kwargs,
     ) -> aiohttp.ClientResponse:
-        """Make a request, reauthenticating once on an explicit expired token."""
+        """Make a request with bounded refresh-token and full-login recovery."""
 
         explicit_headers = dict(headers or {})
         kwarg_headers = dict(kwargs.pop("headers", {}))
@@ -78,7 +86,14 @@ class AquareaAPIClient:
         else:
             # If external_url is not provided, join the base_url with the given url
             url = urllib.parse.urljoin(self._base_url, url)
-        for attempt in range(2):
+        recovery_callbacks = tuple(
+            callback
+            for callback in (self._refresh_authentication, self._reauthenticate)
+            if callback is not None
+        )
+        recovery_index = 0
+
+        while True:
             base_headers = await PanasonicRequestHeader.get(
                 self._settings, self._app_version
             )
@@ -120,22 +135,39 @@ class AquareaAPIClient:
                 return resp
 
             error = errors[0]
-            if (
-                attempt == 0
-                and self._reauthenticate is not None
-                and self._requires_reauthentication(error)
-            ):
-                self._logger.warning(
-                    "Panasonic access token expired during API request; logging in and retrying once"
-                )
-                await self._reauthenticate()
+            if self._requires_reauthentication(error):
+                while recovery_index < len(recovery_callbacks):
+                    callback = recovery_callbacks[recovery_index]
+                    recovery_index += 1
+                    recovery_name = (
+                        "refresh token"
+                        if callback is self._refresh_authentication
+                        else "full login"
+                    )
+                    self._logger.warning(
+                        "Panasonic access token expired during API request; "
+                        "%s recovery (%d/%d)",
+                        recovery_name,
+                        recovery_index,
+                        len(recovery_callbacks),
+                    )
+                    try:
+                        await callback()
+                    except Exception as exc:  # noqa: BLE001 - fall through to full login
+                        self._logger.warning(
+                            "Panasonic %s recovery failed: %s",
+                            recovery_name,
+                            exc,
+                        )
+                        continue
+                    break
+                else:
+                    raise AuthenticationError(error.error_code, error.error_message)
                 continue
 
             if error.error_code in list(AuthenticationErrorCodes):
                 raise AuthenticationError(error.error_code, error.error_message)
             raise ApiError(error.error_code, error.error_message)
-
-        raise RuntimeError("Panasonic API request retry exhausted")
 
     def __contains_valid_token(self, data: dict) -> bool:
         """Check if the data contains a valid token."""

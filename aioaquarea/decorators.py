@@ -2,11 +2,7 @@ import functools
 import logging
 from typing import TYPE_CHECKING  # Re-add TYPE_CHECKING
 
-from .errors import (  # Added ApiError
-    ApiError,
-    AuthenticationError,
-    AuthenticationErrorCodes,
-)
+from .errors import ApiError, AuthenticationError
 
 if TYPE_CHECKING:  # Re-add TYPE_CHECKING block
     from .core import AquareaClient
@@ -15,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def auth_required(fn):
-    """Decorator to require authentication and to refresh login if it's able to."""
+    """Require an authenticated client before entering an API operation."""
 
     @functools.wraps(fn)
     async def _wrap(
@@ -35,34 +31,10 @@ def auth_required(fn):
                 f"{client}: API Error: {getattr(exception, 'error_code', 'N/A')} - {getattr(exception, 'error_message', str(exception))}."
             )
 
-            # If the error is invalid credentials, always raise.
-            if (
-                isinstance(exception, AuthenticationError)
-                and exception.error_code
-                == AuthenticationErrorCodes.INVALID_USERNAME_OR_PASSWORD
-            ):
-                raise
-
-            # If refresh is not enabled, always raise.
-            if not client.is_refresh_login_enabled:
-                raise
-
-            # If it's an ApiError with "Missing Authentication Token" or AuthenticationError with TOKEN_EXPIRED, try to re-login.
-            if (
-                isinstance(exception, ApiError)
-                and "Missing Authentication Token" in str(exception)
-            ) or (
-                isinstance(exception, AuthenticationError)
-                and exception.error_code == AuthenticationErrorCodes.TOKEN_EXPIRED
-            ):
-                client.logger.warning(
-                    f"{client}: Token expired or missing. Trying to login again."
-                )
-                await client.login()
-                response = await fn(client, *args, **kwargs)
-            else:
-                # For any other unhandled AuthenticationError or ApiError, re-raise.
-                raise
+            # API response authentication failures are recovered centrally by
+            # AquareaAPIClient. Retrying here would multiply full login attempts
+            # and resend the same logical Panasonic operation more than once.
+            raise
 
         return response
 

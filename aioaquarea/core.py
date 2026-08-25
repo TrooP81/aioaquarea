@@ -110,6 +110,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
             self._logger,
         )
         if environment is AquareaEnvironment.PRODUCTION:
+            self._api_client.set_refresh_authentication_callback(self.refresh_login)
             self._api_client.set_reauthenticate_callback(self.login)
         self._device_control = AquareaDeviceControl(self._api_client, self._base_url)
         self._consumption_manager = AquareaConsumptionManager(
@@ -187,20 +188,38 @@ class AquareaClient:  # Renamed Client to AquareaClient
                 else:
                     _LOGGER.error("Missing User name and/or password, cannot login")
 
-            self._last_login = dt.datetime.now(dt.timezone.utc)
-            self._login_generation += 1
-            # Production authentication stores tokens in PanasonicSettings;
-            # demo requests update the API client directly. Do not overwrite a
-            # valid demo token with the empty production settings object.
-            if self._settings.access_token is not None:
-                self._api_client.access_token = self._settings.access_token
-            if self._settings.expires_at is not None:
-                self._api_client.token_expiration = dt.datetime.fromtimestamp(
-                    self._settings.expires_at, tz=dt.timezone.utc
-                )
+            self._sync_authentication_state()
             # Removed await self._device_manager.get_groups() as it's not a public method and device fetching handles it.
         finally:
             self._login_lock.release()
+
+    async def refresh_login(self) -> None:
+        """Refresh the current token once, serialized with full login attempts."""
+
+        intent_generation = self._login_generation
+        await self._login_lock.acquire()
+        try:
+            if self._login_generation != intent_generation:
+                return
+            await self._authenticator.refresh_token()
+            self._sync_authentication_state()
+        finally:
+            self._login_lock.release()
+
+    def _sync_authentication_state(self) -> None:
+        """Publish newly authenticated settings to request handling."""
+
+        self._last_login = dt.datetime.now(dt.timezone.utc)
+        self._login_generation += 1
+        # Production authentication stores tokens in PanasonicSettings;
+        # demo requests update the API client directly. Do not overwrite a
+        # valid demo token with the empty production settings object.
+        if self._settings.access_token is not None:
+            self._api_client.access_token = self._settings.access_token
+        if self._settings.expires_at is not None:
+            self._api_client.token_expiration = dt.datetime.fromtimestamp(
+                self._settings.expires_at, tz=dt.timezone.utc
+            )
 
     @auth_required
     async def get_devices(self) -> list[DeviceInfo]:
