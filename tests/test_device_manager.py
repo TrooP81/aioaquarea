@@ -6,6 +6,7 @@ import pytest
 from aioaquarea.auth import CCAppVersion, PanasonicSettings
 from aioaquarea.data import (
     DeviceDirection,
+    DeviceAction,
     DeviceInfo,
     DeviceModeStatus,
     DeviceZoneInfo,
@@ -21,10 +22,12 @@ from aioaquarea.data import (
     SensorMode,
     SpecialStatus,
     StatusDataMode,
+    UpdateOperationMode,
     ZoneSensor,
     ZoneType,
 )
 from aioaquarea.device_manager import DeviceManager
+from aioaquarea.entities import DeviceImpl
 from aioaquarea.errors import DeviceUnavailableError, RequestFailedError
 
 
@@ -285,3 +288,32 @@ async def test_get_device_status_operation_status_defaults_off_when_absent(
     status = await device_manager.get_device_status(device_info)
 
     assert status.operation_status == OperationStatus.OFF
+
+
+@pytest.mark.asyncio
+async def test_device_with_declared_tank_tolerates_missing_live_tank_status(
+    device_manager, device_info
+):
+    device_manager._client._api_client.request.return_value = FakeResponse(
+        _minimal_status_payload(direction=DeviceDirection.WATER.value)
+    )
+    status = await device_manager.get_device_status(device_info)
+    client = SimpleNamespace(post_device_operation_update=AsyncMock())
+    device = DeviceImpl(
+        device_id=device_info.device_id,
+        long_id=device_info.long_id,
+        name=device_info.name,
+        firmware_version=device_info.firmware_version,
+        model=device_info.model,
+        has_tank=True,
+        zones_info=device_info.zones,
+        status=status,
+        client=client,
+    )
+
+    assert device.tank is None
+    assert device.current_action == DeviceAction.IDLE
+
+    await device.set_mode(UpdateOperationMode.HEAT)
+
+    assert client.post_device_operation_update.await_args.args[4] == OperationStatus.OFF

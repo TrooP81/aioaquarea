@@ -25,7 +25,9 @@ from .data import (
     ZoneTemperatureSetUpdate,
 )
 from .errors import DataNotAvailableError
+from .command_result import PanasonicCommandResult
 from .statistics import Consumption, ConsumptionType, DateType
+from .weekly_timer import WeeklyTimerSettings
 
 if TYPE_CHECKING:
     from .core import AquareaClient
@@ -94,8 +96,7 @@ class DeviceImpl(Device):
             {}
         )  # Initialize _consumption with dt.date as key and single Consumption object for the day
 
-        if self.has_tank and self._status.tank_status:
-            self._tank = TankImpl(self._status.tank_status[0], self, self._client)
+        self._sync_tank_from_status()
 
         # The consumption data refresh is now triggered and awaited in AquareaClient.get_device
         # TODO
@@ -118,14 +119,20 @@ class DeviceImpl(Device):
         self._status = await self._client.get_device_status(
             self._info, allow_cached_fallback=allow_cached_fallback
         )
-
-        if self.has_tank and self._status.tank_status:
-            self._tank = TankImpl(self._status.tank_status[0], self, self._client)
+        self._sync_tank_from_status()
 
         if (
             self._consumption_refresh_interval
         ):  # Always attempt to refresh if interval is set
             await self.__refresh_consumption__()
+
+    def _sync_tank_from_status(self) -> None:
+        """Keep the tank entity aligned with the latest optional tank status."""
+        self._tank = (
+            TankImpl(self._status.tank_status[0], self, self._client)
+            if self.has_tank and self._status.tank_status
+            else None
+        )
 
     async def __refresh_consumption__(self) -> None:
         """Refreshes the consumption data."""
@@ -212,11 +219,8 @@ class DeviceImpl(Device):
             else:
                 zones[zone.zone_id] = zone.operation_status
 
-        tank_off = (
-            not self.has_tank
-            or self.has_tank
-            and self.tank.operation_status == OperationStatus.OFF
-        )
+        tank = self.tank
+        tank_off = tank is None or tank.operation_status == OperationStatus.OFF
 
         operation_status = (
             OperationStatus.OFF
@@ -227,9 +231,7 @@ class DeviceImpl(Device):
         )
 
         tank_operation_status = (
-            self.tank.operation_status
-            if self.has_tank and self.tank
-            else OperationStatus.OFF
+            tank.operation_status if tank is not None else OperationStatus.OFF
         )
 
         # Prepare zone temperature updates to be sent along with operation mode
@@ -285,8 +287,8 @@ class DeviceImpl(Device):
                 self.long_id, zone_id, temperature
             )
 
-    async def set_quiet_mode(self, mode: QuietMode) -> None:
-        await self._client.post_device_set_quiet_mode(self.long_id, mode)
+    async def set_quiet_mode(self, mode: QuietMode) -> PanasonicCommandResult:
+        return await self._client.post_device_set_quiet_mode(self.long_id, mode)
 
     async def get_and_refresh_consumption(
         self, date: dt.datetime, consumption_type: ConsumptionType
@@ -340,12 +342,12 @@ class DeviceImpl(Device):
             return consumption_obj.total_consumption
         return None
 
-    async def set_force_dhw(self, force_dhw: ForceDHW) -> None:
+    async def set_force_dhw(self, force_dhw: ForceDHW) -> PanasonicCommandResult:
         """Set the force dhw.
 
         :param force_dhw: Set the Force DHW mode if the device has a tank.
         """
-        await self._client.post_device_force_dhw(self.long_id, force_dhw)
+        return await self._client.post_device_force_dhw(self.long_id, force_dhw)
 
     async def set_force_heater(self, force_heater: ForceHeater) -> None:
         """Set the force heater configuration.
@@ -377,6 +379,10 @@ class DeviceImpl(Device):
             await self._client.post_device_set_powerful_time(
                 self.long_id, powerful_time
             )
+
+    async def get_weekly_timer(self) -> WeeklyTimerSettings | None:
+        """Read the Panasonic schedule without permitting timer writes."""
+        return await self._client.get_device_weekly_timer(self.long_id)
 
     async def __set_special_status__(
         self,

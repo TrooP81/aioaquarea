@@ -177,22 +177,52 @@ def generate_random_string(length: int) -> str:
     )
 
 
+def _decode_json_object(payload: str, context: str) -> dict:
+    """Decode an authentication response without leaking its contents."""
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise AuthenticationError(
+            AuthenticationErrorCodes.API_ERROR,
+            f"Panasonic {context} response is not valid JSON.",
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise AuthenticationError(
+            AuthenticationErrorCodes.API_ERROR,
+            f"Panasonic {context} response is not a JSON object.",
+        )
+    return decoded
+
+
 def get_querystring_parameter_from_header_entry_url(
     response: aiohttp.ClientResponse, header_entry, querystring_parameter
 ):
-    header_entry_value = response.headers[header_entry]
+    header_entry_value = response.headers.get(header_entry)
+    if not header_entry_value:
+        raise AuthenticationError(
+            AuthenticationErrorCodes.API_ERROR,
+            f"Authentication response is missing the {header_entry!r} header.",
+        )
     parsed_url = urllib.parse.urlparse(header_entry_value)
     params = urllib.parse.parse_qs(parsed_url.query)
-    return params.get(querystring_parameter, [None])[0]
+    value = params.get(querystring_parameter, [None])[0]
+    if value is None:
+        raise AuthenticationError(
+            AuthenticationErrorCodes.API_ERROR,
+            f"Authentication redirect is missing the {querystring_parameter!r} parameter.",
+        )
+    return value
 
 
 async def check_response(
     response: aiohttp.ClientResponse, step_name: str, expected_status: int
 ):
     if response.status != expected_status:
-        response_text = await response.text()
         _LOGGER.error(
-            f"Error in {step_name}: Expected status {expected_status}, got {response.status}. Response: {response_text}"
+            "Error in %s: expected status %s, got %s",
+            step_name,
+            expected_status,
+            response.status,
         )
         raise AuthenticationError(
             AuthenticationErrorCodes.API_ERROR,
@@ -202,9 +232,11 @@ async def check_response(
 
 async def has_new_version_been_published(response: aiohttp.ClientResponse) -> bool:
     if response.status == 401:
-        response_json = await response.json()
-        if response_json["code"] == 4106:
-            return True
+        try:
+            response_json = await response.json()
+        except (aiohttp.ClientError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        return isinstance(response_json, dict) and response_json.get("code") == 4106
     return False
 
 
@@ -237,7 +269,12 @@ class Authenticator:
         )
 
         authorization_response = await self._authorize(code_challenge)
-        authorization_redirect = authorization_response.headers["Location"]
+        authorization_redirect = authorization_response.headers.get("Location")
+        if not authorization_redirect:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Authorization response is missing the redirect location.",
+            )
 
         # check if the user can skip the authentication workflows - in that case,
         # the location is directly pointing to the redirect url with the "code"
@@ -279,7 +316,7 @@ class Authenticator:
             allow_redirects=False,
         )
         await check_response(response, "refresh_token", 200)
-        token_response = json.loads(await response.text())
+        token_response = _decode_json_object(await response.text(), "refresh token")
         self._set_token(token_response, unix_time_token_received)
 
     async def _authorize(self, challenge) -> aiohttp.ClientResponse:
@@ -322,7 +359,12 @@ class Authenticator:
         state = get_querystring_parameter_from_header_entry_url(
             authorization_response, "Location", "state"
         )
-        location = authorization_response.headers["Location"]
+        location = authorization_response.headers.get("Location")
+        if not location:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Authorization redirect is missing its location.",
+            )
         self._logger.debug(
             "Following authorization redirect, %s",
             json.dumps({"url": f"{BASE_PATH_AUTH}/{location}", "state": state}),
@@ -333,14 +375,20 @@ class Authenticator:
         await check_response(response, "authorize_redirect", 200)
 
         # get the "_csrf" cookie
-        csrf_cookie = response.cookies["_csrf"]
+        csrf_cookie = response.cookies.get("_csrf")
+        if csrf_cookie is None:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Authorization response is missing the CSRF cookie.",
+            )
+        csrf_value = getattr(csrf_cookie, "value", str(csrf_cookie))
 
         # -------------------------------------------------------------------
         # LOGIN
         # -------------------------------------------------------------------
         self._logger.debug(
             "Authenticating with username and password, %s",
-            json.dumps({"csrf": csrf_cookie, "state": state}),
+            json.dumps({"csrf_present": True, "state": state}),
         )
         response = await self._sess.post(
             f"{BASE_PATH_AUTH}/usernamepassword/login",
@@ -355,7 +403,7 @@ class Authenticator:
                 "response_type": "code",
                 "scope": "openid offline_access comfortcloud.control a2w.control",
                 "audience": f"https://digital.panasonic.com/{APP_CLIENT_ID}/api/v1/",
-                "_csrf": csrf_cookie,
+                "_csrf": csrf_value,
                 "state": state,
                 "_intstate": "deprecated",
                 "username": username,
@@ -373,16 +421,24 @@ class Authenticator:
 
         # get wa, wresult, wctx from body
         response_text = await response.text()
-        self._logger.debug(
-            "Authentication response, %s", json.dumps({"html": response_text})
-        )
+        self._logger.debug("Panasonic authentication form received")
         soup = BeautifulSoup(response_text, "html.parser")
         input_lines = soup.find_all("input", {"type": "hidden"})
         parameters = dict()
         for input_line in input_lines:
-            parameters[input_line.get("name")] = input_line.get("value")
+            name = input_line.get("name")
+            if name:
+                parameters[name] = input_line.get("value")
 
-        self._logger.debug("Callback with parameters, %s", json.dumps(parameters))
+        if not parameters:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic login response contains no callback parameters.",
+            )
+
+        self._logger.debug(
+            "Panasonic callback parameters found: %s", sorted(parameters)
+        )
         response = await self._sess.post(
             url=f"{BASE_PATH_AUTH}/login/callback",
             data=parameters,
@@ -398,20 +454,30 @@ class Authenticator:
         # FOLLOW REDIRECT
         # ------------------------------------------------------------------
 
-        location = response.headers["Location"]
+        location = response.headers.get("Location")
+        if not location:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic login callback is missing its redirect location.",
+            )
         self._logger.debug(
             "Callback response, %s",
-            json.dumps({"redirect": location, "html": await response.text()}),
+            json.dumps({"redirect": location}),
         )
 
         response = await self._sess.get(
             f"{BASE_PATH_AUTH}/{location}", allow_redirects=False
         )
         await check_response(response, "login_redirect", 302)
-        location = response.headers["Location"]
+        location = response.headers.get("Location")
+        if not location:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic login redirect is missing its callback location.",
+            )
         self._logger.debug(
             "Callback redirect, %s",
-            json.dumps({"redirect": location, "html": await response.text()}),
+            json.dumps({"redirect": location}),
         )
 
         return get_querystring_parameter_from_header_entry_url(
@@ -442,15 +508,33 @@ class Authenticator:
         )
         await check_response(response, "get_token", 200)
 
-        token_response = json.loads(await response.text())
+        token_response = _decode_json_object(await response.text(), "access token")
         self._set_token(token_response, unix_time_token_received)
 
     def _set_token(self, token_response, unix_time_token_received):
+        access_token = token_response.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic token response is missing a valid access token.",
+            )
+        expires_in = token_response.get("expires_in")
+        if isinstance(expires_in, bool):
+            expires_in = None
+        try:
+            expires_in = float(expires_in)
+        except (TypeError, ValueError):
+            expires_in = 0
+        if expires_in <= 0:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic token response is missing a valid expiration time.",
+            )
         self._settings.set_token(
-            token_response["access_token"],
+            access_token,
             token_response.get("refresh_token") or self._settings.refresh_token,
-            unix_time_token_received + token_response["expires_in"],
-            token_response.get("scope", self._settings.scope),
+            unix_time_token_received + expires_in,
+            token_response.get("scope") or self._settings.scope or "openid",
         )
 
     async def _retrieve_client_acc(self):
@@ -477,6 +561,12 @@ class Authenticator:
 
         await check_response(response, "get_acc_client_id", 200)
 
-        json_body = json.loads(await response.text())
-        self._settings.clientId = json_body["clientId"]
+        json_body = _decode_json_object(await response.text(), "ACC login")
+        client_id = json_body.get("clientId")
+        if not isinstance(client_id, str) or not client_id:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Panasonic ACC login response is missing a valid clientId.",
+            )
+        self._settings.clientId = client_id
         return

@@ -81,7 +81,24 @@ def _tank_target_reached(device: Any) -> tuple[bool, Any, Any]:
     return reached, current_temp, target_temp
 
 
+async def _active_weekly_timer_conflict(wrapper: Any, zone_id: int) -> dict[str, Any] | None:
+    slots = await wrapper.get_active_weekly_timer_slots()
+    if not isinstance(slots, (list, tuple)):
+        return None
+    requested_zone = zone_id or 1
+    matching = [slot for slot in slots if getattr(slot, "zone_id", None) == requested_zone]
+    if not matching:
+        return None
+    return {
+        "skip": True,
+        "reason": "panasonic_weekly_timer_active",
+        "timer_zone_id": requested_zone,
+        "timer_slot_count": len(matching),
+    }
+
+
 async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    from aioaquarea import PanasonicCommandResult
     from aioaquarea import ForceDHW
 
     device = await wrapper.get_device()
@@ -97,7 +114,10 @@ async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[
     changed = await wrapper.force_dhw(ForceDHW.ON)
     if changed is False:
         return {"skip": True, "reason": "force_dhw_already_on"}
-    return {"force_dhw": "ON"}
+    return {
+        "force_dhw": "ON",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _redispatch_force_dhw_on(
@@ -116,16 +136,19 @@ async def _redispatch_force_dhw_on(
 
 
 async def _dispatch_force_dhw_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import ForceDHW
+    from aioaquarea import ForceDHW, PanasonicCommandResult
 
     changed = await wrapper.force_dhw(ForceDHW.OFF)
     if changed is False:
         return {"skip": True, "reason": "force_dhw_already_off"}
-    return {"force_dhw": "OFF"}
+    return {
+        "force_dhw": "OFF",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import QuietMode
+    from aioaquarea import PanasonicCommandResult, QuietMode
 
     level = payload.get("level", 1)
     if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
@@ -143,21 +166,29 @@ async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict
             "reason": "quiet_mode_already_active",
             "observed_quiet_level": level,
         }
-    return {"quiet_mode": mode.name}
+    return {
+        "quiet_mode": mode.name,
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_quiet_mode_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import QuietMode
+    from aioaquarea import PanasonicCommandResult, QuietMode
 
     changed = await wrapper.set_quiet_mode(QuietMode.OFF)
     if changed is False:
         return {"skip": True, "reason": "quiet_mode_already_off"}
-    return {"quiet_mode": "OFF"}
+    return {
+        "quiet_mode": "OFF",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     offset = int(payload.get("offset", 2))
     zone_id = int(payload.get("zone_id", 0))
+    if conflict := await _active_weekly_timer_conflict(wrapper, zone_id):
+        return conflict
     device = await wrapper.get_device()
     zone = _zone_from_device(device, zone_id)
     current_target = getattr(zone, "heat_target_temperature", None)
@@ -219,6 +250,8 @@ async def _redispatch_zone_temp_boost(
     if not _is_whole_number(target):
         raise ValueError("Zone boost retry is missing a whole-degree absolute target")
     target = int(target)
+    if await _active_weekly_timer_conflict(wrapper, zone_id):
+        return expected
     await wrapper.set_zone_heat_temperature(zone_id, target)
     return {"zone_id": zone_id, "temperature": target}
 
@@ -269,6 +302,8 @@ async def _dispatch_set_zone_heat_temperature(
     wrapper: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:
     zone_id = int(payload.get("zone_id", 0))
+    if conflict := await _active_weekly_timer_conflict(wrapper, zone_id):
+        return conflict
     target = payload["temperature"]
     device = await wrapper.get_device()
     zone = _zone_from_device(device, zone_id)

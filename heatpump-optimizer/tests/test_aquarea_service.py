@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aioaquarea import (
@@ -44,6 +44,26 @@ async def test_cached_device_does_not_consume_read_budget() -> None:
 
     wrapper._read_limiter.acquire.assert_not_awaited()
     wrapper._client.get_devices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_weekly_timer_read_is_cached_and_evaluated_in_user_timezone() -> None:
+    wrapper = _wrapper()
+    slots = (SimpleNamespace(zone_id=1),)
+    timer = SimpleNamespace(active_slots=MagicMock(return_value=slots))
+    device = SimpleNamespace(
+        status_data_mode=StatusDataMode.LIVE,
+        get_weekly_timer=AsyncMock(return_value=timer),
+    )
+    wrapper._device = device
+    instant = dt.datetime(2026, 8, 24, 20, tzinfo=dt.timezone.utc)
+
+    assert await wrapper.get_active_weekly_timer_slots(instant) == slots
+    assert await wrapper.get_active_weekly_timer_slots(instant) == slots
+
+    device.get_weekly_timer.assert_awaited_once()
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    timer.active_slots.assert_called_with(instant, wrapper._timezone)
 
 
 @pytest.mark.asyncio

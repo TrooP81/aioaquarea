@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .auth import PanasonicRequestHeader
+from .command_result import PanasonicCommandResult
 from .const import AQUAREA_SERVICE_A2W_STATUS_DISPLAY, AQUAREA_SERVICE_DEVICES
 from .data import (
     DeviceZoneStatus,
@@ -41,17 +42,20 @@ class AquareaDeviceControl:
             "bodyParam": {"gwid": long_id, **body_params},
         }
 
-    async def _post_transfer(self, payload: dict[str, object]) -> None:
-        await self._api_client.request(
+    async def _post_transfer(
+        self, payload: dict[str, object]
+    ) -> PanasonicCommandResult:
+        response = await self._api_client.request(
             "POST",
             self._TRANSFER_URL,
             json=payload,
             throw_on_error=True,
         )
+        return await PanasonicCommandResult.from_response(response)
 
     async def post_device_operation_status(
         self, long_device_id: str, new_operation_status: OperationStatus
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device operation status."""
         data = {
             "status": [
@@ -62,7 +66,7 @@ class AquareaDeviceControl:
             ]
         }
 
-        await self._api_client.request(
+        response = await self._api_client.request(
             "POST",
             f"{AQUAREA_SERVICE_DEVICES}/{long_device_id}",
             headers=PanasonicRequestHeader.get_aqua_headers(
@@ -71,12 +75,13 @@ class AquareaDeviceControl:
             ),
             json=data,
         )
+        return await PanasonicCommandResult.from_response(response)
 
     async def post_device_tank_temperature(
         self, long_device_id: str, new_temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device tank temperature."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(
                 long_device_id,
                 tankStatus={"heatSet": new_temperature},
@@ -88,7 +93,7 @@ class AquareaDeviceControl:
         long_device_id: str,
         new_operation_status: OperationStatus,
         zones: list[DeviceZoneStatus],
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device tank operation status."""
         zone_status_list = []
         for zone in zones:
@@ -99,7 +104,7 @@ class AquareaDeviceControl:
                 }
             )
 
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(
                 long_device_id,
                 zoneStatus=zone_status_list,
@@ -117,7 +122,7 @@ class AquareaDeviceControl:
         zone_temperature_updates: (
             list[ZoneTemperatureSetUpdate] | None
         ) = None,  # New parameter
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device operation update."""
         # Construct zoneStatus list based on provided zones and optional temperature updates
         zone_status_list = []
@@ -136,7 +141,7 @@ class AquareaDeviceControl:
                         break
             zone_status_list.append(zone_data)
 
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(
                 long_id,
                 operationMode=mode.value,
@@ -151,7 +156,7 @@ class AquareaDeviceControl:
         long_id: str,
         special_status: SpecialStatus | None,
         zones: list[ZoneTemperatureSetUpdate],
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device operation update."""
         data = {
             "status": [
@@ -174,7 +179,7 @@ class AquareaDeviceControl:
             ]
         }
 
-        await self._api_client.request(
+        response = await self._api_client.request(
             "POST",
             f"{AQUAREA_SERVICE_DEVICES}/{long_id}",
             headers=PanasonicRequestHeader.get_aqua_headers(
@@ -183,10 +188,11 @@ class AquareaDeviceControl:
             ),
             json=data,
         )
+        return await PanasonicCommandResult.from_response(response)
 
     async def post_device_zone_heat_temperature(
         self, long_id: str, zone_id: int, temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device zone heat temperature."""
         return await self._post_device_zone_temperature(
             long_id, zone_id, temperature, "heatSet"
@@ -194,7 +200,7 @@ class AquareaDeviceControl:
 
     async def post_device_zone_cool_temperature(
         self, long_id: str, zone_id: int, temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device zone cool temperature."""
         return await self._post_device_zone_temperature(
             long_id, zone_id, temperature, "coolSet"
@@ -202,9 +208,9 @@ class AquareaDeviceControl:
 
     async def _post_device_zone_temperature(
         self, long_id: str, zone_id: int, temperature: int, key: str
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device zone temperature."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(
                 long_id,
                 zoneStatus=[
@@ -216,42 +222,50 @@ class AquareaDeviceControl:
             )
         )
 
-    async def post_device_set_quiet_mode(self, long_id: str, mode: QuietMode) -> None:
+    async def post_device_set_quiet_mode(
+        self, long_id: str, mode: QuietMode
+    ) -> PanasonicCommandResult:
         """Post quiet mode."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(long_id, quietMode=mode.value)
         )
 
-    async def post_device_force_dhw(self, long_id: str, force_dhw: ForceDHW) -> None:
+    async def post_device_force_dhw(
+        self, long_id: str, force_dhw: ForceDHW
+    ) -> PanasonicCommandResult:
         """Post force DHW command."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(long_id, forceDHW=force_dhw.value)
         )
 
     async def post_device_force_heater(
         self, long_id: str, force_heater: ForceHeater
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post force heater command."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(long_id, forceHeater=force_heater.value)
         )
 
     async def post_device_holiday_timer(
         self, long_id: str, holiday_timer: HolidayTimer
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post holidayTimer command."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(long_id, holidayTimer=holiday_timer.value)
         )
 
-    async def post_device_request_defrost(self, long_id: str) -> None:
+    async def post_device_request_defrost(
+        self, long_id: str
+    ) -> PanasonicCommandResult:
         """Post forcedefrost command."""
-        await self._post_transfer(self._build_transfer_request(long_id, forcedefrost=1))
+        return await self._post_transfer(
+            self._build_transfer_request(long_id, forcedefrost=1)
+        )
 
     async def post_device_set_powerful_time(
         self, long_id: str, powerful_time: PowerfulTime
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post powerful time."""
-        await self._post_transfer(
+        return await self._post_transfer(
             self._build_transfer_request(long_id, powerfulRequest=powerful_time.value)
         )

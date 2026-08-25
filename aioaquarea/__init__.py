@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
+from .command_result import PanasonicCommandResult
 from .const import AquareaEnvironment
 from .core import AquareaClient as Client  # Import AquareaClient and alias it as Client
 from .data import (
@@ -35,6 +36,7 @@ from .errors import (
     RequestFailedError,
 )
 from .statistics import Consumption, ConsumptionType, DateType
+from .weekly_timer import DayOfWeek, WeeklyTimerSettings, WeeklyTimerSlot
 
 __all__: Final[tuple[str, ...]] = (
     "Client",  # Keep "Client" in __all__ as it's aliased
@@ -66,4 +68,8 @@ __all__: Final[tuple[str, ...]] = (
     "PowerfulTime",
     "AquareaEnvironment",
     "SpecialStatus",
+    "PanasonicCommandResult",
+    "DayOfWeek",
+    "WeeklyTimerSettings",
+    "WeeklyTimerSlot",
 )
