@@ -61,6 +61,7 @@ async def test_initial_device_load_consumes_one_read_token() -> None:
     wrapper._client.get_device.assert_awaited_once_with(
         device_info=device_info,
         consumption_refresh_interval=dt.timedelta(minutes=5),
+        timezone=wrapper._timezone,
     )
 
 

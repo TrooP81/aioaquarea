@@ -107,6 +107,8 @@ class AquareaClient:  # Renamed Client to AquareaClient
             self._environment,
             self._logger,
         )
+        if environment is AquareaEnvironment.PRODUCTION:
+            self._api_client.set_reauthenticate_callback(self.login)
         self._device_control = AquareaDeviceControl(self._api_client, self._base_url)
         self._consumption_manager = AquareaConsumptionManager(
             self._api_client, self._base_url, timezone

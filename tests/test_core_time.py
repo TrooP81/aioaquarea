@@ -60,6 +60,18 @@ def test_consumption_manager_uses_client_timezone() -> None:
     assert client._consumption_manager._timezone is timezone
 
 
+def test_production_client_registers_serialized_login_for_api_reauthentication() -> None:
+    client = _client()
+
+    assert client._api_client._reauthenticate == client.login
+
+
+def test_demo_client_does_not_register_recursive_api_reauthentication() -> None:
+    client = _client(AquareaEnvironment.DEMO)
+
+    assert client._api_client._reauthenticate is None
+
+
 @pytest.mark.asyncio
 async def test_demo_login_preserves_token_from_api_response() -> None:
     client = _client(AquareaEnvironment.DEMO)
