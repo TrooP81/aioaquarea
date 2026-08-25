@@ -94,8 +94,7 @@ class DeviceImpl(Device):
             {}
         )  # Initialize _consumption with dt.date as key and single Consumption object for the day
 
-        if self.has_tank and self._status.tank_status:
-            self._tank = TankImpl(self._status.tank_status[0], self, self._client)
+        self._sync_tank_from_status()
 
         # The consumption data refresh is now triggered and awaited in AquareaClient.get_device
         # TODO
@@ -118,14 +117,20 @@ class DeviceImpl(Device):
         self._status = await self._client.get_device_status(
             self._info, allow_cached_fallback=allow_cached_fallback
         )
-
-        if self.has_tank and self._status.tank_status:
-            self._tank = TankImpl(self._status.tank_status[0], self, self._client)
+        self._sync_tank_from_status()
 
         if (
             self._consumption_refresh_interval
         ):  # Always attempt to refresh if interval is set
             await self.__refresh_consumption__()
+
+    def _sync_tank_from_status(self) -> None:
+        """Keep the tank entity aligned with the latest optional tank status."""
+        self._tank = (
+            TankImpl(self._status.tank_status[0], self, self._client)
+            if self.has_tank and self._status.tank_status
+            else None
+        )
 
     async def __refresh_consumption__(self) -> None:
         """Refreshes the consumption data."""
@@ -212,11 +217,8 @@ class DeviceImpl(Device):
             else:
                 zones[zone.zone_id] = zone.operation_status
 
-        tank_off = (
-            not self.has_tank
-            or self.has_tank
-            and self.tank.operation_status == OperationStatus.OFF
-        )
+        tank = self.tank
+        tank_off = tank is None or tank.operation_status == OperationStatus.OFF
 
         operation_status = (
             OperationStatus.OFF
@@ -227,9 +229,7 @@ class DeviceImpl(Device):
         )
 
         tank_operation_status = (
-            self.tank.operation_status
-            if self.has_tank and self.tank
-            else OperationStatus.OFF
+            tank.operation_status if tank is not None else OperationStatus.OFF
         )
 
         # Prepare zone temperature updates to be sent along with operation mode
