@@ -17,6 +17,17 @@ export interface ReleaseNote {
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
+    released: "2026-08-25",
+    title: "Resilient Panasonic control",
+    changes: [
+      "Expired Panasonic sessions now recover through one bounded token refresh and reauthentication attempt before an action is reported as failed.",
+      "Device readings handle missing tank data and invalid consumption values safely, while command outcomes retain sanitized diagnostic details for auditing.",
+      "The optimizer uses verified live state to avoid redundant actions and respects active Panasonic weekly-timer slots before changing zone temperatures.",
+      "Production images now install the reviewed local Panasonic integration and record the exact application version and source revision in OCI metadata."
+    ],
+  },
+  {
+    version: "0.13.2",
     released: "2026-08-19",
     title: "Raw chart expansion hotfix",
     changes: [
