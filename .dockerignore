@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.pyc
+heatpump-optimizer/.env
+heatpump-optimizer/backups
+heatpump-optimizer/backups-replica
+heatpump-optimizer/models
+heatpump-optimizer/tests
+heatpump-optimizer/web
+tests

@@ -11,13 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev git && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+COPY heatpump-optimizer/pyproject.toml ./
 RUN pip install --no-cache-dir -e ".[all]"
 
-COPY . .
+COPY heatpump-optimizer/ .
+
+# The optimizer and aioaquarea live in the same repository. Install the local
+# library after third-party dependencies so production images contain the
+# exact Panasonic integration that was reviewed and merged with the app.
+COPY pyproject.toml README.md LICENSE /opt/aioaquarea-src/
+COPY aioaquarea/ /opt/aioaquarea-src/aioaquarea/
 
 # Install the project itself
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --force-reinstall --no-deps /opt/aioaquarea-src \
+ && pip install --no-cache-dir --no-deps -e .
 
 RUN useradd --create-home --shell /bin/bash appuser \
  && mkdir -p /app/models \

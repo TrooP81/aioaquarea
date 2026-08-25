@@ -30,8 +30,8 @@ services:
 
   migrate:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: heatpump-optimizer/Dockerfile
       target: base
     command: ["alembic", "upgrade", "head"]
     env_file: .env
@@ -43,8 +43,8 @@ services:
 
   poller:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: heatpump-optimizer/Dockerfile
       target: base
     command: ["python", "-m", "packages.poller.main"]
     env_file: .env
@@ -63,8 +63,8 @@ services:
 
   optimizer:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: heatpump-optimizer/Dockerfile
       target: base
     command: ["python", "-m", "packages.optimizer.main"]
     env_file: .env
@@ -83,8 +83,8 @@ services:
 
   api:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: heatpump-optimizer/Dockerfile
       target: base
     command: ["uvicorn", "packages.api.main:app", "--host", "0.0.0.0", "--port", "8500"]
     env_file: .env
