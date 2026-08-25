@@ -27,6 +27,7 @@ from .data import (
 from .errors import DataNotAvailableError
 from .command_result import PanasonicCommandResult
 from .statistics import Consumption, ConsumptionType, DateType
+from .weekly_timer import WeeklyTimerSettings
 
 if TYPE_CHECKING:
     from .core import AquareaClient
@@ -378,6 +379,10 @@ class DeviceImpl(Device):
             await self._client.post_device_set_powerful_time(
                 self.long_id, powerful_time
             )
+
+    async def get_weekly_timer(self) -> WeeklyTimerSettings | None:
+        """Read the Panasonic schedule without permitting timer writes."""
+        return await self._client.get_device_weekly_timer(self.long_id)
 
     async def __set_special_status__(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import math
 import time
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 _COMMAND_STATUS_MAX_AGE_SECONDS = 60.0
 _ADAPTER_RETRY_BASE_SECONDS = 300
 _ADAPTER_RETRY_MAX_SECONDS = 1800
+_WEEKLY_TIMER_CACHE_SECONDS = 3600.0
 
 
 class PanasonicAdapterUnavailableError(RuntimeError):
@@ -114,6 +116,8 @@ class AquareaWrapper:
         self._write_limiter = RateLimiter(max_tokens=20, refill_per_second=20 / 3600)
         self._circuit_breaker = CircuitBreaker()
         self._authenticated = False
+        self._weekly_timer = None
+        self._weekly_timer_fetched_at: float | None = None
 
     async def start(self) -> None:
         """Initialize session, redis, and authenticate."""
@@ -215,6 +219,30 @@ class AquareaWrapper:
             ) from exc
         self._record_live_status(self._device)
         return self._device
+
+    async def get_active_weekly_timer_slots(
+        self, at: dt.datetime | None = None
+    ) -> tuple:
+        """Read and cache active Panasonic timer slots; failures never block control."""
+        now_monotonic = time.monotonic()
+        stale = (
+            self._weekly_timer_fetched_at is None
+            or now_monotonic - self._weekly_timer_fetched_at >= _WEEKLY_TIMER_CACHE_SECONDS
+        )
+        if stale:
+            try:
+                device = await self.get_device()
+                await self._read_limiter.acquire()
+                self._weekly_timer = await device.get_weekly_timer()
+            except Exception as exc:  # noqa: BLE001 - optional read-only capability
+                logger.warning("Panasonic weekly timer read failed; continuing control: %s", exc)
+                self._weekly_timer = None
+            self._weekly_timer_fetched_at = now_monotonic
+
+        if self._weekly_timer is None:
+            return ()
+        instant = at or dt.datetime.now(dt.timezone.utc)
+        return self._weekly_timer.active_slots(instant, self._timezone)
 
     def _record_live_status(self, device) -> None:
         try:

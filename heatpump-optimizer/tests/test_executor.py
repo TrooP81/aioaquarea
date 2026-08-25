@@ -68,6 +68,7 @@ def mock_wrapper():
     wrapper.clear_special_status = AsyncMock()
     wrapper.refresh_device = AsyncMock()
     wrapper.get_device = AsyncMock(return_value=_device(zone_temp=35))
+    wrapper.get_active_weekly_timer_slots = AsyncMock(return_value=())
     return wrapper
 
 
@@ -88,6 +89,26 @@ def _make_action(action_type: str, payload: dict | None = None, scheduled_ts=Non
 
 
 class TestRegistry:
+    @pytest.mark.asyncio
+    async def test_zone_boost_skips_during_active_panasonic_weekly_timer(
+        self, mock_wrapper
+    ):
+        mock_wrapper.get_active_weekly_timer_slots.return_value = (
+            SimpleNamespace(zone_id=1),
+        )
+
+        result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
+            mock_wrapper, {"offset": 2, "zone_id": 0}
+        )
+
+        assert result == {
+            "skip": True,
+            "reason": "panasonic_weekly_timer_active",
+            "timer_zone_id": 1,
+            "timer_slot_count": 1,
+        }
+        mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
+
     def test_every_action_has_a_handler(self):
         assert set(ACTION_REGISTRY) == set(ActionType)
         for handler in ACTION_REGISTRY.values():

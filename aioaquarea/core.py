@@ -33,6 +33,8 @@ from .device_control import AquareaDeviceControl
 from .device_manager import DeviceManager
 from .entities import DeviceImpl
 from .statistics import Consumption, DateType
+from .weekly_timer import WeeklyTimerSettings
+from .weekly_timer_manager import WeeklyTimerManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +115,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
         self._consumption_manager = AquareaConsumptionManager(
             self._api_client, self._base_url, timezone
         )
+        self._weekly_timer_manager = WeeklyTimerManager(self._api_client)
         self._settings.username = username
         self._settings.password = password
         self._settings.access_token = self._api_client.access_token
@@ -388,6 +391,13 @@ class AquareaClient:  # Renamed Client to AquareaClient
         return await self._consumption_manager.get_device_consumption(
             long_id, aggregation, date_input
         )
+
+    @auth_required
+    async def get_device_weekly_timer(
+        self, device_id: str
+    ) -> WeeklyTimerSettings | None:
+        """Read the device's weekly timer; timer writes are intentionally unsupported."""
+        return await self._weekly_timer_manager.get_weekly_timer(device_id)
 
     async def close(self) -> None:
         """Close the aiohttp client session."""
