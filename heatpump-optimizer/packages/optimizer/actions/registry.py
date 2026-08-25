@@ -82,6 +82,7 @@ def _tank_target_reached(device: Any) -> tuple[bool, Any, Any]:
 
 
 async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    from aioaquarea import PanasonicCommandResult
     from aioaquarea import ForceDHW
 
     device = await wrapper.get_device()
@@ -97,7 +98,10 @@ async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[
     changed = await wrapper.force_dhw(ForceDHW.ON)
     if changed is False:
         return {"skip": True, "reason": "force_dhw_already_on"}
-    return {"force_dhw": "ON"}
+    return {
+        "force_dhw": "ON",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _redispatch_force_dhw_on(
@@ -116,16 +120,19 @@ async def _redispatch_force_dhw_on(
 
 
 async def _dispatch_force_dhw_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import ForceDHW
+    from aioaquarea import ForceDHW, PanasonicCommandResult
 
     changed = await wrapper.force_dhw(ForceDHW.OFF)
     if changed is False:
         return {"skip": True, "reason": "force_dhw_already_off"}
-    return {"force_dhw": "OFF"}
+    return {
+        "force_dhw": "OFF",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import QuietMode
+    from aioaquarea import PanasonicCommandResult, QuietMode
 
     level = payload.get("level", 1)
     if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
@@ -143,16 +150,22 @@ async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict
             "reason": "quiet_mode_already_active",
             "observed_quiet_level": level,
         }
-    return {"quiet_mode": mode.name}
+    return {
+        "quiet_mode": mode.name,
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_quiet_mode_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import QuietMode
+    from aioaquarea import PanasonicCommandResult, QuietMode
 
     changed = await wrapper.set_quiet_mode(QuietMode.OFF)
     if changed is False:
         return {"skip": True, "reason": "quiet_mode_already_off"}
-    return {"quiet_mode": "OFF"}
+    return {
+        "quiet_mode": "OFF",
+        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+    }
 
 
 async def _dispatch_zone_temp_boost(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:

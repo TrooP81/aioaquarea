@@ -340,7 +340,9 @@ class AquareaWrapper:
             )
         return tank
 
-    async def set_quiet_mode(self, mode) -> bool:
+    async def set_quiet_mode(self, mode):
+        from aioaquarea import PanasonicCommandResult
+
         device = await self._get_writable_device()
         if getattr(device, "quiet_mode", None) == mode:
             logger.info("Quiet mode already %s; skipping Panasonic write", mode)
@@ -352,11 +354,13 @@ class AquareaWrapper:
             logger.info("Quiet mode became %s while waiting; skipping write", mode)
             return False
 
-        await device.set_quiet_mode(mode)
+        result = await device.set_quiet_mode(mode)
         logger.info("Set quiet mode to %s", mode)
-        return True
+        return result if isinstance(result, PanasonicCommandResult) else True
 
-    async def force_dhw(self, state) -> bool:
+    async def force_dhw(self, state):
+        from aioaquarea import PanasonicCommandResult
+
         device = await self._get_writable_device()
         if getattr(device, "force_dhw", None) == state:
             logger.info("Force DHW already %s; skipping Panasonic write", state)
@@ -368,9 +372,9 @@ class AquareaWrapper:
             logger.info("Force DHW became %s while waiting; skipping write", state)
             return False
 
-        await device.set_force_dhw(state)
+        result = await device.set_force_dhw(state)
         logger.info("Set force DHW to %s", state)
-        return True
+        return result if isinstance(result, PanasonicCommandResult) else True
 
     async def set_powerful_time(self, duration: PowerfulTime) -> None:
         """Set Panasonic's bounded 30/60/90 minute powerful mode."""

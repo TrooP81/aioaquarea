@@ -150,6 +150,27 @@ class TestExecuteAction:
         }
 
     @pytest.mark.asyncio
+    async def test_quiet_mode_records_safe_panasonic_acknowledgement(self, mock_wrapper):
+        from aioaquarea import PanasonicCommandResult
+
+        mock_wrapper.set_quiet_mode.return_value = PanasonicCommandResult(
+            http_status=200,
+            response_code=0,
+            request_id="request-123",
+        )
+
+        result = await ACTION_REGISTRY[ActionType.QUIET_MODE_ON].dispatch(
+            mock_wrapper, {"level": 2}
+        )
+
+        assert result == {
+            "quiet_mode": "LEVEL2",
+            "panasonic_http_status": 200,
+            "panasonic_response_code": 0,
+            "panasonic_request_id": "request-123",
+        }
+
+    @pytest.mark.asyncio
     async def test_force_dhw_off_skips_when_live_state_is_already_off(self, mock_wrapper):
         mock_wrapper.force_dhw.return_value = False
 
