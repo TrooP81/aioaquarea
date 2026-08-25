@@ -110,6 +110,48 @@ async def test_request_raises_authentication_error_for_token_expiration(api_clie
 
 
 @pytest.mark.asyncio
+async def test_token_expiration_reauthenticates_and_retries_with_fresh_headers(api_client):
+    expired = FakeResponse({"message": ["Token expires"]})
+    success = FakeResponse({"message": []})
+    api_client._sess.request = AsyncMock(side_effect=[expired, success])
+
+    async def reauthenticate():
+        api_client._settings.access_token = "fresh-token"
+
+    callback = AsyncMock(side_effect=reauthenticate)
+    api_client.set_reauthenticate_callback(callback)
+
+    returned = await api_client.request("POST", url="/command", json={"quietMode": 0})
+
+    assert returned is success
+    callback.assert_awaited_once()
+    first_headers = api_client._sess.request.await_args_list[0].kwargs["headers"]
+    second_headers = api_client._sess.request.await_args_list[1].kwargs["headers"]
+    assert first_headers["x-user-authorization-v2"] == "Bearer access-token"
+    assert second_headers["x-user-authorization-v2"] == "Bearer fresh-token"
+    assert api_client._sess.request.await_args_list[1].kwargs["json"] == {"quietMode": 0}
+
+
+@pytest.mark.asyncio
+async def test_token_expiration_retries_only_once(api_client):
+    api_client._sess.request = AsyncMock(
+        side_effect=[
+            FakeResponse({"message": ["Token expires"]}),
+            FakeResponse({"message": ["Token expires"]}),
+        ]
+    )
+    callback = AsyncMock()
+    api_client.set_reauthenticate_callback(callback)
+
+    with pytest.raises(AuthenticationError) as exc:
+        await api_client.request("POST", url="/command")
+
+    assert exc.value.error_code == AuthenticationErrorCodes.TOKEN_EXPIRED
+    callback.assert_awaited_once()
+    assert api_client._sess.request.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_request_uses_external_url_when_absolute(api_client):
     response = FakeResponse({"message": []})
     api_client._sess.request = AsyncMock(return_value=response)

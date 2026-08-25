@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Optional
 import urllib.parse
 
@@ -35,6 +36,21 @@ class AquareaAPIClient:
         )
         self._access_token: Optional[str] = None
         self._token_expiration: Optional[dt.datetime] = None
+        self._reauthenticate: Callable[[], Awaitable[None]] | None = None
+
+    def set_reauthenticate_callback(
+        self, callback: Callable[[], Awaitable[None]] | None
+    ) -> None:
+        """Register the owning client's serialized production login callback."""
+
+        self._reauthenticate = callback
+
+    @staticmethod
+    def _requires_reauthentication(error: ApiError) -> bool:
+        return (
+            isinstance(error, AuthenticationError)
+            and error.error_code == AuthenticationErrorCodes.TOKEN_EXPIRED
+        ) or "Missing Authentication Token" in str(error)
 
     async def request(
         self,
@@ -47,26 +63,10 @@ class AquareaAPIClient:
         headers: Optional[dict] = None,
         **kwargs,
     ) -> aiohttp.ClientResponse:
-        """Make a request to Aquarea and return the response."""
+        """Make a request, reauthenticating once on an explicit expired token."""
 
-        # Get base headers including authentication
-        base_headers = await PanasonicRequestHeader.get(
-            self._settings, self._app_version
-        )
-
-        # If headers are explicitly provided by the caller, use them as a base
-        # Otherwise, use the base_headers as the starting point
-        if headers is None:
-            headers = base_headers
-        else:
-            # Merge base_headers into the provided headers, allowing provided headers to override
-            base_headers.update(headers)
-            headers = base_headers
-
-        # Merge any headers from kwargs (e.g., from aiohttp's json=data)
-        request_headers = kwargs.get("headers", {})
-        headers.update(request_headers)
-        kwargs["headers"] = headers
+        explicit_headers = dict(headers or {})
+        kwarg_headers = dict(kwargs.pop("headers", {}))
 
         if external_url is not None:
             # If external_url is provided, use it directly or join with base_url if relative
@@ -78,12 +78,25 @@ class AquareaAPIClient:
         else:
             # If external_url is not provided, join the base_url with the given url
             url = urllib.parse.urljoin(self._base_url, url)
-        resp = await self._sess.request(method, url, **kwargs)
+        for attempt in range(2):
+            base_headers = await PanasonicRequestHeader.get(
+                self._settings, self._app_version
+            )
+            request_headers = {
+                **base_headers,
+                **explicit_headers,
+                **kwarg_headers,
+            }
+            resp = await self._sess.request(
+                method,
+                url,
+                **{**kwargs, "headers": request_headers},
+            )
 
-        if resp.content_type == "application/json":
+            if resp.content_type != "application/json":
+                return resp
+
             data = await resp.json()
-
-            # let's check for access token and expiration time
             if self._access_token and self.__contains_valid_token(data):
                 access_token = data["accessToken"]["token"]
                 token_expiration = dt.datetime.strptime(
@@ -99,18 +112,30 @@ class AquareaAPIClient:
                 self._settings.access_token = access_token
                 self._settings.expires_at = token_expiration.timestamp()
 
-            # Aquarea returns a 200 even if the request failed, we need to check the message property to see if it's an error
-            # Some errors just require to login again, so we raise a AuthenticationError in those known cases
-            if throw_on_error:
-                errors = await self.look_for_errors(data)
-                # If we have errors, let's look for authentication errors
-                for error in errors:
-                    if error.error_code in list(AuthenticationErrorCodes):
-                        raise AuthenticationError(error.error_code, error.error_message)
+            if not throw_on_error:
+                return resp
 
-                    raise ApiError(error.error_code, error.error_message)
+            errors = await self.look_for_errors(data)
+            if not errors:
+                return resp
 
-        return resp
+            error = errors[0]
+            if (
+                attempt == 0
+                and self._reauthenticate is not None
+                and self._requires_reauthentication(error)
+            ):
+                self._logger.warning(
+                    "Panasonic access token expired during API request; logging in and retrying once"
+                )
+                await self._reauthenticate()
+                continue
+
+            if error.error_code in list(AuthenticationErrorCodes):
+                raise AuthenticationError(error.error_code, error.error_message)
+            raise ApiError(error.error_code, error.error_message)
+
+        raise RuntimeError("Panasonic API request retry exhausted")
 
     def __contains_valid_token(self, data: dict) -> bool:
         """Check if the data contains a valid token."""
