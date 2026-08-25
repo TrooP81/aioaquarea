@@ -442,6 +442,90 @@ class TestRulesOptimizer:
 
         assert [action["payload"]["level"] for action in normalised] == [1, 2]
 
+    def test_normalise_actions_starts_from_observed_panasonic_quiet_level(self):
+        base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+        normalised = RulesOptimizer._normalise_actions(
+            [
+                {
+                    "ts": base.isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 1, "reason": "already_active"},
+                },
+                {
+                    "ts": (base + dt.timedelta(hours=1)).isoformat(),
+                    "type": "quiet_mode_off",
+                    "payload": {"reason": "peak_end"},
+                },
+                {
+                    "ts": (base + dt.timedelta(hours=2)).isoformat(),
+                    "type": "quiet_mode_on",
+                    "payload": {"level": 1, "reason": "next_peak"},
+                },
+            ],
+            initial_quiet_level=1,
+        )
+
+        assert [action["type"] for action in normalised] == [
+            "quiet_mode_off",
+            "quiet_mode_on",
+        ]
+
+    def test_quiet_schedule_reconciles_missed_off_from_live_panasonic_state(self):
+        optimizer = RulesOptimizer()
+        horizon_start = dt.datetime(2026, 4, 30, 7, tzinfo=dt.timezone.utc)
+
+        actions = optimizer._plan_quiet_mode(
+            horizon_start,
+            start_hour=22,
+            end_hour=6,
+            tz_name="UTC",
+            current_level=2,
+        )
+
+        assert actions[0] == {
+            "ts": horizon_start.isoformat(),
+            "type": "quiet_mode_off",
+            "payload": {"reason": "night_quiet_end_reconcile"},
+        }
+
+    def test_quiet_schedule_reconciles_missed_on_from_live_panasonic_state(self):
+        optimizer = RulesOptimizer()
+        horizon_start = dt.datetime(2026, 4, 30, 23, tzinfo=dt.timezone.utc)
+
+        actions = optimizer._plan_quiet_mode(
+            horizon_start,
+            start_hour=22,
+            end_hour=6,
+            tz_name="UTC",
+            current_level=0,
+        )
+
+        assert actions[0] == {
+            "ts": horizon_start.isoformat(),
+            "type": "quiet_mode_on",
+            "payload": {"reason": "night_quiet_reconcile", "level": 2},
+        }
+
+    def test_equal_quiet_schedule_hours_disable_and_clear_live_quiet_mode(self):
+        optimizer = RulesOptimizer()
+        horizon_start = dt.datetime(2026, 4, 30, 7, tzinfo=dt.timezone.utc)
+
+        actions = optimizer._plan_quiet_mode(
+            horizon_start,
+            start_hour=6,
+            end_hour=6,
+            tz_name="UTC",
+            current_level=2,
+        )
+
+        assert actions == [
+            {
+                "ts": horizon_start.isoformat(),
+                "type": "quiet_mode_off",
+                "payload": {"reason": "night_quiet_schedule_disabled"},
+            }
+        ]
+
     def test_normalise_actions_prefers_stronger_quiet_level_at_same_timestamp(self):
         base = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
         normalised = RulesOptimizer._normalise_actions(

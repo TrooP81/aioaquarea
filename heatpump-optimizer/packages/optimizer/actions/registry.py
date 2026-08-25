@@ -94,7 +94,9 @@ async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[
             "tank_target_temp": target_temp,
         }
 
-    await wrapper.force_dhw(ForceDHW.ON)
+    changed = await wrapper.force_dhw(ForceDHW.ON)
+    if changed is False:
+        return {"skip": True, "reason": "force_dhw_already_on"}
     return {"force_dhw": "ON"}
 
 
@@ -116,7 +118,9 @@ async def _redispatch_force_dhw_on(
 async def _dispatch_force_dhw_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     from aioaquarea import ForceDHW
 
-    await wrapper.force_dhw(ForceDHW.OFF)
+    changed = await wrapper.force_dhw(ForceDHW.OFF)
+    if changed is False:
+        return {"skip": True, "reason": "force_dhw_already_off"}
     return {"force_dhw": "OFF"}
 
 
@@ -132,14 +136,22 @@ async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict
         }
 
     mode = QuietMode(level)
-    await wrapper.set_quiet_mode(mode)
+    changed = await wrapper.set_quiet_mode(mode)
+    if changed is False:
+        return {
+            "skip": True,
+            "reason": "quiet_mode_already_active",
+            "observed_quiet_level": level,
+        }
     return {"quiet_mode": mode.name}
 
 
 async def _dispatch_quiet_mode_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     from aioaquarea import QuietMode
 
-    await wrapper.set_quiet_mode(QuietMode.OFF)
+    changed = await wrapper.set_quiet_mode(QuietMode.OFF)
+    if changed is False:
+        return {"skip": True, "reason": "quiet_mode_already_off"}
     return {"quiet_mode": "OFF"}
 
 

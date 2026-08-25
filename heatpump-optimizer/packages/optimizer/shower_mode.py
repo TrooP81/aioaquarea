@@ -179,7 +179,8 @@ class ShowerDetector:
         if elapsed >= max_duration:
             event.status = "timeout"
             event.recovered_at = current.ts
-            await self._inject_dhw_off(session, "timeout")
+            if current.force_dhw != 0:
+                await self._inject_dhw_off(session, "timeout")
             logger.warning(
                 "shower_mode_timeout",
                 elapsed_min=elapsed,
@@ -191,7 +192,8 @@ class ShowerDetector:
         if current.tank_temp is not None and current.tank_temp >= event.pre_shower_temp:
             event.status = "recovered"
             event.recovered_at = current.ts
-            await self._inject_dhw_off(session, "recovered")
+            if current.force_dhw != 0:
+                await self._inject_dhw_off(session, "recovered")
             logger.info(
                 "shower_mode_recovered",
                 tank_temp=current.tank_temp,

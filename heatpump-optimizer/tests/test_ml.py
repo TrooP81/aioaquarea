@@ -821,7 +821,7 @@ class TestOrchestratorFallback:
                 return_value=False,
             ):
                 status = await get_optimizer_status_snapshot("auto")
-                assert status["active_layer"] == "rules_v6"
+                assert status["active_layer"] == "rules_v7"
 
             with patch(
                 "packages.optimizer.main._has_sufficient_ml_data",
@@ -849,7 +849,7 @@ class TestOrchestratorFallback:
                     "horizon_start": dt.datetime.now(dt.timezone.utc),
                     "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
                     "actions": [],
-                    "version": "rules_v6",
+                    "version": "rules_v7",
                     "cost_estimate": 0.0,
                 }
                 MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
@@ -884,7 +884,7 @@ class TestOrchestratorFallback:
             "horizon_start": dt.datetime.now(dt.timezone.utc),
             "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
             "actions": [],
-            "version": "rules_v6",
+            "version": "rules_v7",
             "cost_estimate": 0.0,
         }
         with patch(
@@ -923,7 +923,7 @@ class TestOrchestratorFallback:
             "horizon_start": dt.datetime.now(dt.timezone.utc),
             "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
             "actions": [],
-            "version": "rules_v6",
+            "version": "rules_v7",
             "cost_estimate": 0.0,
         }
 

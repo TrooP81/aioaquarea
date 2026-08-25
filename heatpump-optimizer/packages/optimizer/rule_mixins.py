@@ -984,10 +984,54 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         start_hour: int = 22,
         end_hour: int = 6,
         tz_name: str | None = None,
+        current_level: int | None = None,
     ) -> list[dict]:
         from packages.core.settings_service import _to_local
 
         actions = []
+        local_start_hour = _to_local(horizon_start, tz_name).hour
+        schedule_active = (
+            start_hour <= local_start_hour < end_hour
+            if start_hour < end_hour
+            else start_hour != end_hour
+            and (local_start_hour >= start_hour or local_start_hour < end_hour)
+        )
+        valid_current_level = (
+            isinstance(current_level, int)
+            and not isinstance(current_level, bool)
+            and 0 <= current_level <= 3
+        )
+        if start_hour == end_hour:
+            if valid_current_level and current_level != 0:
+                return [
+                    {
+                        "ts": horizon_start.isoformat(),
+                        "type": str(ActionType.QUIET_MODE_OFF),
+                        "payload": {"reason": "night_quiet_schedule_disabled"},
+                    }
+                ]
+            return []
+
+        desired_level = 2 if schedule_active else 0
+        if valid_current_level and current_level != desired_level:
+            actions.append(
+                {
+                    "ts": horizon_start.isoformat(),
+                    "type": str(
+                        ActionType.QUIET_MODE_ON
+                        if desired_level
+                        else ActionType.QUIET_MODE_OFF
+                    ),
+                    "payload": {
+                        "reason": (
+                            "night_quiet_reconcile"
+                            if desired_level
+                            else "night_quiet_end_reconcile"
+                        ),
+                        **({"level": desired_level} if desired_level else {}),
+                    },
+                }
+            )
         for offset_hours in range(24):
             ts = horizon_start + dt.timedelta(hours=offset_hours)
             local_hour = _to_local(ts, tz_name).hour

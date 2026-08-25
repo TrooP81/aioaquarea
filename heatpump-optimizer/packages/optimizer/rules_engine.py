@@ -46,7 +46,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     6. Detects holiday mode and suspends actions
     """
 
-    VERSION = "rules_v6"
+    VERSION = "rules_v7"
 
     def __init__(self, cop_model=None):
         self._dhw_cop_model = cop_model
@@ -114,7 +114,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         return timestamp is not None and any(start <= timestamp <= end for start, end in windows)
 
     @classmethod
-    def _normalise_actions(cls, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _normalise_actions(
+        cls,
+        actions: list[dict[str, Any]],
+        *,
+        initial_quiet_level: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Resolve command ownership and duplicates while preserving plan intent.
 
         Zone boost windows exclusively own their Panasonic target. Multiple
@@ -178,7 +183,13 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         )
         normalised: list[dict[str, Any]] = []
         seen_exact: set[tuple[str, str, str]] = set()
-        active_quiet_level: int | None = None
+        active_quiet_level = (
+            initial_quiet_level
+            if isinstance(initial_quiet_level, int)
+            and not isinstance(initial_quiet_level, bool)
+            and 0 <= initial_quiet_level <= 3
+            else None
+        )
 
         for action in ordered:
             action_type = str(action.get("type", ""))
@@ -278,6 +289,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         current_special_status = (
             getattr(last_status, "special_status", None) if last_status is not None else None
         )
+        current_quiet_level = (
+            getattr(last_status, "quiet_mode", None) if last_status is not None else None
+        )
         tank_heating_available = panasonic_tank_heating_available(last_status)
         zone_heating_available = panasonic_zone_heating_available(last_status)
         tank_target = (
@@ -354,7 +368,13 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         quiet_start = await get_int_setting("quiet_mode_start")
         quiet_end = await get_int_setting("quiet_mode_end")
         actions.extend(
-            self._plan_quiet_mode(horizon_start, quiet_start, quiet_end, tz_name=tz_name)
+            self._plan_quiet_mode(
+                horizon_start,
+                quiet_start,
+                quiet_end,
+                tz_name=tz_name,
+                current_level=current_quiet_level,
+            )
         )
 
         if control_temperature.is_usable and zone_heating_available:
@@ -407,7 +427,10 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         if not actions:
             return None
 
-        actions = self._normalise_actions(actions)
+        actions = self._normalise_actions(
+            actions,
+            initial_quiet_level=current_quiet_level,
+        )
         cost_estimate = await self._estimate_cost(actions, prices)
         forecast_snapshot = self._build_forecast_snapshot(
             prices=prices,
