@@ -133,6 +133,106 @@ async def test_token_expiration_reauthenticates_and_retries_with_fresh_headers(a
 
 
 @pytest.mark.asyncio
+async def test_token_expiration_prefers_refresh_token_recovery(api_client):
+    expired = FakeResponse({"message": ["Token expires"]})
+    success = FakeResponse({"message": []})
+    api_client._sess.request = AsyncMock(side_effect=[expired, success])
+
+    async def refresh_authentication():
+        api_client._settings.access_token = "refreshed-token"
+
+    refresh = AsyncMock(side_effect=refresh_authentication)
+    full_login = AsyncMock()
+    api_client.set_refresh_authentication_callback(refresh)
+    api_client.set_reauthenticate_callback(full_login)
+
+    returned = await api_client.request("GET", url="/status")
+
+    assert returned is success
+    refresh.assert_awaited_once()
+    full_login.assert_not_awaited()
+    second_headers = api_client._sess.request.await_args_list[1].kwargs["headers"]
+    assert second_headers["x-user-authorization-v2"] == "Bearer refreshed-token"
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_falls_back_to_full_login_before_retry(api_client):
+    expired = FakeResponse({"message": ["Token expires"]})
+    success = FakeResponse({"message": []})
+    api_client._sess.request = AsyncMock(side_effect=[expired, success])
+
+    refresh = AsyncMock(side_effect=RuntimeError("refresh rejected"))
+
+    async def reauthenticate():
+        api_client._settings.access_token = "full-login-token"
+
+    full_login = AsyncMock(side_effect=reauthenticate)
+    api_client.set_refresh_authentication_callback(refresh)
+    api_client.set_reauthenticate_callback(full_login)
+
+    returned = await api_client.request("GET", url="/status")
+
+    assert returned is success
+    refresh.assert_awaited_once()
+    full_login.assert_awaited_once()
+    assert api_client._sess.request.await_count == 2
+    second_headers = api_client._sess.request.await_args_list[1].kwargs["headers"]
+    assert second_headers["x-user-authorization-v2"] == "Bearer full-login-token"
+
+
+@pytest.mark.asyncio
+async def test_rejected_refreshed_token_falls_back_to_full_login(api_client):
+    api_client._sess.request = AsyncMock(
+        side_effect=[
+            FakeResponse({"message": ["Token expires"]}),
+            FakeResponse({"message": ["Token expires"]}),
+            FakeResponse({"message": []}),
+        ]
+    )
+
+    async def refresh_authentication():
+        api_client._settings.access_token = "refreshed-token"
+
+    async def reauthenticate():
+        api_client._settings.access_token = "full-login-token"
+
+    refresh = AsyncMock(side_effect=refresh_authentication)
+    full_login = AsyncMock(side_effect=reauthenticate)
+    api_client.set_refresh_authentication_callback(refresh)
+    api_client.set_reauthenticate_callback(full_login)
+
+    await api_client.request("GET", url="/status")
+
+    refresh.assert_awaited_once()
+    full_login.assert_awaited_once()
+    headers = [call.kwargs["headers"] for call in api_client._sess.request.await_args_list]
+    assert [item["x-user-authorization-v2"] for item in headers] == [
+        "Bearer access-token",
+        "Bearer refreshed-token",
+        "Bearer full-login-token",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_full_login_recovery_are_each_attempted_only_once(api_client):
+    api_client._sess.request = AsyncMock(
+        return_value=FakeResponse({"message": ["Token expires"]})
+    )
+    refresh = AsyncMock()
+    full_login = AsyncMock()
+    api_client.set_refresh_authentication_callback(refresh)
+    api_client.set_reauthenticate_callback(full_login)
+
+    with pytest.raises(AuthenticationError) as exc:
+        await api_client.request("GET", url="/status")
+
+    assert exc.value.error_code == AuthenticationErrorCodes.TOKEN_EXPIRED
+    refresh.assert_awaited_once()
+    full_login.assert_awaited_once()
+    assert api_client._sess.request.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_token_expiration_retries_only_once(api_client):
     api_client._sess.request = AsyncMock(
         side_effect=[

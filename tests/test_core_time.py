@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from aioaquarea.const import AquareaEnvironment
 from aioaquarea.core import AquareaClient
+from aioaquarea.decorators import auth_required
+from aioaquarea.errors import AuthenticationError, AuthenticationErrorCodes
 
 
 def _client(environment=AquareaEnvironment.PRODUCTION) -> AquareaClient:
@@ -63,13 +66,55 @@ def test_consumption_manager_uses_client_timezone() -> None:
 def test_production_client_registers_serialized_login_for_api_reauthentication() -> None:
     client = _client()
 
+    assert client._api_client._refresh_authentication == client.refresh_login
     assert client._api_client._reauthenticate == client.login
 
 
 def test_demo_client_does_not_register_recursive_api_reauthentication() -> None:
     client = _client(AquareaEnvironment.DEMO)
 
+    assert client._api_client._refresh_authentication is None
     assert client._api_client._reauthenticate is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_login_publishes_refreshed_token_to_api_requests() -> None:
+    client = _client()
+
+    async def refresh_token():
+        client._settings.set_token(
+            "refreshed-token",
+            "next-refresh-token",
+            dt.datetime.now(dt.timezone.utc).timestamp() + 3600,
+            "scope",
+        )
+
+    client._authenticator.refresh_token = AsyncMock(side_effect=refresh_token)
+
+    await client.refresh_login()
+
+    client._authenticator.refresh_token.assert_awaited_once()
+    assert client._api_client.access_token == "refreshed-token"
+    assert client.token_expiration is not None
+    assert client.is_logged is True
+
+
+@pytest.mark.asyncio
+async def test_auth_decorator_does_not_duplicate_api_token_recovery() -> None:
+    login = AsyncMock()
+    fake_client = SimpleNamespace(is_logged=True, login=login, logger=MagicMock())
+
+    @auth_required
+    async def operation(client):
+        raise AuthenticationError(
+            AuthenticationErrorCodes.TOKEN_EXPIRED,
+            "Token expires",
+        )
+
+    with pytest.raises(AuthenticationError):
+        await operation(fake_client)
+
+    login.assert_not_awaited()
 
 
 @pytest.mark.asyncio
