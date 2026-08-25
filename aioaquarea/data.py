@@ -350,7 +350,7 @@ class Device(ABC):
             return DeviceAction.IDLE
 
         if (
-            self.has_tank
+            self.tank is not None
             and direction == DeviceDirection.WATER
             and self.tank.operation_status == OperationStatus.ON
         ):
