@@ -35,6 +35,7 @@ from .errors import (
     RequestFailedError,
 )
 from .statistics import Consumption, ConsumptionType, DateType
+from .weekly_timer import DayOfWeek, WeeklyTimerSettings, WeeklyTimerSlot
 
 __all__: Final[tuple[str, ...]] = (
     "Client",  # Keep "Client" in __all__ as it's aliased
@@ -66,4 +67,7 @@ __all__: Final[tuple[str, ...]] = (
     "PowerfulTime",
     "AquareaEnvironment",
     "SpecialStatus",
+    "DayOfWeek",
+    "WeeklyTimerSettings",
+    "WeeklyTimerSlot",
 )
