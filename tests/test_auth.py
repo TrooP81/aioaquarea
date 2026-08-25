@@ -19,11 +19,20 @@ from aioaquarea.errors import AuthenticationError, AuthenticationErrorCodes
 
 
 class DummyResponse:
-    def __init__(self, *, status=200, text_data="", json_data=None, headers=None):
+    def __init__(
+        self,
+        *,
+        status=200,
+        text_data="",
+        json_data=None,
+        headers=None,
+        cookies=None,
+    ):
         self.status = status
         self._text_data = text_data
         self._json_data = json_data if json_data is not None else {}
         self.headers = headers or {}
+        self.cookies = cookies or {}
 
     async def text(self):
         return self._text_data
@@ -74,6 +83,19 @@ def test_get_querystring_parameter_from_header_entry_url_extracts_value():
     code = get_querystring_parameter_from_header_entry_url(response, "Location", "code")
 
     assert code == "abc123"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Location": "https://example.test/callback?state=xyz"}],
+)
+def test_get_querystring_parameter_rejects_incomplete_redirect(headers):
+    with pytest.raises(AuthenticationError) as exc:
+        get_querystring_parameter_from_header_entry_url(
+            DummyResponse(headers=headers), "Location", "code"
+        )
+
+    assert exc.value.error_code == AuthenticationErrorCodes.API_ERROR
 
 
 @pytest.mark.asyncio
@@ -153,3 +175,94 @@ async def test_refresh_token_rejects_missing_token_before_request():
 
     assert exc.value.error_code == AuthenticationErrorCodes.API_ERROR
     session.post.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "token_response",
+    [
+        {"expires_in": 3600},
+        {"access_token": "token"},
+        {"access_token": "token", "expires_in": 0},
+        {"access_token": "token", "expires_in": True},
+    ],
+)
+def test_set_token_rejects_incomplete_token_response(token_response):
+    settings = PanasonicSettings()
+    authenticator = Authenticator(
+        AsyncMock(),
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+
+    with pytest.raises(AuthenticationError) as exc:
+        authenticator._set_token(token_response, 1_700_000_000.0)
+
+    assert exc.value.error_code == AuthenticationErrorCodes.API_ERROR
+    assert settings.access_token is None
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_missing_csrf_cookie_before_credentials_are_posted():
+    settings = PanasonicSettings()
+    session = AsyncMock()
+    session.get.return_value = DummyResponse(status=200)
+    authenticator = Authenticator(
+        session,
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+    authorization = DummyResponse(
+        headers={"Location": "authorize?state=state-123"}
+    )
+
+    with pytest.raises(AuthenticationError, match="CSRF cookie"):
+        await authenticator._login(authorization, "user", "password")
+
+    session.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_client_acc_rejects_missing_client_id():
+    settings = PanasonicSettings()
+    settings.access_token = "access-token"
+    session = AsyncMock()
+    session.post.return_value = DummyResponse(status=200, text_data="{}")
+    authenticator = Authenticator(
+        session,
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+
+    with pytest.raises(AuthenticationError, match="clientId"):
+        await authenticator._retrieve_client_acc()
+
+    assert settings.clientId is None
+
+
+@pytest.mark.parametrize("payload", ["", "[]", "not-json"])
+@pytest.mark.asyncio
+async def test_retrieve_client_acc_rejects_malformed_json(payload):
+    settings = PanasonicSettings()
+    settings.access_token = "access-token"
+    session = AsyncMock()
+    session.post.return_value = DummyResponse(status=200, text_data=payload)
+    authenticator = Authenticator(
+        session,
+        settings,
+        CCAppVersion(),
+        AquareaEnvironment.PRODUCTION,
+        logging.getLogger(__name__),
+    )
+
+    with pytest.raises(AuthenticationError, match="ACC login response"):
+        await authenticator._retrieve_client_acc()
+
+
+def test_logged_out_system_error_is_classified_as_authentication_error():
+    assert AuthenticationErrorCodes.LOGGED_OUT_SYSTEM_ERROR == "1000-0999"
