@@ -352,8 +352,9 @@ async def test_force_dhw_skips_already_applied_state() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.force_dhw(ForceDHW.ON)
+    changed = await wrapper.force_dhw(ForceDHW.ON)
 
+    assert changed is False
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_force_dhw.assert_not_awaited()
 
@@ -369,8 +370,9 @@ async def test_force_dhw_writes_changed_state_once() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.force_dhw(ForceDHW.ON)
+    changed = await wrapper.force_dhw(ForceDHW.ON)
 
+    assert changed is True
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_force_dhw.assert_awaited_once_with(ForceDHW.ON)
 
@@ -391,8 +393,9 @@ async def test_force_dhw_rechecks_state_after_write_wait() -> None:
 
     wrapper._write_limiter.acquire.side_effect = apply_state_during_wait
 
-    await wrapper.force_dhw(ForceDHW.ON)
+    changed = await wrapper.force_dhw(ForceDHW.ON)
 
+    assert changed is False
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_force_dhw.assert_not_awaited()
 
@@ -408,8 +411,9 @@ async def test_quiet_mode_skips_already_applied_level() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
+    assert changed is False
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_quiet_mode.assert_not_awaited()
 
@@ -425,8 +429,9 @@ async def test_quiet_mode_writes_changed_level_once() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
+    assert changed is True
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_quiet_mode.assert_awaited_once_with(QuietMode.LEVEL2)
 
@@ -447,8 +452,9 @@ async def test_quiet_mode_rechecks_level_after_write_wait() -> None:
 
     wrapper._write_limiter.acquire.side_effect = apply_level_during_wait
 
-    await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
+    assert changed is False
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_quiet_mode.assert_not_awaited()
 

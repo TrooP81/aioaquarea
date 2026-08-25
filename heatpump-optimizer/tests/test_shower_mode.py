@@ -179,7 +179,7 @@ class TestShowerDetection:
             pre_shower_temp=55.0,
             status="active",
         )
-        current_record = _make_status(now, tank_temp=56.0)  # Recovered above 55
+        current_record = _make_status(now, tank_temp=56.0, force_dhw=1)  # Recovered above 55
 
         added_objects = []
 
@@ -233,7 +233,7 @@ class TestShowerDetection:
             pre_shower_temp=55.0,
             status="active",
         )
-        current_record = _make_status(now, tank_temp=50.0)  # Still below target
+        current_record = _make_status(now, tank_temp=50.0, force_dhw=1)  # Still below target
 
         added_objects = []
 
@@ -272,6 +272,25 @@ class TestShowerDetection:
         assert actions[0].action_type == "force_dhw_off"
         payload = json.loads(actions[0].payload_json)
         assert payload["reason"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_recovery_does_not_stop_dhw_when_force_mode_was_never_started(
+        self, detector, now
+    ):
+        event = ShowerEventRecord(
+            id=1,
+            started_at=now - dt.timedelta(minutes=15),
+            pre_shower_temp=55.0,
+            status="active",
+        )
+        current = _make_status(now, tank_temp=56.0, force_dhw=0)
+        detector._inject_dhw_off = AsyncMock()
+
+        with patch("packages.optimizer.shower_mode.get_setting", return_value="60"):
+            await detector._check_recovery(AsyncMock(), event, current)
+
+        assert event.status == "recovered"
+        detector._inject_dhw_off.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skip_during_peak_price(self, detector, now, sample_prices_with_peak):

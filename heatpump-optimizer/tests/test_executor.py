@@ -136,6 +136,28 @@ class TestExecuteAction:
         mock_wrapper.set_quiet_mode.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_quiet_mode_skips_when_live_level_is_already_active(self, mock_wrapper):
+        mock_wrapper.set_quiet_mode.return_value = False
+
+        result = await ACTION_REGISTRY[ActionType.QUIET_MODE_ON].dispatch(
+            mock_wrapper, {"level": 2}
+        )
+
+        assert result == {
+            "skip": True,
+            "reason": "quiet_mode_already_active",
+            "observed_quiet_level": 2,
+        }
+
+    @pytest.mark.asyncio
+    async def test_force_dhw_off_skips_when_live_state_is_already_off(self, mock_wrapper):
+        mock_wrapper.force_dhw.return_value = False
+
+        result = await ACTION_REGISTRY[ActionType.FORCE_DHW_OFF].dispatch(mock_wrapper, {})
+
+        assert result == {"skip": True, "reason": "force_dhw_already_off"}
+
+    @pytest.mark.asyncio
     async def test_eco_mode_dispatch_requires_safe_device_support(self, mock_wrapper):
         mock_wrapper.get_device.return_value = _device(zone_temp=35, special_status_supported=False)
 
