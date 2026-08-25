@@ -25,6 +25,7 @@ from .data import (
     ZoneTemperatureSetUpdate,
 )
 from .errors import DataNotAvailableError
+from .command_result import PanasonicCommandResult
 from .statistics import Consumption, ConsumptionType, DateType
 
 if TYPE_CHECKING:
@@ -285,8 +286,8 @@ class DeviceImpl(Device):
                 self.long_id, zone_id, temperature
             )
 
-    async def set_quiet_mode(self, mode: QuietMode) -> None:
-        await self._client.post_device_set_quiet_mode(self.long_id, mode)
+    async def set_quiet_mode(self, mode: QuietMode) -> PanasonicCommandResult:
+        return await self._client.post_device_set_quiet_mode(self.long_id, mode)
 
     async def get_and_refresh_consumption(
         self, date: dt.datetime, consumption_type: ConsumptionType
@@ -340,12 +341,12 @@ class DeviceImpl(Device):
             return consumption_obj.total_consumption
         return None
 
-    async def set_force_dhw(self, force_dhw: ForceDHW) -> None:
+    async def set_force_dhw(self, force_dhw: ForceDHW) -> PanasonicCommandResult:
         """Set the force dhw.
 
         :param force_dhw: Set the Force DHW mode if the device has a tank.
         """
-        await self._client.post_device_force_dhw(self.long_id, force_dhw)
+        return await self._client.post_device_force_dhw(self.long_id, force_dhw)
 
     async def set_force_heater(self, force_heater: ForceHeater) -> None:
         """Set the force heater configuration.

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 from .const import AquareaEnvironment
+from .command_result import PanasonicCommandResult
 from .core import AquareaClient as Client  # Import AquareaClient and alias it as Client
 from .data import (
     Device,
@@ -66,4 +67,5 @@ __all__: Final[tuple[str, ...]] = (
     "PowerfulTime",
     "AquareaEnvironment",
     "SpecialStatus",
+    "PanasonicCommandResult",
 )
