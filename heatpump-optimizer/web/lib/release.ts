@@ -18,6 +18,16 @@ export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
     released: "2026-08-25",
+    title: "Bounded Panasonic token recovery",
+    changes: [
+      "Expired sessions now try Panasonic's refresh token before falling back to a full credential login.",
+      "Authentication recovery is centralized and bounded, preventing decorators from multiplying login attempts or resending one logical operation repeatedly.",
+      "If a refreshed token is rejected, one full login is attempted; persistent expiry is then reported clearly instead of entering another retry loop."
+    ],
+  },
+  {
+    version: "0.13.3",
+    released: "2026-08-25",
     title: "Resilient Panasonic control",
     changes: [
       "Expired Panasonic sessions now recover through one bounded token refresh and reauthentication attempt before an action is reported as failed.",
