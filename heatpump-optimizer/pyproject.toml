@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heatpump-optimizer"
-version = "0.13.4"
+version = "0.13.5"
 description = "Cost-optimizing controller for Panasonic Aquarea heat pumps"
 requires-python = ">=3.11"
 dependencies = [

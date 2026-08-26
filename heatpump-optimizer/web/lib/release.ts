@@ -17,6 +17,17 @@ export interface ReleaseNote {
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
+    released: "2026-08-26",
+    title: "Reliable SmartThings sensor freshness",
+    changes: [
+      "SmartThings temperature freshness now matches the measured cadence of battery sensors, avoiding false stale warnings for normal quiet rooms.",
+      "The maximum device-reported age is configurable from Settings, bounded between 30 minutes and 24 hours, with a three-hour default.",
+      "Repeated stale warnings are condensed into one event per outage and one recovery event, while missing or malformed timestamps remain excluded from control.",
+      "Existing sensor history is reclassified so comfort diagnostics and future model training can recover previously discarded valid evidence."
+    ],
+  },
+  {
+    version: "0.13.4",
     released: "2026-08-25",
     title: "Bounded Panasonic token recovery",
     changes: [

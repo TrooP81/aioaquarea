@@ -1,4 +1,4 @@
-ARG APP_VERSION=0.13.4
+ARG APP_VERSION=0.13.5
 ARG BUILD_REVISION=unknown
 
 # node:20-alpine, pinned by the official multi-architecture digest.
