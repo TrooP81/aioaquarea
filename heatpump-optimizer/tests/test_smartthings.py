@@ -186,7 +186,7 @@ class TestSmartThingsClient:
     async def test_batch_stops_on_rate_limit(self):
         call_count = 0
 
-        async def mock_get_temp(device_id):
+        async def mock_get_temp(_http_client, device_id):
             nonlocal call_count
             call_count += 1
             if call_count == 2:
@@ -194,13 +194,49 @@ class TestSmartThingsClient:
             return {"value": 21.0, "timestamp": "2026-06-01T10:00:00Z"}
 
         client = SmartThingsClient("test-pat")
-        client.get_temperature = mock_get_temp
+        client._get_temperature = mock_get_temp
 
         results = await client.get_temperatures_batch(["d1", "d2", "d3"])
 
         # Should get 1 result (first succeeded, second rate limited, third skipped)
         assert len(results) == 1
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_reuses_one_http_client(self):
+        client = SmartThingsClient("test-pat")
+
+        with patch("packages.poller.smartthings.httpx.AsyncClient") as client_cls:
+            http_client = AsyncMock()
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=http_client)
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            client._get_temperature = AsyncMock(
+                side_effect=[
+                    {"value": 21.0, "timestamp": "2026-06-01T10:00:00Z"},
+                    {"value": 22.0, "timestamp": "2026-06-01T10:00:00Z"},
+                ]
+            )
+
+            results = await client.get_temperatures_batch(["d1", "d2"])
+
+        assert [result["device_id"] for result in results] == ["d1", "d2"]
+        assert client_cls.call_count == 1
+        assert all(
+            awaited.args[0] is http_client
+            for awaited in client._get_temperature.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_propagates_auth_error_for_single_recovery(self):
+        client = SmartThingsClient("rejected-token")
+        client._get_temperature = AsyncMock(
+            side_effect=SmartThingsAuthError("expired")
+        )
+
+        with pytest.raises(SmartThingsAuthError, match="expired"):
+            await client.get_temperatures_batch(["d1", "d2"])
+
+        client._get_temperature.assert_awaited_once()
 
 
 # ------------------------------------------------------------------
@@ -356,13 +392,21 @@ class TestStaleReadingHandling:
                     "smartthings_device_ids": "d1",
                 }.get(k),
             ):
-                with patch.object(
-                    SmartThingsClient,
-                    "get_temperatures_batch",
-                    new_callable=AsyncMock,
-                    return_value=[
-                        {"device_id": "d1", "value": 21.0, "timestamp": stale_ts},
-                    ],
+                with (
+                    patch.object(
+                        SmartThingsClient,
+                        "discover_temp_sensors",
+                        new_callable=AsyncMock,
+                        return_value=[],
+                    ),
+                    patch.object(
+                        SmartThingsClient,
+                        "get_temperatures_batch",
+                        new_callable=AsyncMock,
+                        return_value=[
+                            {"device_id": "d1", "value": 21.0, "timestamp": stale_ts},
+                        ],
+                    ),
                 ):
                     count = await poll_smartthings_temps(mock_session)
 
@@ -397,13 +441,21 @@ class TestStaleReadingHandling:
                     "smartthings_device_ids": "d1",
                 }.get(k),
             ):
-                with patch.object(
-                    SmartThingsClient,
-                    "get_temperatures_batch",
-                    new_callable=AsyncMock,
-                    return_value=[
-                        {"device_id": "d1", "value": 21.0, "timestamp": fresh_ts},
-                    ],
+                with (
+                    patch.object(
+                        SmartThingsClient,
+                        "discover_temp_sensors",
+                        new_callable=AsyncMock,
+                        return_value=[],
+                    ),
+                    patch.object(
+                        SmartThingsClient,
+                        "get_temperatures_batch",
+                        new_callable=AsyncMock,
+                        return_value=[
+                            {"device_id": "d1", "value": 21.0, "timestamp": fresh_ts},
+                        ],
+                    ),
                 ):
                     count = await poll_smartthings_temps(mock_session)
 
@@ -432,17 +484,25 @@ class TestStaleReadingHandling:
                 new_callable=AsyncMock,
                 side_effect=lambda key: {"smartthings_device_ids": "d1"}.get(key),
             ):
-                with patch.object(
-                    SmartThingsClient,
-                    "get_temperatures_batch",
-                    new_callable=AsyncMock,
-                    return_value=[
-                        {
-                            "device_id": "d1",
-                            "value": 21.0,
-                            "timestamp": invalid_timestamp,
-                        }
-                    ],
+                with (
+                    patch.object(
+                        SmartThingsClient,
+                        "discover_temp_sensors",
+                        new_callable=AsyncMock,
+                        return_value=[],
+                    ),
+                    patch.object(
+                        SmartThingsClient,
+                        "get_temperatures_batch",
+                        new_callable=AsyncMock,
+                        return_value=[
+                            {
+                                "device_id": "d1",
+                                "value": 21.0,
+                                "timestamp": invalid_timestamp,
+                            }
+                        ],
+                    ),
                 ):
                     count = await poll_smartthings_temps(mock_session)
 
@@ -450,6 +510,52 @@ class TestStaleReadingHandling:
         reading = mock_session.add.call_args[0][0]
         assert reading.is_stale is True
         assert reading.device_timestamp is None
+
+    @pytest.mark.asyncio
+    async def test_rejected_oauth_token_is_refreshed_and_batch_retried_once(self):
+        from packages.poller.smartthings import poll_smartthings_temps
+
+        invalidate_device_cache()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        mock_session = MagicMock()
+
+        with (
+            patch(
+                "packages.poller.smartthings_oauth.get_valid_access_token",
+                new_callable=AsyncMock,
+                side_effect=["rejected-token", "fresh-token"],
+            ) as resolve_token,
+            patch(
+                "packages.poller.smartthings.get_selected_device_ids",
+                new_callable=AsyncMock,
+                return_value=["d1"],
+            ),
+            patch(
+                "packages.poller.smartthings.get_stale_reading_threshold",
+                new_callable=AsyncMock,
+                return_value=dt.timedelta(hours=3),
+            ),
+            patch(
+                "packages.poller.smartthings._fetch_smartthings_batch",
+                new_callable=AsyncMock,
+                side_effect=[
+                    SmartThingsAuthError("expired"),
+                    (
+                        {"d1": {"label": "Living room", "room_id": "room-1"}},
+                        [{"device_id": "d1", "value": 21.5, "timestamp": now}],
+                    ),
+                ],
+            ) as fetch_batch,
+        ):
+            count = await poll_smartthings_temps(mock_session)
+
+        assert count == 1
+        assert fetch_batch.await_count == 2
+        assert fetch_batch.await_args_list[0].args == ("rejected-token", ["d1"])
+        assert fetch_batch.await_args_list[1].args == ("fresh-token", ["d1"])
+        assert resolve_token.await_args_list[1].kwargs == {
+            "rejected_access_token": "rejected-token"
+        }
 
 
 # ------------------------------------------------------------------
