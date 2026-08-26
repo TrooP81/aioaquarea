@@ -19,8 +19,13 @@ logger = structlog.get_logger(__name__)
 
 SMARTTHINGS_API_BASE = "https://api.smartthings.com/v1"
 
-# Stale reading threshold — ignore SmartThings readings older than this
-STALE_READING_THRESHOLD = dt.timedelta(minutes=30)
+# Battery sensors commonly publish temperature only when it changes or at a
+# periodic heartbeat. Three hours tolerates a quiet sensor without accepting a
+# day-old value, while the independent poll-recency check still detects
+# API/poller failures quickly.
+STALE_READING_THRESHOLD = dt.timedelta(hours=3)
+MIN_STALE_READING_MINUTES = 30
+MAX_STALE_READING_MINUTES = 24 * 60
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -137,6 +142,7 @@ _device_cache: list[dict[str, Any]] = []
 _device_cache_ts: float = 0.0
 _DEVICE_CACHE_TTL = 3600.0  # 1 hour
 _device_cache_lock = asyncio.Lock()
+_stale_devices: set[str] = set()
 
 
 async def _get_cached_devices(client: SmartThingsClient) -> list[dict[str, Any]]:
@@ -155,6 +161,41 @@ def invalidate_device_cache() -> None:
     global _device_cache, _device_cache_ts
     _device_cache = []
     _device_cache_ts = 0.0
+    _stale_devices.clear()
+
+
+async def get_stale_reading_threshold() -> dt.timedelta:
+    """Return the bounded device-reported timestamp age allowed for control."""
+
+    raw = await get_setting("smartthings_device_max_age_minutes")
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        minutes = round(STALE_READING_THRESHOLD.total_seconds() / 60)
+    minutes = max(MIN_STALE_READING_MINUTES, min(minutes, MAX_STALE_READING_MINUTES))
+    return dt.timedelta(minutes=minutes)
+
+
+def _record_staleness_transition(
+    device_id: str, *, is_stale: bool, age_minutes: int | None, threshold_minutes: int
+) -> None:
+    """Log one warning per stale episode and one recovery event."""
+
+    if is_stale and device_id not in _stale_devices:
+        _stale_devices.add(device_id)
+        logger.warning(
+            "smartthings_stale_reading",
+            device_id=device_id,
+            age_minutes=age_minutes,
+            stale_after_minutes=threshold_minutes,
+        )
+    elif not is_stale and device_id in _stale_devices:
+        _stale_devices.remove(device_id)
+        logger.info(
+            "smartthings_reading_recovered",
+            device_id=device_id,
+            age_minutes=age_minutes,
+        )
 
 
 # ------------------------------------------------------------------
@@ -212,25 +253,47 @@ async def poll_smartthings_temps(session) -> int:
 
     readings = await client.get_temperatures_batch(device_ids)
     now = dt.datetime.now(dt.timezone.utc)
+    stale_threshold = await get_stale_reading_threshold()
+    stale_after_minutes = round(stale_threshold.total_seconds() / 60)
 
     count = 0
     for r in readings:
         is_stale = False
         device_ts: dt.datetime | None = None
 
-        # Parse the device-reported timestamp and check staleness
+        # Parse the device-reported timestamp and check staleness. Poll time is
+        # stored separately, so an API outage is still detected independently.
         if r.get("timestamp"):
             try:
                 device_ts = dt.datetime.fromisoformat(r["timestamp"].replace("+0000", "+00:00"))
-                if (now - device_ts) > STALE_READING_THRESHOLD:
-                    logger.warning(
-                        "smartthings_stale_reading",
-                        device_id=r["device_id"],
-                        age_minutes=round((now - device_ts).total_seconds() / 60),
-                    )
-                    is_stale = True
-            except (ValueError, TypeError):
-                pass  # If timestamp parsing fails, accept the reading
+                if device_ts.tzinfo is None:
+                    device_ts = device_ts.replace(tzinfo=dt.timezone.utc)
+                else:
+                    device_ts = device_ts.astimezone(dt.timezone.utc)
+                age_minutes = max(0, round((now - device_ts).total_seconds() / 60))
+                is_stale = (now - device_ts) > stale_threshold
+                _record_staleness_transition(
+                    r["device_id"],
+                    is_stale=is_stale,
+                    age_minutes=age_minutes,
+                    threshold_minutes=stale_after_minutes,
+                )
+            except (AttributeError, ValueError, TypeError):
+                is_stale = True
+                _record_staleness_transition(
+                    r["device_id"],
+                    is_stale=True,
+                    age_minutes=None,
+                    threshold_minutes=stale_after_minutes,
+                )
+        else:
+            is_stale = True
+            _record_staleness_transition(
+                r["device_id"],
+                is_stale=True,
+                age_minutes=None,
+                threshold_minutes=stale_after_minutes,
+            )
 
         session.add(
             IndoorTempReading(
