@@ -12,8 +12,11 @@ from packages.poller.smartthings import (
     SmartThingsError,
     SmartThingsRateLimited,
     STALE_READING_THRESHOLD,
+    _record_staleness_transition,
     _to_celsius,
     _check_response,
+    get_stale_reading_threshold,
+    invalidate_device_cache,
 )
 
 
@@ -287,6 +290,47 @@ class TestRetryBehavior:
 
 class TestStaleReadingHandling:
     @pytest.mark.asyncio
+    async def test_default_threshold_matches_battery_sensor_cadence(self):
+        with patch(
+            "packages.poller.smartthings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            threshold = await get_stale_reading_threshold()
+
+        assert threshold == dt.timedelta(hours=3)
+
+    @pytest.mark.asyncio
+    async def test_configured_threshold_is_bounded(self):
+        with patch(
+            "packages.poller.smartthings.get_setting",
+            new_callable=AsyncMock,
+            side_effect=["10", "99999"],
+        ):
+            minimum = await get_stale_reading_threshold()
+            maximum = await get_stale_reading_threshold()
+
+        assert minimum == dt.timedelta(minutes=30)
+        assert maximum == dt.timedelta(hours=24)
+
+    def test_stale_warning_is_logged_once_until_sensor_recovers(self):
+        invalidate_device_cache()
+
+        with patch("packages.poller.smartthings.logger") as mock_logger:
+            _record_staleness_transition(
+                "d1", is_stale=True, age_minutes=200, threshold_minutes=180
+            )
+            _record_staleness_transition(
+                "d1", is_stale=True, age_minutes=205, threshold_minutes=180
+            )
+            _record_staleness_transition(
+                "d1", is_stale=False, age_minutes=2, threshold_minutes=180
+            )
+
+        mock_logger.warning.assert_called_once()
+        mock_logger.info.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_stale_reading_is_written_with_flag(self):
         """Readings older than STALE_READING_THRESHOLD are written with is_stale=True."""
         from packages.poller.smartthings import poll_smartthings_temps, invalidate_device_cache
@@ -368,6 +412,44 @@ class TestStaleReadingHandling:
         reading = mock_session.add.call_args[0][0]
         assert reading.is_stale is False
         assert reading.temperature == 21.0
+
+    @pytest.mark.parametrize("invalid_timestamp", [None, 123, "not-a-timestamp"])
+    @pytest.mark.asyncio
+    async def test_invalid_device_timestamp_is_excluded_from_control(self, invalid_timestamp):
+        from packages.poller.smartthings import poll_smartthings_temps
+
+        invalidate_device_cache()
+        mock_session = MagicMock()
+        mock_session.add = MagicMock()
+
+        with patch(
+            "packages.poller.smartthings_oauth.get_valid_access_token",
+            new_callable=AsyncMock,
+            return_value="test-token",
+        ):
+            with patch(
+                "packages.poller.smartthings.get_setting",
+                new_callable=AsyncMock,
+                side_effect=lambda key: {"smartthings_device_ids": "d1"}.get(key),
+            ):
+                with patch.object(
+                    SmartThingsClient,
+                    "get_temperatures_batch",
+                    new_callable=AsyncMock,
+                    return_value=[
+                        {
+                            "device_id": "d1",
+                            "value": 21.0,
+                            "timestamp": invalid_timestamp,
+                        }
+                    ],
+                ):
+                    count = await poll_smartthings_temps(mock_session)
+
+        assert count == 1
+        reading = mock_session.add.call_args[0][0]
+        assert reading.is_stale is True
+        assert reading.device_timestamp is None
 
 
 # ------------------------------------------------------------------

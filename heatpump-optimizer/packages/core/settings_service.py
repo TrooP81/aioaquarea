@@ -400,6 +400,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "300",
         "description": "SmartThings poll interval in seconds (default 300 = 5 min)",
     },
+    "smartthings_device_max_age_minutes": {
+        "type": "int",
+        "default": "180",
+        "description": "Maximum age of a sensor-reported temperature before it is excluded from comfort control (minutes, 30-1440)",
+    },
     "_smartthings_oauth_state": {
         "type": "secret",
         "default": "",
