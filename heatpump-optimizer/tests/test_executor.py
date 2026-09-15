@@ -88,14 +88,20 @@ def _make_action(action_type: str, payload: dict | None = None, scheduled_ts=Non
     return action
 
 
+def _extract_stmt_values(stmt) -> dict[str, object]:
+    if not hasattr(stmt, "_values"):
+        return {}
+    values: dict[str, object] = {}
+    for key, value in stmt._values.items():
+        normalized_key = key.key if hasattr(key, "key") else str(key)
+        values[normalized_key] = value.value if hasattr(value, "value") else value
+    return values
+
+
 class TestRegistry:
     @pytest.mark.asyncio
-    async def test_zone_boost_skips_during_active_panasonic_weekly_timer(
-        self, mock_wrapper
-    ):
-        mock_wrapper.get_active_weekly_timer_slots.return_value = (
-            SimpleNamespace(zone_id=1),
-        )
+    async def test_zone_boost_skips_during_active_panasonic_weekly_timer(self, mock_wrapper):
+        mock_wrapper.get_active_weekly_timer_slots.return_value = (SimpleNamespace(zone_id=1),)
 
         result = await ACTION_REGISTRY[ActionType.ZONE_TEMP_BOOST].dispatch(
             mock_wrapper, {"offset": 2, "zone_id": 0}
@@ -172,7 +178,13 @@ class TestExecuteAction:
 
     @pytest.mark.asyncio
     async def test_quiet_mode_records_safe_panasonic_acknowledgement(self, mock_wrapper):
-        from aioaquarea import PanasonicCommandResult
+        try:
+            from aioaquarea.command_result import PanasonicCommandResult
+        except ModuleNotFoundError:
+            try:
+                from aioaquarea import PanasonicCommandResult
+            except ImportError:
+                pytest.skip("PanasonicCommandResult is unavailable in installed aioaquarea")
 
         mock_wrapper.set_quiet_mode.return_value = PanasonicCommandResult(
             http_status=200,
@@ -725,3 +737,43 @@ class TestExpireStaleActions:
             await executor.expire_stale_actions()
 
         assert mock_session.execute.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_executing_action_is_expired(self, executor):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        action.status = "executing"
+
+        with (
+            patch("packages.optimizer.executor.get_session") as mock_gs,
+            patch.object(
+                executor,
+                "_diagnose_missed",
+                new=AsyncMock(return_value={"reason": "executor_gap", "gap_minutes": 12.0}),
+            ),
+        ):
+            mock_session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = [action]
+            latest_plan_result = MagicMock()
+            latest_plan_result.scalar_one_or_none.return_value = action.plan_id
+            mock_session.execute = AsyncMock(side_effect=[stale_result, latest_plan_result, None])
+
+            await executor.expire_stale_actions()
+
+        status_updates: list[str] = []
+        expired_stmt_sql: str | None = None
+        for call in mock_session.execute.await_args_list:
+            stmt = call.args[0]
+            values = _extract_stmt_values(stmt)
+            status = values.get("status")
+            if isinstance(status, str):
+                status_updates.append(status)
+                if status == "expired":
+                    expired_stmt_sql = str(stmt)
+
+        assert "expired" in status_updates
+        assert expired_stmt_sql is not None
+        assert "plan_actions.status IN" in expired_stmt_sql

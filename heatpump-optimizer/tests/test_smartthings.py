@@ -222,16 +222,13 @@ class TestSmartThingsClient:
         assert [result["device_id"] for result in results] == ["d1", "d2"]
         assert client_cls.call_count == 1
         assert all(
-            awaited.args[0] is http_client
-            for awaited in client._get_temperature.await_args_list
+            awaited.args[0] is http_client for awaited in client._get_temperature.await_args_list
         )
 
     @pytest.mark.asyncio
     async def test_batch_propagates_auth_error_for_single_recovery(self):
         client = SmartThingsClient("rejected-token")
-        client._get_temperature = AsyncMock(
-            side_effect=SmartThingsAuthError("expired")
-        )
+        client._get_temperature = AsyncMock(side_effect=SmartThingsAuthError("expired"))
 
         with pytest.raises(SmartThingsAuthError, match="expired"):
             await client.get_temperatures_batch(["d1", "d2"])
@@ -318,6 +315,34 @@ class TestRetryBehavior:
         assert call_count == 2
         assert resp.status_code == 200
 
+    @pytest.mark.asyncio
+    async def test_429_malformed_retry_after_uses_bounded_backoff(self):
+        from packages.poller.smartthings import _request_with_retry
+
+        rate_resp = MagicMock(status_code=429, headers={"Retry-After": "not-a-delay"})
+        ok_resp = MagicMock(status_code=200)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[rate_resp, ok_resp])
+
+        with patch("packages.poller.smartthings.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await _request_with_retry(mock_client, "http://test")
+
+        sleep.assert_awaited_once_with(2.0)
+
+    @pytest.mark.asyncio
+    async def test_429_oversized_retry_after_is_capped(self):
+        from packages.poller.smartthings import MAX_RETRY_AFTER_SECONDS, _request_with_retry
+
+        rate_resp = MagicMock(status_code=429, headers={"Retry-After": "999999"})
+        ok_resp = MagicMock(status_code=200)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[rate_resp, ok_resp])
+
+        with patch("packages.poller.smartthings.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await _request_with_retry(mock_client, "http://test")
+
+        sleep.assert_awaited_once_with(MAX_RETRY_AFTER_SECONDS)
+
 
 # ------------------------------------------------------------------
 # Stale reading exclusion
@@ -359,9 +384,7 @@ class TestStaleReadingHandling:
             _record_staleness_transition(
                 "d1", is_stale=True, age_minutes=205, threshold_minutes=180
             )
-            _record_staleness_transition(
-                "d1", is_stale=False, age_minutes=2, threshold_minutes=180
-            )
+            _record_staleness_transition("d1", is_stale=False, age_minutes=2, threshold_minutes=180)
 
         mock_logger.warning.assert_called_once()
         mock_logger.info.assert_called_once()

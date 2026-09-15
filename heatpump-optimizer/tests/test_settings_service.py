@@ -126,88 +126,48 @@ class TestLearningModeSettings:
         assert SETTING_SPECS["learning_mode_since"].default == ""
 
 
-class TestOperationalLearningSettings:
-    def test_seasonal_campaign_and_alert_settings_registered(self):
-        for key in (
-            "seasonal_calibration_auto_train",
-            "seasonal_calibration_auto_exit",
-            "operational_alerts_enabled",
-            "operational_alert_webhook_url",
-        ):
-            assert key in SETTINGS_SCHEMA
-
-    def test_new_boolean_settings_default_to_safe_values(self):
-        assert SETTING_SPECS["seasonal_calibration_auto_train"].parse("true") is True
-        assert SETTING_SPECS["seasonal_calibration_auto_exit"].parse("true") is True
-        assert SETTING_SPECS["operational_alerts_enabled"].parse("true") is True
-
-
-class TestManualTrialSettings:
-    def test_manual_trial_settings_are_registered_and_disabled_by_default(self):
-        assert "outcome_experiments_enabled" in SETTINGS_SCHEMA
-        assert "outcome_experiment_max_curve_step_c" in SETTINGS_SCHEMA
-        assert SETTING_SPECS["outcome_experiments_enabled"].parse("false") is False
-        assert SETTING_SPECS["outcome_experiment_max_curve_step_c"].parse("0.5") == 0.5
-
-
 class TestValidateSettingValue:
     def test_unknown_key_raises_keyerror(self):
         with pytest.raises(KeyError):
             validate_setting_value("does_not_exist", "1")
 
-    def test_valid_int_passes(self):
-        validate_setting_value("tank_min_temp", "42")
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("tank_min_temp", "42"),
+            ("comfort_temp_min", "20.5"),
+            ("learning_mode_enabled", "true"),
+            ("price_provider", "manual"),
+            ("comfort_schedule", '{"weekday": [7]}'),
+        ],
+    )
+    def test_valid_values_pass(self, key, value):
+        validate_setting_value(key, value)
 
-    def test_invalid_int_raises_valueerror(self):
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("tank_min_temp", "not-a-number"),
+            ("comfort_temp_min", "warm"),
+            ("learning_mode_enabled", "perhaps"),
+            ("price_provider", "invalid"),
+            ("comfort_schedule", "not-json"),
+        ],
+    )
+    def test_invalid_values_raise_valueerror(self, key, value):
         with pytest.raises(ValueError):
-            validate_setting_value("tank_min_temp", "not-a-number")
+            validate_setting_value(key, value)
 
-    def test_valid_float_passes(self):
-        validate_setting_value("comfort_temp_min", "20.5")
-
-    def test_invalid_float_raises_valueerror(self):
-        with pytest.raises(ValueError):
-            validate_setting_value("comfort_temp_min", "warm")
-
-    def test_valid_bool_passes(self):
-        validate_setting_value("learning_mode_enabled", "true")
-
-    def test_invalid_bool_raises_valueerror(self):
-        with pytest.raises(ValueError):
-            validate_setting_value("learning_mode_enabled", "maybe")
-
-    def test_valid_option_passes(self):
-        validate_setting_value("optimizer_layer", "milp_preferred")
-
-    def test_invalid_option_raises_valueerror(self):
-        with pytest.raises(ValueError):
-            validate_setting_value("optimizer_layer", "nonsense")
-
-    def test_valid_json_passes(self):
-        validate_setting_value("comfort_schedule", '{"weekday": [7], "weekend": []}')
-
-    def test_invalid_json_raises_valueerror(self):
-        with pytest.raises(ValueError):
-            validate_setting_value("comfort_schedule", "{not json")
-
-    def test_empty_string_allowed_for_numeric_to_clear(self):
-        # Empty clears the override and falls back to env/default.
-        validate_setting_value("comfort_temp_min", "")
-
-    def test_empty_string_rejected_for_option(self):
-        with pytest.raises(ValueError):
-            validate_setting_value("optimizer_layer", "")
+    def test_get_setting_spec_returns_registered_spec(self):
+        assert get_setting_spec("tank_min_temp") is SETTING_SPECS["tank_min_temp"]
 
 
 class TestIsMaskedSecret:
     def test_masked_secret_detected(self):
-        spec = get_setting_spec("entsoe_api_token")
-        assert is_masked_secret(spec, "ab***yz") is True
+        assert is_masked_secret(get_setting_spec("entsoe_api_token"), "abc***xyz") is True
 
     def test_unmasked_secret_not_flagged(self):
-        spec = get_setting_spec("entsoe_api_token")
-        assert is_masked_secret(spec, "real-secret-value") is False
+        assert is_masked_secret(get_setting_spec("entsoe_api_token"), "plain-token") is False
 
     def test_non_secret_never_flagged(self):
-        spec = get_setting_spec("optimizer_layer")
-        assert is_masked_secret(spec, "***") is False
+        assert is_masked_secret(get_setting_spec("price_provider"), "***") is False

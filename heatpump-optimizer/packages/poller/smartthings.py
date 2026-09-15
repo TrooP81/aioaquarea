@@ -30,6 +30,7 @@ MAX_STALE_READING_MINUTES = 24 * 60
 # Retry configuration
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 2.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 
 class SmartThingsClient:
@@ -372,6 +373,17 @@ class SmartThingsRateLimited(SmartThingsError):
     """HTTP 429 — too many requests."""
 
 
+def _retry_after_seconds(value: str | None, fallback: float) -> float:
+    """Parse a server retry delay without allowing an unbounded poller sleep."""
+    try:
+        retry_after = float(value) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+    if retry_after <= 0:
+        return fallback
+    return min(retry_after, MAX_RETRY_AFTER_SECONDS)
+
+
 async def _request_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -402,7 +414,7 @@ async def _request_with_retry(
 
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2**attempt)
+            wait = _retry_after_seconds(retry_after, BASE_BACKOFF_SECONDS * (2**attempt))
             if attempt < MAX_RETRIES - 1:
                 logger.warning(
                     "smartthings_rate_limited_retrying",

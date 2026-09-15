@@ -12,6 +12,7 @@ build/
 *.egg
 .venv/
 venv/
+.pytest_tmp/
 
 # ML models
 models/*.pkl

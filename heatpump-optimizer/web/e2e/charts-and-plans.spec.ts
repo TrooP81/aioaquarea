@@ -340,12 +340,12 @@ test.describe("Plan View", () => {
     await page.getByRole("tab", { name: "Plan" }).click();
 
     // Active Plan section should show the plan header
-    await expect(page.locator("text=Active Plan")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Active Plan" })).toBeVisible();
     await expect(page.locator(".plan-cost-value")).toContainText("EUR");
     await expect(page.locator(".plan-cost-value")).not.toContainText("kr");
 
     // Should show human-readable status "Scheduled" instead of raw "pending"
-    await expect(page.locator("text=Scheduled").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator("#dashboard-panel-plan .plan-action-status", { hasText: "Scheduled" }).first()).toBeVisible({ timeout: 5000 });
 
     // Should show human-readable action label
     await expect(

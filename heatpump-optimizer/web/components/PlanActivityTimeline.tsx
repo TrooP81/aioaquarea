@@ -60,7 +60,17 @@ function activityDetail(activity: PlanActivity): string {
   }
 
   if (activity.status === "skipped") return "Skipped by the optimizer";
-  if (activity.status === "cancelled") return "Cancelled because a newer plan replaced this one";
+  if (activity.status === "cancelled") {
+    const detail = activity.result?.detail;
+    if (typeof detail === "string" && detail.trim().length > 0) return detail;
+
+    const reason = activity.result?.reason;
+    if (typeof reason === "string" && reason.trim().length > 0) {
+      return reason.replace(/_/g, " ");
+    }
+
+    return "Cancelled by the optimizer";
+  }
   return "Recorded by the optimizer";
 }
 

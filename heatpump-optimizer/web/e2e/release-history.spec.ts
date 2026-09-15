@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import packageInfo from "../package.json";
 
 async function mockSettingsPage(page: Page) {
   await page.route("**/api/**", (route) =>
@@ -50,9 +51,9 @@ test("shows the live release and its change history on Settings", async ({ page 
   await page.goto("/settings");
   await page.getByRole("tab", { name: "System" }).click();
 
-  await expect(page.getByTestId("app-version")).toContainText("v0.12.0");
+  await expect(page.getByTestId("app-version")).toContainText(`v${packageInfo.version}`);
   await expect(page.getByRole("heading", { name: "Release History" })).toBeVisible();
-  await expect(page.getByTestId("dashboard-version")).toHaveText("v0.12.0");
+  await expect(page.getByTestId("dashboard-version")).toHaveText(`v${packageInfo.version}`);
   await expect(page.getByTestId("api-version")).toHaveText("v0.12.0");
   await expect(page.getByTestId("api-contract")).toHaveText("2026-07-28.3");
   await expect(page.getByRole("heading", { name: "Manual trial suggestions" })).toBeVisible();

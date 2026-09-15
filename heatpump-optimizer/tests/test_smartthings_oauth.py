@@ -1,5 +1,6 @@
 """Tests for SmartThings OAuth 2.0 token management."""
 
+import asyncio
 import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -166,6 +167,50 @@ class TestSaveTokens:
 
 
 class TestGetValidAccessToken:
+    @pytest.mark.asyncio
+    async def test_concurrent_expired_token_refreshes_once(self):
+        past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+        expired = {
+            "access_token": "expired",
+            "refresh_token": "ref-tok",
+            "expires_at": past,
+        }
+        fresh = {
+            **expired,
+            "access_token": "fresh",
+            "expires_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
+        }
+        saved = False
+
+        async def load_current_tokens():
+            return fresh if saved else expired
+
+        async def save_current_tokens(_tokens):
+            nonlocal saved
+            saved = True
+
+        with (
+            patch("packages.poller.smartthings_oauth.load_tokens", side_effect=load_current_tokens),
+            patch(
+                "packages.poller.smartthings_oauth.get_setting",
+                new_callable=AsyncMock,
+                side_effect=lambda key: {
+                    "smartthings_client_id": "cid",
+                    "smartthings_client_secret": "secret",
+                }.get(key, ""),
+            ),
+            patch(
+                "packages.poller.smartthings_oauth.refresh_access_token",
+                new_callable=AsyncMock,
+                return_value={"access_token": "fresh", "expires_in": 3600},
+            ) as refresh,
+            patch("packages.poller.smartthings_oauth.save_tokens", side_effect=save_current_tokens),
+        ):
+            tokens = await asyncio.gather(get_valid_access_token(), get_valid_access_token())
+
+        assert tokens == ["fresh", "fresh"]
+        refresh.assert_awaited_once_with("ref-tok", "cid", "secret")
+
     @pytest.mark.asyncio
     async def test_no_oauth_tokens_falls_back_to_pat(self):
         """When no OAuth tokens exist, fall back to legacy PAT."""

@@ -7,113 +7,31 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
-from packages.api._helpers import get_price_area
-from packages.api.schemas import (
-    OverrideCreate,
-    PlanActivityResponse,
-    PlanDetailResponse,
-    PlanResponse,
-)
+from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
 from packages.core.database import get_session
-from packages.core.plan_outcome import measured_window_outcome, plan_measurement
 from packages.core.models import (
     AuditLogRecord,
-    ConsumptionRecord,
-    DeviceStatusRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
 )
-from packages.core.settings_service import get_user_tz
+from packages.core.plan_outcome import measured_window_outcome, plan_measurement
 
 router = APIRouter()
 
 
-def _plan_provenance(plan: PlanRecord) -> dict:
-    try:
-        parsed = json.loads(plan.input_provenance_json) if plan.input_provenance_json else {}
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _action_signature(action: PlanActionRecord) -> tuple[str, str, tuple[tuple[str, object], ...]]:
-    payload = json.loads(action.payload_json) if action.payload_json else {}
-    relevant = tuple(
-        sorted(
-            (key, payload[key])
-            for key in ("temperature", "offset", "level", "zone_id")
-            if key in payload
-        )
-    )
-    return action.action_type, action.scheduled_ts.isoformat(), relevant
-
-
-def _plan_outcome(actions: list[PlanActionRecord]) -> dict:
-    statuses: dict[str, int] = {}
-    delays: list[int] = []
-    verified = 0
-    for action in actions:
-        statuses[action.status] = statuses.get(action.status, 0) + 1
-        result = json.loads(action.result_json) if action.result_json else {}
-        # Older rows and manually repaired data can contain a JSON scalar.
-        # Treat it as unstructured rather than letting the history endpoint
-        # fail for the whole plan.
-        if not isinstance(result, dict):
-            result = {}
-        if result.get("verified") is True:
-            verified += 1
-        if action.executed_at is not None:
-            delays.append(max(0, round((action.executed_at - action.scheduled_ts).total_seconds())))
-    return {
-        "statuses": statuses,
-        "verified_actions": verified,
-        "timing": {
-            "measured_actions": len(delays),
-            "on_time_actions": sum(delay <= 120 for delay in delays),
-            "average_lateness_seconds": round(sum(delays) / len(delays)) if delays else None,
-            "max_lateness_seconds": max(delays) if delays else None,
-        },
-        "cost_note": "Actual electricity cost is shown daily; individual commands are not separately metered.",
-    }
-
-
-def _plan_change_summary(
-    actions: list[PlanActionRecord],
-    previous_plan_id: int | None,
-    previous_actions: list[PlanActionRecord],
-) -> dict:
-    if previous_plan_id is None:
-        return {"kind": "first_plan", "message": "First retained plan in this history."}
-    current = {_action_signature(action) for action in actions}
-    previous = {_action_signature(action) for action in previous_actions}
-    added = current - previous
-    removed = previous - current
-    drivers: list[str] = []
-    for action in actions:
-        if _action_signature(action) not in added:
-            continue
-        payload = json.loads(action.payload_json) if action.payload_json else {}
-        reason = payload.get("reason")
-        if isinstance(reason, str) and reason not in drivers:
-            drivers.append(reason)
-    if not added and not removed:
-        message = "No command-level change from the preceding plan."
-    else:
-        message = f"{len(added)} command(s) added and {len(removed)} removed versus plan #{previous_plan_id}."
-    return {
-        "kind": "diff",
-        "compared_to_plan_id": previous_plan_id,
-        "added_actions": len(added),
-        "removed_actions": len(removed),
-        "drivers": drivers[:3],
-        "message": message,
-    }
-
-
 class LearningModeUpdate(BaseModel):
     enabled: bool
+
+
+def _json_object(value: str | None) -> dict[str, object]:
+    """Decode persisted object JSON without making a history endpoint fail."""
+    try:
+        decoded = json.loads(value) if value else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 @router.get("/api/plans", response_model=list[PlanResponse])
@@ -161,8 +79,6 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
 @router.get("/api/plans/{plan_id}", response_model=PlanDetailResponse)
 async def get_plan_detail(plan_id: int):
     """Get plan details with actions."""
-    price_area = await get_price_area()
-    comfort_min_c, comfort_max_c = await _comfort_bounds()
     async with get_session() as session:
         plan_result = await session.execute(select(PlanRecord).where(PlanRecord.id == plan_id))
         plan = plan_result.scalar_one_or_none()
@@ -175,33 +91,44 @@ async def get_plan_detail(plan_id: int):
             .order_by(PlanActionRecord.scheduled_ts)
         )
         actions = actions_result.scalars().all()
-        previous_plan = (
-            await session.execute(
-                select(PlanRecord)
-                .where(PlanRecord.created_at < plan.created_at)
-                .order_by(desc(PlanRecord.created_at))
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        previous_actions: list[PlanActionRecord] = []
-        if previous_plan is not None:
-            previous_actions = (
-                (
-                    await session.execute(
-                        select(PlanActionRecord).where(PlanActionRecord.plan_id == previous_plan.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        measurement = await plan_measurement(
+        from packages.api._helpers import get_price_area
+        from packages.core.settings_service import get_float_setting, get_user_tz
+
+        outcome = await plan_measurement(
             session,
             plan=plan,
-            price_area=price_area,
-            comfort_min_c=comfort_min_c,
-            comfort_max_c=comfort_max_c,
+            price_area=await get_price_area(),
+            comfort_min_c=await get_float_setting("comfort_temp_min"),
+            comfort_max_c=await get_float_setting("comfort_temp_max"),
             timezone_name=await get_user_tz(),
         )
+
+    plan_data = _json_object(plan.plan_json)
+    provenance = _json_object(plan.input_provenance_json)
+    statuses: dict[str, int] = {}
+    lateness_values = []
+    for action in actions:
+        statuses[action.status] = statuses.get(action.status, 0) + 1
+        if action.executed_at is not None:
+            lateness_values.append(
+                max(0, (action.executed_at - action.scheduled_ts).total_seconds())
+            )
+    outcome.update(
+        {
+            "statuses": statuses,
+            "verified_actions": sum(
+                _json_object(action.result_json).get("verified") is True for action in actions
+            ),
+            "timing": {
+                "measured_actions": len(lateness_values),
+                "on_time_actions": sum(value <= 120 for value in lateness_values),
+                "average_lateness_seconds": (
+                    round(sum(lateness_values) / len(lateness_values)) if lateness_values else None
+                ),
+                "max_lateness_seconds": round(max(lateness_values)) if lateness_values else None,
+            },
+        }
+    )
 
     return PlanDetailResponse(
         id=plan.id,
@@ -217,6 +144,9 @@ async def get_plan_detail(plan_id: int):
         status_reason=plan.status_reason,
         superseded_at=plan.superseded_at,
         superseded_by_plan_id=plan.superseded_by_plan_id,
+        outcome=outcome,
+        change_summary=_json_object(plan_data.get("change_summary")),
+        provenance=provenance,
         actions=[
             {
                 "id": a.id,
@@ -229,129 +159,99 @@ async def get_plan_detail(plan_id: int):
             }
             for a in actions
         ],
-        outcome={**_plan_outcome(actions), "measurement": measurement},
-        change_summary=_plan_change_summary(
-            actions,
-            previous_plan.id if previous_plan is not None else None,
-            previous_actions,
-        ),
-        provenance=_plan_provenance(plan),
     )
 
 
-async def _comfort_bounds() -> tuple[float, float]:
-    """Read the configured comfort band once for measured outcome endpoints."""
-
-    from packages.core.settings_service import get_float_setting
-
-    return (
-        await get_float_setting("comfort_temp_min"),
-        await get_float_setting("comfort_temp_max"),
-    )
-
-
-@router.get("/api/outcomes/summary")
-async def get_outcome_summary(days: int = Query(7, ge=1, le=30)):
-    """Summarise measured cost exposure and indoor comfort for a recent period.
-
-    Savings are intentionally labelled as *price-shift* estimates: the system
-    has one cumulative heat-pump meter and cannot prove a per-command energy
-    counterfactual.
-    """
-
-    from packages.core.outcome_experiments import get_outcome_experiment_status
-
-    now = dt.datetime.now(dt.timezone.utc)
-    start = now - dt.timedelta(days=days)
-    price_area = await get_price_area()
-    comfort_min_c, comfort_max_c = await _comfort_bounds()
-    async with get_session() as session:
-        measurement = await measured_window_outcome(
-            session,
-            start=start,
-            end=now,
-            price_area=price_area,
-            price_currency=None,
-            price_source=None,
-            comfort_min_c=comfort_min_c,
-            comfort_max_c=comfort_max_c,
-            timezone_name=await get_user_tz(),
-        )
-    return {
-        "days": days,
-        **measurement,
-        "experiment": await get_outcome_experiment_status(),
-        "baseline_method": (
-            "Estimated price-shift savings compare measured energy with the same energy "
-            "bought at the simple average available market price in the selected period."
-        ),
-        "note": "This is a measured period outcome, not a claim that individual commands caused specific kWh.",
-    }
-
-
-@router.get("/api/operations/alerts")
-async def get_operations_alerts():
-    """Return current actionable operational alerts for the dashboard."""
-
-    from packages.core.operational_alerts import get_operational_alerts
-
-    return await get_operational_alerts()
-
-
-@router.get("/api/plan-activity", response_model=list[PlanActivityResponse])
+@router.get("/api/plan-activity")
 async def get_plan_activity(
-    limit: int = Query(25, ge=1, le=100),
-    status: list[str] | None = Query(default=None),
+    limit: int = Query(100, ge=1, le=200),
+    status: list[str] | None = Query(None),
 ):
-    """Get recent actions that were actually attempted by the optimizer.
-
-    Pending actions are intentionally excluded: they belong to a current plan,
-    not to the record of what the system has already done.
-    """
+    """Return recent plan actions and their lifecycle outcomes."""
+    meaningful_statuses = [
+        "executed",
+        "executed_unverified",
+        "failed",
+        "expired",
+        "skipped",
+        "cancelled",
+    ]
+    statuses = status if status else meaningful_statuses
     async with get_session() as session:
-        query = (
+        result = await session.execute(
             select(PlanActionRecord, PlanRecord.created_at, PlanRecord.optimizer_version)
-            .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
-            .where(PlanActionRecord.status != "pending")
+            .join(PlanRecord, PlanRecord.id == PlanActionRecord.plan_id)
+            .where(PlanActionRecord.status.in_(statuses))
             .order_by(
                 desc(func.coalesce(PlanActionRecord.executed_at, PlanActionRecord.scheduled_ts))
             )
             .limit(limit)
         )
-        if status:
-            allowed = {
-                "executed",
-                "executed_unverified",
-                "failed",
-                "expired",
-                "skipped",
-                "cancelled",
-            }
-            selected = [value for value in status if value in allowed]
-            if selected:
-                query = query.where(PlanActionRecord.status.in_(selected))
-        result = await session.execute(query)
+        rows = result.all()
 
-        return [
-            PlanActivityResponse(
-                id=action.id,
-                plan_id=action.plan_id,
-                plan_created_at=plan_created_at,
-                optimizer_version=optimizer_version,
-                scheduled_ts=action.scheduled_ts,
-                action_type=action.action_type,
-                status=action.status,
-                executed_at=action.executed_at,
-                lateness_seconds=(
-                    max(0, round((action.executed_at - action.scheduled_ts).total_seconds()))
-                    if action.executed_at is not None
-                    else None
-                ),
-                payload=json.loads(action.payload_json) if action.payload_json else {},
-                result=json.loads(action.result_json) if action.result_json else None,
-            )
-            for action, plan_created_at, optimizer_version in result.all()
-        ]
+    return [
+        {
+            "id": action.id,
+            "plan_id": action.plan_id,
+            "plan_created_at": created_at,
+            "optimizer_version": optimizer_version,
+            "scheduled_ts": action.scheduled_ts,
+            "action_type": action.action_type,
+            "status": action.status,
+            "executed_at": action.executed_at,
+            "lateness_seconds": (
+                max(0, round((action.executed_at - action.scheduled_ts).total_seconds()))
+                if action.executed_at is not None
+                else None
+            ),
+            "payload": json.loads(action.payload_json) if action.payload_json else {},
+            "result": json.loads(action.result_json) if action.result_json else None,
+        }
+        for action, created_at, optimizer_version in rows
+    ]
+
+
+@router.get("/api/outcomes/summary")
+async def get_outcome_summary(days: int = Query(7, ge=1, le=30)):
+    """Return measured energy, cost, and comfort outcomes for a recent period."""
+    from packages.api._helpers import get_price_area
+    from packages.core.outcome_experiments import get_outcome_experiment_status
+    from packages.core.settings_service import get_float_setting, get_user_tz
+
+    now = dt.datetime.now(dt.timezone.utc)
+    start = now - dt.timedelta(days=days)
+    async with get_session() as session:
+        outcome = await measured_window_outcome(
+            session,
+            start=start,
+            end=now,
+            price_area=await get_price_area(),
+            price_currency=None,
+            price_source=None,
+            comfort_min_c=await get_float_setting("comfort_temp_min"),
+            comfort_max_c=await get_float_setting("comfort_temp_max"),
+            timezone_name=await get_user_tz(),
+        )
+
+    return {
+        "days": days,
+        "cost": outcome["cost"],
+        "comfort": outcome["comfort"],
+        "weather_matched_comparison": outcome["weather_matched_comparison"],
+        "baseline_method": (
+            "Estimated price-shift savings compare measured energy with the simple average "
+            "available market price over this period. This is not proof of per-command savings."
+        ),
+        "experiment": await get_outcome_experiment_status(),
+    }
+
+
+@router.get("/api/operations/alerts")
+async def get_operations_alerts():
+    """Return current operational warnings for the dashboard."""
+    from packages.core.operational_alerts import get_operational_alerts
+
+    return await get_operational_alerts()
 
 
 @router.post("/api/overrides")
@@ -423,47 +323,6 @@ async def _learning_mode_status() -> dict[str, object]:
     return {"enabled": enabled, "since": since_iso, "days_elapsed": days_elapsed}
 
 
-def _decision_readiness_summary(
-    *,
-    active_layer: str,
-    demand_quality: dict[str, object],
-    indoor_heating_samples: int,
-    indoor_heating_confidence: str,
-) -> dict[str, str]:
-    """Give the UI one plain-language reason for the selected safe layer."""
-
-    if "rules" not in active_layer:
-        return {
-            "state": "ready",
-            "title": "Data requirements met for the active decision layer",
-            "detail": "The optimizer has enough current evidence for this layer.",
-        }
-    remaining = int(demand_quality.get("remaining_samples") or 0)
-    blocker = str(demand_quality.get("training_blocker") or "")
-    if remaining:
-        season_note = (
-            " Heating-season evidence is naturally sparse in mild weather."
-            if blocker == "waiting_for_space_heating_season"
-            else ""
-        )
-        return {
-            "state": "collecting",
-            "title": "Rules are active while the demand model gathers heating evidence",
-            "detail": f"{remaining} more valid space-heating interval(s) are needed before demand training can begin.{season_note}",
-        }
-    if indoor_heating_confidence != "learned":
-        return {
-            "state": "collecting",
-            "title": "Rules are active while indoor heating response is still being learned",
-            "detail": f"Only {indoor_heating_samples} trusted indoor-heating sample(s) are currently available.",
-        }
-    return {
-        "state": "fallback",
-        "title": "Rules are active as the current safe fallback",
-        "detail": "Review the forecast-quality card and planning-input status for the condition keeping ML control inactive.",
-    }
-
-
 @router.get("/api/learning-mode")
 async def get_learning_mode():
     """Get the current learning-mode state."""
@@ -507,94 +366,27 @@ async def set_learning_mode(body: LearningModeUpdate):
 @router.get("/api/optimizer/status")
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
-    from packages.core.config import settings as app_settings
-    from packages.core.settings_service import get_float_setting, get_heat_curve_config, get_setting
-    from packages.core.control_temperature import get_control_temperature
-    from packages.ml.cop_model_core import COP_MODEL_ARTIFACT_GLOB, COP_MODEL_ARTIFACT_PREFIX
-    from packages.ml.models import MODEL_DIR, cop_model, demand_model
-    from packages.ml.seasonal_learning import get_seasonal_calibration_progress
+    from packages.core.settings_service import get_setting
+    from packages.ml.models import MODEL_DIR
     from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
 
     layer = await get_setting("optimizer_layer") or "rules_only"
-    optimizer_status = await get_optimizer_status_snapshot(layer, reload_models=True)
+    optimizer_status = await get_optimizer_status_snapshot(layer)
     learning_mode = await _learning_mode_status()
-    seasonal_calibration = await get_seasonal_calibration_progress()
 
-    cop_models = sorted(MODEL_DIR.glob(COP_MODEL_ARTIFACT_GLOB))
+    cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
     demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
-    cop_model.load_latest()
-    thermal_model.load_latest()
 
-    demand_data_quality = await demand_model.training_data_quality()
-    now = dt.datetime.now(dt.timezone.utc)
-    device_max_age_seconds = max(int(app_settings.poll_interval_seconds) * 3, 15 * 60)
     async with get_session() as session:
-        energy_record_count = (
-            await session.execute(select(func.count()).select_from(ConsumptionRecord))
-        ).scalar() or 0
-        latest_device_status = (
-            await session.execute(
-                select(DeviceStatusRecord.ts).order_by(DeviceStatusRecord.ts.desc()).limit(1)
-            )
-        ).scalar_one_or_none()
-        latest_status_record = (
-            await session.execute(
-                select(DeviceStatusRecord).order_by(DeviceStatusRecord.ts.desc()).limit(1)
-            )
-        ).scalar_one_or_none()
-        last_plan = (
-            await session.execute(select(PlanRecord).order_by(desc(PlanRecord.created_at)).limit(1))
-        ).scalar_one_or_none()
-        control_temperature = await get_control_temperature(session=session)
+        consumption_count = await session.execute(
+            select(func.count()).select_from(PlanActionRecord)
+        )
+        total_consumption = consumption_count.scalar() or 0
 
-    last_plan_info = None
-    if last_plan is not None:
-        version = last_plan.optimizer_version or ""
-        engine = "milp" if version.startswith("milp") else "rules"
-        last_plan_info = {
-            "version": version,
-            "engine": engine,
-            "fell_back": layer != "rules_only" and engine == "rules",
-            "created_at": last_plan.created_at.isoformat() if last_plan.created_at else None,
-        }
-
-    heat_curve = await get_heat_curve_config()
-    comfort_min_c = await get_float_setting("comfort_temp_min")
-    comfort_max_c = await get_float_setting("comfort_temp_max")
-    outdoor_c = (
-        float(latest_status_record.outdoor_temp)
-        if latest_status_record is not None and latest_status_record.outdoor_temp is not None
-        else None
-    )
-    if outdoor_c is not None and outdoor_c >= heat_curve.heating_off_outdoor_c:
-        comfort_controllability = {
-            "status": "not_heatpump_controllable",
-            "message": "Space heating is off above the controller cutoff, so warm-weather indoor deviations are shown separately from optimizer comfort performance.",
-            "outdoor_temp_c": outdoor_c,
-            "cutoff_c": heat_curve.heating_off_outdoor_c,
-        }
-    elif control_temperature.value is None:
-        comfort_controllability = {
-            "status": "awaiting_sensor",
-            "message": "A fresh indoor sensor reading is needed before comfort controllability can be assessed.",
-            "outdoor_temp_c": outdoor_c,
-            "cutoff_c": heat_curve.heating_off_outdoor_c,
-        }
-    elif comfort_min_c <= control_temperature.value <= comfort_max_c:
-        comfort_controllability = {
-            "status": "within_band",
-            "message": "Indoor temperature is within the configured comfort band.",
-            "outdoor_temp_c": outdoor_c,
-            "cutoff_c": heat_curve.heating_off_outdoor_c,
-        }
-    else:
-        comfort_controllability = {
-            "status": "heat_curve_controllable",
-            "message": "The controller can influence space heating under the current outdoor conditions.",
-            "outdoor_temp_c": outdoor_c,
-            "cutoff_c": heat_curve.heating_off_outdoor_c,
-        }
+    estimated_days = max(1, total_consumption // 96) if total_consumption > 0 else 0
+    cop_samples = max(0, total_consumption - estimated_days)
+    demand_samples = total_consumption
 
     def _version_to_iso(prefix: str, models: list) -> str | None:
         if not models:
@@ -612,62 +404,22 @@ async def get_optimizer_status():
     return {
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
-        "fallback_layer": "rules_v7",
-        "last_plan": last_plan_info,
-        "data_freshness": {
-            "latest_device_status": latest_device_status.isoformat()
-            if latest_device_status
-            else None,
-            "age_seconds": round((now - latest_device_status).total_seconds())
-            if latest_device_status
-            else None,
-            "stale_after_seconds": device_max_age_seconds,
-            "fresh": latest_device_status is not None
-            and latest_device_status >= now - dt.timedelta(seconds=device_max_age_seconds),
-        },
-        "planning_data_quality": optimizer_status["planning_data_quality"],
-        "comfort_controllability": comfort_controllability,
+        "fallback_layer": "rules_v3",
         "learning_mode": learning_mode,
-        "seasonal_calibration": seasonal_calibration,
-        "decision_readiness": _decision_readiness_summary(
-            active_layer=optimizer_status["active_layer"],
-            demand_quality=demand_data_quality,
-            indoor_heating_samples=thermal_model.params.indoor_heating_samples,
-            indoor_heating_confidence=thermal_model.confidence_for("indoor_heating"),
-        ),
         "cop_model": {
             "trained": optimizer_status["cop_trained"],
-            "last_trained": _version_to_iso(COP_MODEL_ARTIFACT_PREFIX, cop_models),
-            # COP has a different pairing/filter pipeline. Expose the raw input
-            # count under its own name rather than mislabelling it as samples.
-            "source_records": energy_record_count,
-            "metrics": cop_model.metrics if cop_model.is_trained else {},
+            "last_trained": _version_to_iso("cop_model_", cop_models),
+            "samples": cop_samples,
         },
         "demand_model": {
             "trained": optimizer_status["demand_trained"],
             "last_trained": _version_to_iso("demand_model_", demand_models),
-            "samples": demand_data_quality["usable_samples"],
-            "data_quality": demand_data_quality,
+            "samples": demand_samples,
         },
         "thermal_model": {
             "calibrated": thermal_model.params.last_calibrated is not None,
-            # Effective, outdoor-adjusted and clamped rate. The raw stored
-            # intercept can be negative if calibration data only covered one
-            # season, which is confusing when surfaced to the dashboard.
-            "tank_heating_rate": round(
-                thermal_model._tank_heating_rate(outdoor_c if outdoor_c is not None else 10.0),
-                2,
-            ),
-            "tank_heating_rate_intercept_c0": round(
-                thermal_model.params.tank_heating_rate, 2
-            ),
-            "tank_heating_outdoor_factor": round(
-                thermal_model.params.tank_heating_outdoor_factor, 3
-            ),
-            "confidence": thermal_model.confidence_for("tank_heating"),
-            "indoor_heating_confidence": thermal_model.confidence_for("indoor_heating"),
-            "indoor_heating_samples": thermal_model.params.indoor_heating_samples,
-            "calibration_status": thermal_model.params.calibration_status,
+            "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),
+            "confidence": "learned" if thermal_model.params.last_calibrated else "default",
             "last_calibrated": thermal_model.params.last_calibrated.isoformat()
             if thermal_model.params.last_calibrated
             else None,
@@ -677,12 +429,7 @@ async def get_optimizer_status():
 
 @router.post("/api/optimize-now")
 async def optimize_now():
-    """Queue a one-off optimization for the optimizer service.
-
-    Running the solver in the API process used to compete with the scheduled
-    optimizer and could create overlapping plans. Requests are durable, so the
-    UI can follow their state even if the API restarts.
-    """
+    """Queue a durable manual optimization request for the optimizer service."""
     async with get_session() as session:
         request = OptimizationRequestRecord(requested_by="api")
         session.add(request)
@@ -694,12 +441,12 @@ async def optimize_now():
 
 @router.get("/api/optimize-now/{request_id}")
 async def get_optimization_request(request_id: int):
-    """Return the status of a queued manual optimization."""
-
+    """Return the durable state of a manual optimization request."""
     async with get_session() as session:
         request = await session.get(OptimizationRequestRecord, request_id)
-        if request is None:
-            raise HTTPException(status_code=404, detail="Optimization request not found")
+
+    if request is None:
+        raise HTTPException(status_code=404, detail="Optimization request not found")
 
     return {
         "id": request.id,

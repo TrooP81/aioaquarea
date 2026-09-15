@@ -101,11 +101,21 @@ test("shows rainfall and separates actual activity from plan revisions", async (
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify([{
-        id: 7, plan_id: 17, plan_created_at: now.toISOString(), optimizer_version: "rules_v3",
-        scheduled_ts: now.toISOString(), action_type: "force_dhw_on", status: "executed",
-        executed_at: now.toISOString(), payload: {}, result: { verified: true },
-      }]),
+      body: JSON.stringify([
+        {
+          id: 7, plan_id: 17, plan_created_at: now.toISOString(), optimizer_version: "rules_v3",
+          scheduled_ts: now.toISOString(), action_type: "force_dhw_on", status: "executed",
+          executed_at: now.toISOString(), payload: {}, result: { verified: true },
+        },
+        {
+          id: 8, plan_id: 17, plan_created_at: now.toISOString(), optimizer_version: "rules_v3",
+          scheduled_ts: now.toISOString(), action_type: "normal_mode_on", status: "cancelled",
+          executed_at: now.toISOString(), payload: {}, result: {
+            reason: "shutdown_cancelled",
+            detail: "Executor shutdown interrupted action verification",
+          },
+        },
+      ]),
     })
   );
   await page.route(/\/api\/plans\/42(?:\?|$)/, (route) =>
@@ -128,5 +138,7 @@ test("shows rainfall and separates actual activity from plan revisions", async (
   await expect(page.getByTestId("plan-activity")).toBeVisible();
   await expect(page.getByText("Heat hot water")).toBeVisible();
   await expect(page.getByText("Command completed and verified")).toBeVisible();
+  await expect(page.getByText("Executor shutdown interrupted action verification")).toBeVisible();
+  await expect(page.getByText("Cancelled because a newer plan replaced this one")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Plan change history" })).toBeVisible();
 });

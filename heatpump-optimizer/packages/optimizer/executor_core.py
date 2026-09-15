@@ -33,6 +33,7 @@ MAX_ACTIONS_PER_CYCLE = 3
 VERIFY_POLL_INTERVAL_S = 10
 VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
+SHUTDOWN_CANCEL_REASON = "shutdown_cancelled"
 
 
 def _device_status_freshness_cutoff(now: dt.datetime) -> dt.datetime:
@@ -56,6 +57,7 @@ async def is_learning_mode_active() -> bool:
     try:
         if await get_bool_setting("learning_mode_enabled"):
             return True
+
         from packages.ml.seasonal_learning import get_seasonal_calibration_status
 
         seasonal = await get_seasonal_calibration_status()
@@ -76,6 +78,7 @@ class PlanExecutor:
 
     async def execute_due_actions(self) -> None:
         """Find and execute all actions whose scheduled time has passed."""
+        actions: list[PlanActionRecord] = []
         now = dt.datetime.now(dt.timezone.utc)
 
         async with get_session() as session:
@@ -102,9 +105,8 @@ class PlanExecutor:
                 )
                 .order_by(PlanActionRecord.scheduled_ts)
                 .limit(MAX_ACTIONS_PER_CYCLE)
-                # Lock both the action and its active plan.  A replacement
-                # plan waits until these actions are either claimed or left
-                # pending, so it cannot race a command sent to the pump.
+                # Lock both the action and its active plan so replacement plans
+                # cannot race a due command in another executor cycle.
                 .with_for_update()
             )
             actions = result.scalars().all()
@@ -211,8 +213,71 @@ class PlanExecutor:
                 )
                 return
 
-        for action in actions:
-            await self._execute_action(action)
+        try:
+            for action in actions:
+                await self._execute_action(action)
+        except asyncio.CancelledError:
+            await self._reconcile_claimed_batch_cancelled(actions)
+            raise
+
+    async def _reconcile_claimed_batch_cancelled(
+        self, claimed_actions: list[PlanActionRecord]
+    ) -> None:
+        """Cancel any still-executing actions from a claimed batch after interruption."""
+        if not claimed_actions:
+            return
+
+        claimed_ids = [action.id for action in claimed_actions]
+        action_by_id = {action.id: action for action in claimed_actions}
+        now = dt.datetime.now(dt.timezone.utc)
+
+        async with get_session() as session:
+            executing_result = await session.execute(
+                select(PlanActionRecord.id).where(
+                    and_(
+                        PlanActionRecord.id.in_(claimed_ids),
+                        PlanActionRecord.status == "executing",
+                    )
+                )
+            )
+            executing_ids = list(executing_result.scalars().all())
+            if not executing_ids:
+                return
+
+            await session.execute(
+                update(PlanActionRecord)
+                .where(
+                    and_(
+                        PlanActionRecord.id.in_(executing_ids),
+                        PlanActionRecord.status == "executing",
+                    )
+                )
+                .values(
+                    status="cancelled",
+                    executed_at=now,
+                    result_json=json.dumps(
+                        {
+                            "reason": SHUTDOWN_CANCEL_REASON,
+                            "detail": "Executor shutdown interrupted action verification",
+                        }
+                    ),
+                )
+            )
+
+            for action_id in executing_ids:
+                action = action_by_id.get(action_id)
+                if action is None:
+                    continue
+                add_result = session.add(
+                    AuditLogRecord(
+                        actor="optimizer",
+                        action=action.action_type,
+                        payload_json=action.payload_json,
+                        result="cancelled",
+                    )
+                )
+                if asyncio.iscoroutine(add_result):
+                    await add_result
 
     async def _execute_action(self, action: PlanActionRecord) -> None:
         """Execute a single action, then synchronously verify it."""
@@ -275,6 +340,14 @@ class PlanExecutor:
 
             await self._verify_with_retry(action, payload, expected_state)
 
+        except asyncio.CancelledError:
+            logger.warning(
+                "action_cancelled",
+                action_type=action.action_type,
+                action_id=action.id,
+            )
+            await self._mark_cancelled(action)
+            raise
         except ValueError:
             logger.warning("executor_unknown_action", action_type=action.action_type)
         except Exception as exc:
@@ -291,6 +364,34 @@ class PlanExecutor:
                         result_json=json.dumps({"error": str(exc)}),
                     )
                 )
+
+    async def _mark_cancelled(self, action: PlanActionRecord) -> None:
+        """Reconcile in-flight cancellation so dispatched actions do not get stranded."""
+        now = dt.datetime.now(dt.timezone.utc)
+        audit_record = AuditLogRecord(
+            actor="optimizer",
+            action=action.action_type,
+            payload_json=action.payload_json,
+            result="cancelled",
+        )
+        async with get_session() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="cancelled",
+                    executed_at=now,
+                    result_json=json.dumps(
+                        {
+                            "reason": SHUTDOWN_CANCEL_REASON,
+                            "detail": "Executor shutdown interrupted action verification",
+                        }
+                    ),
+                )
+            )
+            add_result = session.add(audit_record)
+            if asyncio.iscoroutine(add_result):
+                await add_result
 
     async def _verify_with_retry(
         self,
@@ -324,10 +425,8 @@ class PlanExecutor:
                     expected=last_result.expected_value,
                     reason=last_result.reason,
                 )
-                # Relative actions (notably a zone boost) must retry the exact
-                # target calculated on first dispatch. Re-running ``current +
-                # offset`` can otherwise compound the boost when Panasonic's
-                # read-after-write status is delayed or changed concurrently.
+                # Relative actions must retry their originally calculated
+                # target to avoid compounding adjustments.
                 expected_state = (
                     await handler.redispatch_expected(self._wrapper, payload, expected_state)
                     or expected_state
@@ -445,7 +544,7 @@ class PlanExecutor:
         )
 
     async def expire_stale_actions(self) -> None:
-        """Mark stale claimed or pending actions as expired with a diagnostic reason.
+        """Mark stale pending actions as expired with a diagnostic reason.
 
         Runs periodically to catch actions that the executor never picked up
         (e.g. scheduled during an override window, or from a superseded plan).
@@ -461,7 +560,7 @@ class PlanExecutor:
                 .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
                 .where(
                     and_(
-                        PlanActionRecord.status.in_(("pending", "executing")),
+                        PlanActionRecord.status.in_(["pending", "executing"]),
                         PlanActionRecord.scheduled_ts <= cutoff,
                         PlanRecord.status == ACTIVE_PLAN_STATUS,
                     )
@@ -484,6 +583,7 @@ class PlanExecutor:
                 await session.execute(
                     update(PlanActionRecord)
                     .where(PlanActionRecord.id == action.id)
+                    .where(PlanActionRecord.status.in_(["pending", "executing"]))
                     .values(
                         status="expired",
                         executed_at=now,

@@ -22,7 +22,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Hourly-accurate cost tracking**: Today's cost is computed as Σ(per-interval Δ kWh × that hour's spot price), not a flat-rate estimate
 - **Fault detection**: Automatic detection and logging of device faults
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
-- **Weather-aware**: Open-Meteo (default) or SMHI forecast for COP estimation and pre-heating
+- **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
 - **Rules-based optimizer (v3)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
 - **MILP optimizer**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
@@ -32,9 +32,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Action verification**: Confirms commands took effect by polling device after execution
 - **Manual overrides**: Always-wins pause button for the optimizer; survives optimizer reruns
 - **Learning mode**: Manually toggleable observe-only mode — the optimizer keeps planning but sends no device commands, so the heat pump runs naturally while clean training data is collected over a long period
-- **Condition-aware forecast safety**: Forecast quality is evaluated separately for rain, cold, and mild weather. Unobserved adverse conditions add a comfort reserve; failed conditions fall back to rules only when forecast.
-- **Seasonal calibration**: Optional, observe-only collection activates only during detected heating weather; it never changes heat-pump settings autonomously.
-- **On-demand actions**: "Optimize now" and "Poll now" buttons trigger an immediate plan or device refresh
+- **On-demand actions**: "Optimize now" queues a durable re-plan for the optimizer service; "Poll now" triggers a device refresh
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
 - **Audit log**: Every executed action is recorded
@@ -92,17 +90,13 @@ Settings can be supplied via environment variables (typically through `.env`) an
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SECRET_KEY` | _(insecure default)_ | Required: set to a random string in production (used for HMAC-signed model files) |
-| `API_TOKEN` | `disabled` | Set to a strong token to protect FastAPI. The web container forwards it server-to-server and never exposes it to the browser. |
+| `API_TOKEN` | `disabled` | Set to a strong token to enable bearer-token auth on `/api/*` |
 | `CORS_ORIGINS` | `http://localhost:3500` | Comma-separated allowed origins |
 | `MODEL_DIR` | `/app/models` | Where ML models are persisted |
 | `LOG_LEVEL` | `INFO` | Standard log level |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | — | Database credentials (used by `docker-compose`) |
 | `REDIS_URL` | `redis://redis:6379/0` | Redis connection string |
-| `DB_PORT` / `API_PORT` / `WEB_PORT` | `5434` / `8500` / `3500` | Host-side port mappings. DB and API bind to `127.0.0.1`; web remains the user-facing service. |
-| `BACKUP_INTERVAL_SECONDS` / `BACKUP_RETENTION_DAYS` | `86400` / `14` | Automated PostgreSQL backup cadence and local archive retention |
-| `BACKUP_VERIFY_AFTER_DUMP` | `false` | Restore each new backup into a disposable database before accepting it |
-| `BACKUP_REPLICA_ENABLED` / `BACKUP_REPLICA_HOST_DIR` | `false` / `./backups-replica` | Opt-in encrypted replica; point the host directory at a mounted NAS/share |
-| `BACKUP_REPLICA_ENCRYPTION_KEY` | — | Required when replica is enabled; use a long secret managed outside source control |
+| `DB_PORT` / `API_PORT` / `WEB_PORT` | `5434` / `8500` / `3500` | Host-side port mappings |
 
 ## Services
 
@@ -114,7 +108,18 @@ Settings can be supplied via environment variables (typically through `.env`) an
 | `optimizer` | — | Plan generation + action execution |
 | `db` | `DB_PORT` (5434 → container 5432) | TimescaleDB |
 | `redis` | (internal only) | Cache + token persistence |
-| `backup` | — | Scheduled PostgreSQL custom-format backups in `./backups` |
+
+## Backups And Calibration
+
+The `backup` service creates PostgreSQL custom-format archives every 24 hours by default and retains completed archives for 14 days. Set `BACKUP_INTERVAL_SECONDS` and `BACKUP_RETENTION_DAYS` to change those bounds. Optional encrypted replicas require `BACKUP_REPLICA_ENABLED=true` and `BACKUP_REPLICA_ENCRYPTION_KEY`; set `BACKUP_REPLICA_REQUIRED=true` only when a failed replica should make backup health fail.
+
+Validate the newest archive with the disposable restore verifier:
+
+```bash
+docker compose --profile maintenance run --rm backup-verify
+```
+
+Thermal calibration is explicit: use `POST /api/thermal/calibrate` after enough representative operating data exists. It updates model parameters only; it does not send a heat-pump command.
 
 ## API Endpoints
 
@@ -137,7 +142,8 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 - `GET /api/plans` / `GET /api/plans/{id}` — Plans and plan details with actions
 - `GET /api/optimizer/status` — Current optimizer mode, ML model readiness, and learning-mode state
 - `GET /api/learning-mode` / `POST /api/learning-mode` — Read or toggle observe-only learning mode (`{"enabled": true|false}`)
-- `POST /api/optimize-now` — Force an immediate optimizer run
+- `POST /api/optimize-now` — Queue a durable re-plan; poll `GET /api/optimize-now/{request_id}` for its status and resulting plan
+- `GET /api/plan-activity` / `GET /api/outcomes/summary` / `GET /api/operations/alerts` — Dashboard lifecycle, measured outcome, and operational-health data
 - `POST /api/poll-now` — Force an immediate device poll
 - `POST /api/overrides` / `DELETE /api/overrides/{id}` — Create or cancel a manual override
 
@@ -192,7 +198,7 @@ Solves a 24h cost-minimization problem with:
 - Objective: minimize Σ(price × kWh_electrical)
 - Constraints: per-hour tank floor (uses `tank_min_temp_offpeak` during sleep/away hours, normal `tank_min_temp` during comfort hours), tank max, comfort bounds, COP curve, hardware rate limits, and the comfort model's predicted indoor response when available
 
-The MILP path is selected automatically when ≥14 days of training data and trained ML models are available; otherwise the rules engine runs. A partial price horizon produces a shorter, explicitly marked plan and a full newly published horizon queues one safe re-plan.
+The MILP path is selected automatically when ≥14 days of training data and trained ML models are available; otherwise the rules engine runs.
 
 ### ML Models
 - **COP Model**: Predicts COP directly from real thermal data using compressor direction-aware sample pairing
@@ -214,27 +220,6 @@ pytest
 python -m packages.poller.main
 ```
 
-## Backups and data retention
-
-Timescale retention policies keep raw device, weather, price, consumption, and
-indoor-temperature history bounded. Plans and audit history are retained for
-traceability. The `backup` service creates a PostgreSQL custom-format archive
-immediately at startup and then on the configured interval in `./backups`.
-
-Run a real restore verification at any time; it restores the newest archive to
-a disposable database and removes that database afterwards:
-
-```bash
-docker compose --profile maintenance run --rm backup-verify
-```
-
-Set `BACKUP_VERIFY_AFTER_DUMP=true` to perform that restore check after every
-scheduled backup. For machine-loss protection, set
-`BACKUP_REPLICA_ENABLED=true`, mount a NAS/share through
-`BACKUP_REPLICA_HOST_DIR`, and set `BACKUP_REPLICA_ENCRYPTION_KEY`. The replica
-is AES-256-CBC encrypted with PBKDF2 and stored with a SHA-256 checksum. It is
-off by default; use a secret manager rather than committing the key to `.env`.
-
 ### Frontend end-to-end tests
 
 The dashboard has two Playwright suites under `web/`:
@@ -246,15 +231,16 @@ cd web
 # dev server. Fast, deterministic, good for CI. (web/e2e/)
 npm run test:e2e
 
-# Live-stack tests — drive the real running system (web :4444 + API :8500 +
+# Live-stack tests — drive the real running system (web :3500 + API :8500 +
 # DB + optimizer) with NO mocking, asserting real data and physical invariants
 # (e.g. the indoor forecast must drift gradually toward outdoor, never snap).
 # Requires the Docker stack to be up first (`docker compose up -d`). (web/e2e-live/)
 npm run test:e2e:live
 
 # Override targets when not on the default ports:
-#   E2E_BASE_URL=http://host:4444 E2E_API_URL=http://host:8500 npm run test:e2e:live
+#   E2E_BASE_URL=http://host:3500 E2E_API_URL=http://host:8500 npm run test:e2e:live
 ```
+
 
 ## Safety
 

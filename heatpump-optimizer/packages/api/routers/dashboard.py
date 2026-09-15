@@ -174,9 +174,9 @@ async def get_dashboard():
     unpriced_kwh = 0.0
     prev_record = None
     for record in consumption_records:
-        if prev_record is not None and local_date(
-            record.ts, timezone_name
-        ) == local_date(prev_record.ts, timezone_name):
+        if prev_record is not None and local_date(record.ts, timezone_name) == local_date(
+            prev_record.ts, timezone_name
+        ):
             heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
             cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
             tank_delta = max(0.0, (record.tank_kwh or 0) - (prev_record.tank_kwh or 0))
@@ -395,9 +395,7 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     prev = previous
     for r in rows:
         if prev is not None:
-            day_changed = local_date(r.ts, timezone_name) != local_date(
-                prev.ts, timezone_name
-            )
+            day_changed = local_date(r.ts, timezone_name) != local_date(prev.ts, timezone_name)
             heat_delta = cumulative_counter_delta(
                 r.heat_kwh or 0.0, prev.heat_kwh or 0.0, day_changed=day_changed
             )

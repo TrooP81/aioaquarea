@@ -66,7 +66,9 @@ def test_zone_heating_rejects_non_heating_or_incomplete_panasonic_state(override
 
 
 def test_legacy_missing_status_flags_keep_complete_heat_circuit_available():
-    status = _status(operation_status=None, zone1_operation_status=None, device_action=None, mode=None)
+    status = _status(
+        operation_status=None, zone1_operation_status=None, device_action=None, mode=None
+    )
 
     assert panasonic_zone_heating_available(status) is True
 

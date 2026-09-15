@@ -10,6 +10,7 @@ automatically before they expire.
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
 import secrets
 from typing import Any
 
@@ -30,6 +31,7 @@ DEFAULT_SCOPES = "r:devices:*"
 
 # Refresh tokens before they actually expire (5-minute safety margin)
 EXPIRY_MARGIN = dt.timedelta(minutes=5)
+_refresh_lock = asyncio.Lock()
 
 
 class SmartThingsOAuthError(Exception):
@@ -224,8 +226,7 @@ async def get_valid_access_token(*, rejected_access_token: str | None = None) ->
 
     token_was_rejected = rejected_access_token == tokens["access_token"]
     token_was_replaced = (
-        rejected_access_token is not None
-        and rejected_access_token != tokens["access_token"]
+        rejected_access_token is not None and rejected_access_token != tokens["access_token"]
     )
 
     if token_was_replaced and now < expires_at:
@@ -236,22 +237,40 @@ async def get_valid_access_token(*, rejected_access_token: str | None = None) ->
         # Token is still valid
         return tokens["access_token"]
 
-    # Token expired or about to expire — refresh
-    client_id = await get_setting("smartthings_client_id")
-    client_secret = await get_setting("smartthings_client_secret")
+    # Token expired or about to expire — refresh. Re-read after acquiring the
+    # lock so concurrent pollers reuse the token saved by the first caller.
+    async with _refresh_lock:
+        tokens = await load_tokens()
+        if tokens is None:
+            return None
 
-    if not client_id or not client_secret:
-        logger.error("smartthings_oauth_refresh_missing_credentials")
-        return None
-
-    try:
-        new_tokens = await refresh_access_token(tokens["refresh_token"], client_id, client_secret)
-        await save_tokens(new_tokens)
-        logger.info(
-            "smartthings_oauth_token_refreshed",
-            reason="server_rejected" if token_was_rejected else "expiry_margin",
+        expires_at = tokens["expires_at"]
+        token_was_rejected = rejected_access_token == tokens["access_token"]
+        token_was_replaced = (
+            rejected_access_token is not None and rejected_access_token != tokens["access_token"]
         )
-        return new_tokens["access_token"]
-    except SmartThingsOAuthError:
-        logger.exception("smartthings_oauth_refresh_failed")
-        return None
+        if token_was_replaced and now < expires_at:
+            return tokens["access_token"]
+        if not token_was_rejected and now + EXPIRY_MARGIN < expires_at:
+            return tokens["access_token"]
+
+        client_id = await get_setting("smartthings_client_id")
+        client_secret = await get_setting("smartthings_client_secret")
+
+        if not client_id or not client_secret:
+            logger.error("smartthings_oauth_refresh_missing_credentials")
+            return None
+
+        try:
+            new_tokens = await refresh_access_token(
+                tokens["refresh_token"], client_id, client_secret
+            )
+            await save_tokens(new_tokens)
+            logger.info(
+                "smartthings_oauth_token_refreshed",
+                reason="server_rejected" if token_was_rejected else "expiry_margin",
+            )
+            return new_tokens["access_token"]
+        except SmartThingsOAuthError:
+            logger.exception("smartthings_oauth_refresh_failed")
+            return None
