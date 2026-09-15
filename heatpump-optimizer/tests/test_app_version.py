@@ -1,4 +1,5 @@
 import json
+import os
 import tomllib
 from pathlib import Path
 
@@ -34,7 +35,11 @@ def test_release_version_is_embedded_in_container_builds():
 
 @pytest.mark.asyncio
 async def test_version_endpoint_reports_running_api_version():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {os.environ['API_TOKEN']}"},
+    ) as client:
         response = await client.get("/api/version")
 
     assert response.status_code == 200

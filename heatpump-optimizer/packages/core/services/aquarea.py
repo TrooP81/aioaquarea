@@ -7,6 +7,8 @@ import datetime as dt
 import logging
 import math
 import time
+from functools import lru_cache
+from importlib import import_module
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -33,6 +35,23 @@ _COMMAND_STATUS_MAX_AGE_SECONDS = 60.0
 _ADAPTER_RETRY_BASE_SECONDS = 300
 _ADAPTER_RETRY_MAX_SECONDS = 1800
 _WEEKLY_TIMER_CACHE_SECONDS = 3600.0
+
+
+@lru_cache(maxsize=1)
+def _panasonic_command_result_type():
+    candidates = (
+        ("aioaquarea.command_result", "PanasonicCommandResult"),
+        ("aioaquarea", "PanasonicCommandResult"),
+    )
+    for module_name, attr in candidates:
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        command_result_type = getattr(module, attr, None)
+        if isinstance(command_result_type, type):
+            return command_result_type
+    return None
 
 
 class PanasonicAdapterUnavailableError(RuntimeError):
@@ -220,9 +239,7 @@ class AquareaWrapper:
         self._record_live_status(self._device)
         return self._device
 
-    async def get_active_weekly_timer_slots(
-        self, at: dt.datetime | None = None
-    ) -> tuple:
+    async def get_active_weekly_timer_slots(self, at: dt.datetime | None = None) -> tuple:
         """Read and cache active Panasonic timer slots; failures never block control."""
         now_monotonic = time.monotonic()
         stale = (
@@ -369,7 +386,7 @@ class AquareaWrapper:
         return tank
 
     async def set_quiet_mode(self, mode):
-        from aioaquarea import PanasonicCommandResult
+        command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
         if getattr(device, "quiet_mode", None) == mode:
@@ -384,10 +401,10 @@ class AquareaWrapper:
 
         result = await device.set_quiet_mode(mode)
         logger.info("Set quiet mode to %s", mode)
-        return result if isinstance(result, PanasonicCommandResult) else True
+        return result if command_result_type and isinstance(result, command_result_type) else True
 
     async def force_dhw(self, state):
-        from aioaquarea import PanasonicCommandResult
+        command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
         if getattr(device, "force_dhw", None) == state:
@@ -402,7 +419,7 @@ class AquareaWrapper:
 
         result = await device.set_force_dhw(state)
         logger.info("Set force DHW to %s", state)
-        return result if isinstance(result, PanasonicCommandResult) else True
+        return result if command_result_type and isinstance(result, command_result_type) else True
 
     async def set_powerful_time(self, duration: PowerfulTime) -> None:
         """Set Panasonic's bounded 30/60/90 minute powerful mode."""

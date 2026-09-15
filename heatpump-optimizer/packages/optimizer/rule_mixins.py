@@ -1018,9 +1018,7 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": horizon_start.isoformat(),
                     "type": str(
-                        ActionType.QUIET_MODE_ON
-                        if desired_level
-                        else ActionType.QUIET_MODE_OFF
+                        ActionType.QUIET_MODE_ON if desired_level else ActionType.QUIET_MODE_OFF
                     ),
                     "payload": {
                         "reason": (

@@ -143,7 +143,7 @@ def _plan_forecast_window(
         if len(indexes) == hours:
             break
 
-    if not indexes or any(index >= len(sequence) for index in indexes for sequence in sequences):
+    if len(indexes) < hours or any(index >= len(sequence) for index in indexes for sequence in sequences):
         return None
 
     def curve(key: str) -> list[dict[str, Any]]:

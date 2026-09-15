@@ -30,6 +30,7 @@ MAX_STALE_READING_MINUTES = 24 * 60
 # Retry configuration
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 2.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 
 class SmartThingsClient:
@@ -84,17 +85,25 @@ class SmartThingsClient:
         Returns ``{"value": float_celsius, "timestamp": str}`` or *None* on
         transient failure.
         """
+        async with httpx.AsyncClient(timeout=15, headers=self._headers) as client:
+            return await self._get_temperature(client, device_id)
+
+    async def _get_temperature(
+        self,
+        client: httpx.AsyncClient,
+        device_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one sensor using a caller-owned, reusable HTTP client."""
+
         url = (
             f"{SMARTTHINGS_API_BASE}/devices/{device_id}"
             f"/components/main/capabilities/temperatureMeasurement/status"
         )
-
-        async with httpx.AsyncClient(timeout=15, headers=self._headers) as client:
-            resp = await _request_with_retry(client, url)
-            if resp.status_code == 404:
-                logger.warning("smartthings_device_not_found", device_id=device_id)
-                return None
-            data = resp.json()
+        resp = await _request_with_retry(client, url)
+        if resp.status_code == 404:
+            logger.warning("smartthings_device_not_found", device_id=device_id)
+            return None
+        data = resp.json()
 
         temp_attr = data.get("temperature", {})
         value = temp_attr.get("value")
@@ -119,18 +128,29 @@ class SmartThingsClient:
         return {"value": celsius, "timestamp": timestamp}
 
     async def get_temperatures_batch(self, device_ids: list[str]) -> list[dict[str, Any]]:
-        """Poll multiple devices, returning successful readings only."""
+        """Poll devices sequentially over one pooled HTTP connection.
+
+        Sequential reads preserve the existing stop-on-rate-limit behaviour;
+        connection reuse removes repeated DNS/TLS setup without increasing the
+        request burst sent to SmartThings.
+        """
         results: list[dict[str, Any]] = []
-        for did in device_ids:
-            try:
-                reading = await self.get_temperature(did)
-                if reading is not None:
-                    results.append({"device_id": did, **reading})
-            except SmartThingsRateLimited:
-                logger.warning("smartthings_rate_limited, stopping batch")
-                break
-            except SmartThingsError as exc:
-                logger.error("smartthings_read_failed", device_id=did, error=str(exc))
+        async with httpx.AsyncClient(timeout=15, headers=self._headers) as client:
+            for did in device_ids:
+                try:
+                    reading = await self._get_temperature(client, did)
+                    if reading is not None:
+                        results.append({"device_id": did, **reading})
+                except SmartThingsAuthError:
+                    # Authentication applies to the entire batch. Propagate it
+                    # so the poller can refresh OAuth once instead of logging
+                    # the same rejected token separately for every sensor.
+                    raise
+                except SmartThingsRateLimited:
+                    logger.warning("smartthings_rate_limited, stopping batch")
+                    break
+                except SmartThingsError as exc:
+                    logger.error("smartthings_read_failed", device_id=did, error=str(exc))
         return results
 
 
@@ -230,28 +250,25 @@ async def poll_smartthings_temps(session) -> int:
     if not access_token:
         return 0
 
-    client = SmartThingsClient(access_token)
-
     # Keep labels and room identifiers with readings even when the user has
     # explicitly selected a subset.  Discovery is cached for an hour, so this
     # does not add a request to normal polling.
     selected_ids = await get_selected_device_ids()
     try:
-        devices = await _get_cached_devices(client)
-    except SmartThingsError as exc:
-        # A configured sensor set remains pollable if discovery is temporarily
-        # unavailable; room labels will be filled again on the next refresh.
-        if not selected_ids:
+        device_meta, readings = await _fetch_smartthings_batch(access_token, selected_ids)
+    except SmartThingsAuthError:
+        # A token can be invalidated by SmartThings before its persisted expiry.
+        # Refresh OAuth once and retry the whole read-only batch. A rejected PAT
+        # deliberately returns None and requires the user to replace it.
+        refreshed_token = await get_valid_access_token(rejected_access_token=access_token)
+        if not refreshed_token:
             raise
-        logger.warning("smartthings_discovery_metadata_unavailable", error=str(exc))
-        devices = []
-    device_meta = {device["device_id"]: device for device in devices}
-    device_ids = selected_ids or list(device_meta)
+        logger.info("smartthings_auth_recovery_retrying")
+        device_meta, readings = await _fetch_smartthings_batch(refreshed_token, selected_ids)
 
-    if not device_ids:
+    if not readings:
         return 0
 
-    readings = await client.get_temperatures_batch(device_ids)
     now = dt.datetime.now(dt.timezone.utc)
     stale_threshold = await get_stale_reading_threshold()
     stale_after_minutes = round(stale_threshold.total_seconds() / 60)
@@ -311,6 +328,34 @@ async def poll_smartthings_temps(session) -> int:
     return count
 
 
+async def _fetch_smartthings_batch(
+    access_token: str,
+    selected_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch discovery metadata and readings for one authenticated poll attempt."""
+
+    client = SmartThingsClient(access_token)
+    try:
+        devices = await _get_cached_devices(client)
+    except SmartThingsError as exc:
+        # A configured sensor set remains pollable if discovery is temporarily
+        # unavailable (including stale discovery auth); the required batch read
+        # below still propagates authentication failures for OAuth recovery.
+        # Room labels will be filled again on the next successful refresh.
+        if not selected_ids:
+            raise
+        logger.warning("smartthings_discovery_metadata_unavailable", error=str(exc))
+        devices = []
+    device_meta = {device["device_id"]: device for device in devices}
+    device_ids = selected_ids or list(device_meta)
+
+    if not device_ids:
+        return device_meta, []
+
+    readings = await client.get_temperatures_batch(device_ids)
+    return device_meta, readings
+
+
 # ------------------------------------------------------------------
 # Helpers / exceptions
 # ------------------------------------------------------------------
@@ -326,6 +371,17 @@ class SmartThingsAuthError(SmartThingsError):
 
 class SmartThingsRateLimited(SmartThingsError):
     """HTTP 429 — too many requests."""
+
+
+def _retry_after_seconds(value: str | None, fallback: float) -> float:
+    """Parse a server retry delay without allowing an unbounded poller sleep."""
+    try:
+        retry_after = float(value) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+    if retry_after <= 0:
+        return fallback
+    return min(retry_after, MAX_RETRY_AFTER_SECONDS)
 
 
 async def _request_with_retry(
@@ -358,7 +414,7 @@ async def _request_with_retry(
 
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2**attempt)
+            wait = _retry_after_seconds(retry_after, BASE_BACKOFF_SECONDS * (2**attempt))
             if attempt < MAX_RETRIES - 1:
                 logger.warning(
                     "smartthings_rate_limited_retrying",

@@ -45,6 +45,8 @@ _OPTIMIZATION_REQUEST_TIMEOUT = dt.timedelta(minutes=30)
 _ABANDONED_REQUEST_ERROR = (
     "Optimizer stopped before the request completed; submit a new optimization request."
 )
+_executor_shutdown_tasks: set[asyncio.Task[None]] = set()
+_EXECUTOR_SHUTDOWN_WAIT_S = 10
 
 
 def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, object], ...]]:
@@ -511,11 +513,63 @@ async def process_pending_optimization_requests() -> None:
 
 async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
     """Execute any pending plan actions whose time has come."""
+    current = asyncio.current_task()
+    if current is not None:
+        _executor_shutdown_tasks.add(current)
+
     executor = PlanExecutor(wrapper)
-    # Never "catch up" a command that belongs to an already-passed price
-    # interval. Expire it before claiming newly due actions instead.
-    await executor.expire_stale_actions()
-    await executor.execute_due_actions()
+    try:
+        # Never "catch up" a command that belongs to an already-passed price
+        # interval. Expire it before claiming newly due actions instead.
+        await executor.expire_stale_actions()
+        await executor.execute_due_actions()
+    finally:
+        if current is not None:
+            _executor_shutdown_tasks.discard(current)
+
+
+async def _shutdown_runtime(scheduler, wrapper: AquareaWrapper) -> None:
+    """Stop scheduler and Panasonic client resources during service shutdown.
+
+    ``wait=False`` avoids blocking on long in-flight jobs (for example action
+    verification polling). We still explicitly await tracked executor cycles so
+    cancellation reconciliation is durable before the process exits.
+    """
+
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception as exc:  # noqa: BLE001 - best-effort shutdown path
+        logger.warning("optimizer_scheduler_shutdown_failed", error=str(exc))
+
+    try:
+        pending = [task for task in _executor_shutdown_tasks if not task.done()]
+        if pending:
+            logger.info("optimizer_waiting_for_executor_shutdown", pending=len(pending))
+            for task in pending:
+                task.cancel()
+
+            done, still_pending = await asyncio.wait(
+                pending,
+                timeout=_EXECUTOR_SHUTDOWN_WAIT_S,
+            )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning("optimizer_executor_shutdown_task_failed", error=str(exc))
+
+            if still_pending:
+                logger.warning(
+                    "optimizer_executor_shutdown_wait_timeout",
+                    pending=len(still_pending),
+                    timeout_seconds=_EXECUTOR_SHUTDOWN_WAIT_S,
+                )
+
+            for task in pending:
+                _executor_shutdown_tasks.discard(task)
+    finally:
+        await wrapper.stop()
 
 
 async def main() -> None:
@@ -606,8 +660,7 @@ async def main() -> None:
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        scheduler.shutdown(wait=True)
-        await wrapper.stop()
+        await _shutdown_runtime(scheduler, wrapper)
         logger.info("optimizer_stopped")
 
 

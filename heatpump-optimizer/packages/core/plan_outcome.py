@@ -65,9 +65,9 @@ def cumulative_intervals(
     previous: ConsumptionRecord | None = None
     for record in sorted(records, key=lambda row: row.ts):
         if previous is not None:
-            day_changed = record.ts.astimezone(timezone).date() != previous.ts.astimezone(
-                timezone
-            ).date()
+            day_changed = (
+                record.ts.astimezone(timezone).date() != previous.ts.astimezone(timezone).date()
+            )
             # Meter counters arrive as floats; round only the interval to
             # prevent binary representation noise from leaking into costs/UI.
             delta = round(

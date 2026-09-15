@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib import import_module
 from typing import Any, Awaitable, Callable
 
 from packages.core.panasonic_special_status import optimizer_special_status_supported
@@ -81,6 +83,30 @@ def _tank_target_reached(device: Any) -> tuple[bool, Any, Any]:
     return reached, current_temp, target_temp
 
 
+@lru_cache(maxsize=1)
+def _panasonic_command_result_type():
+    candidates = (
+        ("aioaquarea.command_result", "PanasonicCommandResult"),
+        ("aioaquarea", "PanasonicCommandResult"),
+    )
+    for module_name, attr in candidates:
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        command_result_type = getattr(module, attr, None)
+        if isinstance(command_result_type, type):
+            return command_result_type
+    return None
+
+
+def _panasonic_audit_fields(result: Any) -> dict[str, Any]:
+    command_result_type = _panasonic_command_result_type()
+    if command_result_type is not None and isinstance(result, command_result_type):
+        return result.audit_fields()
+    return {}
+
+
 async def _active_weekly_timer_conflict(wrapper: Any, zone_id: int) -> dict[str, Any] | None:
     slots = await wrapper.get_active_weekly_timer_slots()
     if not isinstance(slots, (list, tuple)):
@@ -98,7 +124,6 @@ async def _active_weekly_timer_conflict(wrapper: Any, zone_id: int) -> dict[str,
 
 
 async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import PanasonicCommandResult
     from aioaquarea import ForceDHW
 
     device = await wrapper.get_device()
@@ -116,7 +141,7 @@ async def _dispatch_force_dhw_on(wrapper: Any, payload: dict[str, Any]) -> dict[
         return {"skip": True, "reason": "force_dhw_already_on"}
     return {
         "force_dhw": "ON",
-        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+        **_panasonic_audit_fields(changed),
     }
 
 
@@ -136,19 +161,19 @@ async def _redispatch_force_dhw_on(
 
 
 async def _dispatch_force_dhw_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import ForceDHW, PanasonicCommandResult
+    from aioaquarea import ForceDHW
 
     changed = await wrapper.force_dhw(ForceDHW.OFF)
     if changed is False:
         return {"skip": True, "reason": "force_dhw_already_off"}
     return {
         "force_dhw": "OFF",
-        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+        **_panasonic_audit_fields(changed),
     }
 
 
 async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import PanasonicCommandResult, QuietMode
+    from aioaquarea import QuietMode
 
     level = payload.get("level", 1)
     if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
@@ -168,19 +193,19 @@ async def _dispatch_quiet_mode_on(wrapper: Any, payload: dict[str, Any]) -> dict
         }
     return {
         "quiet_mode": mode.name,
-        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+        **_panasonic_audit_fields(changed),
     }
 
 
 async def _dispatch_quiet_mode_off(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    from aioaquarea import PanasonicCommandResult, QuietMode
+    from aioaquarea import QuietMode
 
     changed = await wrapper.set_quiet_mode(QuietMode.OFF)
     if changed is False:
         return {"skip": True, "reason": "quiet_mode_already_off"}
     return {
         "quiet_mode": "OFF",
-        **(changed.audit_fields() if isinstance(changed, PanasonicCommandResult) else {}),
+        **_panasonic_audit_fields(changed),
     }
 
 

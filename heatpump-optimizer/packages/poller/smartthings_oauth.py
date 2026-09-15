@@ -10,6 +10,7 @@ automatically before they expire.
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
 import secrets
 from typing import Any
 
@@ -30,6 +31,7 @@ DEFAULT_SCOPES = "r:devices:*"
 
 # Refresh tokens before they actually expire (5-minute safety margin)
 EXPIRY_MARGIN = dt.timedelta(minutes=5)
+_refresh_lock = asyncio.Lock()
 
 
 class SmartThingsOAuthError(Exception):
@@ -154,7 +156,14 @@ async def save_tokens(token_data: dict[str, Any]) -> None:
             session.add(row)
 
         row.access_token = token_data["access_token"]
-        row.refresh_token = token_data["refresh_token"]
+        # RFC 6749 allows a refresh response to omit a replacement refresh
+        # token. Preserve the working token in that case; the initial code
+        # exchange still requires one because a new row has no fallback.
+        replacement_refresh_token = token_data.get("refresh_token")
+        if replacement_refresh_token:
+            row.refresh_token = replacement_refresh_token
+        elif not row.refresh_token:
+            raise SmartThingsOAuthError("SmartThings token response omitted refresh_token")
         row.token_type = token_data.get("token_type", "bearer")
         row.scope = token_data.get("scope", "")
         row.expires_at = expires_at
@@ -193,10 +202,13 @@ async def delete_tokens() -> None:
 # ------------------------------------------------------------------
 
 
-async def get_valid_access_token() -> str | None:
+async def get_valid_access_token(*, rejected_access_token: str | None = None) -> str | None:
     """Return a valid access token, refreshing if needed.
 
     Falls back to the legacy PAT setting when no OAuth tokens are stored.
+    When ``rejected_access_token`` is supplied, OAuth is refreshed even if the
+    persisted expiry is in the future. This recovers from early server-side
+    invalidation while avoiding an ineffective retry for a rejected legacy PAT.
     Returns ``None`` when no credentials are available at all.
     """
     tokens = await load_tokens()
@@ -204,28 +216,61 @@ async def get_valid_access_token() -> str | None:
     if tokens is None:
         # Fallback: legacy PAT
         pat = await get_setting("smartthings_pat")
+        if rejected_access_token and pat == rejected_access_token:
+            logger.error("smartthings_pat_rejected")
+            return None
         return pat if pat else None
 
     now = dt.datetime.now(dt.timezone.utc)
     expires_at: dt.datetime = tokens["expires_at"]
 
-    if now + EXPIRY_MARGIN < expires_at:
+    token_was_rejected = rejected_access_token == tokens["access_token"]
+    token_was_replaced = (
+        rejected_access_token is not None and rejected_access_token != tokens["access_token"]
+    )
+
+    if token_was_replaced and now < expires_at:
+        # Another caller refreshed between the failed request and this lookup.
+        return tokens["access_token"]
+
+    if not token_was_rejected and now + EXPIRY_MARGIN < expires_at:
         # Token is still valid
         return tokens["access_token"]
 
-    # Token expired or about to expire — refresh
-    client_id = await get_setting("smartthings_client_id")
-    client_secret = await get_setting("smartthings_client_secret")
+    # Token expired or about to expire — refresh. Re-read after acquiring the
+    # lock so concurrent pollers reuse the token saved by the first caller.
+    async with _refresh_lock:
+        tokens = await load_tokens()
+        if tokens is None:
+            return None
 
-    if not client_id or not client_secret:
-        logger.error("smartthings_oauth_refresh_missing_credentials")
-        return None
+        expires_at = tokens["expires_at"]
+        token_was_rejected = rejected_access_token == tokens["access_token"]
+        token_was_replaced = (
+            rejected_access_token is not None and rejected_access_token != tokens["access_token"]
+        )
+        if token_was_replaced and now < expires_at:
+            return tokens["access_token"]
+        if not token_was_rejected and now + EXPIRY_MARGIN < expires_at:
+            return tokens["access_token"]
 
-    try:
-        new_tokens = await refresh_access_token(tokens["refresh_token"], client_id, client_secret)
-        await save_tokens(new_tokens)
-        logger.info("smartthings_oauth_token_refreshed")
-        return new_tokens["access_token"]
-    except SmartThingsOAuthError:
-        logger.exception("smartthings_oauth_refresh_failed")
-        return None
+        client_id = await get_setting("smartthings_client_id")
+        client_secret = await get_setting("smartthings_client_secret")
+
+        if not client_id or not client_secret:
+            logger.error("smartthings_oauth_refresh_missing_credentials")
+            return None
+
+        try:
+            new_tokens = await refresh_access_token(
+                tokens["refresh_token"], client_id, client_secret
+            )
+            await save_tokens(new_tokens)
+            logger.info(
+                "smartthings_oauth_token_refreshed",
+                reason="server_rejected" if token_was_rejected else "expiry_margin",
+            )
+            return new_tokens["access_token"]
+        except SmartThingsOAuthError:
+            logger.exception("smartthings_oauth_refresh_failed")
+            return None

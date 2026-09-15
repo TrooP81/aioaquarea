@@ -13,8 +13,9 @@ test.describe("Live indoor forecast", () => {
   test("forecast is physically sensible (no snap, correct ordering)", async ({ request }) => {
     const data = await getJson<IndoorForecast>(request, "/api/thermal/indoor-forecast?hours=24");
 
-    expect(data.forecast_with_plan.length).toBe(24);
-    expect(data.forecast_no_heating.length).toBe(24);
+    expect(data.forecast_with_plan).toHaveLength(24);
+    expect(data.forecast_no_heating).toHaveLength(24);
+    expect(data.target_schedule).toHaveLength(24);
     assertForecastPhysical(data);
   });
 
@@ -40,7 +41,7 @@ test.describe("Live indoor forecast", () => {
   });
 
   test("chart paints the indoor forecast section in the live UI", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?view=charts");
     await expect(page.getByRole("heading", { name: "Thermal Predictions" })).toBeVisible({ timeout: 15000 });
     // The thermal predictions block must render its SVG chart with live curves.
     const charts = page.locator("svg");

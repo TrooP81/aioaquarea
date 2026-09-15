@@ -163,11 +163,14 @@ async def get_operational_alerts(
     adapter_alert = _panasonic_adapter_alert(adapter)
     if adapter_alert:
         alerts.append(adapter_alert)
-    if not device_status_is_fresh(
-        latest_device,
-        now=now,
-        poll_interval_seconds=poll_interval,
-    ) and adapter_alert is None:
+    if (
+        not device_status_is_fresh(
+            latest_device,
+            now=now,
+            poll_interval_seconds=poll_interval,
+        )
+        and adapter_alert is None
+    ):
         alerts.append(
             _alert(
                 "device_data_stale",

@@ -46,7 +46,7 @@ test.describe("Live dashboard", () => {
   });
 
   test("charts section renders a thermal predictions chart", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?view=charts");
     await expect(page.getByRole("heading", { name: "Thermal Predictions" })).toBeVisible({ timeout: 15000 });
     // Recharts renders SVG; at least one chart must paint with live data.
     await expect(page.locator("svg").first()).toBeVisible({ timeout: 15000 });
