@@ -107,7 +107,29 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npx playwright install --with-deps chromium firefox
-      - run: npm run test:e2e -- --project=${{ matrix.project }}
+      - name: Build standalone web runtime image
+        run: docker build --tag heatpump-optimizer-web-e2e:ci .
+      - name: Start standalone web runtime
+        run: docker run --detach --rm --name heatpump-optimizer-web-e2e --publish 3100:3000 heatpump-optimizer-web-e2e:ci
+      - name: Wait for standalone web runtime
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3100/ > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs heatpump-optimizer-web-e2e
+          exit 1
+      - name: Smoke test standalone web runtime
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3100
+        run: npx playwright test e2e/dashboard.spec.ts --project=${{ matrix.project }} --grep "loads and shows header"
+      - name: Stop standalone web runtime
+        if: always()
+        run: docker stop heatpump-optimizer-web-e2e || true
+      - name: Run Playwright suite
+        run: npm run test:e2e -- --project=${{ matrix.project }}
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -133,7 +155,8 @@ jobs:
       - name: Prepare Compose validation environment
         run: cp .env.example .env
       - run: docker compose config -q
-      - uses: anchore/sbom-action@v0
+      # anchore/sbom-action v0.24.2
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
         with:
           path: heatpump-optimizer
           format: spdx-json

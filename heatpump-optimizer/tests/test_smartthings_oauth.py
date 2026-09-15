@@ -18,6 +18,17 @@ from packages.poller.smartthings_oauth import (
 )
 
 
+class _AsyncContextManager:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        return False
+
+
 # ------------------------------------------------------------------
 # build_authorize_url
 # ------------------------------------------------------------------
@@ -142,13 +153,10 @@ class TestSaveTokens:
         row = SimpleNamespace(refresh_token="working-refresh-token")
         session = AsyncMock()
         session.get = AsyncMock(return_value=row)
-        session_context = AsyncMock()
-        session_context.__aenter__ = AsyncMock(return_value=session)
-        session_context.__aexit__ = AsyncMock(return_value=False)
 
         with patch(
             "packages.poller.smartthings_oauth.get_session",
-            return_value=session_context,
+            return_value=_AsyncContextManager(session),
         ):
             await save_tokens(
                 {
@@ -306,6 +314,10 @@ class TestGetValidAccessToken:
     async def test_refresh_failure_returns_none(self):
         """If refresh fails, return None rather than crash."""
         past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+
+        async def refresh_access_token(*_args, **_kwargs):
+            raise SmartThingsOAuthError("token revoked")
+
         with patch(
             "packages.poller.smartthings_oauth.load_tokens",
             new_callable=AsyncMock,
@@ -325,8 +337,7 @@ class TestGetValidAccessToken:
             ):
                 with patch(
                     "packages.poller.smartthings_oauth.refresh_access_token",
-                    new_callable=AsyncMock,
-                    side_effect=SmartThingsOAuthError("token revoked"),
+                    new=refresh_access_token,
                 ):
                     token = await get_valid_access_token()
 

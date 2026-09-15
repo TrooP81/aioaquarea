@@ -11,6 +11,17 @@ from packages.core.operational_alerts import _panasonic_adapter_alert, device_st
 from packages.core.operational_alerts import get_operational_alerts
 
 
+class _AsyncContextManager:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        return False
+
+
 def test_fresh_adapter_outage_builds_actionable_alert() -> None:
     alert = _panasonic_adapter_alert(
         {
@@ -47,12 +58,12 @@ def test_device_status_freshness_uses_shared_polling_threshold() -> None:
 
 @pytest.mark.asyncio
 async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -> None:
-    session = AsyncMock()
-    session.execute.side_effect = [
+    session = SimpleNamespace()
+    session.execute = AsyncMock(side_effect=[
         SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
         SimpleNamespace(scalar_one_or_none=lambda: None),
         SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
-    ]
+    ])
 
     with (
         patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),
@@ -72,8 +83,7 @@ async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -
         ),
         patch("packages.core.operational_alerts.get_session") as mock_get_session,
     ):
-        mock_get_session.return_value.__aenter__ = AsyncMock(return_value=session)
-        mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_get_session.return_value = _AsyncContextManager(session)
 
         result = await get_operational_alerts(
             now=dt.datetime(2026, 8, 19, 10, tzinfo=dt.timezone.utc)

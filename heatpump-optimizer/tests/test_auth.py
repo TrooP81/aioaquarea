@@ -31,3 +31,10 @@ async def test_control_api_requires_matching_bearer_token(monkeypatch):
         _request("/api/dashboard"),
         HTTPAuthorizationCredentials(scheme="Bearer", credentials="test-production-token"),
     )
+
+
+@pytest.mark.asyncio
+async def test_control_api_skips_auth_when_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "api_token", "disabled")
+
+    await require_auth(_request("/api/dashboard"), None)

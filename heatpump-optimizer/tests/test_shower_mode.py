@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -12,6 +13,17 @@ from packages.core.models import (
     ShowerEventRecord,
 )
 from packages.optimizer.shower_mode import ShowerDetector
+
+
+class _AsyncContextManager:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        return False
 
 
 def _make_status(ts, tank_temp, force_dhw=0, device_id="test-device"):
@@ -62,7 +74,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
 
@@ -90,8 +102,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
             patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {"shower_mode_enabled": "true", "shower_drop_threshold": "10"}.get(key, "")
@@ -123,7 +134,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
 
         mock_active_result = MagicMock()
@@ -147,8 +158,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {"shower_mode_enabled": "true", "shower_drop_threshold": "10"}.get(key, "")
@@ -183,7 +193,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
 
@@ -199,8 +209,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {
@@ -237,7 +246,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
 
@@ -253,8 +262,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {
@@ -300,7 +308,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
 
@@ -326,8 +334,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
             patch("packages.optimizer.shower_mode.get_prices") as mock_get_prices,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {"shower_mode_enabled": "true", "shower_drop_threshold": "10"}.get(key, "")
@@ -361,7 +368,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
 
@@ -377,8 +384,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {
@@ -404,7 +410,7 @@ class TestShowerDetection:
 
         added_objects = []
 
-        mock_session = AsyncMock()
+        mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
 
         mock_active_result = MagicMock()
@@ -428,8 +434,7 @@ class TestShowerDetection:
             patch("packages.optimizer.shower_mode.get_session") as mock_get_session,
             patch("packages.optimizer.shower_mode.get_setting") as mock_get_setting,
         ):
-            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
                 return {"shower_mode_enabled": "true", "shower_drop_threshold": "10"}.get(key, "")

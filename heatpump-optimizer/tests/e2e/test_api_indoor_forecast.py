@@ -6,7 +6,7 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from packages.core.models import IndoorTempReading, PlanRecord
+from packages.core.models import IndoorTempReading, PlanRecord, SettingRecord
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -134,3 +134,94 @@ class TestIndoorForecast:
         assert data["forecast_with_plan"][0]["predicted_indoor_temp"] == 22.0
         assert data["forecast_no_heating"][0]["predicted_indoor_temp"] == 19.5
         assert data["price_forecast"][0]["price_eur_per_kwh"] == 0.12
+
+    async def test_active_plan_snapshot_shorter_than_requested_horizon_falls_back_to_live_forecast(
+        self,
+        client: AsyncClient,
+        db_session,
+        seed_device_status,
+        seed_weather,
+    ):
+        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        db_session.add(
+            IndoorTempReading(
+                timestamp=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+                device_id="forecast-reference",
+                temperature=21.2,
+                is_stale=False,
+            )
+        )
+        db_session.add(SettingRecord(key="smartthings_device_ids", value="forecast-reference"))
+        db_session.add(
+            SettingRecord(key="comfort_reference_sensor_id", value="forecast-reference")
+        )
+        await db_session.commit()
+        snapshot = {
+            "version": "indoor_forecast_v1",
+            "current_indoor": 21.2,
+            "forecast": [],
+            "forecast_with_plan": [],
+            "forecast_no_heating": [],
+            "target_schedule": [],
+            "weather_forecast": [],
+            "price_forecast": [],
+        }
+        for hour in range(1, 15):
+            slot_start = now + dt.timedelta(hours=hour - 1)
+            state_ts = slot_start + dt.timedelta(hours=1)
+            snapshot["forecast"].append(
+                {"hour": hour, "ts": state_ts.isoformat(), "predicted_indoor_temp": 21.0 + hour}
+            )
+            snapshot["forecast_with_plan"].append(
+                {
+                    "hour": hour,
+                    "ts": state_ts.isoformat(),
+                    "predicted_indoor_temp": 21.0 + hour,
+                    "source": "milp_solution",
+                    "space_heating_fraction": 0.5,
+                }
+            )
+            snapshot["forecast_no_heating"].append(
+                {
+                    "hour": hour,
+                    "ts": state_ts.isoformat(),
+                    "predicted_indoor_temp": 20.5 - hour,
+                    "source": "milp_counterfactual",
+                }
+            )
+            snapshot["target_schedule"].append(
+                {"hour": hour, "ts": state_ts.isoformat(), "target": 20.5}
+            )
+            snapshot["weather_forecast"].append(
+                {
+                    "ts": slot_start.isoformat(),
+                    "hour": slot_start.hour,
+                    "outdoor_temp": 4.0,
+                    "wind_speed": 3.0,
+                    "irradiance": 0.0,
+                    "precipitation": 1.2,
+                }
+            )
+            snapshot["price_forecast"].append(
+                {"ts": slot_start.isoformat(), "price_eur_per_kwh": 0.12}
+            )
+
+        plan = PlanRecord(
+            created_at=now - dt.timedelta(hours=1),
+            horizon_start=now - dt.timedelta(hours=1),
+            horizon_end=now + dt.timedelta(hours=23),
+            plan_json=json.dumps({"forecast_snapshot": snapshot}),
+            optimizer_version="milp_v1",
+        )
+        db_session.add(plan)
+        await db_session.commit()
+
+        response = await client.get("/api/thermal/indoor-forecast?hours=24")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["forecast_source"] == "live_estimate"
+        assert len(data["forecast_with_plan"]) == 24
+        assert len(data["forecast_no_heating"]) == 24
+        assert len(data["target_schedule"]) == 24
+        assert len(data["weather_forecast"]) == 24

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import statistics
+import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -251,10 +253,37 @@ def write_mae_baseline(name: str, mae: float) -> None:
     import json
 
     payload = {"mae": float(mae), "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    path = _baseline_path(name)
+    temporary_path: str | None = None
     try:
-        _baseline_path(name).write_text(json.dumps(payload))
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(json.dumps(payload))
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        if os.name == "posix":
+            try:
+                directory_descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError:
+                pass
     except OSError:
         _logger.warning("mae_baseline_write_failed", model=name)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 def evaluate_regression(name: str, mae: float, has_prior_model: bool) -> dict[str, object]:

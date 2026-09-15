@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # Override settings BEFORE importing app modules
+os.environ.setdefault("API_TOKEN", "test-token")
 os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+asyncpg://heatpump:heatpump_test@localhost:5433/heatpump_test",
@@ -72,7 +73,11 @@ async def clean_tables(setup_database):
 async def client() -> AsyncGenerator[AsyncClient, None]:
     """Async HTTP client targeting the FastAPI app."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {os.environ['API_TOKEN']}"},
+    ) as ac:
         yield ac
 
 

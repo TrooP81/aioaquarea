@@ -1,6 +1,8 @@
 """Tests for ML models (COP, Demand) and ThermalModel."""
 
 import datetime as dt
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,13 +17,21 @@ class _FakeResult:
     def all(self):
         return self._rows
 
+    def scalar_one_or_none(self):
+        return None
+
 
 class _FakeSession:
     def __init__(self, results):
         self._results = list(results)
 
+    def add(self, *_args, **_kwargs):
+        return None
+
     async def execute(self, *args, **kwargs):
-        return self._results.pop(0)
+        if self._results:
+            return self._results.pop(0)
+        return _FakeResult([])
 
 
 class _FakeSessionCtx:
@@ -714,11 +724,17 @@ class TestOrchestratorFallback:
                 }
                 MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                with patch("packages.optimizer.main.get_session") as mock_session_ctx:
-                    mock_session = AsyncMock()
-                    mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-                    mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
+                with patch(
+                    "packages.optimizer.main.get_session",
+                    _mock_get_session([_FakeResult([]), _FakeResult([])]),
+                ), patch(
+                    "packages.optimizer.main.get_active_price_context",
+                    AsyncMock(
+                        return_value=SimpleNamespace(
+                            area="NL", currency="EUR", source="test"
+                        )
+                    ),
+                ):
                     await run_optimization()
 
                 MockRules.return_value.generate_plan.assert_awaited_once()
@@ -752,13 +768,28 @@ class TestOrchestratorFallback:
                 with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
                     MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                    with patch("packages.optimizer.main.get_session") as mock_session_ctx:
-                        mock_session = AsyncMock()
-                        mock_session_ctx.return_value.__aenter__ = AsyncMock(
-                            return_value=mock_session
-                        )
-                        mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
+                    with patch(
+                        "packages.optimizer.main.get_session",
+                        _mock_get_session([_FakeResult([]), _FakeResult([])]),
+                    ), patch(
+                        "packages.optimizer.main.get_planning_data_quality",
+                        AsyncMock(
+                            return_value={
+                                "control_allowed": True,
+                                "status": "ready",
+                                "reasons": [],
+                                "price": {},
+                                "weather": {},
+                            }
+                        ),
+                    ), patch(
+                        "packages.optimizer.main.get_active_price_context",
+                        AsyncMock(
+                            return_value=SimpleNamespace(
+                                area="NL", currency="EUR", source="test"
+                            )
+                        ),
+                    ):
                         await run_optimization()
 
                     # MILP failed, so rules should have been called
@@ -895,6 +926,50 @@ class TestDemandQuantiles:
 
 
 class TestMAEBaseline:
+    def test_write_atomically_replaces_baseline(self, tmp_path):
+        from packages.ml import models_common as models_common
+
+        baseline_path = tmp_path / "cop_mae_baseline.json"
+        baseline_path.write_text('{"mae": 1.0}')
+        with (
+            patch.object(models_common, "MODEL_DIR", tmp_path),
+            patch.object(models_common.os, "replace", wraps=models_common.os.replace) as replace,
+        ):
+            models_common.write_mae_baseline("cop", 0.5)
+            assert models_common.read_mae_baseline("cop") == 0.5
+
+        replace.assert_called_once()
+        temporary_path, destination_path = replace.call_args.args
+        assert Path(temporary_path).parent == tmp_path
+        assert destination_path == baseline_path
+        assert set(json.loads(baseline_path.read_text())) == {"mae", "updated_at"}
+
+    def test_write_failure_preserves_baseline_and_removes_temp_file(self, tmp_path):
+        from packages.ml import models_common as models_common
+
+        baseline_path = tmp_path / "cop_mae_baseline.json"
+        original_contents = '{"mae": 1.0}'
+        baseline_path.write_text(original_contents)
+        with (
+            patch.object(models_common, "MODEL_DIR", tmp_path),
+            patch.object(models_common.os, "replace", side_effect=OSError("replace failed")),
+        ):
+            models_common.write_mae_baseline("cop", 0.5)
+
+        assert baseline_path.read_text() == original_contents
+        assert not list(tmp_path.glob(".cop_mae_baseline.json.*.tmp"))
+
+    @pytest.mark.parametrize("contents", [None, "not json", '{"mae": null}', "{}"])
+    def test_read_missing_or_malformed_baseline_returns_none(self, tmp_path, contents):
+        from packages.ml import models_common as models_common
+
+        baseline_path = tmp_path / "cop_mae_baseline.json"
+        if contents is not None:
+            baseline_path.write_text(contents)
+
+        with patch.object(models_common, "MODEL_DIR", tmp_path):
+            assert models_common.read_mae_baseline("cop") is None
+
     def test_regression_blocks_deploy(self, tmp_path):
         from packages.ml import models_common as models_common
 

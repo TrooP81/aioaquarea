@@ -18,10 +18,17 @@ from packages.api.routers.optimizer import (
 
 
 def _session_context(session):
-    context = AsyncMock()
-    context.__aenter__ = AsyncMock(return_value=session)
-    context.__aexit__ = AsyncMock(return_value=False)
-    return context
+    class _AsyncContextManager:
+        def __init__(self, value):
+            self._value = value
+
+        async def __aenter__(self):
+            return self._value
+
+        async def __aexit__(self, *args):
+            return False
+
+    return _AsyncContextManager(session)
 
 
 @pytest.mark.asyncio
@@ -40,10 +47,10 @@ async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
         superseded_at=dt.datetime(2026, 9, 14, 2, tzinfo=dt.timezone.utc),
         superseded_by_plan_id=8,
     )
-    session = AsyncMock()
+    session = SimpleNamespace()
     result = MagicMock()
     result.all.return_value = [(plan, 4)]
-    session.execute.return_value = result
+    session.execute = AsyncMock(return_value=result)
 
     with patch(
         "packages.api.routers.optimizer.get_session", return_value=_session_context(session)
@@ -94,10 +101,10 @@ async def test_plan_detail_preserves_provenance_and_change_summary() -> None:
         executed_at=None,
         result_json=None,
     )
-    session = AsyncMock()
+    session = SimpleNamespace()
     plan_result = SimpleNamespace(scalar_one_or_none=lambda: plan)
     actions_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [action]))
-    session.execute.side_effect = [plan_result, actions_result]
+    session.execute = AsyncMock(side_effect=[plan_result, actions_result])
 
     with (
         patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
@@ -125,7 +132,8 @@ async def test_plan_detail_preserves_provenance_and_change_summary() -> None:
 
 @pytest.mark.asyncio
 async def test_optimize_now_enqueues_and_status_reports_durable_record() -> None:
-    session = MagicMock()
+    session = SimpleNamespace()
+    session.add = MagicMock()
     session.flush = AsyncMock()
     session.get = AsyncMock()
     added = {}
