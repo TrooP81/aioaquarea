@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useTimeFormat, formatHourLabel } from "./useTimeFormat";
 
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
@@ -17,12 +17,28 @@ interface LearnedSchedule {
   weekend: Record<string, number>;
 }
 
+function normalizeHours(hours: unknown): number[] {
+  if (!Array.isArray(hours)) return [];
+  return [...new Set(hours.filter((hour): hour is number => Number.isInteger(hour) && hour >= 0 && hour < 24))]
+    .sort((first, second) => first - second);
+}
+
+function normalizeSchedule(value: unknown): Schedule {
+  const schedule = value && typeof value === "object" ? value as Partial<Schedule> : {};
+  return {
+    weekday: normalizeHours(schedule.weekday),
+    weekend: normalizeHours(schedule.weekend),
+  };
+}
+
 export function ComfortSchedule() {
   const [schedule, setSchedule] = useState<Schedule>({ weekday: [], weekend: [] });
   const [learned, setLearned] = useState<LearnedSchedule | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const [dragging, setDragging] = useState<{ dayType: DayType; adding: boolean } | null>(null);
+  const [activeCell, setActiveCell] = useState({ dayIndex: 0, hour: 0 });
+  const cellRefs = useRef(new Map<string, HTMLDivElement>());
   const timeFormat = useTimeFormat();
 
   const fetchSchedule = useCallback(async () => {
@@ -31,7 +47,7 @@ export function ComfortSchedule() {
         fetch("/api/comfort-schedule"),
         fetch("/api/comfort-schedule/learned"),
       ]);
-      if (schedRes.ok) setSchedule(await schedRes.json());
+      if (schedRes.ok) setSchedule(normalizeSchedule(await schedRes.json()));
       if (learnedRes.ok) setLearned(await learnedRes.json());
     } catch {
       // ignore
@@ -67,6 +83,7 @@ export function ComfortSchedule() {
   };
 
   const handleMouseDown = (dayType: DayType, hour: number) => {
+    setActiveCell({ dayIndex: DAY_TYPES.indexOf(dayType), hour });
     const isActive = schedule[dayType].includes(hour);
     setDragging({ dayType, adding: !isActive });
     toggleHour(dayType, hour);
@@ -82,10 +99,12 @@ export function ComfortSchedule() {
     setSaving(true);
     setMessage(null);
     try {
+      const normalizedSchedule = normalizeSchedule(schedule);
+      setSchedule(normalizedSchedule);
       const res = await fetch("/api/comfort-schedule", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(schedule),
+        body: JSON.stringify(normalizedSchedule),
       });
       if (!res.ok) throw new Error((await res.json()).detail || "Save failed");
       setMessage({ text: "Schedule saved", type: "success" });
@@ -101,7 +120,7 @@ export function ComfortSchedule() {
       const res = await fetch("/api/comfort-schedule/apply-learned", { method: "POST" });
       if (!res.ok) throw new Error("Failed to apply");
       const data = await res.json();
-      setSchedule(data);
+      setSchedule(normalizeSchedule(data));
       setMessage({ text: "Applied learned schedule", type: "success" });
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
@@ -111,6 +130,12 @@ export function ComfortSchedule() {
   const getLearnedScore = (dayType: DayType, hour: number): number => {
     if (!learned) return 0;
     return learned[dayType]?.[hour.toString()] ?? 0;
+  };
+
+  const moveFocus = (dayIndex: number, hour: number) => {
+    const next = { dayIndex: Math.max(0, Math.min(DAY_TYPES.length - 1, dayIndex)), hour: Math.max(0, Math.min(23, hour)) };
+    setActiveCell(next);
+    cellRefs.current.get(`${DAY_TYPES[next.dayIndex]}-${next.hour}`)?.focus();
   };
 
   return (
@@ -139,23 +164,22 @@ export function ComfortSchedule() {
             color: message.type === "success" ? "var(--success)" : "var(--danger)",
             border: `1px solid ${message.type === "success" ? "var(--success)" : "var(--danger)"}`,
           }}
+          role={message.type === "error" ? "alert" : "status"}
+          aria-live={message.type === "success" ? "polite" : undefined}
         >
           {message.text}
         </div>
       )}
 
       <div
-        style={{ userSelect: "none", overflowX: "auto" }}
+        className="comfort-schedule-scroller"
         onMouseLeave={() => setDragging(null)}
       >
-        <table
-          style={{
-            width: "100%",
-            borderCollapse: "collapse",
-            fontSize: "0.75rem",
-            tableLayout: "fixed",
-          }}
-        >
+        <table className="comfort-schedule-table">
+          <colgroup>
+            <col className="comfort-schedule-label-column" />
+            {HOURS.map((hour) => <col key={hour} className="comfort-schedule-hour-column" />)}
+          </colgroup>
           <thead>
             <tr>
               <th style={{ width: "80px", textAlign: "left", padding: "0.25rem", color: "var(--text-muted)" }} />
@@ -197,24 +221,36 @@ export function ComfortSchedule() {
                       onMouseEnter={() => handleCellEnter(dayType, h)}
                       style={{
                         padding: "2px",
-                        textAlign: "center",
-                        cursor: "pointer",
                       }}
                     >
                       <div
                         role="checkbox"
                         aria-checked={active}
-                        aria-label={`${dayType} ${formatHourLabel(h, timeFormat.hour12)} — ${active ? "comfort" : "eco"}`}
-                        tabIndex={0}
+                        aria-label={`${dayType} ${formatHourLabel(h, timeFormat.hour12)}: ${active ? "comfort selected" : "eco selected"}`}
+                        tabIndex={activeCell.dayIndex === DAY_TYPES.indexOf(dayType) && activeCell.hour === h ? 0 : -1}
+                        ref={(element) => {
+                          const key = `${dayType}-${h}`;
+                          if (element) cellRefs.current.set(key, element);
+                          else cellRefs.current.delete(key);
+                        }}
+                        onFocus={() => setActiveCell({ dayIndex: DAY_TYPES.indexOf(dayType), hour: h })}
                         onKeyDown={(e) => {
                           if (e.key === " " || e.key === "Enter") {
                             e.preventDefault();
                             toggleHour(dayType, h);
+                            return;
                           }
+                          if (e.key === "ArrowRight") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType), h + 1); }
+                          if (e.key === "ArrowLeft") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType), h - 1); }
+                          if (e.key === "ArrowDown") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType) + 1, h); }
+                          if (e.key === "ArrowUp") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType) - 1, h); }
+                          if (e.key === "Home") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType), 0); }
+                          if (e.key === "End") { e.preventDefault(); moveFocus(DAY_TYPES.indexOf(dayType), 23); }
                         }}
                         style={{
                           position: "relative",
-                          height: "32px",
+                          minWidth: "44px",
+                          height: "44px",
                           borderRadius: "4px",
                           background: active ? "var(--accent)" : "var(--card-bg)",
                           border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,

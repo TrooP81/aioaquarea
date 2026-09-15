@@ -17,6 +17,16 @@ export interface ReleaseNote {
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
     version: APP_VERSION,
+    released: "2026-09-15",
+    title: "Reliable SmartThings transport and accessible dashboard",
+    changes: [
+      "SmartThings polling now handles transport failures more predictably and preserves validation coverage for stale and malformed sensor data.",
+      "Dashboard and Settings navigation now provide clearer keyboard focus, live status feedback, and reliable error routing.",
+      "Responsive workspace tabs and comfort-schedule editing remain usable on compact screens without hiding the active control.",
+    ],
+  },
+  {
+    version: "0.13.5",
     released: "2026-08-26",
     title: "Reliable SmartThings sensor freshness",
     changes: [

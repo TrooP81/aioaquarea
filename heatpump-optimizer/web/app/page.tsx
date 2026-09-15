@@ -11,7 +11,6 @@ import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
 import { PlanView } from "@/components/PlanView";
 import { PlanActivityTimeline } from "@/components/PlanActivityTimeline";
 import { PlanHistory } from "@/components/PlanHistory";
-import { NextActionCard } from "@/components/NextActionCard";
 import { Controls } from "@/components/Controls";
 import { LearningModeCard } from "@/components/LearningModeCard";
 import { OptimizerStatus } from "@/components/OptimizerStatus";
@@ -220,7 +219,7 @@ export default function Home() {
 
   if (loading) {
     return (
-      <div className="dashboard">
+      <main id="main-content" className="dashboard" tabIndex={-1}>
         <div className="header">
           <h1>Heat Pump Optimizer</h1>
           <span className="status-badge loading">Loading...</span>
@@ -229,7 +228,7 @@ export default function Home() {
           <div className="chart-skeleton" />
           <div className="chart-skeleton" style={{ width: "60%" }} />
         </div>
-      </div>
+      </main>
     );
   }
 
@@ -247,7 +246,7 @@ export default function Home() {
   const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
 
   return (
-    <div className="dashboard">
+    <main id="main-content" className="dashboard" tabIndex={-1}>
       <TabNavigation
         activeId={activeSection}
         ariaLabel="Dashboard workspace"
@@ -287,7 +286,7 @@ export default function Home() {
             background: pollResult.success ? "rgba(34,197,94,0.1)" : "rgba(251,191,36,0.1)",
           }}
         >
-          <p style={{ color: pollResult.success ? "var(--success)" : "var(--warning)" }}>
+          <p role={pollResult.success ? "status" : "alert"} aria-live={pollResult.success ? "polite" : undefined} style={{ color: pollResult.success ? "var(--success)" : "var(--warning)" }}>
             {pollResult.message}
           </p>
           <button className="btn btn-sm" onClick={() => setPollResult(null)}>
@@ -297,7 +296,7 @@ export default function Home() {
       )}
 
       {error && (
-        <div className="override-banner" style={{ borderColor: "var(--danger)", background: "rgba(239,68,68,0.1)" }}>
+        <div className="override-banner" role="alert" style={{ borderColor: "var(--danger)", background: "rgba(239,68,68,0.1)" }}>
           <p style={{ color: "var(--danger)" }}>API Error: {error}</p>
         </div>
       )}
@@ -337,7 +336,6 @@ export default function Home() {
         <DecisionSummary plan={data?.active_plan ?? null} indoorTemp={indoorTemp?.avg_temperature ?? null} />
         <OperationalAlerts />
         <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
-        <NextActionCard plan={data?.active_plan ?? null} />
         <OutcomeSummary />
       </section>
 
@@ -403,6 +401,6 @@ export default function Home() {
       >
         <OptimizerStatus />
       </section>
-    </div>
+    </main>
   );
 }

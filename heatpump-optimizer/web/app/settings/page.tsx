@@ -217,10 +217,34 @@ const SETTING_GROUPS = [
   },
 ];
 
+const SETTING_GROUP_BY_KEY = new Map<string, (typeof SETTING_GROUPS)[number]>();
+for (const group of SETTING_GROUPS) {
+  for (const key of group.keys) {
+    if (SETTING_GROUP_BY_KEY.has(key)) throw new Error(`Setting key belongs to multiple groups: ${key}`);
+    SETTING_GROUP_BY_KEY.set(key, group);
+  }
+}
+
 function tabForSetting(key: string): SettingsTabId | null {
-  const group = SETTING_GROUPS.find((candidate) => candidate.keys.includes(key));
+  const group = SETTING_GROUP_BY_KEY.get(key);
   if (!group) return null;
   return (SETTINGS_TABS.find((tab) => tab.groups.includes(group.title as never))?.id ?? null) as SettingsTabId | null;
+}
+
+function isSettingApplicable(key: string, values: Record<string, string>, showAdvanced: boolean): boolean {
+  const group = SETTING_GROUP_BY_KEY.get(key);
+  if (!group || (!showAdvanced && ADVANCED_OPTIMIZER_GROUPS.has(group.title))) return false;
+  if (group.title === "Price Provider") {
+    if (values.price_provider === "manual") return !["entsoe_api_token", "entsoe_area", "tibber_api_token"].includes(key);
+    if (key === "manual_price_eur_per_kwh") return false;
+    if (values.price_provider !== "tibber" && key === "tibber_api_token") return false;
+    if (values.price_provider !== "entsoe" && ["entsoe_api_token", "entsoe_area"].includes(key)) return false;
+  }
+  if (group.title === "Weather Provider" && values.weather_provider !== "manual" && ["manual_outdoor_temp", "manual_wind_speed", "manual_humidity", "manual_irradiance", "manual_precipitation"].includes(key)) return false;
+  if (group.title === "Weather Provider" && values.outdoor_temperature_source !== "weather" && ["outdoor_temperature_weather_offset_c", "outdoor_temperature_weather_max_age_minutes"].includes(key)) return false;
+  if (group.title === "SmartThings Integration" && values.smartthings_enabled !== "true" && key !== "smartthings_enabled") return false;
+  if (group.title === "Comfort Model" && values.use_comfort_model !== "true" && key !== "use_comfort_model") return false;
+  return true;
 }
 
 export default function SettingsPage() {
@@ -234,21 +258,26 @@ export default function SettingsPage() {
   const [apiVersionUnavailable, setApiVersionUnavailable] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTabId>("optimizer");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [pendingErrorKey, setPendingErrorKey] = useState<string | null>(null);
   const currency = useCurrency();
+  const applicableKeys = useMemo(
+    () => new Set(Object.keys(settings).filter((key) => isSettingApplicable(key, editValues, showAdvanced))),
+    [editValues, settings, showAdvanced],
+  );
   const activeTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
   const visibleGroupTitles: readonly string[] = activeTabMeta.groups;
   const dirtyKeys = useMemo(
     () => Object.keys(editValues).filter((key) => {
       const original = settings[key]?.value ?? "";
-      return editValues[key] !== original && !editValues[key].includes("***");
+      return applicableKeys.has(key) && editValues[key] !== original && !editValues[key].includes("***");
     }),
-    [editValues, settings],
+    [applicableKeys, editValues, settings],
   );
   const validationErrors = useMemo(() => {
     const errors: Record<string, string> = {};
     for (const [key, value] of Object.entries(editValues)) {
       const meta = settings[key];
-      if (!meta || value.includes("***")) continue;
+      if (!meta || !applicableKeys.has(key) || value.includes("***")) continue;
       const rule = FIELD_RULES[key] ?? {};
       const numeric = rule.inputType === "number" || ["int", "float", "number"].includes(meta.type);
       if (numeric) {
@@ -285,8 +314,13 @@ export default function SettingsPage() {
       errors.heat_curve_outdoor_cold_c = "Cold outdoor point must be below the warm point.";
     }
     return errors;
-  }, [editValues, settings]);
+  }, [applicableKeys, editValues, settings]);
   const activeTabDirtyCount = dirtyKeys.filter((key) => tabForSetting(key) === activeTab).length;
+  const tabErrorCounts = useMemo(() => Object.keys(validationErrors).reduce<Record<string, number>>((counts, key) => {
+    const tab = tabForSetting(key);
+    if (tab) counts[tab] = (counts[tab] ?? 0) + 1;
+    return counts;
+  }, {}), [validationErrors]);
 
   useEffect(() => {
     fetchSettings();
@@ -322,6 +356,15 @@ export default function SettingsPage() {
       target.scrollIntoView({ block: "start" });
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    if (!pendingErrorKey) return;
+    const input = document.getElementById(`setting-${pendingErrorKey}`);
+    if (input) {
+      input.focus();
+      setPendingErrorKey(null);
+    }
+  }, [activeTab, pendingErrorKey, showAdvanced]);
 
   const fetchApiVersion = async () => {
     try {
@@ -361,8 +404,16 @@ export default function SettingsPage() {
   };
 
   const handleSave = async () => {
-    if (Object.keys(validationErrors).length > 0) {
+    const firstInvalidKey = SETTINGS_TABS.flatMap((tab) => SETTING_GROUPS
+      .filter((group) => tab.groups.includes(group.title as never))
+      .flatMap((group) => group.keys))
+      .find((key) => validationErrors[key] && applicableKeys.has(key));
+    if (firstInvalidKey) {
       setMessage({ text: `Fix ${Object.keys(validationErrors).length} invalid field(s) before saving.`, type: "error" });
+      const errorTab = tabForSetting(firstInvalidKey);
+      if (errorTab) selectTab(errorTab);
+      if (ADVANCED_OPTIMIZER_GROUPS.has(SETTING_GROUP_BY_KEY.get(firstInvalidKey)?.title ?? "")) setShowAdvanced(true);
+      setPendingErrorKey(firstInvalidKey);
       return;
     }
     setSaving(true);
@@ -372,7 +423,7 @@ export default function SettingsPage() {
     const updates: Record<string, string> = {};
     for (const [key, val] of Object.entries(editValues)) {
       const original = settings[key]?.value || "";
-      if (val !== original && !val.includes("***")) {
+      if (applicableKeys.has(key) && val !== original && !val.includes("***")) {
         updates[key] = val;
       }
     }
@@ -402,9 +453,6 @@ export default function SettingsPage() {
     }
   };
 
-  const isManualPriceMode = editValues["price_provider"] === "manual";
-  const isManualWeatherMode = editValues["weather_provider"] === "manual";
-
   const useHeatCurveSuggestion = (suggested: HeatCurveValues) => {
     setEditValues((previous) => ({
       ...previous,
@@ -431,34 +479,9 @@ export default function SettingsPage() {
     setMessage({ text: "Unsaved changes discarded", type: "success" });
   };
 
-  const shouldShowKey = (groupTitle: string, key: string): boolean => {
-    // Hide API-specific fields when in manual mode
-    if (groupTitle === "Price Provider") {
-      if (isManualPriceMode && ["entsoe_api_token", "entsoe_area", "tibber_api_token"].includes(key)) return false;
-      if (!isManualPriceMode && key === "manual_price_eur_per_kwh") return false;
-      if (editValues["price_provider"] !== "tibber" && key === "tibber_api_token") return false;
-      if (editValues["price_provider"] !== "entsoe" && ["entsoe_api_token", "entsoe_area"].includes(key)) return false;
-    }
-    if (groupTitle === "Weather Provider") {
-      if (isManualWeatherMode && false) return false; // show manual fields
-      if (!isManualWeatherMode && ["manual_outdoor_temp", "manual_wind_speed", "manual_humidity", "manual_irradiance", "manual_precipitation"].includes(key)) return false;
-      if (
-        editValues["outdoor_temperature_source"] !== "weather"
-        && ["outdoor_temperature_weather_offset_c", "outdoor_temperature_weather_max_age_minutes"].includes(key)
-      ) return false;
-    }
-    if (groupTitle === "SmartThings Integration") {
-      if (editValues["smartthings_enabled"] !== "true" && key !== "smartthings_enabled") return false;
-    }
-    if (groupTitle === "Comfort Model") {
-      if (editValues["use_comfort_model"] !== "true" && key !== "use_comfort_model") return false;
-    }
-    return true;
-  };
-
   if (loading) {
     return (
-      <div className="dashboard">
+      <main id="main-content" className="dashboard" tabIndex={-1}>
         <div className="header">
           <h1>Settings</h1>
           <div className="header-actions">
@@ -467,12 +490,12 @@ export default function SettingsPage() {
           </div>
         </div>
         <p style={{ color: "var(--text-muted)" }}>Loading settings...</p>
-      </div>
+      </main>
     );
   }
 
   return (
-    <div className="dashboard">
+    <main id="main-content" className="dashboard" tabIndex={-1}>
       <div className="header">
         <h1>Settings</h1>
         <div className="header-actions">
@@ -485,7 +508,7 @@ export default function SettingsPage() {
         activeId={activeTab}
         ariaLabel="Settings categories"
         idPrefix="settings"
-        items={SETTINGS_TABS}
+        items={SETTINGS_TABS.map((tab) => ({ ...tab, label: `${tab.label}${tabErrorCounts[tab.id] ? ` (${tabErrorCounts[tab.id]} errors)` : ""}` }))}
         onChange={selectTab}
       />
 
@@ -498,6 +521,8 @@ export default function SettingsPage() {
       {message && (
         <div
           className="override-banner"
+          role={message.type === "error" ? "alert" : "status"}
+          aria-live={message.type === "success" ? "polite" : undefined}
           style={{
             borderColor: message.type === "success" ? "var(--success)" : "var(--danger)",
             background: message.type === "success" ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)",
@@ -519,7 +544,7 @@ export default function SettingsPage() {
           )}
           {Object.keys(validationErrors).length > 0 && <span className="text-danger">{Object.keys(validationErrors).length} field(s) need attention</span>}
         </div>
-        <button className="btn btn-primary" onClick={handleSave} disabled={saving || dirtyKeys.length === 0 || Object.keys(validationErrors).length > 0}>
+        <button className="btn btn-primary" onClick={handleSave} disabled={saving || dirtyKeys.length === 0}>
           {saving ? "Saving..." : `Save ${dirtyKeys.length || ""} change${dirtyKeys.length === 1 ? "" : "s"}`}
         </button>
         <button className="btn" onClick={discardChanges} disabled={dirtyKeys.length === 0}>
@@ -578,7 +603,7 @@ export default function SettingsPage() {
 
           <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
             {group.keys
-              .filter((key) => settings[key] && shouldShowKey(group.title, key))
+              .filter((key) => settings[key] && isSettingApplicable(key, editValues, showAdvanced))
               .map((key) => {
                 const meta = settings[key];
                 const rule = FIELD_RULES[key] ?? {};
@@ -763,6 +788,6 @@ export default function SettingsPage() {
         <ResetDataCard />
       </div>
       </div>
-    </div>
+    </main>
   );
 }

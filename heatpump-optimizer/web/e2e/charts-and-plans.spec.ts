@@ -334,8 +334,10 @@ test.describe("Plan View", () => {
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
 
-    // Next action card should be visible in dashboard area
-    await expect(page.locator(".next-action-card").first()).toBeVisible({ timeout: 10000 });
+    // DecisionSummary is the dashboard's sole next-action presentation.
+    const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(decisionSummary).toBeVisible({ timeout: 10000 });
+    await expect(decisionSummary).toContainText("Active plan #42");
 
     await page.getByRole("tab", { name: "Plan" }).click();
 
@@ -375,8 +377,11 @@ test.describe("Plan View", () => {
     // Should not crash — page loads normally
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     await expect(page.locator(".status-badge.online")).toBeVisible();
-    // Empty next action card should be present
-    await expect(page.locator(".next-action-card--empty")).toBeVisible({ timeout: 5000 });
+    // DecisionSummary presents the no-plan state without a separate empty card.
+    const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(decisionSummary).toBeVisible({ timeout: 5000 });
+    await expect(decisionSummary).toContainText("No active plan");
+    await expect(decisionSummary).toContainText("No pending command");
   });
 
   test("shows error state when plan actions fail to load", async ({ page }) => {

@@ -267,9 +267,9 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           <div className="card-subtitle">
             {optBrief ? (
               <span className="ml-status-dots">
-                <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} title="COP (efficiency) model" />
-                <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} title="Demand (hot-water) model" />
-                <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} title="Thermal (heat-up rate) model" />
+                <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} aria-label={`COP efficiency model ${optBrief.cop_trained ? "ready" : "not ready"}`} title="COP (efficiency) model" />
+                <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} aria-label={`Demand hot-water model ${optBrief.demand_trained ? "ready" : "not ready"}`} title="Demand (hot-water) model" />
+                <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} aria-label={`Thermal heat-up model ${optBrief.thermal_calibrated ? "ready" : "not ready"}`} title="Thermal (heat-up rate) model" />
                 <span className="ml-status-label">
                   {[optBrief.cop_trained, optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/3 learning models ready
                 </span>
