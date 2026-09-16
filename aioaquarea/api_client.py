@@ -1,6 +1,6 @@
+from collections.abc import Awaitable, Callable
 import datetime as dt
 import logging
-from collections.abc import Awaitable, Callable
 from typing import Optional
 import urllib.parse
 
@@ -153,7 +153,9 @@ class AquareaAPIClient:
                     )
                     try:
                         await callback()
-                    except Exception as exc:  # noqa: BLE001 - fall through to full login
+                    except (
+                        Exception
+                    ) as exc:  # noqa: BLE001 - fall through to full login
                         self._logger.warning(
                             "Panasonic %s recovery failed: %s",
                             recovery_name,

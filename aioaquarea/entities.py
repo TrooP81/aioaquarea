@@ -3,6 +3,7 @@ import datetime as dt
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from .command_result import PanasonicCommandResult
 from .data import (
     Device,
     DeviceInfo,
@@ -25,7 +26,6 @@ from .data import (
     ZoneTemperatureSetUpdate,
 )
 from .errors import DataNotAvailableError
-from .command_result import PanasonicCommandResult
 from .statistics import Consumption, ConsumptionType, DateType
 from .weekly_timer import WeeklyTimerSettings
 

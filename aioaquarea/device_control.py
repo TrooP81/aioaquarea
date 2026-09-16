@@ -254,9 +254,7 @@ class AquareaDeviceControl:
             self._build_transfer_request(long_id, holidayTimer=holiday_timer.value)
         )
 
-    async def post_device_request_defrost(
-        self, long_id: str
-    ) -> PanasonicCommandResult:
+    async def post_device_request_defrost(self, long_id: str) -> PanasonicCommandResult:
         """Post forcedefrost command."""
         return await self._post_transfer(
             self._build_transfer_request(long_id, forcedefrost=1)

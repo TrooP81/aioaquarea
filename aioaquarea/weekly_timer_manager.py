@@ -49,7 +49,9 @@ class WeeklyTimerManager:
             slot = cls._parse_slot(entry)
             if slot is not None:
                 slots.append(slot)
-        return WeeklyTimerSettings(enabled=data.get("enabled") is True, slots=tuple(slots))
+        return WeeklyTimerSettings(
+            enabled=data.get("enabled") is True, slots=tuple(slots)
+        )
 
     @staticmethod
     def _parse_slot(entry: object) -> WeeklyTimerSlot | None:

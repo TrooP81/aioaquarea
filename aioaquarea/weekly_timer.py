@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass
+import datetime as dt
 from enum import IntEnum
 from zoneinfo import ZoneInfo
 
@@ -54,9 +54,9 @@ class WeeklyTimerSettings:
                 matches = slot.day.value == weekday and start <= minute < end
             elif start > end:
                 previous_day = 7 if weekday == 1 else weekday - 1
-                matches = (
-                    slot.day.value == weekday and minute >= start
-                ) or (slot.day.value == previous_day and minute < end)
+                matches = (slot.day.value == weekday and minute >= start) or (
+                    slot.day.value == previous_day and minute < end
+                )
             else:
                 matches = False
             if matches:

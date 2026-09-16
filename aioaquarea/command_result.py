@@ -24,7 +24,11 @@ class PanasonicCommandResult:
             payload = await response.json()
         data = payload if isinstance(payload, dict) else {}
         response_code = next(
-            (data[key] for key in ("code", "resultCode") if isinstance(data.get(key), (str, int))),
+            (
+                data[key]
+                for key in ("code", "resultCode")
+                if isinstance(data.get(key), (str, int))
+            ),
             None,
         )
         request_id = next(
@@ -37,7 +41,11 @@ class PanasonicCommandResult:
         )
         status = getattr(response, "status", None)
         return cls(
-            http_status=status if isinstance(status, int) and not isinstance(status, bool) else None,
+            http_status=(
+                status
+                if isinstance(status, int) and not isinstance(status, bool)
+                else None
+            ),
             response_code=response_code,
             request_id=request_id,
         )
