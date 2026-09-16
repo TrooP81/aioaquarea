@@ -4,7 +4,7 @@ description: "Use for independent high-reasoning review of a design packet or co
 argument-hint: "Specify design mode or code mode and provide the relevant artifact, acceptance criteria, and changed scope."
 tools: [read, search, execute]
 agents: []
-model: ["Claude Sonnet 5 (copilot)", "GPT-5.5 (copilot)", "GPT-5.6 Terra (copilot)"]
+model: ["Claude Sonnet 5 (copilot)", "GPT-5.6 Terra (copilot)"]
 reasoning-effort: high
 user-invocable: true
 handoffs:

@@ -4,7 +4,7 @@ description: "Use when developing a feature or fixing a defect end to end with c
 argument-hint: "Describe the change, constraints, and acceptance criteria."
 tools: [read, search, agent, todo]
 agents: ["Solution Architect", "Implementer", "Test Engineer", "Lightweight Reviewer", "Quality Reviewer", "Release Gate"]
-model: ["GPT-5.4 mini (copilot)", "GPT-5.3-Codex (copilot)"]
+model: ["GPT-5.6 Luna (copilot)"]
 reasoning-effort: medium
 user-invocable: true
 disable-model-invocation: true
