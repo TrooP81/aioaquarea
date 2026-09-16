@@ -17,7 +17,7 @@ TEST_API_TOKEN = "test-token"
 
 os.environ.setdefault("API_TOKEN", TEST_API_TOKEN)
 
-import aioaquarea
+import aioaquarea  # noqa: E402
 
 
 def pytest_configure() -> None:

@@ -724,15 +724,16 @@ class TestOrchestratorFallback:
                 }
                 MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                with patch(
-                    "packages.optimizer.main.get_session",
-                    _mock_get_session([_FakeResult([]), _FakeResult([])]),
-                ), patch(
-                    "packages.optimizer.main.get_active_price_context",
-                    AsyncMock(
-                        return_value=SimpleNamespace(
-                            area="NL", currency="EUR", source="test"
-                        )
+                with (
+                    patch(
+                        "packages.optimizer.main.get_session",
+                        _mock_get_session([_FakeResult([]), _FakeResult([])]),
+                    ),
+                    patch(
+                        "packages.optimizer.main.get_active_price_context",
+                        AsyncMock(
+                            return_value=SimpleNamespace(area="NL", currency="EUR", source="test")
+                        ),
                     ),
                 ):
                     await run_optimization()
@@ -768,26 +769,30 @@ class TestOrchestratorFallback:
                 with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
                     MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
-                    with patch(
-                        "packages.optimizer.main.get_session",
-                        _mock_get_session([_FakeResult([]), _FakeResult([])]),
-                    ), patch(
-                        "packages.optimizer.main.get_planning_data_quality",
-                        AsyncMock(
-                            return_value={
-                                "control_allowed": True,
-                                "status": "ready",
-                                "reasons": [],
-                                "price": {},
-                                "weather": {},
-                            }
+                    with (
+                        patch(
+                            "packages.optimizer.main.get_session",
+                            _mock_get_session([_FakeResult([]), _FakeResult([])]),
                         ),
-                    ), patch(
-                        "packages.optimizer.main.get_active_price_context",
-                        AsyncMock(
-                            return_value=SimpleNamespace(
-                                area="NL", currency="EUR", source="test"
-                            )
+                        patch(
+                            "packages.optimizer.main.get_planning_data_quality",
+                            AsyncMock(
+                                return_value={
+                                    "control_allowed": True,
+                                    "status": "ready",
+                                    "reasons": [],
+                                    "price": {},
+                                    "weather": {},
+                                }
+                            ),
+                        ),
+                        patch(
+                            "packages.optimizer.main.get_active_price_context",
+                            AsyncMock(
+                                return_value=SimpleNamespace(
+                                    area="NL", currency="EUR", source="test"
+                                )
+                            ),
                         ),
                     ):
                         await run_optimization()

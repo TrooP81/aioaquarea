@@ -59,11 +59,13 @@ def test_device_status_freshness_uses_shared_polling_threshold() -> None:
 @pytest.mark.asyncio
 async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -> None:
     session = SimpleNamespace()
-    session.execute = AsyncMock(side_effect=[
-        SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
-        SimpleNamespace(scalar_one_or_none=lambda: None),
-        SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
-    ])
+    session.execute = AsyncMock(
+        side_effect=[
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+        ]
+    )
 
     with (
         patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),

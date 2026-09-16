@@ -152,9 +152,7 @@ class TestIndoorForecast:
             )
         )
         db_session.add(SettingRecord(key="smartthings_device_ids", value="forecast-reference"))
-        db_session.add(
-            SettingRecord(key="comfort_reference_sensor_id", value="forecast-reference")
-        )
+        db_session.add(SettingRecord(key="comfort_reference_sensor_id", value="forecast-reference"))
         await db_session.commit()
         snapshot = {
             "version": "indoor_forecast_v1",
