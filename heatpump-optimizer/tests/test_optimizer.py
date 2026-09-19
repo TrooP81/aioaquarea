@@ -734,6 +734,637 @@ class TestRulesOptimizer:
 
         assert actions == []
 
+    def test_preheat_charges_house_during_cheap_slot_before_expensive_hours(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base + dt.timedelta(hours=hour), price)
+            for hour, price in enumerate([0.10, 0.03, 0.10, 0.25, 0.20])
+        ]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        passive = {timestamp: 19.5 for timestamp, _ in prices}
+
+        with patch.object(optimizer, "_passive_indoor_forecast", return_value=passive):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=19.5,
+                current_outdoor_temp=5.0,
+                current_water_temp=35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_target=20.5,
+            )
+
+        assert [action["type"] for action in actions] == [
+            "zone_temp_boost",
+            "zone_temp_restore",
+        ]
+        assert actions[0]["ts"] == (base + dt.timedelta(hours=1)).isoformat()
+        assert actions[0]["payload"]["temperature"] == 36
+        assert actions[0]["payload"]["reason"] == "thermal_battery_cheap_slot"
+        assert actions[1]["ts"] == (base + dt.timedelta(hours=2)).isoformat()
+
+    def test_preheat_does_not_charge_house_without_later_expensive_hour(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base + dt.timedelta(hours=hour), price)
+            for hour, price in enumerate([0.25, 0.20, 0.10, 0.03])
+        ]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        passive = {timestamp: 19.5 for timestamp, _ in prices}
+
+        with patch.object(optimizer, "_passive_indoor_forecast", return_value=passive):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=19.5,
+                current_outdoor_temp=5.0,
+                current_water_temp=35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_target=20.5,
+            )
+
+        assert actions == []
+
+    def test_thermal_battery_uses_cop_adjusted_price_and_endpoint(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.08),
+            (base + dt.timedelta(hours=1), 0.09),
+            (base + dt.timedelta(hours=8), 0.30),
+        ]
+        weather = [
+            (base, 5.0),
+            (base + dt.timedelta(hours=1), 10.0),
+            (base + dt.timedelta(hours=8), 5.0),
+        ]
+        passive = {timestamp: 19.0 for timestamp, _ in prices}
+
+        with (
+            patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                side_effect=lambda outdoor: 2.0 if outdoor == 5.0 else 4.0,
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                current_indoor_temp=19.0,
+                current_outdoor_temp=5.0,
+                current_water_temp=35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_max=22.0,
+            )
+
+        assert actions[0]["ts"] == (base + dt.timedelta(hours=1)).isoformat()
+        assert actions[0]["payload"]["deferred_ts"] == (base + dt.timedelta(hours=8)).isoformat()
+
+    def test_thermal_battery_accepts_exact_spread_at_eight_hour_endpoint_and_blocked_deferred(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base + dt.timedelta(hours=hour), 0.05 if hour == 8 else 0.03) for hour in range(10)
+        ]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        evidence = [
+            (timestamp, SimpleNamespace(state="ALLOWED" if hour == 0 else "BLOCKED"))
+            for hour, (timestamp, _) in enumerate(prices)
+        ]
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                return_value=1.0,
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_evidence=evidence,
+                gate_control_enabled=True,
+            )
+
+        assert actions[0]["ts"] == base.isoformat()
+        assert actions[0]["payload"]["deferred_ts"] == (base + dt.timedelta(hours=8)).isoformat()
+
+    def test_thermal_battery_ties_choose_max_spread_then_earliest_deferred(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base + dt.timedelta(hours=hour), price)
+            for hour, price in enumerate(
+                [0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.05, 0.03, 0.10, 0.10]
+            )
+        ]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        evidence = [
+            (timestamp, SimpleNamespace(state="ALLOWED" if hour in {0, 8} else "BLOCKED"))
+            for hour, (timestamp, _) in enumerate(prices)
+        ]
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                return_value=1.0,
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_evidence=evidence,
+                gate_control_enabled=True,
+            )
+
+        assert actions[0]["ts"] == (base + dt.timedelta(hours=8)).isoformat()
+        assert actions[0]["payload"]["deferred_ts"] == (base + dt.timedelta(hours=9)).isoformat()
+
+    @pytest.mark.parametrize("states", [("ALLOWED", "UNKNOWN"), ("ALLOWED", "BLOCKED")])
+    def test_thermal_battery_gate_requires_valid_candidate_but_allows_blocked_deferred(
+        self, states
+    ):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        evidence = [
+            (timestamp, SimpleNamespace(state=state))
+            for (timestamp, _), state in zip(prices, states)
+        ]
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_evidence=evidence,
+                gate_control_enabled=True,
+            )
+
+        assert actions == [] if "UNKNOWN" in states else [actions[0], actions[1]]
+
+    def test_thermal_battery_rejects_blocked_candidate(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        evidence = [
+            (base, SimpleNamespace(state="BLOCKED")),
+            (base + dt.timedelta(hours=1), SimpleNamespace(state="ALLOWED")),
+        ]
+
+        with patch.object(
+            optimizer,
+            "_passive_indoor_forecast",
+            return_value={timestamp: 19.0 for timestamp, _ in prices},
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_evidence=evidence,
+                gate_control_enabled=True,
+            )
+
+        assert actions == []
+
+    def test_thermal_battery_gate_grid_is_fail_closed_but_disabled_gate_is_permissive(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        invalid_evidence = [(base, SimpleNamespace(state="ALLOWED"))]
+        kwargs = dict(
+            current_zone_target_temp=34,
+            current_zone_heat_min=20,
+            current_zone_heat_max=65,
+        )
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
+            ),
+        ):
+            blocked = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                gate_evidence=invalid_evidence,
+                gate_control_enabled=True,
+                **kwargs,
+            )
+            direct = optimizer._plan_preheat(prices, weather, base, 19.0, 5.0, 35.0, **kwargs)
+
+        assert blocked == []
+        assert [action["type"] for action in direct] == ["zone_temp_boost", "zone_temp_restore"]
+
+    @pytest.mark.parametrize(
+        "invalid_grid",
+        [
+            "naive_price_timestamp",
+            "offset_price_timestamp",
+            "non_hour_price_timestamp",
+            "weather_timestamp_mismatch",
+            "gate_timestamp_mismatch",
+            "missing_gate_state",
+        ],
+    )
+    def test_thermal_battery_rejects_noncanonical_or_malformed_gate_grid(self, invalid_grid):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        evidence = [(timestamp, SimpleNamespace(state="ALLOWED")) for timestamp, _ in prices]
+        if invalid_grid == "naive_price_timestamp":
+            prices[0] = (base.replace(tzinfo=None), prices[0][1])
+        elif invalid_grid == "offset_price_timestamp":
+            prices[0] = (base.astimezone(dt.timezone(dt.timedelta(hours=1))), prices[0][1])
+        elif invalid_grid == "non_hour_price_timestamp":
+            prices[0] = (base + dt.timedelta(minutes=30), prices[0][1])
+        elif invalid_grid == "weather_timestamp_mismatch":
+            weather[0] = (base + dt.timedelta(minutes=1), weather[0][1])
+        elif invalid_grid == "gate_timestamp_mismatch":
+            evidence[0] = (base + dt.timedelta(minutes=1), evidence[0][1])
+        else:
+            evidence[0] = (evidence[0][0], SimpleNamespace())
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch("packages.optimizer.rule_mixins.logger.info") as info,
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_evidence=evidence,
+                gate_control_enabled=True,
+            )
+
+        assert actions == []
+        info.assert_called_once()
+        assert info.call_args.args == ("thermal_battery_suppressed",)
+        assert info.call_args.kwargs["reason_code"] == "gate_grid_invalid"
+
+    def test_thermal_battery_suppression_distinguishes_grid_failure_and_no_opportunity(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.10), (base + dt.timedelta(hours=1), 0.10)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        common = {
+            "current_zone_target_temp": 34.0,
+            "current_zone_heat_min": 20,
+            "current_zone_heat_max": 65,
+        }
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch("packages.optimizer.rule_mixins.logger.info") as info,
+        ):
+            assert (
+                optimizer._plan_preheat(
+                    prices,
+                    weather,
+                    base,
+                    19.0,
+                    5.0,
+                    35.0,
+                    gate_evidence=[(base, SimpleNamespace(state="ALLOWED"))],
+                    gate_control_enabled=True,
+                    **common,
+                )
+                == []
+            )
+            info.assert_called_once()
+            assert info.call_args.kwargs["reason_code"] == "gate_grid_invalid"
+
+            info.reset_mock()
+            assert (
+                optimizer._plan_preheat(
+                    prices,
+                    weather,
+                    base,
+                    19.0,
+                    5.0,
+                    35.0,
+                    **common,
+                )
+                == []
+            )
+            info.assert_called_once()
+            assert info.call_args.kwargs["reason_code"] == "no_economic_opportunity"
+
+    @pytest.mark.parametrize(
+        ("current_indoor_temp", "prices", "reason_code"),
+        [
+            (20.5, [(0, 0.03), (1, 0.20)], "comfort_already_satisfied"),
+            (19.0, [(0, float("nan")), (1, 0.20)], "invalid_thermal_price"),
+        ],
+    )
+    def test_thermal_battery_logs_direct_suppression_reason(
+        self, current_indoor_temp, prices, reason_code
+    ):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        price_grid = [(base + dt.timedelta(hours=hour), price) for hour, price in prices]
+        weather = [(timestamp, 5.0) for timestamp, _ in price_grid]
+
+        with patch("packages.optimizer.rule_mixins.logger.info") as info:
+            actions = optimizer._plan_preheat(
+                price_grid,
+                weather,
+                base,
+                current_indoor_temp,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+            )
+
+        assert actions == []
+        info.assert_called_once()
+        assert info.call_args.args == ("thermal_battery_suppressed",)
+        assert info.call_args.kwargs["reason_code"] == reason_code
+
+    def test_thermal_battery_uses_full_weather_and_falls_back_to_one_degree_offset(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        weather_full = [
+            {"ts": timestamp, "temperature": 7.0, "wind_speed": 9.0} for timestamp, _ in weather
+        ]
+
+        def simulate(**kwargs):
+            assert all(row["outdoor_temp"] == 7.0 for row in kwargs["weather_forecast"])
+            return [
+                {"predicted_indoor_temp": 23.0 if max(kwargs["zone_water_temps"]) > 36 else 21.0}
+            ] * 2
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                side_effect=simulate,
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                weather_full=weather_full,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_max=22.0,
+            )
+
+        assert actions[0]["payload"]["offset"] == 1
+
+    def test_thermal_battery_simulates_full_horizon_before_falling_back_to_one_degree(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.03),
+            (base + dt.timedelta(hours=1), 0.20),
+            (base + dt.timedelta(hours=2), 0.20),
+        ]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        simulation_calls = []
+
+        def simulate(**kwargs):
+            simulation_calls.append((max(kwargs["zone_water_temps"]), kwargs["hours"]))
+            peak = 23.0 if max(kwargs["zone_water_temps"]) > 36.0 else 21.0
+            return [{"predicted_indoor_temp": peak} for _ in range(kwargs["hours"])]
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                side_effect=simulate,
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_max=22.0,
+            )
+
+        assert actions[0]["payload"]["offset"] == 1
+        assert simulation_calls == [(37.0, 3), (36.0, 3)]
+
+    def test_thermal_battery_rejection_logs_one_suppression_event(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 23.0}] * 2,
+            ),
+            patch("packages.optimizer.rule_mixins.logger.info") as info,
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_temp_max=22.0,
+            )
+
+        assert actions == []
+        info.assert_called_once_with(
+            "thermal_battery_suppressed",
+            reason_code="comfort_simulation_rejected",
+            candidate_count=1,
+            horizon_hours=2,
+        )
+
+    def test_thermal_battery_model_failure_fails_closed(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(timestamp, 5.0) for timestamp, _ in prices]
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 19.0 for timestamp, _ in prices},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                side_effect=ValueError("invalid model input"),
+            ),
+            patch("packages.optimizer.rule_mixins.logger.info") as info,
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                19.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+            )
+
+        assert actions == []
+        assert info.call_args.kwargs["reason_code"] == "comfort_simulation_rejected"
+
+    def test_cold_risk_precedes_thermal_battery_charge(self):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.20)]
+        weather = [(base, 5.0), (base + dt.timedelta(hours=1), 0.0)]
+        passive = {base: 21.0, base + dt.timedelta(hours=1): 17.0}
+        with (
+            patch.object(optimizer, "_passive_indoor_forecast", return_value=passive),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
+                return_value=SimpleNamespace(
+                    estimated_hours=1.0, estimated_minutes=60.0, heating_rate_per_hour=2.0
+                ),
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve"
+            ) as simulation,
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                21.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+            )
+
+        assert actions[0]["payload"]["reason"] == "thermal_preheat_before_cold"
+        simulation.assert_not_called()
+
     def test_comfort_mode_uses_passive_forecast_before_clearing_eco(self, sample_prices):
         optimizer = RulesOptimizer()
         warm_weather = [(ts, 20.0) for ts, _ in sample_prices]
@@ -780,6 +1411,7 @@ class TestRulesOptimizer:
     def test_comfort_schedule_does_not_emit_mode_only_heat_above_cutoff(self, sample_prices):
         optimizer = RulesOptimizer()
         warm_weather = [(ts, 18.0) for ts, _ in sample_prices]
+        gate_projections = [SimpleNamespace(state="BLOCKED") for _ in warm_weather]
 
         actions = optimizer._plan_eco_comfort(
             sample_prices,
@@ -793,6 +1425,8 @@ class TestRulesOptimizer:
             comfort_temp_target=21.0,
             tz_name="UTC",
             special_status_supported=True,
+            gate_projections=gate_projections,
+            gate_control_enabled=True,
         )
 
         assert all(
@@ -1296,6 +1930,7 @@ class TestRulesOptimizer:
     def test_guardrail_does_not_schedule_heat_above_controller_cutoff(self, sample_prices):
         optimizer = RulesOptimizer()
         warm_weather = [(ts, 18.0) for ts, _ in sample_prices[:4]]
+        gate_projections = [SimpleNamespace(state="BLOCKED") for _ in warm_weather]
 
         actions = optimizer._plan_indoor_guardrails(
             sample_prices[:4],
@@ -1304,14 +1939,178 @@ class TestRulesOptimizer:
             current_indoor_temp=18.0,
             current_outdoor_temp=18.0,
             current_water_temp=35.0,
+            current_zone_target_temp=34.0,
+            current_zone_heat_min=20,
+            current_zone_heat_max=65,
             comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
             comfort_temp_target=21.0,
             comfort_temp_min=18.0,
             heat_curve=HeatCurveConfig(heating_off_outdoor_c=13),
             tz_name="UTC",
+            gate_projections=gate_projections,
+            gate_control_enabled=True,
         )
 
         assert actions == []
+
+    @pytest.mark.parametrize("gate_state", ["BLOCKED", "ALLOWED"])
+    def test_guardrail_gate_requires_allowed_projection(self, sample_prices, gate_state):
+        optimizer = RulesOptimizer()
+        weather = [(ts, 2.0) for ts, _ in sample_prices[:4]]
+        gate_projections = [SimpleNamespace(state=gate_state) for _ in weather]
+
+        with (
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 17.0}] * len(weather),
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_heating_time",
+                return_value=SimpleNamespace(estimated_hours=0.5, estimated_minutes=30.0),
+            ),
+        ):
+            actions = optimizer._plan_indoor_guardrails(
+                sample_prices[:4],
+                weather,
+                sample_prices[0][0],
+                current_indoor_temp=18.0,
+                current_outdoor_temp=2.0,
+                current_water_temp=35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                comfort_schedule={"weekday": list(range(24)), "weekend": list(range(24))},
+                comfort_temp_target=21.0,
+                comfort_temp_min=18.0,
+                tz_name="UTC",
+                gate_projections=gate_projections,
+                gate_control_enabled=True,
+            )
+
+        assert bool(actions) is (gate_state == "ALLOWED")
+
+    @pytest.mark.parametrize("gate_state", ["BLOCKED", "ALLOWED"])
+    def test_mode_switch_gate_requires_allowed_projection(self, sample_prices, gate_state):
+        optimizer = RulesOptimizer()
+        prices = sample_prices[:4]
+        weather = [(ts, 2.0) for ts, _ in prices]
+        gate_projections = [SimpleNamespace(state=gate_state) for _ in weather]
+
+        actions = optimizer._plan_eco_comfort(
+            prices,
+            weather,
+            prices[0][0],
+            {"weekday": list(range(24)), "weekend": list(range(24))},
+            special_status_supported=True,
+            gate_projections=gate_projections,
+            gate_control_enabled=True,
+        )
+
+        assert bool(actions) is (gate_state == "ALLOWED")
+
+    @pytest.mark.parametrize("gate_state", ["BLOCKED", "ALLOWED"])
+    def test_cold_risk_preheat_gate_requires_allowed_projection(self, gate_state):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base + dt.timedelta(hours=hour), 0.10) for hour in range(2)]
+        weather = [(prices[0][0], 5.0), (prices[1][0], -1.0)]
+        gate_projections = [SimpleNamespace(state=gate_state) for _ in weather]
+        gate_evidence = list(zip((timestamp for timestamp, _ in prices), gate_projections))
+
+        with (
+            patch.object(
+                optimizer,
+                "_passive_indoor_forecast",
+                return_value={timestamp: 18.0 for timestamp, _ in weather},
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_zone_heating_time",
+                return_value=SimpleNamespace(
+                    estimated_hours=0.5, estimated_minutes=30.0, heating_rate_per_hour=2.0
+                ),
+            ),
+        ):
+            actions = optimizer._plan_preheat(
+                prices,
+                weather,
+                base,
+                18.0,
+                -1.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_projections=gate_projections,
+                gate_evidence=gate_evidence,
+                gate_control_enabled=True,
+            )
+
+        assert bool(actions) is (gate_state == "ALLOWED")
+
+    @pytest.mark.parametrize(
+        "gate_projections",
+        [None, [SimpleNamespace(state="INVALID"), SimpleNamespace(state="INVALID")]],
+    )
+    def test_enabled_gate_rejects_missing_or_invalid_projections(self, gate_projections):
+        optimizer = RulesOptimizer()
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        prices = [(base + dt.timedelta(hours=hour), 0.10) for hour in range(2)]
+        cold_risk_weather = [(prices[0][0], 5.0), (prices[1][0], -1.0)]
+        guardrail_weather = [(timestamp, 2.0) for timestamp, _ in prices]
+        schedule = {"weekday": list(range(24)), "weekend": list(range(24))}
+
+        with (
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
+                return_value=[{"predicted_indoor_temp": 17.0}] * len(prices),
+            ),
+            patch(
+                "packages.optimizer.rule_mixins.thermal_model.predict_indoor_heating_time",
+                return_value=SimpleNamespace(estimated_hours=0.5, estimated_minutes=30.0),
+            ),
+        ):
+            guardrails = optimizer._plan_indoor_guardrails(
+                prices,
+                guardrail_weather,
+                base,
+                18.0,
+                2.0,
+                35.0,
+                schedule,
+                21.0,
+                18.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_projections=gate_projections,
+                gate_control_enabled=True,
+            )
+            preheat = optimizer._plan_preheat(
+                prices,
+                cold_risk_weather,
+                base,
+                18.0,
+                5.0,
+                35.0,
+                current_zone_target_temp=34.0,
+                current_zone_heat_min=20,
+                current_zone_heat_max=65,
+                gate_projections=gate_projections,
+                gate_control_enabled=True,
+            )
+        mode_switches = optimizer._plan_eco_comfort(
+            prices,
+            guardrail_weather,
+            base,
+            schedule,
+            special_status_supported=True,
+            gate_projections=gate_projections,
+            gate_control_enabled=True,
+        )
+
+        assert guardrails == []
+        assert preheat == []
+        assert mode_switches == []
 
     def test_guardrail_preserves_zone_water_baseline(self, sample_prices):
         optimizer = RulesOptimizer()

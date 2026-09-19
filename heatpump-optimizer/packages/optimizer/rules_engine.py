@@ -14,7 +14,8 @@ from packages.core.database import get_session
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.control_temperature import get_control_temperature
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
-from packages.core.models import ConsumptionRecord, ShowerEventRecord
+from packages.core.models import ConsumptionRecord, ShowerEventRecord, SpaceHeatingGateRecord
+from packages.core.space_heating_gate import project_gate_states, resolve_effective_gate
 from packages.core.time_slots import next_hour_boundary
 from packages.core.panasonic_control_state import (
     panasonic_tank_heating_available,
@@ -25,6 +26,7 @@ from packages.core.settings_service import (
     get_float_setting,
     get_heat_curve_config,
     get_int_setting,
+    get_space_heating_gate_config,
     get_user_tz,
     is_comfort_hour,
 )
@@ -227,6 +229,17 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             weather = await self._get_weather(session, horizon_start, horizon_end)
             weather_full = await self._get_weather_full(session, horizon_start, horizon_end)
             last_status = await self._get_last_status(session)
+            gate_row = (
+                (
+                    await session.execute(
+                        select(SpaceHeatingGateRecord).where(
+                            SpaceHeatingGateRecord.device_id == last_status.device_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if last_status is not None
+                else None
+            )
             outdoor_reading = await resolve_outdoor_temperature(
                 session,
                 heat_pump_c=(
@@ -318,11 +331,22 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         actions: list[dict[str, Any]] = []
 
         heat_curve = await get_heat_curve_config()
+        gate_config = await get_space_heating_gate_config()
+        effective_gate = resolve_effective_gate(gate_row, gate_config)
+        gate_projections = project_gate_states(
+            effective_gate, [temperature for _, temperature in weather], gate_config
+        )
+        gate_evidence = (
+            [(weather[index][0], gate_projections[index]) for index in range(len(weather))]
+            if len(prices) == len(weather) == len(gate_projections)
+            else None
+        )
         learned_threshold = await get_float_setting("learned_schedule_threshold")
         comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
         tz_name = await get_user_tz()
         comfort_temp_target = await get_float_setting("comfort_temp_target")
         comfort_temp_min = await get_float_setting("comfort_temp_min")
+        comfort_temp_max = await get_float_setting("comfort_temp_max")
 
         if tank_heating_available:
             async with get_session() as session:
@@ -353,9 +377,13 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     current_outdoor_temp,
                     current_water_temp,
                     heat_curve=heat_curve,
+                    gate_projections=gate_projections,
+                    gate_evidence=gate_evidence,
+                    gate_control_enabled=True,
                     comfort_schedule=comfort_schedule,
                     comfort_temp_target=comfort_temp_target,
                     comfort_temp_min=comfort_temp_min,
+                    comfort_temp_max=comfort_temp_max,
                     tz_name=tz_name,
                     weather_full=weather_full,
                     current_zone_target_temp=current_zone_target_temp,
@@ -390,11 +418,13 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     comfort_temp_target,
                     comfort_temp_min,
                     heat_curve=heat_curve,
+                    gate_projections=gate_projections,
                     tz_name=tz_name,
                     weather_full=weather_full,
                     current_zone_target_temp=current_zone_target_temp,
                     current_zone_heat_min=current_zone_heat_min,
                     current_zone_heat_max=current_zone_heat_max,
+                    gate_control_enabled=True,
                 )
             )
 
@@ -421,6 +451,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     special_status_supported=special_status_supported,
                     current_special_status=current_special_status,
                     zone_control_windows=zone_control_windows,
+                    gate_projections=gate_projections,
+                    gate_control_enabled=True,
                 )
             )
 
@@ -431,6 +463,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             actions,
             initial_quiet_level=current_quiet_level,
         )
+        if last_status is not None:
+            for action in actions:
+                action["device_id"] = last_status.device_id
         cost_estimate = await self._estimate_cost(actions, prices)
         forecast_snapshot = self._build_forecast_snapshot(
             prices=prices,
@@ -445,6 +480,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             comfort_temp_target=comfort_temp_target,
             comfort_temp_min=comfort_temp_min,
             tz_name=tz_name,
+            gate_projections=gate_projections,
             control_input={
                 "available": control_temperature.is_usable,
                 "confidence": control_temperature.confidence,
@@ -473,6 +509,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         )
 
         return {
+            "device_id": last_status.device_id if last_status is not None else None,
             "horizon_start": horizon_start,
             "horizon_end": horizon_end,
             "actions": actions,
@@ -494,6 +531,17 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     "compensation_c": outdoor_reading.compensation_c,
                     "fallback_reason": outdoor_reading.fallback_reason,
                 },
+            },
+            "space_heating_gate": {
+                "state": effective_gate.state,
+                "reason": effective_gate.reason_code,
+                "profile_id": effective_gate.profile_id,
+                "base_c": effective_gate.base_c,
+                "on_threshold_c": effective_gate.on_threshold_c,
+                "off_threshold_c": effective_gate.off_threshold_c,
+                "last_raw_outdoor_c": effective_gate.last_raw_outdoor_c,
+                "fingerprint_matches": effective_gate.fingerprint_matches,
+                "projected_states": [evidence.state for evidence in gate_projections],
             },
         }
 
@@ -560,6 +608,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         comfort_temp_target: float,
         comfort_temp_min: float,
         tz_name: str | None,
+        gate_projections: list | None = None,
         control_input: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Freeze the rules engine's own forecast inputs and control scenario.
@@ -690,11 +739,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             # A NORMAL/ECO/QUIET mode is a heat-pump configuration, not an
             # explicit compressor-on command. Only an actual zone-temperature
             # action contributes planned space heat to this rules forecast.
-            heating_fractions.append(
-                explicit_heat_fraction
-                if weather_slot["outdoor_temp"] < heat_curve.heating_off_outdoor_c
-                else 0.0
+            gate_state = (
+                gate_projections[hour].state
+                if gate_projections is not None and hour < len(gate_projections)
+                else None
             )
+            heating_fractions.append(explicit_heat_fraction if gate_state == "ALLOWED" else 0.0)
             target = (
                 comfort_temp_target
                 if is_comfort_hour(comfort_schedule, slot_ts, tz_name=tz_name)
