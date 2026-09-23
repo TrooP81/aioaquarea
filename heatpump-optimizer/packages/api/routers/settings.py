@@ -38,6 +38,7 @@ from packages.core.heat_curve import (
     HeatCurveConfig,
     start_heat_curve_verification,
 )
+from packages.core.space_heating_gate import HeatingGateConfig
 
 router = APIRouter()
 
@@ -107,6 +108,12 @@ async def update_settings(body: SettingsUpdate):
     if errors:
         raise HTTPException(status_code=400, detail={"invalid_values": errors})
 
+    gate_setting_keys = {
+        "heat_curve_heating_off_outdoor_c",
+        "space_heating_gate_on_offset_c",
+        "space_heating_gate_off_offset_c",
+        "space_heating_behavior_profile",
+    }
     heat_curve_changed = any(key in HEAT_CURVE_SETTING_KEYS for key in cleaned)
     previous_curve: HeatCurveConfig | None = None
     applied_curve: HeatCurveConfig | None = None
@@ -119,10 +126,32 @@ async def update_settings(body: SettingsUpdate):
         values.update(cleaned)
         try:
             applied_curve = HeatCurveConfig.from_settings(values)
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    await set_settings_bulk(cleaned)
+    if any(key in gate_setting_keys for key in cleaned) and not heat_curve_changed:
+        values = await get_all_settings()
+        values.update(cleaned)
+        try:
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        await set_settings_bulk(cleaned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if heat_curve_changed and applied_curve is not None:
         async with get_session() as session:

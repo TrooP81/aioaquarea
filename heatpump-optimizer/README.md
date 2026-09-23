@@ -42,7 +42,9 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 1. **Copy environment config:**
    ```bash
    cp .env.example .env
-   # Edit .env with your Panasonic credentials and ENTSO-E token
+   # Edit .env with your Panasonic credentials and ENTSO-E token.
+   # The checked-in contract stays local-only: development mode, API_TOKEN=disabled,
+   # loopback database/API/dashboard ports, and CORS at http://localhost:4444.
    ```
 
 2. **Start all services:**
@@ -51,7 +53,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
    ```
 
 3. **Access the dashboard:**
-   - Web UI: http://localhost:3500
+   - Web UI: http://localhost:4444
    - API docs: http://localhost:8500/docs
 
 ## Configuration
@@ -91,18 +93,18 @@ Settings can be supplied via environment variables (typically through `.env`) an
 |----------|---------|-------------|
 | `SECRET_KEY` | _(insecure default)_ | Required: set to a random string in production (used for HMAC-signed model files) |
 | `API_TOKEN` | `disabled` | Set to a strong token to enable bearer-token auth on `/api/*` |
-| `CORS_ORIGINS` | `http://localhost:3500` | Comma-separated allowed origins |
+| `CORS_ORIGINS` | `http://localhost:4444` | Comma-separated allowed origins |
 | `MODEL_DIR` | `/app/models` | Where ML models are persisted |
 | `LOG_LEVEL` | `INFO` | Standard log level |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | — | Database credentials (used by `docker-compose`) |
 | `REDIS_URL` | `redis://redis:6379/0` | Redis connection string |
-| `DB_PORT` / `API_PORT` / `WEB_PORT` | `5434` / `8500` / `3500` | Host-side port mappings |
+| `DB_PORT` / `API_PORT` / `WEB_PORT` | `5434` / `8500` / `4444` | Loopback-only host-side port mappings |
 
 ## Services
 
 | Service | Default host port | Description |
 |---------|-------------------|-------------|
-| `web` | `WEB_PORT` (3500) | Dashboard UI |
+| `web` | `WEB_PORT` (4444) | Dashboard UI |
 | `api` | `API_PORT` (8500) | REST API + Swagger docs (`/docs`) |
 | `poller` | — | Data collection (device + prices + weather + SmartThings) |
 | `optimizer` | — | Plan generation + action execution |
@@ -118,6 +120,47 @@ Validate the newest archive with the disposable restore verifier:
 ```bash
 docker compose --profile maintenance run --rm backup-verify
 ```
+
+### Local Evidence And Restore Runbook
+
+The checked-in compose configuration is intentionally a local-only, no-token
+contract: `APP_ENVIRONMENT=development`, `API_TOKEN=disabled`, database and API
+on loopback port `5434`/`8500`, dashboard on loopback port `4444`, and CORS limited
+to `http://localhost:4444`. It is not a production deployment recipe.
+
+Render objective, zero-write evidence with the guarded wrapper only:
+
+```bash
+python scripts/render_compose_evidence.py --output compose-evidence.json
+```
+
+The wrapper creates its own empty environment file, supplies it to both Compose
+environment selectors, runs Compose with a sanitized child environment, validates
+the rendered JSON, and writes only the validated evidence projection. It never
+contacts Panasonic or writes to the database. It fails closed when Docker/Compose
+is unavailable or the render contains secret-bearing fields, values, locations, or
+credential-bearing URLs. Share `compose-evidence.json` only after the wrapper
+reports `PASS`.
+
+To recover a local database, first stop the application writers, choose a named
+completed archive directly under `backups/`, and run:
+
+```bash
+scripts/restore_db.sh --production heatpump-YYYYMMDDTHHMMSSZ.dump
+```
+
+The script internally validates the selected archive before requesting the exact
+`RESTORE <archive-name>` confirmation, refuses active API/poller/optimizer/backup/migration writers, uses
+the pinned `backup` and `backup-verify` images for restore tools, checks tables and
+the Alembic revision, then leaves application services stopped. Any failure stops
+the compose services. Test-only restore mode is limited to
+`docker-compose.test.yml`, a unique `restore-db-test-*` project, and a disposable
+`restore_test_*` database; it uses `docker cp` for binary archives and passes the
+test password only through `docker compose exec` child environments.
+
+Use a restore for data recovery, not to downgrade schema or application code. A
+downgrade needs an explicit, reviewed Alembic/image compatibility plan; restore a
+backup only when its schema and the selected application image are known compatible.
 
 Thermal calibration is explicit: use `POST /api/thermal/calibrate` after enough representative operating data exists. It updates model parameters only; it does not send a heat-pump command.
 
@@ -231,14 +274,14 @@ cd web
 # dev server. Fast, deterministic, good for CI. (web/e2e/)
 npm run test:e2e
 
-# Live-stack tests — drive the real running system (web :3500 + API :8500 +
+# Live-stack tests — drive the real running system (web :4444 + API :8500 +
 # DB + optimizer) with NO mocking, asserting real data and physical invariants
 # (e.g. the indoor forecast must drift gradually toward outdoor, never snap).
 # Requires the Docker stack to be up first (`docker compose up -d`). (web/e2e-live/)
 npm run test:e2e:live
 
 # Override targets when not on the default ports:
-#   E2E_BASE_URL=http://host:3500 E2E_API_URL=http://host:8500 npm run test:e2e:live
+#   E2E_BASE_URL=http://host:4444 E2E_API_URL=http://host:8500 npm run test:e2e:live
 ```
 
 

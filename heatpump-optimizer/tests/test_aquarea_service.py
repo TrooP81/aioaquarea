@@ -24,6 +24,29 @@ from packages.core.services.aquarea import (
     PanasonicCachedStatusError,
     PanasonicCommandValidationError,
 )
+from packages.core.resilience import RedisCircuitBreaker
+
+
+class FakeRedis:
+    def __init__(self):
+        self.values = {}
+
+    async def ttl(self, key):
+        return 900 if key in self.values else -2
+
+    async def incr(self, key):
+        self.values[key] = int(self.values.get(key, 0)) + 1
+        return self.values[key]
+
+    async def expire(self, key, seconds):
+        return True
+
+    async def set(self, key, value, ex):
+        self.values[key] = value
+
+    async def delete(self, *keys):
+        for key in keys:
+            self.values.pop(key, None)
 
 
 def _wrapper() -> AquareaWrapper:
@@ -44,6 +67,49 @@ async def test_cached_device_does_not_consume_read_budget() -> None:
 
     wrapper._read_limiter.acquire.assert_not_awaited()
     wrapper._client.get_devices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_breaker_persists_across_wrapper_instances() -> None:
+    redis = FakeRedis()
+    failing_wrapper = _wrapper()
+    failing_wrapper._client.login.side_effect = RuntimeError("invalid credentials")
+    failing_wrapper._redis_circuit_breaker = RedisCircuitBreaker(redis)
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="invalid credentials"):
+            await failing_wrapper._authenticate()
+
+    restarted_wrapper = _wrapper()
+    restarted_wrapper._redis_circuit_breaker = RedisCircuitBreaker(redis)
+
+    with pytest.raises(RuntimeError, match="900s remaining"):
+        await restarted_wrapper._authenticate()
+
+    restarted_wrapper._client.login.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_breaker_uses_memory_when_redis_errors() -> None:
+    class FailingRedis:
+        async def ttl(self, key):
+            raise ConnectionError("redis unavailable")
+
+        async def incr(self, key):
+            raise ConnectionError("redis unavailable")
+
+    wrapper = _wrapper()
+    wrapper._client.login.side_effect = RuntimeError("invalid credentials")
+    wrapper._redis_circuit_breaker = RedisCircuitBreaker(FailingRedis())
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="invalid credentials"):
+            await wrapper._authenticate()
+
+    with pytest.raises(RuntimeError, match="auth disabled temporarily"):
+        await wrapper._authenticate()
+
+    assert wrapper._client.login.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -581,6 +647,25 @@ async def test_zone_temperature_writes_changed_target_once() -> None:
     await wrapper.set_zone_heat_temperature(1, 37)
 
     wrapper._write_limiter.acquire.assert_awaited_once()
+    device.set_temperature.assert_awaited_once_with(37, zone_id=1)
+
+
+@pytest.mark.asyncio
+async def test_zone_temperature_normalizes_zero_based_optimizer_zone_to_panasonic_zone_one() -> (
+    None
+):
+    wrapper = _wrapper()
+    zone = SimpleNamespace(heat_target_temperature=35, heat_min=20, heat_max=65)
+    device = SimpleNamespace(
+        zones={1: zone},
+        status_data_mode=StatusDataMode.LIVE,
+        set_temperature=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    await wrapper.set_zone_heat_temperature(0, 37)
+
     device.set_temperature.assert_awaited_once_with(37, zone_id=1)
 
 

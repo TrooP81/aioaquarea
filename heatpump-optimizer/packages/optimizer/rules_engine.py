@@ -568,7 +568,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 if avg_kwh and avg_kwh > 0:
                     estimated_kwh_per_day = float(avg_kwh)
         except Exception:
-            pass
+            logger.warning("failed to estimate average daily consumption", exc_info=True)
 
         return avg_price * estimated_kwh_per_day
 

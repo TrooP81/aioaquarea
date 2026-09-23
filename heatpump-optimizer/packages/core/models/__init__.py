@@ -33,6 +33,8 @@ class DeviceStatusRecord(Base):
     device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     mode: Mapped[str | None] = mapped_column(String(32))
     operation_status: Mapped[int | None] = mapped_column(Integer)
+    operation_status_present: Mapped[bool | None] = mapped_column(Boolean)
+    operation_status_valid: Mapped[bool | None] = mapped_column(Boolean)
     outdoor_temp: Mapped[float | None] = mapped_column(Float)
     # Effective temperature used by planning/learning is stored above. Keep
     # the physical Aquarea sensor and source separately for diagnostics.
@@ -72,6 +74,27 @@ class DeviceStatusRecord(Base):
     # Tank limits
     tank_heat_max: Mapped[int | None] = mapped_column(Integer)
     tank_heat_min: Mapped[int | None] = mapped_column(Integer)
+
+
+class SpaceHeatingGateRecord(Base):
+    """Last authoritative room-heating eligibility evidence per device."""
+
+    __tablename__ = "space_heating_gate"
+
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_c: Mapped[float] = mapped_column(Float, nullable=False)
+    on_threshold_c: Mapped[float] = mapped_column(Float, nullable=False)
+    off_threshold_c: Mapped[float] = mapped_column(Float, nullable=False)
+    last_raw_outdoor_c: Mapped[float | None] = mapped_column(Float)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_status_ts: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    evaluated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    transitioned_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_evaluation_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_since: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ConsumptionRecord(Base):
@@ -195,6 +218,7 @@ class PlanActionRecord(Base):
     scheduled_ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
     action_type: Mapped[str] = mapped_column(String(64))
     payload_json: Mapped[str] = mapped_column(Text)
+    device_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(24), default="pending")
     executed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     expected_state_json: Mapped[str | None] = mapped_column(Text)

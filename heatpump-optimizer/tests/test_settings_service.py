@@ -1,6 +1,8 @@
 """Tests for settings_service pure functions."""
 
 import datetime as dt
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -124,6 +126,39 @@ class TestLearningModeSettings:
 
     def test_learning_mode_since_defaults_empty(self):
         assert SETTING_SPECS["learning_mode_since"].default == ""
+
+
+class TestBoolSettings:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("key", "stored_value", "expected"),
+        [
+            ("smartthings_enabled", None, False),
+            ("smartthings_enabled", "false", False),
+            ("smartthings_enabled", "true", True),
+            ("use_comfort_model", None, False),
+            ("use_comfort_model", "false", False),
+            ("use_comfort_model", "true", True),
+            ("smartthings_enabled", "garbage", False),
+            ("use_comfort_model", "garbage", False),
+            ("learning_mode_enabled", "false", False),
+            ("learning_mode_enabled", "true", True),
+        ],
+    )
+    async def test_get_bool_setting_parses_stored_and_default_values(
+        self, key, stored_value, expected
+    ):
+        from packages.core.settings_service import get_bool_setting
+
+        record = SimpleNamespace(key=key, value=stored_value) if stored_value is not None else None
+        session = AsyncMock()
+        session.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: record)
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("packages.core.settings_service.get_session", return_value=context):
+            assert await get_bool_setting(key) is expected
 
 
 class TestValidateSettingValue:

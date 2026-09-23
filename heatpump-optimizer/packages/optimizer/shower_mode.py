@@ -61,6 +61,7 @@ class ShowerDetector:
         result = await session.execute(
             select(DeviceStatusRecord)
             .where(DeviceStatusRecord.ts < current.ts)
+            .where(DeviceStatusRecord.device_id == current.device_id)
             .order_by(DeviceStatusRecord.ts.desc())
             .limit(1)
         )
@@ -138,6 +139,7 @@ class ShowerDetector:
                     "reason": f"tank_drop_{drop:.1f}C_in_{elapsed_minutes:.0f}min",
                 }
             ),
+            device_id=current.device_id,
             status="pending",
         )
         session.add(action)
@@ -180,7 +182,7 @@ class ShowerDetector:
             event.status = "timeout"
             event.recovered_at = current.ts
             if current.force_dhw != 0:
-                await self._inject_dhw_off(session, "timeout")
+                await self._inject_dhw_off(session, "timeout", current.device_id)
             logger.warning(
                 "shower_mode_timeout",
                 elapsed_min=elapsed,
@@ -193,14 +195,14 @@ class ShowerDetector:
             event.status = "recovered"
             event.recovered_at = current.ts
             if current.force_dhw != 0:
-                await self._inject_dhw_off(session, "recovered")
+                await self._inject_dhw_off(session, "recovered", current.device_id)
             logger.info(
                 "shower_mode_recovered",
                 tank_temp=current.tank_temp,
                 target=event.pre_shower_temp,
             )
 
-    async def _inject_dhw_off(self, session: AsyncSession, reason: str) -> None:
+    async def _inject_dhw_off(self, session: AsyncSession, reason: str, device_id: str) -> None:
         """Inject a force_dhw_off action to end the shower boost."""
         now = dt.datetime.now(dt.timezone.utc)
         plan = PlanRecord(
@@ -220,6 +222,7 @@ class ShowerDetector:
             scheduled_ts=now,
             action_type=str(ActionType.FORCE_DHW_OFF),
             payload_json=json.dumps({"trigger": "shower_mode", "reason": reason}),
+            device_id=device_id,
             status="pending",
         )
         session.add(action)

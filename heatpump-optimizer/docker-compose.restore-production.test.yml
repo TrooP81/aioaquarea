@@ -1,0 +1,46 @@
+# Canonical, isolated target for opt-in coverage of restore_db.sh --production.
+services:
+  db:
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
+    environment:
+      POSTGRES_USER: restore_test
+      POSTGRES_PASSWORD: restore_test
+      POSTGRES_DB: ${POSTGRES_DB:?set a disposable restore_production_test_ database name}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restore_test -d ${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    environment: &postgres_environment
+      PGHOST: db
+      PGUSER: restore_test
+      PGPASSWORD: restore_test
+      PGDATABASE: ${POSTGRES_DB:?set a disposable restore_production_test_ database name}
+    volumes:
+      - ${RESTORE_PRODUCTION_TEST_BACKUP_DIR:?set a temporary backup directory}:/backups
+
+  backup-verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    environment: *postgres_environment
+    volumes:
+      - ${RESTORE_PRODUCTION_TEST_BACKUP_DIR:?set a temporary backup directory}:/backups
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: heatpump-optimizer/Dockerfile
+      target: base
+    environment:
+      DATABASE_URL: postgresql+asyncpg://restore_test:restore_test@db:5432/${POSTGRES_DB:?set a disposable restore_production_test_ database name}
+      APP_ENVIRONMENT: testing
+      API_TOKEN: disabled
+      CORS_ORIGINS: http://localhost:4444

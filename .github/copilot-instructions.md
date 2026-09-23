@@ -28,7 +28,7 @@ Key pattern: `TYPE_CHECKING` imports are used throughout to avoid circular depen
 
 ### heatpump-optimizer
 
-- **`packages/core/`** – Config (`pydantic-settings`), database (async SQLAlchemy 2.0), domain models, `settings_service.py` (runtime-editable settings persisted to DB), `log_sink.py` (structlog → DB), and `services/` (`AquareaWrapper` in `services/__init__.py` with rate limiting + circuit breaker, plus token persistence in Redis).
+- **`packages/core/`** – Config (`pydantic-settings`), database (async SQLAlchemy 2.0), domain models, `settings_service.py` (runtime-editable settings persisted to DB), `log_sink.py` (structlog → DB), and `services/` (`AquareaWrapper` in `services/__init__.py` with rate limiting + circuit breaker, plus circuit-breaker state persisted in Redis).
 - **`packages/api/`** – FastAPI application. Single-file API (`main.py`, ~50 routes) with no router separation — all routes are flat on `app`. Global auth via `dependencies=[Depends(require_auth)]` on the `FastAPI(...)` constructor. `auth.py` defines the `require_auth` dependency (bearer token gated by `API_TOKEN`).
 - **`packages/optimizer/`** – Dual-layer optimization: `rules.py` (v3, deterministic) and `milp.py` (PuLP/CBC). MILP always falls back to rules on error. `executor.py` dispatches plan actions with verification delay and override checks. `shower_mode.py` handles temporary DHW boost. `data_access.py` reads inputs (prices, status, weather). The package `__init__.py` defines the `Optimizer` Protocol (`generate_plan() -> dict | None`) and three exception types (`InfeasibleError`, `DataIncompleteError`, `SolverTimeoutError`).
 - **`packages/ml/`** – ML models for COP prediction and demand forecasting (scikit-learn/LightGBM). Model files use HMAC-signed pickle via `safe_persistence.py` — changing `SECRET_KEY` invalidates saved models.
@@ -41,7 +41,7 @@ Key pattern: `TYPE_CHECKING` imports are used throughout to avoid circular depen
 ### aioaquarea library
 
 ```bash
-# Install dev dependencies (Pipfile pins python_version = 3.10, but project requires-python = ">=3.9")
+# Install dev dependencies (Pipfile and project both require Python 3.10+)
 pipenv install --dev
 
 # Lint
@@ -100,7 +100,7 @@ E2E backend tests require a separate test database (Postgres on port 5433, Redis
 
 ## Key Conventions
 
-- Python 3.9+ for `aioaquarea`, Python 3.11+ for `heatpump-optimizer`.
+- Python 3.10+ for `aioaquarea`, Python 3.11+ for `heatpump-optimizer`.
 - `from __future__ import annotations` is used consistently throughout both projects.
 - All IO is async (`aiohttp` in the library, `httpx`/`asyncpg` in the optimizer).
 - Formatting: `black` + `isort` (profile: black) for the library; `ruff` (line-length 100, target py311) for the optimizer.
@@ -114,6 +114,6 @@ E2E backend tests require a separate test database (Postgres on port 5433, Redis
 - Tests use `asyncio_mode = "auto"` so `@pytest.mark.asyncio` is usually not needed. Tests are class-based (e.g., `class TestRulesOptimizer`) with inline `@pytest.fixture` data helpers.
 - DB access in the optimizer uses `async with get_session() as session:` which auto-commits on success and auto-rollbacks on exception.
 - Runtime-editable settings live in the DB and are read via `packages.core.settings_service` (`get_setting`, `set_setting`, `get_all_settings`). UI changes via `PUT /api/settings` take precedence over `.env` defaults — when adding a new tunable, register it in `SETTINGS_SCHEMA`.
-- Default host ports are non-standard: web `3500`, API `8500`, Postgres `5434` (test DB `5433`, test Redis `6380`). Don't hardcode `localhost:8000` / `5432`.
+- Default host ports are non-standard: web `4444`, API `8500`, Postgres `5434` (test DB `5433`, test Redis `6380`). Don't hardcode `localhost:8000` / `5432`.
 - The web frontend reaches the API via Next.js rewrites (`/api/*` → API service); never hardcode the API origin in client code.
 - `AquareaWrapper.start()` must be called before any device call; it creates the `aiohttp.ClientSession`, opens Redis, and authenticates. Always pair with `stop()` on shutdown.

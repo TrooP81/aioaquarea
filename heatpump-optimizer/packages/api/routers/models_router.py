@@ -18,6 +18,7 @@ from packages.core.models import (
     IndoorTempReading,
     PlanActionRecord,
     PriceRecord,
+    SpaceHeatingGateRecord,
     WeatherRecord,
 )
 from packages.ml.forecast_quality import get_forecast_scorecard as build_forecast_scorecard
@@ -697,10 +698,13 @@ async def get_heat_curve_advice():
         get_float_setting,
         get_heat_curve_config,
         get_heat_curve_verification_state,
+        get_space_heating_gate_config,
         set_heat_curve_verification_state,
     )
+    from packages.core.space_heating_gate import resolve_effective_gate
 
     heat_curve = await get_heat_curve_config()
+    gate_config = await get_space_heating_gate_config()
     comfort_target = await get_float_setting("comfort_temp_target")
     verification_state = await get_heat_curve_verification_state()
     now = dt.datetime.now(dt.timezone.utc)
@@ -718,6 +722,17 @@ async def get_heat_curve_advice():
                 .limit(1)
             )
         ).scalar()
+        gate_row = (
+            (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == status.device_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if status is not None
+            else None
+        )
 
         # The first deployment of this feature may happen just after a user
         # saved a curve. Recover a recent matching audit entry so that change
@@ -857,6 +872,20 @@ async def get_heat_curve_advice():
             outdoor_temp < heat_curve.heating_off_outdoor_c if outdoor_temp is not None else None
         ),
     }
+    gate_evidence = resolve_effective_gate(gate_row, gate_config)
+    advice = heat_curve_advice(
+        heat_curve,
+        float(indoor_temp) if indoor_temp is not None else None,
+        comfort_target,
+        outdoor_temp,
+        gate_evidence,
+    )
+    if gate_evidence.state != "ALLOWED":
+        return {
+            **advice,
+            "readings": readings,
+            "verification": verification,
+        }
     if not verification["recommendation_available"]:
         return {
             "status": "verification_pending",
@@ -870,12 +899,6 @@ async def get_heat_curve_advice():
             "readings": readings,
             "verification": verification,
         }
-    advice = heat_curve_advice(
-        heat_curve,
-        float(indoor_temp) if indoor_temp is not None else None,
-        comfort_target,
-        outdoor_temp,
-    )
     return {
         **advice,
         "readings": readings,
@@ -890,6 +913,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     from packages.core.settings_service import (
         get_comfort_schedule,
         get_heat_curve_config,
+        get_space_heating_gate_config,
         get_setting,
         get_user_tz,
         is_comfort_hour,
@@ -905,6 +929,17 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         status = status_result.scalar_one_or_none()
 
         control_temperature = await get_control_temperature(session=session)
+        gate_row = (
+            (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == status.device_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if status is not None
+            else None
+        )
 
         now = dt.datetime.now(dt.timezone.utc)
         hour_start = now.replace(minute=0, second=0, microsecond=0)
@@ -992,6 +1027,28 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             )
 
     heat_curve = await get_heat_curve_config()
+    from packages.core.space_heating_gate import project_gate_states, resolve_effective_gate
+
+    gate_config = await get_space_heating_gate_config()
+    effective_gate = resolve_effective_gate(gate_row, gate_config)
+    gate_projections = project_gate_states(
+        effective_gate,
+        [row["outdoor_temp"] for row in weather_forecast],
+        gate_config,
+    )
+    gate_payload = {
+        "state": effective_gate.state,
+        "reason": effective_gate.reason_code,
+        "profile_id": effective_gate.profile_id,
+        "on_operator": effective_gate.on_operator,
+        "off_operator": effective_gate.off_operator,
+        "base_c": effective_gate.base_c,
+        "on_threshold_c": effective_gate.on_threshold_c,
+        "off_threshold_c": effective_gate.off_threshold_c,
+        "last_raw_outdoor_c": effective_gate.last_raw_outdoor_c,
+        "fingerprint_matches": effective_gate.fingerprint_matches,
+        "projected_states": [evidence.state for evidence in gate_projections],
+    }
     # In the no-plan fallback, use the same outdoor-to-supply curve that the
     # Panasonic controller is set to, rather than freezing today's zone reading
     # across the whole forecast horizon.
@@ -1071,6 +1128,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             weather=snapshot_weather,
             planned_actions=planned_actions,
             heat_curve=heat_curve,
+            gate_projections=gate_projections,
             forecast_status=plan_snapshot.get("forecast_status", "available"),
         )
         return {
@@ -1101,6 +1159,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "plan_age_seconds": plan_age_seconds,
             "sensor_age_seconds": sensor_age_seconds,
             "current_vs_plan_delta_c": current_vs_plan_delta_c,
+            "space_heating_gate": gate_payload,
         }
 
     if current_indoor is None:
@@ -1219,6 +1278,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             weather=weather_forecast,
             planned_actions=planned_actions,
             heat_curve=heat_curve,
+            gate_projections=gate_projections,
         ),
         "forecast_provenance": {
             "current_live_indoor_c": current_indoor,
@@ -1244,6 +1304,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             if control_temperature.latest_reading is not None
             else None
         ),
+        "space_heating_gate": gate_payload,
     }
 
 

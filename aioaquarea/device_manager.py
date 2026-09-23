@@ -33,16 +33,34 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-def _coerce_operation_status(value: object) -> OperationStatus:
+def _coerce_operation_status(value: object) -> tuple[OperationStatus, bool]:
     """Safely map a raw ``operationStatus`` value to :class:`OperationStatus`.
 
     Falls back to ``OFF`` when the field is missing or holds an unexpected value
     instead of raising, so a single unfamiliar payload never breaks a refresh.
     """
     try:
-        return OperationStatus(value)
+        return OperationStatus(value), True
     except (ValueError, TypeError):
-        return OperationStatus.OFF
+        return OperationStatus.OFF, False
+
+
+def _coerce_device_direction(value: object) -> DeviceDirection:
+    """Safely map a raw ``direction`` value to :class:`DeviceDirection`."""
+    try:
+        return DeviceDirection(value)
+    except (ValueError, TypeError):
+        _LOGGER.warning("Unknown device direction %r; using IDLE", value)
+        return DeviceDirection.IDLE
+
+
+def _coerce_pump_duty(value: object) -> PumpDuty:
+    """Safely map a raw ``pumpDuty`` value to :class:`PumpDuty`."""
+    try:
+        return PumpDuty(value)
+    except (ValueError, TypeError):
+        _LOGGER.warning("Unknown pump duty %r; using OFF", value)
+        return PumpDuty.OFF
 
 
 def _parse_special_status(value: object) -> SpecialStatus | None:
@@ -75,14 +93,12 @@ class DeviceManager:
         self._logger = logger
         self._groups = None
         self._devices: list[DeviceInfo] | None = None
-        self._unknown_devices: list[DeviceInfo] = []
         self._device_indexer = {}
 
     async def get_devices(self) -> list[DeviceInfo]:
         """Get list of devices and its configuration, without status."""
         if self._devices is None:
             self._devices = []
-            self._unknown_devices = []
             # Assuming self._client.request can be called directly or passed through
             # and BASE_PATH_ACC is accessible.
             # This part needs to be carefully integrated with the actual Client class.
@@ -102,7 +118,16 @@ class DeviceManager:
                         device_list = group.get("deviceIdList", [])
 
                     for device_raw in device_list:
-                        if device_raw and device_raw.get("deviceType") == "2":
+                        if isinstance(device_raw, str):
+                            device_raw = {"deviceGuid": device_raw}
+                            is_bare_guid = True
+                        else:
+                            is_bare_guid = False
+                        if not isinstance(device_raw, dict):
+                            continue
+                        if device_raw and (
+                            device_raw.get("deviceType") == "2" or is_bare_guid
+                        ):
                             _LOGGER.info(f"Raw device response: {device_raw}")
                             device_id = device_raw.get("deviceGuid")
                             device_name = device_raw.get("deviceName", "Unknown Device")
@@ -162,7 +187,7 @@ class DeviceManager:
                             )
                             self._device_indexer[device_id] = device_id
                             self._devices.append(device_info)
-        return self._devices + self._unknown_devices
+        return list(self._devices)
 
     async def get_device_status(
         self, device_info: DeviceInfo, allow_cached_fallback: bool = True
@@ -240,10 +265,14 @@ class DeviceManager:
 
         device = json_response.get("status")
         operation_mode_value = device.get("operationMode")
+        raw_operation_status = device.get("operationStatus")
+        operation_status, operation_status_valid = _coerce_operation_status(
+            raw_operation_status
+        )
 
         device_status = DeviceStatus(
             long_id=device_info.device_id,  # Use device_info.long_id here
-            operation_status=_coerce_operation_status(device.get("operationStatus")),
+            operation_status=operation_status,
             device_status=DeviceModeStatus(device.get("deiceStatus")),
             temperature_outdoor=device.get("outdoorNow"),
             operation_mode=(
@@ -255,8 +284,8 @@ class DeviceManager:
                 FaultError(fault_status["errorMessage"], fault_status["errorCode"])
                 for fault_status in device.get("faultStatus", [])
             ],
-            direction=DeviceDirection(device.get("direction")),
-            pump_duty=PumpDuty(device.get("pumpDuty")),
+            direction=_coerce_device_direction(device.get("direction")),
+            pump_duty=_coerce_pump_duty(device.get("pumpDuty")),
             tank_status=(
                 [
                     TankStatus(
@@ -299,6 +328,8 @@ class DeviceManager:
             holiday_timer=HolidayTimer(device.get("holidayTimer", 0)),
             powerful_time=PowerfulTime(device.get("powerful", 0)),
             special_status=_parse_special_status(device.get("specialStatus")),
+            operation_status_present="operationStatus" in device,
+            operation_status_valid=operation_status_valid,
             status_data_mode=status_data_mode,
         )
 

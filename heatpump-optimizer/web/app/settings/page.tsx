@@ -51,6 +51,8 @@ const FIELD_RULES: Record<string, FieldRule> = {
   heat_curve_supply_warm_c: { label: "Supply temperature at warm point", unit: "°C", min: 20, max: 65, step: 1, inputType: "number" },
   heat_curve_heating_off_outdoor_c: { label: "Heating-off outdoor cutoff", unit: "°C", min: 5, max: 30, step: 0.5, inputType: "number" },
   heat_curve_delta_t_c: { label: "Controller ΔT", unit: "°C", min: 1, max: 15, step: 1, inputType: "number" },
+  space_heating_gate_on_offset_c: { label: "Gate ON offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
+  space_heating_gate_off_offset_c: { label: "Gate OFF offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
   quiet_mode_start: { label: "Quiet mode starts", unit: "hour", min: 0, max: 23, step: 1, inputType: "number" },
   quiet_mode_end: { label: "Quiet mode ends", unit: "hour", min: 0, max: 23, step: 1, inputType: "number" },
   latitude: { label: "Latitude", unit: "°", min: -90, max: 90, step: 0.0001, inputType: "number" },
@@ -77,7 +79,7 @@ const SETTINGS_TABS = [
     id: "optimizer",
     label: "Optimizer",
     description: "Planning rules, comfort targets, and automatic learning",
-    groups: ["Optimizer Layer", "Optimizer Constraints", "Controller Heat Curve", "Quiet Mode", "Price Sensitivity", "Adaptive Learning", "Seasonal Learning", "Comfort Model", "Shower Mode"],
+    groups: ["Optimizer Layer", "Optimizer Constraints", "Controller Heat Curve", "Space Heating Gate", "Quiet Mode", "Price Sensitivity", "Adaptive Learning", "Seasonal Learning", "Comfort Model", "Shower Mode"],
   },
   {
     id: "data",
@@ -159,6 +161,11 @@ const SETTING_GROUPS = [
       "heat_curve_heating_off_outdoor_c",
       "heat_curve_delta_t_c",
     ],
+  },
+  {
+    title: "Space Heating Gate",
+    description: "Recorded profile and hysteresis offsets used to decide whether room-heating increases are eligible.",
+    keys: ["space_heating_behavior_profile", "space_heating_gate_on_offset_c", "space_heating_gate_off_offset_c"],
   },
   {
     title: "Quiet Mode",

@@ -6,9 +6,10 @@ from fastapi import APIRouter
 
 from packages.api._helpers import get_price_area
 from packages.core.database import get_session
-from packages.core.models import ConsumptionRecord, DeviceStatusRecord, PriceRecord, WeatherRecord
+from packages.core.models import ConsumptionRecord, PriceRecord, WeatherRecord
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
-from packages.core.panasonic_special_status import optimizer_special_status_supported
+from packages.core.device_status_snapshot import build_device_status_record
+from packages.core.device_status_ingestion import ingest_device_status
 
 router = APIRouter()
 
@@ -47,61 +48,18 @@ async def poll_now():
                     )
                     await device.refresh_data()
 
-                    zones = device.zones
-                    zone1 = zones.get(1)
-                    zone2 = zones.get(2)
-                    direction = device.current_direction.name
                     device_action = device.current_action.name
-                    defrost_active = device.device_mode_status.name == "DEFROST"
                     raw_outdoor_temp = device.temperature_outdoor
+                    record = build_device_status_record(device)
+
                     async with get_session() as db:
                         outdoor = await resolve_outdoor_temperature(
-                            db,
-                            heat_pump_c=raw_outdoor_temp,
+                            db, heat_pump_c=raw_outdoor_temp
                         )
-
-                    record = DeviceStatusRecord(
-                        ts=dt.datetime.now(dt.timezone.utc),
-                        device_id=device.long_id,
-                        mode=str(device.mode),
-                        operation_status=device.operation_status.value,
-                        outdoor_temp=outdoor.effective_c,
-                        heat_pump_outdoor_temp=outdoor.heat_pump_c,
-                        outdoor_temp_source=outdoor.source,
-                        tank_temp=device.tank.temperature if device.tank else None,
-                        tank_target_temp=device.tank.target_temperature if device.tank else None,
-                        tank_operation_status=device.tank.operation_status.value
-                        if device.tank
-                        else None,
-                        zone1_temp=zone1.temperature if zone1 else None,
-                        zone1_target_temp=zone1.heat_target_temperature if zone1 else None,
-                        zone1_heat_min=zone1.heat_min if zone1 else None,
-                        zone1_heat_max=zone1.heat_max if zone1 else None,
-                        zone2_temp=zone2.temperature if zone2 else None,
-                        zone2_target_temp=zone2.heat_target_temperature if zone2 else None,
-                        zone2_heat_min=zone2.heat_min if zone2 else None,
-                        zone2_heat_max=zone2.heat_max if zone2 else None,
-                        quiet_mode=device.quiet_mode.value,
-                        powerful_mode=device.powerful_time.value,
-                        special_status=device.special_status.value
-                        if device.special_status
-                        else None,
-                        special_status_supported=optimizer_special_status_supported(device),
-                        direction=direction,
-                        pump_duty=device.pump_duty,
-                        device_action=device_action,
-                        defrost_active=defrost_active,
-                        force_dhw=device.force_dhw.value,
-                        force_heater=device.force_heater.value,
-                        holiday_mode=device.holiday_timer.value,
-                        zone1_operation_status=zone1.operation_status.value if zone1 else None,
-                        zone2_operation_status=zone2.operation_status.value if zone2 else None,
-                        tank_heat_max=device.tank.heat_max if device.tank else None,
-                        tank_heat_min=device.tank.heat_min if device.tank else None,
-                    )
-
-                    async with get_session() as db:
-                        db.add(record)
+                        record.outdoor_temp = outdoor.effective_c
+                        record.heat_pump_outdoor_temp = outdoor.heat_pump_c
+                        record.outdoor_temp_source = outdoor.source
+                        await ingest_device_status(db, record)
 
                     from aioaquarea.statistics import ConsumptionType
 

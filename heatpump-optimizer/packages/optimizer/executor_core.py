@@ -22,10 +22,14 @@ from packages.core.models import (
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
+    SpaceHeatingGateRecord,
 )
 from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS
 from packages.core.services import AquareaWrapper
+from packages.core.settings_service import get_space_heating_gate_config
+from packages.core.space_heating_gate import SpaceHeatingGateState, resolve_effective_gate
 from packages.optimizer.actions import ActionType, VerifyResult, get_action_handler
+from packages.optimizer.executor_gate import is_room_heating_increase
 
 logger = structlog.get_logger()
 
@@ -73,15 +77,25 @@ async def is_learning_mode_active() -> bool:
 class PlanExecutor:
     """Executes pending plan actions respecting overrides and rate limits."""
 
-    def __init__(self, wrapper: AquareaWrapper):
+    def __init__(
+        self,
+        wrapper: AquareaWrapper,
+        *,
+        session_factory=get_session,
+        sleep=asyncio.sleep,
+        learning_check=is_learning_mode_active,
+    ):
         self._wrapper = wrapper
+        self._session_factory = session_factory
+        self._sleep = sleep
+        self._learning_check = learning_check
 
     async def execute_due_actions(self) -> None:
         """Find and execute all actions whose scheduled time has passed."""
         actions: list[PlanActionRecord] = []
         now = dt.datetime.now(dt.timezone.utc)
 
-        async with get_session() as session:
+        async with self._session_factory() as session:
             override_result = await session.execute(
                 select(OverrideRecord).where(
                     and_(
@@ -112,48 +126,6 @@ class PlanExecutor:
             actions = result.scalars().all()
 
             if actions:
-                latest_status_ts = (
-                    await session.execute(
-                        select(DeviceStatusRecord.ts)
-                        .order_by(DeviceStatusRecord.ts.desc())
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                freshness_cutoff = _device_status_freshness_cutoff(now)
-                if latest_status_ts is None or latest_status_ts < freshness_cutoff:
-                    age_seconds = (
-                        None
-                        if latest_status_ts is None
-                        else round((now - latest_status_ts).total_seconds())
-                    )
-                    logger.warning(
-                        "executor_device_status_stale",
-                        action_count=len(actions),
-                        latest_status=latest_status_ts.isoformat() if latest_status_ts else None,
-                        age_seconds=age_seconds,
-                    )
-                    for action in actions:
-                        await session.execute(
-                            update(PlanActionRecord)
-                            .where(PlanActionRecord.id == action.id)
-                            .where(PlanActionRecord.status == "pending")
-                            .values(
-                                status="skipped",
-                                executed_at=now,
-                                result_json=json.dumps(
-                                    {
-                                        "reason": "device_status_stale",
-                                        "detail": "Automatic command not sent because live pump status was stale",
-                                        "latest_status": latest_status_ts.isoformat()
-                                        if latest_status_ts
-                                        else None,
-                                    }
-                                ),
-                            )
-                        )
-                    return
-
-            if actions:
                 await session.execute(
                     update(PlanActionRecord)
                     .where(
@@ -165,7 +137,7 @@ class PlanExecutor:
                     .values(status="executing")
                 )
 
-            if await is_learning_mode_active():
+            if await self._learning_check():
                 logger.info(
                     "executor_learning_mode_active",
                     reason="observe-only training mode",
@@ -231,7 +203,7 @@ class PlanExecutor:
         action_by_id = {action.id: action for action in claimed_actions}
         now = dt.datetime.now(dt.timezone.utc)
 
-        async with get_session() as session:
+        async with self._session_factory() as session:
             executing_result = await session.execute(
                 select(PlanActionRecord.id).where(
                     and_(
@@ -268,7 +240,7 @@ class PlanExecutor:
                 action = action_by_id.get(action_id)
                 if action is None:
                     continue
-                add_result = session.add(
+                session.add(
                     AuditLogRecord(
                         actor="optimizer",
                         action=action.action_type,
@@ -276,14 +248,16 @@ class PlanExecutor:
                         result="cancelled",
                     )
                 )
-                if asyncio.iscoroutine(add_result):
-                    await add_result
 
     async def _execute_action(self, action: PlanActionRecord) -> None:
         """Execute a single action, then synchronously verify it."""
         try:
             payload = json.loads(action.payload_json) if action.payload_json else {}
             action_type = ActionType(action.action_type)
+            precondition = await self._dispatch_precondition(action, action_type, payload)
+            if precondition is not None:
+                await self._skip_action(action, precondition)
+                return
             handler = get_action_handler(action_type)
 
             expected_state = await handler.dispatch(self._wrapper, payload) or {}
@@ -298,7 +272,7 @@ class PlanExecutor:
                         if key not in {"skip", "reason"}
                     },
                 }
-                async with get_session() as session:
+                async with self._session_factory() as session:
                     await session.execute(
                         update(PlanActionRecord)
                         .where(PlanActionRecord.id == action.id)
@@ -317,7 +291,7 @@ class PlanExecutor:
                 )
                 return
 
-            async with get_session() as session:
+            async with self._session_factory() as session:
                 await session.execute(
                     update(PlanActionRecord)
                     .where(PlanActionRecord.id == action.id)
@@ -354,7 +328,7 @@ class PlanExecutor:
             logger.error(
                 "action_failed", action_type=action.action_type, action_id=action.id, error=str(exc)
             )
-            async with get_session() as session:
+            async with self._session_factory() as session:
                 await session.execute(
                     update(PlanActionRecord)
                     .where(PlanActionRecord.id == action.id)
@@ -365,6 +339,79 @@ class PlanExecutor:
                     )
                 )
 
+    async def _skip_action(self, action: PlanActionRecord, result: dict[str, object]) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="skipped",
+                    executed_at=dt.datetime.now(dt.timezone.utc),
+                    result_json=json.dumps(result),
+                )
+            )
+
+    async def _dispatch_precondition(
+        self, action, action_type, payload
+    ) -> dict[str, object] | None:
+        try:
+            selected_device_id = await self._wrapper.get_selected_device_id()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return {"reason": "action_device_unresolvable", "identity_error": type(exc).__name__}
+        if action.device_id and action.device_id != selected_device_id:
+            return {"reason": "action_device_unresolvable", "device_id": action.device_id}
+        cutoff = _device_status_freshness_cutoff(dt.datetime.now(dt.timezone.utc))
+        async with self._session_factory() as session:
+            status = (
+                await session.execute(
+                    select(DeviceStatusRecord)
+                    .where(
+                        DeviceStatusRecord.device_id == selected_device_id,
+                        DeviceStatusRecord.ts >= cutoff,
+                    )
+                    .order_by(DeviceStatusRecord.ts.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if status is None:
+                return {"reason": "device_status_stale", "device_id": selected_device_id}
+            if action.device_id is None:
+                fresh_ids = (
+                    (
+                        await session.execute(
+                            select(DeviceStatusRecord.device_id)
+                            .where(DeviceStatusRecord.ts >= cutoff)
+                            .distinct()
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if set(fresh_ids) != {selected_device_id}:
+                    return {"reason": "action_device_unresolvable", "device_id": selected_device_id}
+            if not is_room_heating_increase(action_type, payload, status):
+                return None
+            gate_row = (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == selected_device_id
+                    )
+                )
+            ).scalar_one_or_none()
+        evidence = resolve_effective_gate(gate_row, await get_space_heating_gate_config())
+        if evidence.state is not SpaceHeatingGateState.ALLOWED:
+            return {
+                "reason": "space_heating_gate_blocked"
+                if evidence.state is SpaceHeatingGateState.BLOCKED
+                else "space_heating_gate_unknown",
+                "device_id": selected_device_id,
+                "profile_id": evidence.profile_id,
+                "gate_reason": evidence.reason_code,
+            }
+        return None
+
     async def _mark_cancelled(self, action: PlanActionRecord) -> None:
         """Reconcile in-flight cancellation so dispatched actions do not get stranded."""
         now = dt.datetime.now(dt.timezone.utc)
@@ -374,7 +421,7 @@ class PlanExecutor:
             payload_json=action.payload_json,
             result="cancelled",
         )
-        async with get_session() as session:
+        async with self._session_factory() as session:
             await session.execute(
                 update(PlanActionRecord)
                 .where(PlanActionRecord.id == action.id)
@@ -389,9 +436,7 @@ class PlanExecutor:
                     ),
                 )
             )
-            add_result = session.add(audit_record)
-            if asyncio.iscoroutine(add_result):
-                await add_result
+            session.add(audit_record)
 
     async def _verify_with_retry(
         self,
@@ -453,12 +498,12 @@ class PlanExecutor:
                 return result, attempts
             if asyncio.get_running_loop().time() >= deadline:
                 return result, attempts
-            await asyncio.sleep(VERIFY_POLL_INTERVAL_S)
+            await self._sleep(VERIFY_POLL_INTERVAL_S)
 
     async def _store_verification_progress(
         self, action_id: int, attempts: int, result: VerifyResult
     ) -> None:
-        async with get_session() as session:
+        async with self._session_factory() as session:
             await session.execute(
                 update(PlanActionRecord)
                 .where(PlanActionRecord.id == action_id)
@@ -478,7 +523,7 @@ class PlanExecutor:
             payload_json=action.payload_json,
             result="success",
         )
-        async with get_session() as session:
+        async with self._session_factory() as session:
             await session.execute(
                 update(PlanActionRecord)
                 .where(PlanActionRecord.id == action.id)
@@ -490,9 +535,7 @@ class PlanExecutor:
                     result_json=json.dumps({"success": True, "verified": True}),
                 )
             )
-            add_result = session.add(audit_record)
-            if asyncio.iscoroutine(add_result):
-                await add_result
+            session.add(audit_record)
         logger.info(
             "action_verified",
             action_type=action.action_type,
@@ -510,7 +553,7 @@ class PlanExecutor:
             payload_json=action.payload_json,
             result="failed",
         )
-        async with get_session() as session:
+        async with self._session_factory() as session:
             await session.execute(
                 update(PlanActionRecord)
                 .where(PlanActionRecord.id == action.id)
@@ -530,9 +573,7 @@ class PlanExecutor:
                     ),
                 )
             )
-            add_result = session.add(audit_record)
-            if asyncio.iscoroutine(add_result):
-                await add_result
+            session.add(audit_record)
         logger.error(
             "action_verification_failed",
             action_type=action.action_type,
@@ -554,7 +595,7 @@ class PlanExecutor:
         now = dt.datetime.now(dt.timezone.utc)
         cutoff = now - dt.timedelta(minutes=2)
 
-        async with get_session() as session:
+        async with self._session_factory() as session:
             result = await session.execute(
                 select(PlanActionRecord)
                 .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)

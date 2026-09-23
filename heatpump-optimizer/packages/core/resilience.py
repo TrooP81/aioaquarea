@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -69,3 +70,38 @@ class CircuitBreaker:
     def record_success(self) -> None:
         self._failure_count = 0
         self._open = False
+
+
+class RedisCircuitBreaker:
+    """Persist authentication circuit-breaker state across process restarts."""
+
+    def __init__(
+        self,
+        client: Any,
+        failure_threshold: int = 3,
+        recovery_timeout: int = 900,
+        key_prefix: str = "heatpump:aquarea:auth_breaker",
+    ) -> None:
+        self._client = client
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._failures_key = f"{key_prefix}:failures"
+        self._open_key = f"{key_prefix}:open"
+
+    async def is_open(self) -> int:
+        """Return remaining cooldown seconds, or zero when login is allowed."""
+        return max(0, int(await self._client.ttl(self._open_key)))
+
+    async def record_failure(self) -> None:
+        failures = int(await self._client.incr(self._failures_key))
+        await self._client.expire(self._failures_key, self._recovery_timeout)
+        if failures >= self._failure_threshold:
+            await self._client.set(self._open_key, "1", ex=self._recovery_timeout)
+            logger.error(
+                "Redis circuit breaker OPEN after %s failures. Will retry in %ss",
+                failures,
+                self._recovery_timeout,
+            )
+
+    async def record_success(self) -> None:
+        await self._client.delete(self._failures_key, self._open_key)

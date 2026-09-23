@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from packages.core.config import settings as env_settings
 from packages.core.database import get_session
-from packages.core.heat_curve import HeatCurveConfig
+from packages.core.heat_curve import HEAT_CURVE_SETTING_KEYS, HeatCurveConfig
+from packages.core.space_heating_gate import HeatingGateConfig
 from packages.core.models import SettingRecord
 
 logger = logging.getLogger(__name__)
@@ -261,8 +263,24 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "heat_curve_heating_off_outdoor_c": {
         "type": "float",
-        "default": "13",
+        "default": "12",
         "description": "Controller: Värme AV above this outdoor temperature (°C)",
+    },
+    "space_heating_behavior_profile": {
+        "type": "str",
+        "default": "WH_MXC12J9E8_J_DEFAULT",
+        "description": "Room-heating eligibility behavior profile",
+        "options": ["WH_MXC12J9E8_J_DEFAULT"],
+    },
+    "space_heating_gate_on_offset_c": {
+        "type": "float",
+        "default": "1",
+        "description": "Room-heating gate ON offset above recorded controller heating-off value (°C)",
+    },
+    "space_heating_gate_off_offset_c": {
+        "type": "float",
+        "default": "3",
+        "description": "Room-heating gate OFF offset above recorded controller heating-off value (°C)",
     },
     "heat_curve_delta_t_c": {
         "type": "float",
@@ -578,6 +596,17 @@ async def get_heat_curve_config() -> HeatCurveConfig:
     return HeatCurveConfig.from_settings(await get_all_settings())
 
 
+async def get_space_heating_gate_config() -> HeatingGateConfig:
+    """Load the recorded controller base and validated gate hysteresis."""
+    values = await get_all_settings()
+    return HeatingGateConfig(
+        profile_id=values["space_heating_behavior_profile"],
+        base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+        on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+        off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+    )
+
+
 async def get_heat_curve_verification_state() -> dict[str, Any]:
     """Load the internal, persisted heat-curve evidence window safely."""
     raw = await get_setting("_heat_curve_verification_state")
@@ -594,7 +623,13 @@ async def set_heat_curve_verification_state(state: dict[str, Any]) -> None:
 
 
 async def get_bool_setting(key: str) -> bool:
-    return bool(await get_typed_setting(key))
+    value = await get_typed_setting(key)
+    if isinstance(value, str):
+        try:
+            return _parse_bool(value)
+        except ValueError:
+            return False
+    return bool(value)
 
 
 async def get_string_setting(key: str) -> str:
@@ -615,10 +650,40 @@ async def set_setting(key: str, value: str) -> None:
 
 
 async def set_settings_bulk(updates: dict[str, str]) -> None:
-    """Upsert multiple settings."""
+    """Atomically validate and upsert multiple settings.
+
+    Heat-curve and gate settings are one configuration: no concurrent bulk
+    writer may persist a valid individual value that makes the combined
+    thresholds invalid.
+    """
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with get_session() as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {
+                "key": int.from_bytes(
+                    hashlib.sha256(b"settings:heat-gate").digest()[:8], "big", signed=True
+                )
+            },
+        )
+        values = {key: _default_setting_value(spec) for key, spec in SETTING_SPECS.items()}
+        rows = await session.execute(select(SettingRecord))
+        values.update({row.key: row.value for row in rows.scalars() if row.key in values})
+        values.update(updates)
+        if any(
+            key in HEAT_CURVE_SETTING_KEYS
+            or key.startswith("space_heating_gate_")
+            or key == "space_heating_behavior_profile"
+            for key in updates
+        ):
+            HeatCurveConfig.from_settings(values)
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
         for key, value in updates.items():
             if key not in SETTINGS_SCHEMA:
                 continue

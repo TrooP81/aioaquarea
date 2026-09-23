@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from packages.api.schemas import DashboardResponse
+from packages.api.routers.models_router import get_heat_curve_advice
+from packages.core.heat_curve import HeatCurveConfig
+from packages.core.space_heating_gate import HeatingGateConfig
 from packages.api.routers.optimizer import (
+    get_optimizer_status,
     get_plan_detail,
     get_plans,
     get_optimization_request,
@@ -29,6 +34,82 @@ def _session_context(session):
             return False
 
     return _AsyncContextManager(session)
+
+
+def test_dashboard_response_serializes_space_heating_gate_evidence() -> None:
+    response = DashboardResponse(
+        space_heating_gate={
+            "state": "BLOCKED",
+            "reason": "above_off_threshold",
+            "profile_id": "WH_MXC12J9E8_J_DEFAULT",
+            "on_threshold_c": 13.0,
+            "off_threshold_c": 15.0,
+            "fingerprint_matches": True,
+        }
+    )
+
+    assert response.model_dump(mode="json")["space_heating_gate"] == {
+        "state": "BLOCKED",
+        "reason": "above_off_threshold",
+        "profile_id": "WH_MXC12J9E8_J_DEFAULT",
+        "on_threshold_c": 13.0,
+        "off_threshold_c": 15.0,
+        "fingerprint_matches": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) -> None:
+    quality = {
+        "raw_records": 188,
+        "intervals": 187,
+        "usable_samples": 19,
+        "minimum_samples": 168,
+        "remaining_samples": 149,
+        "ready_to_train": False,
+    }
+    count_result = MagicMock()
+    count_result.scalar.return_value = 188
+    session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
+    thermal_model = SimpleNamespace(
+        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
+    )
+
+    with (
+        patch(
+            "packages.core.settings_service.get_setting",
+            new=AsyncMock(return_value="rules_only"),
+        ),
+        patch(
+            "packages.optimizer.main.get_optimizer_status_snapshot",
+            new=AsyncMock(
+                return_value={
+                    "active_layer": "rules_v3",
+                    "cop_trained": False,
+                    "demand_trained": False,
+                }
+            ),
+        ),
+        patch(
+            "packages.api.routers.optimizer._learning_mode_status",
+            new=AsyncMock(return_value={"enabled": False}),
+        ),
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.models.DemandModel.training_data_quality",
+            new=AsyncMock(return_value=quality),
+        ) as training_data_quality,
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+        patch(
+            "packages.api.routers.optimizer.get_session",
+            return_value=_session_context(session),
+        ),
+    ):
+        response = await get_optimizer_status()
+
+    training_data_quality.assert_awaited_once_with()
+    assert response["demand_model"]["data_quality"] == quality
+    assert response["demand_model"]["samples"] == 19
 
 
 @pytest.mark.asyncio
@@ -172,3 +253,72 @@ async def test_optimize_now_enqueues_and_status_reports_durable_record() -> None
     assert status["status"] == "completed"
     assert status["plan_id"] == 9
     assert status["error"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "fingerprint_matches", "suggestion_available"),
+    [
+        ("ALLOWED", True, True),
+        ("BLOCKED", True, False),
+        ("UNKNOWN", True, False),
+        ("ALLOWED", False, False),
+    ],
+    ids=["allowed", "blocked", "unknown", "fingerprint_mismatch"],
+)
+async def test_heat_curve_advice_uses_current_device_gate_and_fails_closed(
+    state, fingerprint_matches, suggestion_available
+) -> None:
+    config = HeatingGateConfig()
+    gate_row = SimpleNamespace(
+        device_id="device-a",
+        state=state,
+        reason_code="test_gate_state",
+        config_fingerprint=config.fingerprint if fingerprint_matches else "obsolete",
+        last_raw_outdoor_c=5.0,
+    )
+    status_result = MagicMock()
+    status_result.scalar_one_or_none.return_value = SimpleNamespace(
+        device_id="device-a", outdoor_temp=5.0
+    )
+    indoor_result = MagicMock()
+    indoor_result.scalar.return_value = 18.0
+    gate_result = MagicMock()
+    gate_result.scalar_one_or_none.return_value = gate_row
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[status_result, indoor_result, gate_result])
+    )
+
+    with (
+        patch(
+            "packages.api.routers.models_router.get_session",
+            return_value=_session_context(session),
+        ),
+        patch(
+            "packages.core.settings_service.get_heat_curve_config",
+            new=AsyncMock(return_value=HeatCurveConfig()),
+        ),
+        patch(
+            "packages.core.settings_service.get_space_heating_gate_config",
+            new=AsyncMock(return_value=config),
+        ),
+        patch(
+            "packages.core.settings_service.get_float_setting",
+            new=AsyncMock(return_value=21.5),
+        ),
+        patch(
+            "packages.core.settings_service.get_heat_curve_verification_state",
+            new=AsyncMock(return_value={"status": "verified"}),
+        ),
+    ):
+        response = await get_heat_curve_advice()
+
+    gate_statement = session.execute.await_args_list[2].args[0]
+    assert "device-a" in gate_statement.compile().params.values()
+    assert (response["suggested"] is not None) is suggestion_available
+    if suggestion_available:
+        assert response["status"] == "too_cold"
+        assert response["controllability"] == "heat_curve_effective"
+    else:
+        assert response["suggested"] is None
+        assert response["status"] == "not_controllable"

@@ -1,13 +1,26 @@
 """Tests for the comfort model (indoor air temperature prediction)."""
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
 
 from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
 from packages.ml.comfort_model import ComfortModel, MIN_TRAINING_ROWS
+
+
+class _AsyncContextManager:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        return False
 
 
 class TestComfortModelUntrained:
@@ -96,7 +109,7 @@ class TestComfortModelFeatures:
         curve = HeatCurveConfig()
 
         assert effective_zone_target_temperature(-5.0, 5.0, config=curve) == 47.0
-        assert effective_zone_target_temperature(-5.0, 20.0, config=curve) == 20.0
+        assert effective_zone_target_temperature(-5.0, 20.0, config=curve) == 23.0
         assert effective_zone_target_temperature(42.0, 5.0, config=curve) == 42.0
 
     def test_make_features_shape(self):
@@ -165,6 +178,101 @@ class TestComfortModelFeatures:
         assert active[2:4].tolist() == [1.0, 0.75]
         assert no_heat[13] == -0.4
         assert active[13] == 0.4
+
+    def test_recent_heat_fraction_uses_component_evidence(self):
+        statuses = [
+            MagicMock(
+                space_heating_active=None,
+                operation_status=0,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="OFF",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+            ),
+            MagicMock(space_heating_active=False),
+        ]
+
+        fraction = ComfortModel._recent_heat_fraction(
+            statuses, np.array([0.0, 300.0]), latest_index=1, feature_time=300.0
+        )
+
+        assert fraction == 0.5
+
+    @pytest.mark.asyncio
+    async def test_dataset_counts_component_evidence_in_current_and_recent_features(self):
+        model = ComfortModel()
+        base_time = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        readings = [
+            SimpleNamespace(timestamp=base_time, temperature=20.0, device_id="sensor-1"),
+            SimpleNamespace(
+                timestamp=base_time + dt.timedelta(hours=1),
+                temperature=20.5,
+                device_id="sensor-1",
+            ),
+        ]
+        statuses = [
+            SimpleNamespace(
+                ts=base_time - dt.timedelta(hours=1),
+                space_heating_active=None,
+                operation_status=0,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="OFF",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+            SimpleNamespace(
+                ts=base_time,
+                space_heating_active=False,
+                operation_status=0,
+                mode="1",
+                direction="PUMP",
+                pump_duty=0,
+                device_action="OFF",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+        ]
+
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self.rows
+
+        session = MagicMock()
+        session.execute = AsyncMock(side_effect=[Result(readings), Result(statuses), Result([])])
+
+        with (
+            patch("packages.ml.comfort_model.get_all_settings", new=AsyncMock(return_value={})),
+            patch(
+                "packages.ml.comfort_model.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+        ):
+            features, targets, row_count = await model._build_dataset()
+
+        assert targets.tolist() == [20.0, 20.5]
+        assert row_count == 2
+        assert features[:, 2].tolist() == [1.0, 0.0]
+        assert features[:, 3].tolist() == [1.0, 0.5]
+        assert model._last_dataset_evidence["active_heating_rows"] == 1
 
 
 class TestComfortModelTrained:

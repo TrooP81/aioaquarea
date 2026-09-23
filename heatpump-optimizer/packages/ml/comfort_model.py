@@ -58,7 +58,7 @@ MAX_CONTROL_MARGIN_C = 0.45
 # Earlier artifacts were trained with nearest-neighbour indoor and status
 # samples, which could select values recorded *after* the feature timestamp.
 # Keep them separate from the causal dataset definition below.
-COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_causal_v5_"
+COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_causal_v6_component_evidence_"
 COMFORT_MODEL_ARTIFACT_GLOB = f"{COMFORT_MODEL_ARTIFACT_PREFIX}*.pkl"
 
 # Candidate lags surround the one-hour planning step and are selected with a

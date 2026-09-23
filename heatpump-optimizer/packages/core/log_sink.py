@@ -19,6 +19,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import sys
 from typing import Any
 
 import structlog
@@ -99,9 +100,8 @@ async def _flush_loop() -> None:
                 from sqlalchemy import delete
 
                 await session.execute(delete(AppLogRecord).where(AppLogRecord.ts < cutoff))
-        except Exception:
-            # Never crash the flush loop — losing a few log entries is fine
-            pass
+        except Exception as exc:
+            sys.stderr.write(f"log sink flush failed: {type(exc).__name__}: {exc}\n")
 
 
 def _ensure_flush_loop() -> None:

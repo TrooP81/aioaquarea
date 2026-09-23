@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-this-to-a-random-string"
     api_token: str = "disabled"  # Set to a strong token to enable API auth; "disabled" = no auth
     model_dir: str = "/app/models"
-    cors_origins: str = "http://localhost:3500"  # Comma-separated allowed origins
+    cors_origins: str = "http://localhost:4444"  # Comma-separated allowed origins
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
 

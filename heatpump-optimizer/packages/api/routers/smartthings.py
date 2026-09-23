@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import secrets
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -153,7 +154,7 @@ async def smartthings_oauth_callback(
     expected_state = request.cookies.get("smartthings_oauth_state") or ""
     if not expected_state:
         expected_state = await get_setting("_smartthings_oauth_state")
-    if not expected_state or state != expected_state:
+    if not expected_state or not state or not secrets.compare_digest(state, expected_state):
         raise HTTPException(status_code=400, detail="Invalid OAuth state (possible CSRF)")
 
     await set_setting("_smartthings_oauth_state", "")

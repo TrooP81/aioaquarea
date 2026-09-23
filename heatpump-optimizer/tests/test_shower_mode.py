@@ -229,6 +229,7 @@ class TestShowerDetection:
         actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
         assert len(actions) == 1
         assert actions[0].action_type == "force_dhw_off"
+        assert actions[0].device_id == current_record.device_id
         payload = json.loads(actions[0].payload_json)
         assert payload["trigger"] == "shower_mode"
         assert payload["reason"] == "recovered"
@@ -278,6 +279,7 @@ class TestShowerDetection:
         actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
         assert len(actions) == 1
         assert actions[0].action_type == "force_dhw_off"
+        assert actions[0].device_id == current_record.device_id
         payload = json.loads(actions[0].payload_json)
         assert payload["reason"] == "timeout"
 

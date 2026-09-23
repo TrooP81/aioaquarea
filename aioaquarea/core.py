@@ -176,7 +176,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
 
             if self._environment is AquareaEnvironment.DEMO:
                 # In a real scenario, this would be handled by the Authenticator
-                _ = await self._api_client.request("GET", "", referer=self._base_url)
+                _ = await self._api_client.request("GET", "")
                 self._api_client.token_expiration = dt.datetime.now(
                     dt.timezone.utc
                 ) + dt.timedelta(days=1)
@@ -336,6 +336,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
             long_id, special_status, zones
         )
 
+    @auth_required
     async def post_device_zone_heat_temperature(
         self, long_id: str, zone_id: int, temperature: int
     ) -> None:
@@ -344,21 +345,13 @@ class AquareaClient:  # Renamed Client to AquareaClient
             long_id, zone_id, temperature
         )
 
+    @auth_required
     async def post_device_zone_cool_temperature(
         self, long_id: str, zone_id: int, temperature: int
     ) -> None:
         """Post device zone cool temperature."""
         return await self._device_control.post_device_zone_cool_temperature(
             long_id, zone_id, temperature
-        )
-
-    @auth_required
-    async def _post_device_zone_temperature(
-        self, long_id: str, zone_id: int, temperature: int, key: str
-    ) -> None:
-        """Post device zone temperature."""
-        return await self._device_control._post_device_zone_temperature(
-            long_id, zone_id, temperature, key
         )
 
     @auth_required
@@ -403,6 +396,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
             long_id, powerful_time
         )
 
+    @auth_required
     async def get_device_consumption(
         self, long_id: str, aggregation: DateType, date_input: str
     ) -> List[Consumption] | None:

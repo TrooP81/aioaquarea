@@ -224,8 +224,8 @@ class TestMILPSolver:
             [-1.0, None, "invalid", 99.0], hours=5, max_power_kw=12.0
         ) == [0.0, 0.0, 0.0, 12.0, 0.0]
 
-    def test_untrained_demand_fallback_respects_heating_cutoff(self):
-        """Fallback reserve must stop in warm weather and scale safely in cold weather."""
+    def test_untrained_demand_fallback_respects_gate_projection(self):
+        """Fallback reserve is controlled by projected gate evidence, not weather cutoff."""
         from packages.optimizer.milp import MILPOptimizer
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
@@ -240,10 +240,133 @@ class TestMILPSolver:
 
         with patch("packages.optimizer.milp.settings") as mock_settings:
             mock_settings.sh_max_power_kw = 12.0
-            profile = MILPOptimizer()._build_demand_estimates(weather, heating_off_outdoor_c=13.0)
+            profile = MILPOptimizer()._build_demand_estimates(
+                weather,
+                gate_states=["BLOCKED", "UNKNOWN", "ALLOWED", "ALLOWED", "ALLOWED", "UNKNOWN"],
+            )
 
-        assert profile == pytest.approx([0.0, 0.0, 24.0 / 7.0, 12.0, 12.0, 24.0 / 7.0])
+        assert profile == pytest.approx([0.0, 0.0, 36.0 / 7.0, 12.0, 12.0, 0.0])
         assert all(0.0 <= demand <= 12.0 for demand in profile)
+
+    def test_trained_demand_respects_gate_projection(self):
+        from packages.core.space_heating_gate import SpaceHeatingGateState
+        from packages.optimizer.milp import MILPOptimizer
+
+        weather = _make_weather(hours=3)
+        demand = MagicMock(is_trained=True)
+        demand.predict_hourly.return_value = [2.0, 3.0, 4.0]
+
+        profile = MILPOptimizer(demand_model=demand)._build_demand_estimates(
+            weather,
+            gate_states=[
+                SpaceHeatingGateState.ALLOWED,
+                SpaceHeatingGateState.BLOCKED,
+                SpaceHeatingGateState.UNKNOWN,
+            ],
+        )
+
+        assert profile == [2.0, 0.0, 0.0]
+
+    def test_milp_zeroes_blocked_and_unknown_hours_and_emits_no_sh_modes(self):
+        from packages.core.space_heating_gate import SpaceHeatingGateState
+        from packages.optimizer.milp import MILPOptimizer
+
+        prices = _make_prices(hours=4)
+        weather = _make_freezing_weather(hours=4)
+        gates = [
+            SpaceHeatingGateState.ALLOWED,
+            SpaceHeatingGateState.BLOCKED,
+            SpaceHeatingGateState.UNKNOWN,
+            SpaceHeatingGateState.ALLOWED,
+        ]
+        comfort = MagicMock(is_ready_for_control=True)
+        comfort.required_zone_temp.return_value = None
+
+        with patch("packages.optimizer.milp.comfort_model", comfort):
+            plan = MILPOptimizer()._solve(
+                prices,
+                weather,
+                cop_fn=lambda temperature, hour=12: 3.0,
+                demand_per_hour=[2.0, 0.0, 0.0, 2.0],
+                current_tank_temp=40.0,
+                dhw_deadlines=[3],
+                gate_states=gates,
+            )
+
+        fractions = [
+            point["space_heating_fraction"]
+            for point in plan["forecast_snapshot"]["forecast_with_plan"]
+        ]
+        assert fractions[1:3] == [0.0, 0.0]
+        blocked_times = {prices[1][0].isoformat(), prices[2][0].isoformat()}
+        sh_modes = {
+            "eco_mode_on",
+            "normal_mode_on",
+            "comfort_mode_on",
+            "quiet_mode_on",
+            "quiet_mode_off",
+        }
+        assert not any(
+            action["ts"] in blocked_times and action["type"] in sh_modes
+            for action in plan["actions"]
+        )
+        assert any(action["type"] == "force_dhw_on" for action in plan["actions"])
+
+    @pytest.mark.parametrize("trained", [False, True], ids=["fallback", "trained_ml"])
+    def test_milp_gate_bounds_and_action_emission_preserve_dhw(self, trained):
+        from packages.core.space_heating_gate import SpaceHeatingGateState
+        from packages.optimizer.milp import MILPOptimizer
+
+        base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
+        prices = [
+            (base, 0.50),
+            (base + dt.timedelta(hours=1), 0.50),
+            (base + dt.timedelta(hours=2), 0.01),
+            (base + dt.timedelta(hours=3), 0.50),
+        ]
+        weather = [(timestamp, 10.0) for timestamp, _ in prices]
+        gates = [
+            SpaceHeatingGateState.ALLOWED,
+            SpaceHeatingGateState.BLOCKED,
+            SpaceHeatingGateState.UNKNOWN,
+            SpaceHeatingGateState.ALLOWED,
+        ]
+        demand_model = MagicMock(is_trained=True)
+        demand_model.predict_hourly.return_value = [2.0] * len(weather)
+        optimizer = MILPOptimizer(demand_model=demand_model if trained else None)
+        demand = optimizer._build_demand_estimates(weather, gate_states=gates)
+
+        plan = optimizer._solve(
+            prices,
+            weather,
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=demand,
+            current_tank_temp=49.0,
+            dhw_deadlines=[3],
+            gate_states=gates,
+        )
+
+        fractions = [
+            point["space_heating_fraction"]
+            for point in plan["forecast_snapshot"]["forecast_with_plan"]
+        ]
+        assert fractions[0] > 0
+        assert fractions[1:3] == [0.0, 0.0]
+        assert all(0.0 <= fraction <= 1.0 for fraction in fractions)
+
+        blocked_times = {prices[1][0].isoformat(), prices[2][0].isoformat()}
+        room_heating_actions = {
+            "eco_mode_on",
+            "normal_mode_on",
+            "comfort_mode_on",
+            "quiet_mode_on",
+            "quiet_mode_off",
+        }
+        assert not any(
+            action["ts"] in blocked_times and action["type"] in room_heating_actions
+            for action in plan["actions"]
+        )
+        assert any(action["type"] == "force_dhw_on" for action in plan["actions"])
 
     def test_demand_weather_is_aligned_to_horizon_timestamps(self):
         """Out-of-order full weather rows must not shift demand features by an hour."""
@@ -532,13 +655,84 @@ class TestMILPSolver:
             )
 
             dhw_on = [a for a in plan["actions"] if a["type"] == "force_dhw_on"]
+            dhw_off_timestamps = {
+                action["ts"] for action in plan["actions"] if action["type"] == "force_dhw_off"
+            }
             for action in dhw_on:
                 assert "dhw_fraction" in action["payload"]
                 assert 0 < action["payload"]["dhw_fraction"] <= 1.0
                 assert "dhw_minutes" in action["payload"]
                 assert 5 <= action["payload"]["dhw_minutes"] <= 60
+                assert (
+                    dt.datetime.fromisoformat(action["ts"])
+                    + dt.timedelta(minutes=action["payload"]["dhw_minutes"])
+                ).isoformat() in dhw_off_timestamps
         finally:
             thermal_model.params = orig_params
+
+    @pytest.mark.parametrize(
+        ("heating_rate", "standby_loss"),
+        [(20.59, -3.0), (25.0, -2.0), (30.0, -1.0)],
+        ids=["measured_fast_tank", "high_gain", "very_high_gain"],
+    )
+    def test_milp_fast_tank_regressions_use_strict_fractional_dhw(self, heating_rate, standby_loss):
+        """Former fast-tank infeasibilities retry with a fractional DHW slot."""
+        from packages.ml.thermal import ThermalParams, thermal_model
+        from packages.optimizer.milp import MILPOptimizer
+
+        original_params = thermal_model.params
+        thermal_model.params = ThermalParams(
+            tank_heating_rate=heating_rate,
+            tank_standby_loss=standby_loss,
+            last_calibrated=dt.datetime.now(dt.timezone.utc),
+            sample_count=1591,
+        )
+        try:
+            plan = MILPOptimizer()._solve(
+                _make_prices(),
+                _make_weather(),
+                cop_fn=lambda temperature, hour=12: 3.5 + 0.1 * temperature,
+                demand_per_hour=[3.0] * 24,
+                current_tank_temp=48.0,
+            )
+        finally:
+            thermal_model.params = original_params
+
+        fractions = [
+            action["payload"]["dhw_fraction"]
+            for action in plan["actions"]
+            if action["type"] == "force_dhw_on"
+        ]
+        assert any(0 < fraction < 1 for fraction in fractions)
+
+    def test_milp_fractional_fallback_avoids_tied_price_micro_activations(self):
+        """The fallback's activation tie-break avoids splitting a flat-price schedule."""
+        from packages.ml.thermal import ThermalParams, thermal_model
+        from packages.optimizer.milp import MILPOptimizer
+
+        original_params = thermal_model.params
+        thermal_model.params = ThermalParams(
+            tank_heating_rate=20.59,
+            tank_standby_loss=-3.0,
+            last_calibrated=dt.datetime.now(dt.timezone.utc),
+            sample_count=1591,
+        )
+        try:
+            prices = _make_prices(base_price=0.10)
+            prices = [(timestamp, 0.10) for timestamp, _ in prices]
+            weather = [(timestamp, 5.0) for timestamp, _ in prices]
+            plan = MILPOptimizer()._solve(
+                prices,
+                weather,
+                cop_fn=lambda temperature, hour=12: 3.5 + 0.1 * temperature,
+                demand_per_hour=[0.0] * 24,
+                current_tank_temp=48.0,
+            )
+        finally:
+            thermal_model.params = original_params
+
+        dhw_on = [action for action in plan["actions"] if action["type"] == "force_dhw_on"]
+        assert len(dhw_on) <= 9
 
     def test_milp_offpeak_lower_tank_floor(self):
         """Off-peak hours should allow tank to drop below normal min."""
@@ -699,6 +893,31 @@ class TestMILPSolver:
 
         assert plan is not None
         assert plan["comfort_shortfall"] == 0.0
+
+
+class TestDhwDeadlineOffsets:
+    @pytest.mark.parametrize(
+        ("horizon_start", "expected_offset"),
+        [
+            (dt.datetime(2026, 6, 1, 14, tzinfo=dt.timezone.utc), 1),
+            (dt.datetime(2026, 1, 5, 14, tzinfo=dt.timezone.utc), 2),
+        ],
+    )
+    def test_local_deadline_uses_utc_horizon_offset(self, horizon_start, expected_offset):
+        from packages.optimizer.milp import _dhw_deadline_offsets
+
+        assert _dhw_deadline_offsets(
+            {"weekday": [17], "weekend": [17]}, horizon_start, "Europe/Amsterdam"
+        ) == [expected_offset]
+
+    def test_deadline_after_local_midnight_uses_next_day_offset(self):
+        from packages.optimizer.milp import _dhw_deadline_offsets
+
+        horizon_start = dt.datetime(2026, 6, 1, 21, tzinfo=dt.timezone.utc)
+
+        assert _dhw_deadline_offsets(
+            {"weekday": [0], "weekend": [0]}, horizon_start, "Europe/Amsterdam"
+        ) == [1]
 
 
 class TestMILPGeneratePlan:

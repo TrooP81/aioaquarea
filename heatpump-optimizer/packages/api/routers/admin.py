@@ -5,6 +5,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
+import structlog
 
 from packages.core.database import get_session
 from packages.core.models import (
@@ -24,6 +25,7 @@ from packages.core.models import (
 )
 
 router = APIRouter()
+logger = structlog.get_logger()
 
 # Each scope maps to the tables it clears, ordered so that child rows are
 # removed before any parent rows. Settings and SmartThings tokens are never
@@ -76,7 +78,7 @@ def reset_ml_models() -> list[str]:
                 path.unlink()
                 deleted.append(path.name)
             except OSError:
-                pass
+                logger.warning("failed to delete ML model file", file=path.name, exc_info=True)
     return deleted
 
 

@@ -15,6 +15,7 @@ from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
     ServiceHeartbeatRecord,
+    SpaceHeatingGateRecord,
 )
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.panasonic_diagnostics import project_panasonic_adapter_state
@@ -78,6 +79,8 @@ def _panasonic_adapter_alert(adapter: dict[str, object]) -> dict[str, object] | 
     }:
         return None
     failures = int(adapter.get("consecutive_failures") or 0)
+    if failures < 3:
+        return None
     detail = f"The Panasonic adaptor has failed {failures} consecutive live-status attempt(s)."
     retry_at = adapter.get("retry_at")
     if retry_at:
@@ -139,6 +142,7 @@ async def get_operational_alerts(
             .scalars()
             .all()
         )
+        gate_rows = (await session.execute(select(SpaceHeatingGateRecord))).scalars().all()
 
     alerts: list[dict[str, object]] = []
     by_service = {row.service: row for row in heartbeat_rows}
@@ -194,6 +198,30 @@ async def get_operational_alerts(
                 href=f"/?view=plan&activity=failed#plan-action-{affected.id}",
             )
         )
+
+    unknown_grace = dt.timedelta(seconds=max(poll_interval * 3, 60 * 60))
+    for gate_row in gate_rows:
+        if gate_row.consecutive_evaluation_failures >= 3:
+            alerts.append(
+                _alert(
+                    f"space_heating_gate_failures_{gate_row.device_id}",
+                    "warning",
+                    "Space-heating gate evaluation is failing",
+                    f"The gate has failed {gate_row.consecutive_evaluation_failures} consecutive evaluations.",
+                    action="Check the latest heat-pump outdoor-temperature readings.",
+                )
+            )
+        unknown_since = gate_row.transitioned_at or gate_row.evaluated_at
+        if gate_row.state == "UNKNOWN" and now - unknown_since >= unknown_grace:
+            alerts.append(
+                _alert(
+                    f"space_heating_gate_unknown_{gate_row.device_id}",
+                    "warning",
+                    "Space-heating gate remains unknown",
+                    "Room-heating increases remain paused until valid gate evidence is collected.",
+                    action="Check the heat-pump outdoor-temperature readings and polling service.",
+                )
+            )
 
     planning_quality = await get_planning_data_quality(now=now)
     if not planning_quality["control_allowed"]:

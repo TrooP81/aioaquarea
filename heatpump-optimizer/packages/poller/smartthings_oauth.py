@@ -9,16 +9,18 @@ automatically before they expire.
 
 from __future__ import annotations
 
-import datetime as dt
 import asyncio
+import datetime as dt
+import hashlib
 import secrets
 from typing import Any
 
 import httpx
-import structlog
-
 from packages.core.database import get_session
 from packages.core.settings_service import get_setting
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+import structlog
 
 logger = structlog.get_logger(__name__)
 
@@ -31,6 +33,10 @@ DEFAULT_SCOPES = "r:devices:*"
 
 # Refresh tokens before they actually expire (5-minute safety margin)
 EXPIRY_MARGIN = dt.timedelta(minutes=5)
+# PostgreSQL transaction advisory lock key for SmartThings OAuth refreshes.
+SMARTTHINGS_OAUTH_REFRESH_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"smartthings-oauth:refresh").digest()[:8], byteorder="big", signed=True
+)
 _refresh_lock = asyncio.Lock()
 
 
@@ -113,7 +119,7 @@ async def refresh_access_token(
 
     Returns the same shape as :func:`exchange_code_for_tokens`.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             TOKEN_URL,
             auth=(client_id, client_secret),
@@ -143,48 +149,57 @@ async def refresh_access_token(
 
 async def save_tokens(token_data: dict[str, Any]) -> None:
     """Persist OAuth tokens to the database (upsert — single row with id=1)."""
+    async with get_session() as session:
+        if session.bind and session.bind.dialect.name == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": SMARTTHINGS_OAUTH_REFRESH_LOCK_KEY},
+            )
+        await _save_tokens_in_session(session, token_data)
+
+
+async def load_tokens() -> dict[str, Any] | None:
+    """Load persisted tokens.  Returns ``None`` if not connected."""
+    async with get_session() as session:
+        return await _load_tokens_in_session(session)
+
+
+async def _load_tokens_in_session(session: AsyncSession) -> dict[str, Any] | None:
+    from packages.core.models import SmartThingsToken
+
+    row = await session.get(SmartThingsToken, 1)
+    if row is None:
+        return None
+    return {
+        "access_token": row.access_token,
+        "refresh_token": row.refresh_token,
+        "token_type": row.token_type,
+        "scope": row.scope,
+        "expires_at": row.expires_at,
+    }
+
+
+async def _save_tokens_in_session(session: AsyncSession, token_data: dict[str, Any]) -> None:
     from packages.core.models import SmartThingsToken
 
     now = dt.datetime.now(dt.timezone.utc)
     expires_in = int(token_data.get("expires_in", 86400))
     expires_at = now + dt.timedelta(seconds=expires_in)
+    row = await session.get(SmartThingsToken, 1)
+    if row is None:
+        row = SmartThingsToken(id=1)
+        session.add(row)
 
-    async with get_session() as session:
-        row = await session.get(SmartThingsToken, 1)
-        if row is None:
-            row = SmartThingsToken(id=1)
-            session.add(row)
-
-        row.access_token = token_data["access_token"]
-        # RFC 6749 allows a refresh response to omit a replacement refresh
-        # token. Preserve the working token in that case; the initial code
-        # exchange still requires one because a new row has no fallback.
-        replacement_refresh_token = token_data.get("refresh_token")
-        if replacement_refresh_token:
-            row.refresh_token = replacement_refresh_token
-        elif not row.refresh_token:
-            raise SmartThingsOAuthError("SmartThings token response omitted refresh_token")
-        row.token_type = token_data.get("token_type", "bearer")
-        row.scope = token_data.get("scope", "")
-        row.expires_at = expires_at
-        row.updated_at = now
-
-
-async def load_tokens() -> dict[str, Any] | None:
-    """Load persisted tokens.  Returns ``None`` if not connected."""
-    from packages.core.models import SmartThingsToken
-
-    async with get_session() as session:
-        row = await session.get(SmartThingsToken, 1)
-        if row is None:
-            return None
-        return {
-            "access_token": row.access_token,
-            "refresh_token": row.refresh_token,
-            "token_type": row.token_type,
-            "scope": row.scope,
-            "expires_at": row.expires_at,
-        }
+    row.access_token = token_data["access_token"]
+    replacement_refresh_token = token_data.get("refresh_token")
+    if replacement_refresh_token:
+        row.refresh_token = replacement_refresh_token
+    elif not row.refresh_token:
+        raise SmartThingsOAuthError("SmartThings token response omitted refresh_token")
+    row.token_type = token_data.get("token_type", "bearer")
+    row.scope = token_data.get("scope", "")
+    row.expires_at = expires_at
+    row.updated_at = now
 
 
 async def delete_tokens() -> None:
@@ -237,14 +252,27 @@ async def get_valid_access_token(*, rejected_access_token: str | None = None) ->
         # Token is still valid
         return tokens["access_token"]
 
-    # Token expired or about to expire — refresh. Re-read after acquiring the
-    # lock so concurrent pollers reuse the token saved by the first caller.
+    # Token expired or about to expire — refresh.
     async with _refresh_lock:
-        tokens = await load_tokens()
+        return await _refresh_tokens_with_advisory_lock(rejected_access_token, now)
+
+
+async def _refresh_tokens_with_advisory_lock(
+    rejected_access_token: str | None, now: dt.datetime
+) -> str | None:
+    """Refresh tokens after serializing PostgreSQL writers in one transaction."""
+    async with get_session() as session:
+        if session.bind and session.bind.dialect.name == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": SMARTTHINGS_OAUTH_REFRESH_LOCK_KEY},
+            )
+
+        tokens = await _load_tokens_in_session(session)
         if tokens is None:
             return None
 
-        expires_at = tokens["expires_at"]
+        expires_at: dt.datetime = tokens["expires_at"]
         token_was_rejected = rejected_access_token == tokens["access_token"]
         token_was_replaced = (
             rejected_access_token is not None and rejected_access_token != tokens["access_token"]
@@ -256,7 +284,6 @@ async def get_valid_access_token(*, rejected_access_token: str | None = None) ->
 
         client_id = await get_setting("smartthings_client_id")
         client_secret = await get_setting("smartthings_client_secret")
-
         if not client_id or not client_secret:
             logger.error("smartthings_oauth_refresh_missing_credentials")
             return None
@@ -265,7 +292,7 @@ async def get_valid_access_token(*, rejected_access_token: str | None = None) ->
             new_tokens = await refresh_access_token(
                 tokens["refresh_token"], client_id, client_secret
             )
-            await save_tokens(new_tokens)
+            await _save_tokens_in_session(session, new_tokens)
             logger.info(
                 "smartthings_oauth_token_refreshed",
                 reason="server_rejected" if token_was_rejected else "expiry_margin",

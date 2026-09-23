@@ -76,7 +76,9 @@ class AquareaConsumptionManager:
                     consumption_data,
                 )
                 return None
-        except (ApiError, AuthenticationError) as ex:
+        except AuthenticationError:
+            raise
+        except ApiError as ex:
             _LOGGER.warning(
                 "Failed to get consumption data for device %s, date %s, aggregation %s: %s",
                 long_id,

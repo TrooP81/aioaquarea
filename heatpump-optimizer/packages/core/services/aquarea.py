@@ -1,4 +1,4 @@
-"""Aioaquarea wrapper with rate limiting, token persistence, and circuit breaker."""
+"""Aioaquarea wrapper with rate limiting and persisted circuit-breaker state."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from aioaquarea.data import StatusDataMode
 
 from ..config import settings
 from ..panasonic_special_status import optimizer_special_status_supported
-from ..resilience import CircuitBreaker, RateLimiter
+from ..resilience import CircuitBreaker, RateLimiter, RedisCircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,7 @@ class AquareaWrapper:
         self._read_limiter = RateLimiter(max_tokens=30, refill_per_second=30 / 3600)
         self._write_limiter = RateLimiter(max_tokens=20, refill_per_second=20 / 3600)
         self._circuit_breaker = CircuitBreaker()
+        self._redis_circuit_breaker: RedisCircuitBreaker | None = None
         self._authenticated = False
         self._weekly_timer = None
         self._weekly_timer_fetched_at: float | None = None
@@ -144,6 +145,7 @@ class AquareaWrapper:
 
         self._session = aiohttp.ClientSession()
         self._redis = redis.from_url(settings.redis_url)
+        self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
         self._timezone = ZoneInfo(await get_user_tz())
 
         self._client = Client(
@@ -169,14 +171,39 @@ class AquareaWrapper:
         """Authenticate, respecting circuit breaker."""
         if self._circuit_breaker.is_open:
             raise RuntimeError("Circuit breaker is open - auth disabled temporarily")
+        if self._redis_circuit_breaker is not None:
+            try:
+                remaining_seconds = await self._redis_circuit_breaker.is_open()
+            except Exception as exc:
+                logger.warning("Redis auth breaker unavailable; using in-memory breaker: %s", exc)
+            else:
+                if remaining_seconds:
+                    raise RuntimeError(
+                        "Circuit breaker is open - auth disabled temporarily "
+                        f"({remaining_seconds}s remaining)"
+                    )
 
         try:
             await self._client.login()
             self._authenticated = True
             self._circuit_breaker.record_success()
+            if self._redis_circuit_breaker is not None:
+                try:
+                    await self._redis_circuit_breaker.record_success()
+                except Exception as exc:
+                    logger.warning(
+                        "Redis auth breaker unavailable; using in-memory breaker: %s", exc
+                    )
             logger.info("Authenticated with Panasonic cloud")
         except Exception as exc:
             self._circuit_breaker.record_failure()
+            if self._redis_circuit_breaker is not None:
+                try:
+                    await self._redis_circuit_breaker.record_failure()
+                except Exception as redis_exc:
+                    logger.warning(
+                        "Redis auth breaker unavailable; using in-memory breaker: %s", redis_exc
+                    )
             logger.error("Authentication failed: %s", exc)
             raise
 
@@ -208,6 +235,34 @@ class AquareaWrapper:
             )
             self._record_live_status(self._device)
             return self._device
+
+    async def get_selected_device_id(self) -> str:
+        """Return the selected identity without status refresh or resilience mutation."""
+        if self._device is not None:
+            device_id = getattr(self._device, "long_id", None)
+            if device_id:
+                return str(device_id)
+
+        async with self._device_lock:
+            if self._device is not None:
+                device_id = getattr(self._device, "long_id", None)
+                if device_id:
+                    return str(device_id)
+            if self._device_info is not None:
+                device_id = getattr(self._device_info, "device_id", None)
+                if device_id:
+                    return str(device_id)
+            if self._client is None:
+                raise RuntimeError("Aquarea client has not been initialized")
+            await self._read_limiter.acquire()
+            devices = await self._client.get_devices()
+            if not devices:
+                raise RuntimeError("No devices found on account")
+            self._device_info = devices[0]
+            device_id = getattr(self._device_info, "device_id", None)
+            if not device_id:
+                raise RuntimeError("Selected Panasonic device has no identity")
+            return str(device_id)
 
     async def refresh_device(self):
         """Refresh device data using one logical Panasonic read token.

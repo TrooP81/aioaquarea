@@ -27,21 +27,26 @@ def classify_space_heating(
     direction: str | None,
     device_action: str | None,
     defrost_active: bool | None,
+    mode: str | int | None = None,
+    pump_duty: int | None = None,
+    zone1_operation_status: int | None = None,
+    zone2_operation_status: int | None = None,
 ) -> SpaceHeatingEvidence:
     """Classify a live Aquarea status without inferring heat from PUMP alone."""
 
     if defrost_active:
         return SpaceHeatingEvidence(False, "defrost")
-    if operation_status == 0:
-        return SpaceHeatingEvidence(False, "device_off")
-    if device_action == "HEATING" and direction == "PUMP":
-        return SpaceHeatingEvidence(True, "reported_space_heating")
     if device_action == "HEATING_WATER" or direction == "WATER":
         return SpaceHeatingEvidence(False, "domestic_hot_water")
     if device_action == "COOLING":
         return SpaceHeatingEvidence(False, "cooling")
     if device_action == "IDLE" or direction == "IDLE":
         return SpaceHeatingEvidence(False, "idle")
+    active_zone = zone1_operation_status == 1 or zone2_operation_status == 1
+    if str(mode) in {"1", "3"} and direction == "PUMP" and pump_duty == 1 and active_zone:
+        return SpaceHeatingEvidence(True, "component_space_heating")
+    if operation_status == 0:
+        return SpaceHeatingEvidence(False, "device_off")
     return SpaceHeatingEvidence(False, "not_confirmed")
 
 
@@ -58,8 +63,12 @@ def has_confirmed_space_heating(status: Any) -> bool:
         return bool(persisted)
     evidence = classify_space_heating(
         operation_status=getattr(status, "operation_status", None),
+        mode=getattr(status, "mode", None),
         direction=getattr(status, "direction", None),
+        pump_duty=getattr(status, "pump_duty", None),
         device_action=getattr(status, "device_action", None),
         defrost_active=getattr(status, "defrost_active", None),
+        zone1_operation_status=getattr(status, "zone1_operation_status", None),
+        zone2_operation_status=getattr(status, "zone2_operation_status", None),
     )
     return evidence.active

@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aioaquarea"
-version = "1.0.11"
+version = "1.0.12"
 authors = [
   { name="Carlos J. Aliaga", email="dev@cjaliaga.net" },
 ]
@@ -31,6 +31,7 @@ dependencies = [
   "aiohttp>=3.14.3,<4",
   'StrEnum>=0.4.15; python_version < "3.11"',
   "beautifulsoup4>=4.12,<5",
+  "soupsieve>=2.9,<3",
 ]
 
 [project.optional-dependencies]

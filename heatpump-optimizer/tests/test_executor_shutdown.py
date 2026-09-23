@@ -19,6 +19,7 @@ def _make_action(action_type: str, payload: dict | None = None):
     action.payload_json = json.dumps(payload or {})
     action.scheduled_ts = dt.datetime.now(dt.timezone.utc)
     action.status = "pending"
+    action.device_id = "device-a"
     return action
 
 
@@ -35,6 +36,7 @@ def _extract_stmt_values(stmt) -> dict[str, object]:
 @pytest.mark.asyncio
 async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> None:
     wrapper = AsyncMock()
+    wrapper.get_selected_device_id = AsyncMock(return_value="device-a")
     executor = PlanExecutor(wrapper)
     action = _make_action(str(ActionType.FORCE_DHW_ON))
     fake_handler = MagicMock()
@@ -43,9 +45,11 @@ async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> No
     with (
         patch("packages.optimizer.executor_core.get_action_handler", return_value=fake_handler),
         patch.object(executor, "_verify_with_retry", side_effect=asyncio.CancelledError),
+        patch.object(executor, "_dispatch_precondition", new=AsyncMock(return_value=None)),
         patch("packages.optimizer.executor.get_session") as mock_gs,
     ):
         mock_session = AsyncMock()
+        mock_session.add = MagicMock()
         mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
         mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -70,8 +74,8 @@ async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> No
         "reason": "shutdown_cancelled",
         "detail": "Executor shutdown interrupted action verification",
     }
-    assert mock_session.add.await_count == 1
-    added_audit = mock_session.add.await_args.args[0]
+    mock_session.add.assert_called_once()
+    added_audit = mock_session.add.call_args.args[0]
     assert added_audit.actor == "optimizer"
     assert added_audit.action == str(ActionType.FORCE_DHW_ON)
     assert added_audit.result == "cancelled"
@@ -100,6 +104,7 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
         ) as mock_execute_action,
     ):
         mock_session = AsyncMock()
+        mock_session.add = MagicMock()
         mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
         mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -112,13 +117,12 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
         executing_result = MagicMock()
         executing_result.scalars.return_value.all.return_value = [101, 102]
 
-        # Override query, action query, freshness check, claim update,
-        # executing reconciliation query, then cancellation update.
+        # Override query, action query, claim update, executing reconciliation
+        # query, then cancellation update.
         mock_session.execute = AsyncMock(
             side_effect=[
                 override_result,
                 actions_result,
-                status_result,
                 None,
                 executing_result,
                 None,
@@ -144,8 +148,8 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
         "reason": "shutdown_cancelled",
         "detail": "Executor shutdown interrupted action verification",
     }
-    assert mock_session.add.await_count == 2
-    audit_results = [call.args[0].result for call in mock_session.add.await_args_list]
-    audit_actions = [call.args[0].action for call in mock_session.add.await_args_list]
+    assert mock_session.add.call_count == 2
+    audit_results = [call.args[0].result for call in mock_session.add.call_args_list]
+    audit_actions = [call.args[0].action for call in mock_session.add.call_args_list]
     assert audit_results == ["cancelled", "cancelled"]
     assert sorted(audit_actions) == sorted([first_action.action_type, second_action.action_type])

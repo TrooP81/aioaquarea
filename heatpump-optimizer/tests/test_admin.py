@@ -115,6 +115,31 @@ class TestResetEndpoint:
 
 
 class TestModelResetMethods:
+    def test_reset_ml_models_logs_failed_deletion_and_omits_file(self, tmp_path):
+        blocked = tmp_path / "cop_model_blocked.pkl"
+        blocked.write_text("x")
+        deleted = tmp_path / "demand_model_deleted.pkl"
+        deleted.write_text("x")
+        original_unlink = type(blocked).unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == blocked:
+                raise OSError("file is locked")
+            return original_unlink(path, *args, **kwargs)
+
+        with (
+            patch("packages.ml.models_common.MODEL_DIR", tmp_path),
+            patch.object(type(blocked), "unlink", unlink),
+            patch.object(admin.logger, "warning") as warning,
+        ):
+            deleted_files = admin.reset_ml_models()
+
+        assert deleted_files == ["demand_model_deleted.pkl"]
+        assert blocked.exists()
+        warning.assert_called_once_with(
+            "failed to delete ML model file", file=blocked.name, exc_info=True
+        )
+
     def test_cop_model_reset(self):
         from packages.ml.cop_model_core import COPModel
 

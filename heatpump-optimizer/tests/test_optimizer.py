@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from packages.core.heat_curve import HeatCurveConfig
+from packages.optimizer import rules_engine
 from packages.optimizer.rules import RulesOptimizer
 
 
@@ -78,6 +79,23 @@ def sample_weather():
 
 
 class TestRulesOptimizer:
+    @pytest.mark.asyncio
+    async def test_estimate_cost_falls_back_and_logs_when_consumption_lookup_fails(self):
+        optimizer = RulesOptimizer()
+
+        with (
+            patch.object(
+                rules_engine, "get_session", side_effect=RuntimeError("database unavailable")
+            ),
+            patch.object(rules_engine.logger, "warning") as warning,
+        ):
+            cost = await optimizer._estimate_cost([], [(dt.datetime.now(dt.timezone.utc), 0.20)])
+
+        assert cost == 3.0
+        warning.assert_called_once_with(
+            "failed to estimate average daily consumption", exc_info=True
+        )
+
     def test_zone_boost_requires_live_headroom(self):
         optimizer = RulesOptimizer()
 

@@ -5,17 +5,21 @@ import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
+import packages.poller.smartthings_oauth as oauth
 from packages.poller.smartthings_oauth import (
+    AUTHORIZE_URL,
+    SmartThingsOAuthError,
     build_authorize_url,
     exchange_code_for_tokens,
-    refresh_access_token,
     get_valid_access_token,
+    refresh_access_token,
     save_tokens,
-    SmartThingsOAuthError,
-    AUTHORIZE_URL,
 )
+import pytest
+from fastapi import HTTPException
+from fastapi import Request
+
+from packages.api.routers.smartthings import smartthings_oauth_callback
 
 
 class _AsyncContextManager:
@@ -27,6 +31,22 @@ class _AsyncContextManager:
 
     async def __aexit__(self, *args):
         return False
+
+
+class TestOAuthCallback:
+    @pytest.mark.asyncio
+    async def test_rejects_mismatched_oauth_state(self):
+        request = Request(
+            {
+                "type": "http",
+                "headers": [(b"cookie", b"smartthings_oauth_state=expected-state")],
+            }
+        )
+
+        with pytest.raises(HTTPException, match="Invalid OAuth state"):
+            await smartthings_oauth_callback(
+                request, code="authorization-code", state="wrong-state"
+            )
 
 
 # ------------------------------------------------------------------
@@ -130,6 +150,7 @@ class TestRefreshAccessToken:
             tokens = await refresh_access_token("old-ref", "client-id", "client-secret")
 
         assert tokens["access_token"] == "new-acc"
+        mock_cls.assert_called_once_with(timeout=15)
 
     @pytest.mark.asyncio
     async def test_failure_raises(self):
@@ -148,6 +169,31 @@ class TestRefreshAccessToken:
 
 
 class TestSaveTokens:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("dialect", "expects_lock"), [("postgresql", True), ("sqlite", False)])
+    async def test_takes_advisory_lock_only_on_postgres(self, dialect, expects_lock):
+        row = SimpleNamespace(refresh_token="working-refresh-token")
+        session = SimpleNamespace(
+            bind=SimpleNamespace(dialect=SimpleNamespace(name=dialect)),
+            execute=AsyncMock(),
+            get=AsyncMock(return_value=row),
+            add=MagicMock(),
+        )
+
+        with patch(
+            "packages.poller.smartthings_oauth.get_session",
+            return_value=_AsyncContextManager(session),
+        ):
+            await save_tokens({"access_token": "new-access-token", "expires_in": 86400})
+
+        if expects_lock:
+            assert "pg_advisory_xact_lock" in str(session.execute.await_args.args[0])
+            assert session.execute.await_args.args[1] == {
+                "key": oauth.SMARTTHINGS_OAUTH_REFRESH_LOCK_KEY
+            }
+        else:
+            session.execute.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_preserves_refresh_token_when_refresh_response_omits_replacement(self):
         row = SimpleNamespace(refresh_token="working-refresh-token")
@@ -188,36 +234,27 @@ class TestGetValidAccessToken:
             "access_token": "fresh",
             "expires_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
         }
-        saved = False
+        refreshed = False
 
         async def load_current_tokens():
-            return fresh if saved else expired
+            return fresh if refreshed else expired
 
-        async def save_current_tokens(_tokens):
-            nonlocal saved
-            saved = True
+        async def refresh_current_tokens(*_args):
+            nonlocal refreshed
+            refreshed = True
+            return fresh["access_token"]
 
         with (
             patch("packages.poller.smartthings_oauth.load_tokens", side_effect=load_current_tokens),
             patch(
-                "packages.poller.smartthings_oauth.get_setting",
-                new_callable=AsyncMock,
-                side_effect=lambda key: {
-                    "smartthings_client_id": "cid",
-                    "smartthings_client_secret": "secret",
-                }.get(key, ""),
-            ),
-            patch(
-                "packages.poller.smartthings_oauth.refresh_access_token",
-                new_callable=AsyncMock,
-                return_value={"access_token": "fresh", "expires_in": 3600},
+                "packages.poller.smartthings_oauth._refresh_tokens_with_advisory_lock",
+                side_effect=refresh_current_tokens,
             ) as refresh,
-            patch("packages.poller.smartthings_oauth.save_tokens", side_effect=save_current_tokens),
         ):
             tokens = await asyncio.gather(get_valid_access_token(), get_valid_access_token())
 
         assert tokens == ["fresh", "fresh"]
-        refresh.assert_awaited_once_with("ref-tok", "cid", "secret")
+        refresh.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_oauth_tokens_falls_back_to_pat(self):
@@ -274,72 +311,49 @@ class TestGetValidAccessToken:
     async def test_expired_token_triggers_refresh(self):
         """An expired token triggers automatic refresh."""
         past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
-        with patch(
-            "packages.poller.smartthings_oauth.load_tokens",
-            new_callable=AsyncMock,
-            return_value={
-                "access_token": "expired",
-                "refresh_token": "ref-tok",
-                "expires_at": past,
-            },
-        ):
-            with patch(
-                "packages.poller.smartthings_oauth.get_setting",
+        with (
+            patch(
+                "packages.poller.smartthings_oauth.load_tokens",
                 new_callable=AsyncMock,
-                side_effect=lambda k: {
-                    "smartthings_client_id": "cid",
-                    "smartthings_client_secret": "csec",
-                }.get(k, ""),
-            ):
-                with patch(
-                    "packages.poller.smartthings_oauth.refresh_access_token",
-                    new_callable=AsyncMock,
-                    return_value={
-                        "access_token": "refreshed-token",
-                        "refresh_token": "new-ref",
-                        "expires_in": 86400,
-                    },
-                ) as mock_refresh:
-                    with patch(
-                        "packages.poller.smartthings_oauth.save_tokens",
-                        new_callable=AsyncMock,
-                    ) as mock_save:
-                        token = await get_valid_access_token()
+                return_value={
+                    "access_token": "expired",
+                    "refresh_token": "ref-tok",
+                    "expires_at": past,
+                },
+            ),
+            patch(
+                "packages.poller.smartthings_oauth._refresh_tokens_with_advisory_lock",
+                new_callable=AsyncMock,
+                return_value="refreshed-token",
+            ) as mock_refresh,
+        ):
+            token = await get_valid_access_token()
 
         assert token == "refreshed-token"
-        mock_refresh.assert_awaited_once_with("ref-tok", "cid", "csec")
-        mock_save.assert_awaited_once()
+        mock_refresh.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_refresh_failure_returns_none(self):
         """If refresh fails, return None rather than crash."""
         past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
 
-        async def refresh_access_token(*_args, **_kwargs):
-            raise SmartThingsOAuthError("token revoked")
-
-        with patch(
-            "packages.poller.smartthings_oauth.load_tokens",
-            new_callable=AsyncMock,
-            return_value={
-                "access_token": "expired",
-                "refresh_token": "ref",
-                "expires_at": past,
-            },
-        ):
-            with patch(
-                "packages.poller.smartthings_oauth.get_setting",
+        with (
+            patch(
+                "packages.poller.smartthings_oauth.load_tokens",
                 new_callable=AsyncMock,
-                side_effect=lambda k: {
-                    "smartthings_client_id": "cid",
-                    "smartthings_client_secret": "csec",
-                }.get(k, ""),
-            ):
-                with patch(
-                    "packages.poller.smartthings_oauth.refresh_access_token",
-                    new=refresh_access_token,
-                ):
-                    token = await get_valid_access_token()
+                return_value={
+                    "access_token": "expired",
+                    "refresh_token": "ref",
+                    "expires_at": past,
+                },
+            ),
+            patch(
+                "packages.poller.smartthings_oauth._refresh_tokens_with_advisory_lock",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            token = await get_valid_access_token()
 
         assert token is None
 
@@ -357,6 +371,39 @@ class TestGetValidAccessToken:
                 },
             ),
             patch(
+                "packages.poller.smartthings_oauth._refresh_tokens_with_advisory_lock",
+                new_callable=AsyncMock,
+                return_value="fresh-token",
+            ) as refresh,
+        ):
+            token = await get_valid_access_token(rejected_access_token="rejected-token")
+
+        assert token == "fresh-token"
+        refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_advisory_lock_is_taken_before_refresh(self):
+        past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+        row = SimpleNamespace(
+            access_token="expired",
+            refresh_token="ref-tok",
+            token_type="bearer",
+            scope="r:devices:*",
+            expires_at=past,
+        )
+        session = SimpleNamespace(
+            bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+            execute=AsyncMock(),
+            get=AsyncMock(return_value=row),
+            add=MagicMock(),
+        )
+
+        with (
+            patch(
+                "packages.poller.smartthings_oauth.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+            patch(
                 "packages.poller.smartthings_oauth.get_setting",
                 new_callable=AsyncMock,
                 side_effect=lambda key: {
@@ -367,21 +414,52 @@ class TestGetValidAccessToken:
             patch(
                 "packages.poller.smartthings_oauth.refresh_access_token",
                 new_callable=AsyncMock,
-                return_value={
-                    "access_token": "fresh-token",
-                    "refresh_token": "new-ref",
-                    "expires_in": 86400,
-                },
+                return_value={"access_token": "fresh", "expires_in": 3600},
             ) as refresh,
-            patch(
-                "packages.poller.smartthings_oauth.save_tokens",
-                new_callable=AsyncMock,
-            ),
         ):
-            token = await get_valid_access_token(rejected_access_token="rejected-token")
+            token = await oauth._refresh_tokens_with_advisory_lock(
+                None, dt.datetime.now(dt.timezone.utc)
+            )
 
-        assert token == "fresh-token"
+        assert token == "fresh"
+        assert "pg_advisory_xact_lock" in str(session.execute.await_args.args[0])
+        assert session.execute.await_args.args[1] == {
+            "key": oauth.SMARTTHINGS_OAUTH_REFRESH_LOCK_KEY
+        }
         refresh.assert_awaited_once_with("ref-tok", "cid", "csec")
+
+    @pytest.mark.asyncio
+    async def test_fresh_token_after_advisory_lock_skips_second_refresh(self):
+        future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        row = SimpleNamespace(
+            access_token="refreshed-by-other-process",
+            refresh_token="new-ref-tok",
+            token_type="bearer",
+            scope="r:devices:*",
+            expires_at=future,
+        )
+        session = SimpleNamespace(
+            bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+            execute=AsyncMock(),
+            get=AsyncMock(return_value=row),
+        )
+
+        with (
+            patch(
+                "packages.poller.smartthings_oauth.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+            patch(
+                "packages.poller.smartthings_oauth.refresh_access_token",
+                new_callable=AsyncMock,
+            ) as refresh,
+        ):
+            token = await oauth._refresh_tokens_with_advisory_lock(
+                None, dt.datetime.now(dt.timezone.utc)
+            )
+
+        assert token == "refreshed-by-other-process"
+        refresh.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_concurrently_replaced_token_is_reused_without_refresh(self):

@@ -180,6 +180,7 @@ class DashboardResponse(BaseModel):
     today_cost_coverage_pct: float = 0
     today_cost_complete: bool = False
     active_plan: Optional[PlanResponse] = None
+    space_heating_gate: dict = Field(default_factory=dict)
     has_override: bool = False
     override_id: Optional[int] = None
 
@@ -291,3 +292,4 @@ class IndoorForecastResponse(BaseModel):
     plan_age_seconds: int | None = None
     sensor_age_seconds: int | None = None
     current_vs_plan_delta_c: float | None = None
+    space_heating_gate: dict = Field(default_factory=dict)

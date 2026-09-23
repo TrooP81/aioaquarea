@@ -6,13 +6,22 @@ import pytest
 from aioaquarea.api_client import AquareaAPIClient
 from aioaquarea.auth import CCAppVersion, PanasonicSettings
 from aioaquarea.const import AquareaEnvironment
-from aioaquarea.errors import ApiError, AuthenticationError, AuthenticationErrorCodes
+from aioaquarea.errors import (
+    ApiError,
+    AuthenticationError,
+    AuthenticationErrorCodes,
+    RequestFailedError,
+)
 
 
 class FakeResponse:
-    def __init__(self, payload, content_type="application/json"):
+    def __init__(
+        self, payload, content_type="application/json", status=200, reason="OK"
+    ):
         self._payload = payload
         self.content_type = content_type
+        self.status = status
+        self.reason = reason
 
     async def json(self):
         return self._payload
@@ -110,7 +119,9 @@ async def test_request_raises_authentication_error_for_token_expiration(api_clie
 
 
 @pytest.mark.asyncio
-async def test_token_expiration_reauthenticates_and_retries_with_fresh_headers(api_client):
+async def test_token_expiration_reauthenticates_and_retries_with_fresh_headers(
+    api_client,
+):
     expired = FakeResponse({"message": ["Token expires"]})
     success = FakeResponse({"message": []})
     api_client._sess.request = AsyncMock(side_effect=[expired, success])
@@ -129,7 +140,9 @@ async def test_token_expiration_reauthenticates_and_retries_with_fresh_headers(a
     second_headers = api_client._sess.request.await_args_list[1].kwargs["headers"]
     assert first_headers["x-user-authorization-v2"] == "Bearer access-token"
     assert second_headers["x-user-authorization-v2"] == "Bearer fresh-token"
-    assert api_client._sess.request.await_args_list[1].kwargs["json"] == {"quietMode": 0}
+    assert api_client._sess.request.await_args_list[1].kwargs["json"] == {
+        "quietMode": 0
+    }
 
 
 @pytest.mark.asyncio
@@ -205,7 +218,9 @@ async def test_rejected_refreshed_token_falls_back_to_full_login(api_client):
 
     refresh.assert_awaited_once()
     full_login.assert_awaited_once()
-    headers = [call.kwargs["headers"] for call in api_client._sess.request.await_args_list]
+    headers = [
+        call.kwargs["headers"] for call in api_client._sess.request.await_args_list
+    ]
     assert [item["x-user-authorization-v2"] for item in headers] == [
         "Bearer access-token",
         "Bearer refreshed-token",
@@ -260,6 +275,31 @@ async def test_request_uses_external_url_when_absolute(api_client):
 
     called_url = api_client._sess.request.await_args.args[1]
     assert called_url == "https://example.test/path"
+
+
+@pytest.mark.asyncio
+async def test_request_raises_for_non_json_error_response(api_client):
+    response = FakeResponse(
+        "gateway failure",
+        content_type="text/html",
+        status=502,
+        reason="Bad Gateway",
+    )
+    api_client._sess.request = AsyncMock(return_value=response)
+
+    with pytest.raises(RequestFailedError) as exc:
+        await api_client.request("GET", url="/test")
+
+    assert exc.value.response is response
+    assert "502 - Bad Gateway" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_request_keeps_non_json_redirect_response(api_client):
+    response = FakeResponse("", content_type="text/html", status=302, reason="Found")
+    api_client._sess.request = AsyncMock(return_value=response)
+
+    assert await api_client.request("GET", url="/test") is response
 
 
 @pytest.mark.asyncio

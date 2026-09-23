@@ -30,6 +30,7 @@ pgdata/
 redisdata/
 backups/
 backups-replica/
+compose-evidence.json
 
 # IDE
 .vscode/

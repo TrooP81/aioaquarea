@@ -8,7 +8,12 @@ import aiohttp
 
 from .auth import CCAppVersion, PanasonicRequestHeader, PanasonicSettings
 from .const import AQUAREA_SERVICE_BASE, AQUAREA_SERVICE_DEMO_BASE, AquareaEnvironment
-from .errors import ApiError, AuthenticationError, AuthenticationErrorCodes
+from .errors import (
+    ApiError,
+    AuthenticationError,
+    AuthenticationErrorCodes,
+    RequestFailedError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,7 +70,6 @@ class AquareaAPIClient:
         method: str,
         url: str = None,
         external_url: str = None,
-        referer: str = AQUAREA_SERVICE_BASE,
         throw_on_error=True,
         content_type: str = "application/json",
         headers: Optional[dict] = None,
@@ -109,6 +113,8 @@ class AquareaAPIClient:
             )
 
             if resp.content_type != "application/json":
+                if resp.status >= 400:
+                    raise RequestFailedError(resp)
                 return resp
 
             data = await resp.json()

@@ -414,16 +414,20 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 await activate_plan(session, plan_record)
 
                 for action in plan["actions"]:
+                    device_id = (
+                        action.get("device_id")
+                        or plan.get("device_id")
+                        or snapshot.get("device_id")
+                    )
                     action_record = PlanActionRecord(
                         plan_id=plan_record.id,
                         scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
                         action_type=str(ActionType(action["type"])),
                         payload_json=json.dumps(action.get("payload", {})),
+                        device_id=str(device_id) if device_id else None,
                         status="pending",
                     )
-                    add_result = session.add(action_record)
-                    if asyncio.iscoroutine(add_result):
-                        await add_result
+                    session.add(action_record)
 
             _last_plan_generated_at = _time.monotonic()
 

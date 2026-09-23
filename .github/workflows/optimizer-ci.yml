@@ -26,8 +26,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
-      - run: python -m pip install -e ".[all,dev]"
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]"
       - run: python -m ruff check packages tests migrations
       - run: python -m ruff format --check packages tests migrations
       - name: Run unit tests
@@ -58,7 +60,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis:
-        image: redis:7.4.2-alpine
+        image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
         ports:
           - 6379:6379
         options: >-
@@ -72,8 +74,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
-      - run: python -m pip install -e ".[all,dev]"
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]"
       - name: Verify migration graph
         run: python -m alembic heads
       - name: Apply and compare database schema
@@ -148,9 +152,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
       - run: python -m pip install --upgrade "pip>=26.1.2"
-      - run: python -m pip install -e ".[all,dev]" pip-audit
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]" pip-audit
       - run: python -m pip_audit
       - name: Prepare Compose validation environment
         run: cp .env.example .env

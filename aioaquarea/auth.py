@@ -48,10 +48,11 @@ class PanasonicSettings:
 class CCAppVersion:
     def __init__(self):
         self.version = DEFAULT_X_APP_VERSION  # Default version
+        self._initialized = False
 
     async def init(self):
-        # Try to fetch version on initialization
-        await self.refresh()
+        if not self._initialized:
+            self._initialized = await self.refresh()
 
     async def refresh(self):
         # Fetch the latest app version from App Store
@@ -74,14 +75,15 @@ class CCAppVersion:
                             _LOGGER.warning(
                                 f"Could not parse version from App Store page, keeping current version: {self.version}"
                             )
-                    else:
-                        _LOGGER.error(
-                            f"Failed to fetch App Store page: {response.status}, keeping current version: {self.version}"
-                        )
+                        return True
+                    _LOGGER.error(
+                        f"Failed to fetch App Store page: {response.status}, keeping current version: {self.version}"
+                    )
         except Exception as e:
             _LOGGER.error(
                 f"Error fetching app version: {e}, keeping current version: {self.version}"
             )
+        return False
 
     async def get(self):
         return self.version

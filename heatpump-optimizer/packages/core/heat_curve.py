@@ -7,6 +7,8 @@ import statistics
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from packages.core.space_heating_gate import EffectiveGateEvidence, SpaceHeatingGateState
+
 
 HEAT_CURVE_SETTING_KEYS = (
     "heat_curve_outdoor_cold_c",
@@ -37,7 +39,7 @@ class HeatCurveConfig:
     supply_cold_c: float = 47.0
     outdoor_warm_c: float = 15.0
     supply_warm_c: float = 23.0
-    heating_off_outdoor_c: float = 13.0
+    heating_off_outdoor_c: float = 12.0
     delta_t_c: float = 4.0
 
     @classmethod
@@ -87,9 +89,7 @@ class HeatCurveConfig:
         return self.supply_cold_c + ratio * (self.supply_warm_c - self.supply_cold_c)
 
     def planned_supply_temperature(self, outdoor_c: float) -> float:
-        """Return supply target, or outdoor temperature when controller heating is off."""
-        if outdoor_c >= self.heating_off_outdoor_c:
-            return outdoor_c
+        """Return the interpolated supply target independently of eligibility."""
         return self.supply_temperature(outdoor_c)
 
     def as_dict(self) -> dict[str, float]:
@@ -108,10 +108,8 @@ def effective_zone_target_temperature(
     The live controller uses a negative sentinel (commonly ``-5°C``) when the
     weather-compensated curve owns the target.  Prefer a valid target reported
     by the controller; otherwise derive the curve target for the current
-    outdoor temperature.  When the controller is above the heating-off
-    threshold this intentionally returns the outdoor temperature, matching
-    :meth:`HeatCurveConfig.planned_supply_temperature` and signalling that the
-    curve is inactive instead of inventing a heat demand.
+    outdoor temperature. Eligibility is controlled by the stateful
+    space-heating gate, not by this interpolation helper.
     """
     try:
         target = float(reported_target_c)  # type: ignore[arg-type]
@@ -140,6 +138,7 @@ def heat_curve_advice(
     indoor_temp: float | None,
     comfort_target: float,
     outdoor_temp: float | None,
+    gate_evidence: EffectiveGateEvidence,
 ) -> dict:
     """Return a bounded, manual-change recommendation for the heat curve.
 
@@ -152,29 +151,22 @@ def heat_curve_advice(
     status = "insufficient_data"
     indoor_error: float | None = None
 
-    # A high indoor temperature on a warm day is often caused by solar gain or
-    # ventilation rather than the heat curve.  Never turn that into a manual
-    # curve recommendation: the controller is already preventing space heat.
-    if outdoor_temp is not None and outdoor_temp >= config.heating_off_outdoor_c:
-        reasons.append(
-            f"Space heating is off because outdoor temperature ({outdoor_temp:.1f}°C) is at or above the {config.heating_off_outdoor_c:.1f}°C cutoff."
-        )
-        reasons.append(
-            "This comfort deviation is not currently heat-pump controllable; wait for cooler weather before changing the curve."
-        )
-        reasons.append(
-            f"Keep ΔT at {config.delta_t_c:.1f}°C unless a hydraulic installer recommends a change; it is not a direct room-temperature target."
+    if gate_evidence.state is not SpaceHeatingGateState.ALLOWED:
+        reason = (
+            "Space heating is currently blocked by the controller gate."
+            if gate_evidence.state is SpaceHeatingGateState.BLOCKED
+            else "Space-heating gate evidence is unknown, so heat-curve control is not available."
         )
         return {
-            "status": "outside_heating_season",
-            "indoor_error_c": round(indoor_temp - comfort_target, 1)
-            if indoor_temp is not None
-            else None,
+            "status": "not_controllable",
+            "indoor_error_c": None,
             "current": config.as_dict(),
             "suggested": None,
-            "reasons": reasons,
+            "reasons": [reason, f"Gate reason: {gate_evidence.reason_code}."],
             "manual_only": True,
-            "controllability": "not_controllable_by_heat_curve",
+            "controllability": f"space_heating_gate_{gate_evidence.state.lower()}",
+            "gate_state": gate_evidence.state,
+            "gate_reason": gate_evidence.reason_code,
         }
 
     if indoor_temp is not None:
@@ -225,6 +217,8 @@ def heat_curve_advice(
         "reasons": reasons,
         "manual_only": True,
         "controllability": "heat_curve_effective",
+        "gate_state": gate_evidence.state,
+        "gate_reason": gate_evidence.reason_code,
     }
 
 

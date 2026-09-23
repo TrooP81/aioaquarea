@@ -1,4 +1,4 @@
-ARG APP_VERSION=0.13.6
+ARG APP_VERSION=0.13.7
 ARG BUILD_REVISION=unknown
 
 # node:20-alpine, pinned by the official multi-architecture digest.
@@ -19,8 +19,8 @@ COPY --from=builder --chown=appuser:appgroup /app/.next/static ./.next/static
 ARG APP_VERSION
 ARG BUILD_REVISION
 LABEL org.opencontainers.image.version="${APP_VERSION}" \
-	  org.opencontainers.image.revision="${BUILD_REVISION}" \
-	  org.opencontainers.image.source="https://github.com/TrooP81/aioaquarea"
+	org.opencontainers.image.revision="${BUILD_REVISION}" \
+	org.opencontainers.image.source="https://github.com/TrooP81/aioaquarea"
 ENV APP_VERSION="${APP_VERSION}" \
 	BUILD_REVISION="${BUILD_REVISION}"
 

@@ -38,6 +38,7 @@ test.describe("Dashboard", () => {
           today_kwh: 12.5,
           today_cost_eur: 1.23,
           active_plan: null,
+          space_heating_gate: { state: "BLOCKED", profile_id: "WH_MXC12J9E8_J_DEFAULT" },
           has_override: false,
         }),
       })
@@ -45,6 +46,7 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.online")).toContainText("Connected");
+    await expect(page.getByTestId("space-heating-gate")).toContainText("BLOCKED");
   });
 
   test("shows disconnected when no device status", async ({ page }) => {

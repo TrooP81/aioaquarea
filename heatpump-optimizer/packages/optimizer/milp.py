@@ -7,6 +7,8 @@ import datetime as dt
 import math
 from typing import Any
 
+from sqlalchemy import select
+
 try:
     import pulp
 except ImportError:
@@ -17,20 +19,38 @@ from packages.core.database import get_session
 from packages.core.control_temperature import get_control_temperature
 from packages.core.time_slots import next_hour_boundary
 from packages.core.settings_service import (
-    dhw_deadlines_from_schedule,
     get_comfort_schedule,
     get_heat_curve_config,
+    get_space_heating_gate_config,
     get_setting,
     get_user_tz,
     is_comfort_hour,
 )
+from packages.core.models import SpaceHeatingGateRecord
+from packages.core.space_heating_gate import (
+    SpaceHeatingGateState,
+    project_gate_states,
+    resolve_effective_gate,
+)
 from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
+from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+def _dhw_deadline_offsets(
+    comfort_schedule: dict[str, list[int]], horizon_start: dt.datetime, tz_name: str | None
+) -> list[int]:
+    if horizon_start.tzinfo is None:
+        horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
+    return [
+        round((deadline - horizon_start).total_seconds() / 3600)
+        for deadline, _ in local_dhw_deadlines_in_horizon(comfort_schedule, horizon_start, tz_name)
+    ]
 
 
 class MILPOptimizer:
@@ -77,6 +97,17 @@ class MILPOptimizer:
             weather = await self._get_weather(session, horizon_start, horizon_end)
             weather_full = await self._get_weather_full(session, horizon_start, horizon_end)
             last_status = await self._get_last_status(session)
+            gate_row = (
+                (
+                    await session.execute(
+                        select(SpaceHeatingGateRecord).where(
+                            SpaceHeatingGateRecord.device_id == last_status.device_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if last_status is not None
+                else None
+            )
 
         if not prices:
             raise DataIncompleteError("No price data available for the planning horizon")
@@ -150,24 +181,24 @@ class MILPOptimizer:
         # Build COP function: prefer ML model, fall back to default curve
         cop_fn = self._build_cop_function(last_status, weather_full)
 
-        # Use the same controller cutoff for fallback demand and supply-water
-        # planning so manual MILP mode cannot reserve space-heating energy after
-        # the Panasonic heat curve has switched heating off.
         heat_curve = await get_heat_curve_config()
+        gate_config = await get_space_heating_gate_config()
+        effective_gate = resolve_effective_gate(gate_row, gate_config)
+        gate_projections = project_gate_states(
+            effective_gate, [temperature for _, temperature in weather], gate_config
+        )
 
         # Build demand estimates: prefer ML model, fall back to degree-day load.
         demand_per_hour = self._build_demand_estimates(
             weather,
             weather_full,
-            heating_off_outdoor_c=heat_curve.heating_off_outdoor_c,
+            gate_states=[evidence.state for evidence in gate_projections],
         )
 
         # Get comfort schedule to derive DHW deadlines
         comfort_schedule = await get_comfort_schedule()
         tz_name = await get_user_tz()
-        dhw_deadlines = dhw_deadlines_from_schedule(
-            comfort_schedule, horizon_start, tz_name=tz_name
-        )
+        dhw_deadlines = _dhw_deadline_offsets(comfort_schedule, horizon_start, tz_name)
 
         # Resolve per-hour indoor comfort targets from schedule
         comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
@@ -271,6 +302,7 @@ class MILPOptimizer:
             bias_corrections,
             uncertainty_margins,
             forecast_adjustments["hourly_regimes"],
+            [evidence.state for evidence in gate_projections],
         )
         if plan and isinstance(plan.get("forecast_snapshot"), dict):
             snapshot = plan["forecast_snapshot"]
@@ -303,6 +335,16 @@ class MILPOptimizer:
                 "bias_correction": scorecard.get("bias_correction", {}),
                 "condition_adjustments": forecast_adjustments,
                 "prediction_intervals": intervals,
+            }
+        if plan is not None and last_status is not None:
+            plan["device_id"] = last_status.device_id
+            for action in plan.get("actions", []):
+                action["device_id"] = last_status.device_id
+            plan["space_heating_gate"] = {
+                "state": effective_gate.state,
+                "reason": effective_gate.reason_code,
+                "profile_id": effective_gate.profile_id,
+                "projected_states": [evidence.state for evidence in gate_projections],
             }
         return plan
 
@@ -342,9 +384,13 @@ class MILPOptimizer:
         self,
         weather,
         weather_full=None,
-        heating_off_outdoor_c: float = 13.0,
+        gate_states: list[SpaceHeatingGateState | str] | None = None,
     ) -> list[float]:
         """Return hourly demand estimates (kW) for the horizon."""
+
+        def gate_allows(index: int) -> bool:
+            return gate_states is None or gate_states[index] == SpaceHeatingGateState.ALLOWED
+
         if self._demand_model and self._demand_model.is_trained:
             logger.info("milp_using_ml_demand_model")
             weather_dicts = []
@@ -356,37 +402,36 @@ class MILPOptimizer:
                     fallback_temperature=fallback_temperature,
                 )
                 weather_dicts.append({"ts": timestamp, **conditions})
-            return self._demand_model.predict_hourly(weather_dicts, len(weather))
+            predicted = self._demand_model.predict_hourly(weather_dicts, len(weather))
+            return [demand if gate_allows(index) else 0.0 for index, demand in enumerate(predicted)]
 
-        # Fallback: approximate building load from heating-degree demand. The
-        # previous constant 25% reserve forced 72 kWh/day with a 12 kW unit,
-        # even above the controller's heating-off threshold. Indoor-temperature
-        # constraints remain the primary comfort protection; this reserve only
-        # supplies a conservative weather-dependent baseline when ML is absent.
-        try:
-            cutoff = float(heating_off_outdoor_c)
-        except (TypeError, ValueError):
-            cutoff = 13.0
-        if not math.isfinite(cutoff):
-            cutoff = 13.0
-
-        design_outdoor = min(self.FALLBACK_DESIGN_OUTDOOR_C, cutoff - 1.0)
-        temperature_span = cutoff - design_outdoor
+        # Weather estimates load only; stateful controller eligibility is
+        # supplied separately by the raw-status-seeded gate projection.
+        design_outdoor = self.FALLBACK_DESIGN_OUTDOOR_C
+        temperature_span = 20.0 - design_outdoor
         max_power_kw = max(0.0, float(settings.sh_max_power_kw))
         profile = []
-        for _, raw_temperature in weather:
+        for index, (_, raw_temperature) in enumerate(weather):
             try:
                 temperature = float(raw_temperature)
             except (TypeError, ValueError):
                 temperature = 5.0
             if not math.isfinite(temperature):
                 temperature = 5.0
-            load_fraction = max(0.0, min(1.0, (cutoff - temperature) / temperature_span))
+            state = (
+                gate_states[index]
+                if gate_states is not None and index < len(gate_states)
+                else SpaceHeatingGateState.ALLOWED
+            )
+            load_fraction = (
+                max(0.0, min(1.0, (20.0 - temperature) / temperature_span))
+                if state == SpaceHeatingGateState.ALLOWED
+                else 0.0
+            )
             profile.append(max_power_kw * load_fraction)
 
         logger.info(
             "milp_using_degree_day_demand_fallback",
-            heating_off_outdoor_c=cutoff,
             design_outdoor_c=design_outdoor,
             forecast_sh_kwh=round(sum(profile), 2),
         )
@@ -580,6 +625,7 @@ class MILPOptimizer:
         forecast_bias_corrections_c: list[float] | None = None,
         condition_uncertainty_margins_c: list[float] | None = None,
         forecast_regimes: list[list[str]] | None = None,
+        gate_states: list[SpaceHeatingGateState | str] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -622,6 +668,13 @@ class MILPOptimizer:
 
         sh_max_power_kw = max(0.01, float(settings.sh_max_power_kw))
         demand_profile_kw = self._normalise_demand_profile(demand_per_hour, H, sh_max_power_kw)
+        if gate_states is not None:
+            demand_profile_kw = [
+                demand
+                if hour >= len(gate_states) or gate_states[hour] == SpaceHeatingGateState.ALLOWED
+                else 0.0
+                for hour, demand in enumerate(demand_profile_kw)
+            ]
 
         # Tank state (thermal kWh stored, using same kwh_per_degree factor)
         # Per-hour tank floor: lower bound during off-peak hours
@@ -636,13 +689,8 @@ class MILPOptimizer:
             tank_min_floors = [tank_min_abs] * H
         tank_init = max(tank_min_abs, min(_tank_max, current_tank_temp * kwh_per_degree))
 
-        # Cap DHW thermal gain so it can't exceed the tank range in one hour.
-        # Fast-heating tanks (e.g. 20°C/h) reach target in minutes; the solver
-        # needs the ability to run DHW for only a fraction of the hour.
         tank_range = _tank_max - tank_min_abs
         max_thermal_per_h = [dhw_power_kw_per_h[h] * cops[h] for h in range(H)]
-        # If any hour's thermal gain exceeds the tank range, use continuous DHW
-        needs_continuous_dhw = any(g > tank_range * 1.1 for g in max_thermal_per_h)
 
         # Representative values for logging
         avg_dhw_power = sum(dhw_power_kw_per_h) / H
@@ -659,124 +707,139 @@ class MILPOptimizer:
             avg_tank_loss_kwh_per_h=round(avg_tank_loss, 3),
             avg_tank_heat_rate=round(sum(tank_heat_rates) / H, 2),
             max_thermal_gain=round(max(max_thermal_per_h), 2),
-            continuous_dhw=needs_continuous_dhw,
             forecast_sh_kwh=round(sum(demand_profile_kw), 2),
             forecast_peak_sh_kw=round(max(demand_profile_kw, default=0.0), 2),
         )
 
-        # --- Problem setup ---
-        prob = pulp.LpProblem("HeatPumpCostMin", pulp.LpMinimize)
-
-        # DHW decision: continuous [0,1] fraction of the hour when the thermal
-        # gain per hour would exceed the tank range (fast-heating tanks),
-        # binary otherwise (traditional slower tanks).
-        if needs_continuous_dhw:
-            x_dhw = [pulp.LpVariable(f"x_dhw_{h}", 0, 1, cat="Continuous") for h in range(H)]
-        else:
-            x_dhw = [pulp.LpVariable(f"x_dhw_{h}", cat="Binary") for h in range(H)]
-        x_sh = [pulp.LpVariable(f"x_sh_{h}", 0, 1, cat="Continuous") for h in range(H)]
-
-        # --- Objective: minimize cost ---
-        energy_cost_objective = pulp.lpSum(
-            [
-                price_vals[h] * (x_dhw[h] * dhw_power_kw_per_h[h] + x_sh[h] * sh_max_power_kw)
+        def build_model(fractional_dhw: bool):
+            prob = pulp.LpProblem("HeatPumpCostMin", pulp.LpMinimize)
+            x_dhw = [
+                pulp.LpVariable(
+                    f"x_dhw_{h}", 0, 1, cat="Continuous" if fractional_dhw else "Binary"
+                )
                 for h in range(H)
             ]
-        )
-        prob += energy_cost_objective
+            y_dhw = (
+                [pulp.LpVariable(f"y_dhw_{h}", cat="Binary") for h in range(H)]
+                if fractional_dhw
+                else None
+            )
+            x_sh = [pulp.LpVariable(f"x_sh_{h}", 0, 1, cat="Continuous") for h in range(H)]
+            energy_cost = pulp.lpSum(
+                price_vals[h] * (x_dhw[h] * dhw_power_kw_per_h[h] + x_sh[h] * sh_max_power_kw)
+                for h in range(H)
+            )
+            tank_state = [
+                pulp.LpVariable(f"tank_{h}", tank_min_abs, _tank_max) for h in range(H + 1)
+            ]
+            prob += tank_state[0] == tank_init
+            for h in range(H):
+                prob += tank_state[h + 1] == (
+                    tank_state[h]
+                    + x_dhw[h] * dhw_power_kw_per_h[h] * cops[h]
+                    - tank_loss_kwh_per_h[h]
+                )
+            for h in range(1, H + 1):
+                prob += tank_state[h] >= tank_min_floors[min(h, H - 1)]
+            for ready_hour in dhw_deadlines or []:
+                if 0 < ready_hour < H:
+                    prob += tank_state[ready_hour] >= tank_min_comfort * 1.2
 
-        # --- Constraints ---
+            if fractional_dhw:
+                for h in range(H):
+                    prob += x_dhw[h] <= y_dhw[h]
+                    prob += x_dhw[h] >= (5 / 60) * y_dhw[h]
+                prob += pulp.lpSum(y_dhw) <= 20
+            else:
+                prob += pulp.lpSum(x_dhw) <= 20
 
-        # Tank state evolution — LP variable bounds use the absolute (offpeak)
-        # minimum so the solver has full range; per-hour floors are added as
-        # explicit constraints below.
-        tank_state = [pulp.LpVariable(f"tank_{h}", tank_min_abs, _tank_max) for h in range(H + 1)]
-        prob += tank_state[0] == tank_init
+            for h in range(H):
+                gate_allows = (
+                    gate_states is None
+                    or h >= len(gate_states)
+                    or gate_states[h] == SpaceHeatingGateState.ALLOWED
+                )
+                if not gate_allows:
+                    prob += x_sh[h] == 0
+                elif temps[h] < -10:
+                    prob += x_sh[h] >= 0.5
+                elif temps[h] < 0:
+                    prob += x_sh[h] >= 0.2
 
-        for h in range(H):
-            heat_added = x_dhw[h] * dhw_power_kw_per_h[h] * cops[h]
-            prob += tank_state[h + 1] == tank_state[h] + heat_added - tank_loss_kwh_per_h[h]
+            cumulative_demand_kwh = 0.0
+            for h, demand_kw in enumerate(demand_profile_kw):
+                cumulative_demand_kwh += demand_kw
+                prob += (
+                    pulp.lpSum(x_sh[i] * sh_max_power_kw for i in range(h + 1))
+                    >= cumulative_demand_kwh
+                )
 
-        # The initial state is a measured fact rather than a decision. Applying
-        # a floor at h=0 would make a temporarily cold tank impossible to plan.
-        for h in range(1, H + 1):
-            floor = tank_min_floors[min(h, H - 1)]
-            prob += tank_state[h] >= floor
+            indoor_init = current_indoor_temp if current_indoor_temp is not None else 20.0
+            t_indoor = [pulp.LpVariable(f"T_indoor_{h}", 10.0, 35.0) for h in range(H + 1)]
+            prob += t_indoor[0] == indoor_init
+            indoor_dynamics: list[tuple[float, float]] = []
+            for h in range(H):
+                gain, loss = (
+                    indoor_rates[h]
+                    if indoor_rates and h < len(indoor_rates)
+                    else (
+                        thermal_model._indoor_heating_rate(temps[h]),
+                        thermal_model._indoor_cooling_rate(temps[h]),
+                    )
+                )
+                indoor_dynamics.append((gain, loss))
+                prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
 
-        # A deadline at h=0 cannot be scheduled, for the same reason.
-        for ready_hour in dhw_deadlines or []:
-            if 0 < ready_hour < H:
-                prob += tank_state[ready_hour] >= tank_min_comfort * 1.2
-
-        # Limit DHW activations (API rate limit proxy)
-        max_changes = 20
-        prob += pulp.lpSum(x_dhw) <= max_changes
-
-        # Space heating: safety net for extreme cold.
-        # The indoor temperature LP constraints (t_indoor >= target) below are
-        # the primary mechanism — the solver schedules x_sh to keep indoor
-        # temp above the per-hour target at minimum cost.  This hard floor
-        # only kicks in during severe frost as a fail-safe.
-        for h in range(H):
-            if temps[h] < -10:
-                prob += x_sh[h] >= 0.5
-            elif temps[h] < 0:
-                prob += x_sh[h] >= 0.2
-
-        # The demand model predicts the electrical energy the building needs
-        # during each one-hour slot.  Earlier code passed this forecast into
-        # ``_solve`` but never used it, leaving MILP free to plan zero space
-        # heating on mild days even when the learned model predicted demand.
-        #
-        # A cumulative reserve lets the optimiser pre-heat in cheaper earlier
-        # hours while ensuring it has scheduled enough total energy by every
-        # deadline.  It deliberately does not require an exact per-hour match:
-        # the indoor-temperature dynamics remain responsible for deciding
-        # *when* that energy best preserves comfort.
-        cumulative_demand_kwh = 0.0
-        for h, demand_kw in enumerate(demand_profile_kw):
-            cumulative_demand_kwh += demand_kw
-            prob += (
-                pulp.lpSum(x_sh[i] * sh_max_power_kw for i in range(h + 1)) >= cumulative_demand_kwh
+            comfort_slack = [
+                pulp.LpVariable(f"comfort_slack_{h}", lowBound=0) for h in range(H + 1)
+            ]
+            if indoor_targets:
+                for h in range(H):
+                    if h < len(indoor_targets):
+                        prob += t_indoor[h + 1] + comfort_slack[h + 1] >= indoor_targets[h]
+            comfort_penalty = pulp.lpSum(
+                self.COMFORT_VIOLATION_PENALTY * comfort_slack[h] for h in range(H + 1)
+            )
+            activation_tie_break = pulp.lpSum(y_dhw) * 1e-6 if y_dhw else 0
+            prob.setObjective(energy_cost + comfort_penalty + activation_tie_break)
+            return (
+                prob,
+                x_dhw,
+                x_sh,
+                energy_cost,
+                comfort_slack,
+                t_indoor,
+                indoor_dynamics,
+                indoor_init,
             )
 
-        # --- Indoor temperature state variable ---
-        # Track predicted indoor air temperature through the horizon.
-        # Prefers comfort-model-derived rates (accurate, learned from real
-        # sensor data) over the simple thermal model linear rates.
-        indoor_init = current_indoor_temp if current_indoor_temp is not None else 20.0
-        t_indoor = [pulp.LpVariable(f"T_indoor_{h}", 10.0, 35.0) for h in range(H + 1)]
-        prob += t_indoor[0] == indoor_init
-
-        indoor_dynamics: list[tuple[float, float]] = []
-        for h in range(H):
-            if indoor_rates and h < len(indoor_rates):
-                gain, loss = indoor_rates[h]
-            else:
-                gain = thermal_model._indoor_heating_rate(temps[h])
-                loss = thermal_model._indoor_cooling_rate(temps[h])
-            indoor_dynamics.append((gain, loss))
-            # Linear evolution: T[h+1] = T[h] + loss + x_sh[h] * (gain - loss)
-            # When x_sh=0 → pure cooling; when x_sh=1 → full heating
-            prob += t_indoor[h + 1] == t_indoor[h] + loss + x_sh[h] * (gain - loss)
-
-        # A soft comfort floor prevents a physically unreachable cold start
-        # from making the whole MILP infeasible. The target is evaluated after
-        # the controls for each slot have had one hour to act.
-        comfort_slack = [pulp.LpVariable(f"comfort_slack_{h}", lowBound=0) for h in range(H + 1)]
-        if indoor_targets:
-            for h in range(H):
-                if h < len(indoor_targets):
-                    prob += t_indoor[h + 1] + comfort_slack[h + 1] >= indoor_targets[h]
-
-        comfort_penalty = pulp.lpSum(
-            self.COMFORT_VIOLATION_PENALTY * comfort_slack[h] for h in range(H + 1)
-        )
-        prob.setObjective(energy_cost_objective + comfort_penalty)
-
-        # --- Solve ---
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=self.SOLVER_TIMEOUT_SECONDS)
+        (
+            prob,
+            x_dhw,
+            x_sh,
+            energy_cost_objective,
+            comfort_slack,
+            t_indoor,
+            indoor_dynamics,
+            indoor_init,
+        ) = build_model(False)
+        logger.info("milp_solving", dhw_mode="binary")
         prob.solve(solver)
+
+        if prob.status == pulp.constants.LpStatusInfeasible:
+            logger.info("milp_dhw_fractional_fallback", binary_status=prob.status)
+            (
+                prob,
+                x_dhw,
+                x_sh,
+                energy_cost_objective,
+                comfort_slack,
+                t_indoor,
+                indoor_dynamics,
+                indoor_init,
+            ) = build_model(True)
+            prob.solve(solver)
 
         if prob.status == pulp.constants.LpStatusNotSolved:
             raise SolverTimeoutError(
@@ -792,6 +855,11 @@ class MILPOptimizer:
 
         for h in range(H):
             ts = start_ts + dt.timedelta(hours=h)
+            gate_allows = (
+                gate_states is None
+                or h >= len(gate_states)
+                or gate_states[h] == SpaceHeatingGateState.ALLOWED
+            )
 
             dhw_frac = x_dhw[h].varValue or 0
             if dhw_frac > 0.05:
@@ -823,7 +891,7 @@ class MILPOptimizer:
             prev_sh = x_sh[h - 1].varValue or 0 if h > 0 else 1.0
             was_quiet = (prev_sh < 0.3 and temps[h - 1] > 5) if h > 0 else False
 
-            if want_quiet and not was_quiet:
+            if gate_allows and want_quiet and not was_quiet:
                 actions.append(
                     {
                         "ts": ts.isoformat(),
@@ -835,7 +903,7 @@ class MILPOptimizer:
                         },
                     }
                 )
-            elif not want_quiet and was_quiet:
+            elif gate_allows and not want_quiet and was_quiet:
                 actions.append(
                     {
                         "ts": ts.isoformat(),
@@ -858,6 +926,13 @@ class MILPOptimizer:
         if comfort_model.is_ready_for_control:
             for h in range(H):
                 ts = start_ts + dt.timedelta(hours=h)
+                if (
+                    gate_states is not None
+                    and h < len(gate_states)
+                    and gate_states[h] != SpaceHeatingGateState.ALLOWED
+                ):
+                    current_mode = None
+                    continue
                 sh_val = x_sh[h].varValue or 0
                 solved_raw = (
                     t_indoor[h].varValue if t_indoor[h].varValue is not None else indoor_init

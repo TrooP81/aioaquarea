@@ -166,7 +166,11 @@ class AquareaDeviceControl:
                     "zoneStatus": [
                         {
                             "zoneId": zone.zone_id,
-                            "heatSet": zone.heat_set,
+                            **(
+                                {"heatSet": zone.heat_set}
+                                if zone.heat_set is not None
+                                else {}
+                            ),
                             **(
                                 {"coolSet": zone.cool_set}
                                 if zone.cool_set is not None

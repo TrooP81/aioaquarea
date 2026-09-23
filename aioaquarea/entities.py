@@ -98,11 +98,6 @@ class DeviceImpl(Device):
 
         self._sync_tank_from_status()
 
-        # The consumption data refresh is now triggered and awaited in AquareaClient.get_device
-        # TODO
-        # if self._consumption_refresh_interval:
-        #     self.hass.async_create_task(self.__refresh_consumption__())
-
     @property
     def heat_max(self) -> int | None:
         """Gets the maximum allowed temperature for heat mode of the first zone"""
@@ -119,6 +114,7 @@ class DeviceImpl(Device):
         self._status = await self._client.get_device_status(
             self._info, allow_cached_fallback=allow_cached_fallback
         )
+        self.__build_zones__(self._info.zones)
         self._sync_tank_from_status()
 
         if (
@@ -327,7 +323,6 @@ class DeviceImpl(Device):
 
         if not consumption_obj:
             # Schedule a refresh if data is not available
-            # self.hass.async_create_task(self.__refresh_consumption__())
             raise DataNotAvailableError(
                 f"Consumption for {day} is not yet available. Scheduling refresh."
             )

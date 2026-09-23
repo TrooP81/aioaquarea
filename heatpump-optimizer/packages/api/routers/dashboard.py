@@ -23,11 +23,14 @@ from packages.core.models import (
     OverrideRecord,
     PlanActionRecord,
     PriceRecord,
+    SpaceHeatingGateRecord,
 )
 from packages.core.operational_alerts import device_status_is_fresh
 from packages.core.plan_outcome import cumulative_counter_delta, hour_start
+from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
     get_int_setting,
+    get_space_heating_gate_config,
     get_user_tz,
     local_date,
     local_day_start_utc,
@@ -49,6 +52,17 @@ async def get_dashboard():
             select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
         )
         status = status_result.scalar_one_or_none()
+        gate_row = (
+            (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == status.device_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if status is not None
+            else None
+        )
         outdoor = (
             await resolve_outdoor_temperature(
                 session,
@@ -151,6 +165,7 @@ async def get_dashboard():
         now=now,
         poll_interval_seconds=poll_interval,
     )
+    gate = resolve_effective_gate(gate_row, await get_space_heating_gate_config())
     status_timestamp = status.ts if status is not None else None
     if status_timestamp is not None and status_timestamp.tzinfo is None:
         status_timestamp = status_timestamp.replace(tzinfo=dt.timezone.utc)
@@ -271,6 +286,18 @@ async def get_dashboard():
         )
         if active_plan
         else None,
+        space_heating_gate={
+            "state": gate.state,
+            "reason": gate.reason_code,
+            "profile_id": gate.profile_id,
+            "on_operator": gate.on_operator,
+            "off_operator": gate.off_operator,
+            "base_c": gate.base_c,
+            "on_threshold_c": gate.on_threshold_c,
+            "off_threshold_c": gate.off_threshold_c,
+            "last_raw_outdoor_c": gate.last_raw_outdoor_c,
+            "fingerprint_matches": gate.fingerprint_matches,
+        },
         has_override=active_override_id is not None,
         override_id=active_override_id,
     )

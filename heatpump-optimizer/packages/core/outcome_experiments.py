@@ -13,17 +13,25 @@ from sqlalchemy import desc, select
 
 from packages.core.database import get_session
 from packages.core.heat_curve import HeatCurveConfig
-from packages.core.models import DeviceStatusRecord
+from packages.core.models import DeviceStatusRecord, SpaceHeatingGateRecord
 from packages.core.settings_service import (
     get_all_settings,
     get_bool_setting,
     get_float_setting,
+    get_space_heating_gate_config,
+)
+from packages.core.space_heating_gate import (
+    HeatingGateConfig,
+    SpaceHeatingGateState,
+    resolve_effective_gate,
 )
 
 
 def assess_manual_trial_conditions(
     config: HeatCurveConfig,
     status: Any | None,
+    gate_row: Any | None = None,
+    gate_config: HeatingGateConfig | None = None,
 ) -> dict[str, object]:
     """Decide whether a *manual* curve trial can be proposed safely.
 
@@ -41,12 +49,13 @@ def assess_manual_trial_conditions(
         }
 
     outdoor_temp = float(status.outdoor_temp)
-    if outdoor_temp >= config.heating_off_outdoor_c:
+    effective_gate = resolve_effective_gate(gate_row, gate_config or HeatingGateConfig())
+    if effective_gate.state is not SpaceHeatingGateState.ALLOWED:
         return {
             "ready": False,
-            "reason": "above_heating_off_threshold",
+            "reason": f"space_heating_gate_{effective_gate.state.lower()}",
             "outdoor_temp_c": round(outdoor_temp, 1),
-            "heating_off_outdoor_c": config.heating_off_outdoor_c,
+            "gate_reason": effective_gate.reason_code,
         }
 
     evidence = getattr(status, "space_heating_evidence", None)
@@ -83,13 +92,25 @@ async def get_outcome_experiment_status() -> dict[str, object]:
     max_step_c = await get_float_setting("outcome_experiment_max_curve_step_c")
     values = await get_all_settings()
     config = HeatCurveConfig.from_settings(values)
+    gate_config = await get_space_heating_gate_config()
     async with get_session() as session:
         status = (
             await session.execute(
                 select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
             )
         ).scalar_one_or_none()
-    conditions = assess_manual_trial_conditions(config, status)
+        gate_row = (
+            (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == status.device_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if status is not None
+            else None
+        )
+    conditions = assess_manual_trial_conditions(config, status, gate_row, gate_config)
     safe_step_c = round(min(1.0, max(0.1, max_step_c)), 1)
     state = (
         "manual_review_ready"

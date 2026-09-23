@@ -16,7 +16,16 @@ export interface ReleaseNote {
  */
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
-    version: APP_VERSION,
+    version: "0.13.7",
+    released: "2026-09-23",
+    title: "Dependency maintenance and release provenance",
+    changes: [
+      "Dependency maintenance retains the remediated SoupSieve resolution and closes the historical release-scoped waiver without audit suppressions.",
+      "Backend and dashboard images record the application version and build revision in OCI metadata for deployment verification and rollback.",
+    ],
+  },
+  {
+    version: "0.13.6",
     released: "2026-09-15",
     title: "Reliable SmartThings transport and accessible dashboard",
     changes: [

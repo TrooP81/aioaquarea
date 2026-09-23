@@ -66,6 +66,7 @@ class DeviceZone:
     def __init__(self, info: DeviceZoneInfo, status: DeviceZoneStatus | None) -> None:
         self._info = info
         self._status = status
+        self._temperature_modifiers: dict[SpecialStatus, TemperatureModifiers] = {}
 
         if self.supports_special_status:
             eco_heat = self._status.eco_heat if self._status else None
@@ -242,8 +243,6 @@ class Tank(ABC):
 class Device(ABC):
     """Aquarea Device"""
 
-    _zones: dict[int, DeviceZone] = {}
-
     def __init__(self, info: DeviceInfo, status: DeviceStatus) -> None:
         self._info = info  # Store the DeviceInfo object
         self._status = status
@@ -255,13 +254,15 @@ class Device(ABC):
         self.__build_zones__(info.zones)  # Use info.zones directly
 
     def __build_zones__(self, zones_info: list[DeviceZoneInfo]) -> None:
+        zones: dict[int, DeviceZone] = {}
         for zone in zones_info:
             zone_id = zone.zone_id
             # pylint: disable=cell-var-from-loop
             zone_status = next(
                 filter(lambda z: z.zone_id == zone_id, self._status.zones), None
             )
-            self._zones[zone_id] = DeviceZone(zone, zone_status)
+            zones[zone_id] = DeviceZone(zone, zone_status)
+        self._zones = zones
 
     @abstractmethod
     async def refresh_data(self, allow_cached_fallback: bool = True) -> None:
@@ -296,6 +297,16 @@ class Device(ABC):
     def operation_status(self) -> OperationStatus:
         """The operation status of the device"""
         return self._status.operation_status
+
+    @property
+    def operation_status_present(self) -> bool | None:
+        """Whether the latest status response included ``operationStatus``."""
+        return self._status.operation_status_present
+
+    @property
+    def operation_status_valid(self) -> bool | None:
+        """Whether ``operationStatus`` mapped to a known API enum value."""
+        return self._status.operation_status_valid
 
     @property
     def device_id(self) -> str:
@@ -430,6 +441,7 @@ class Device(ABC):
         zones: list[ZoneTemperatureSetUpdate] = [
             self.__calculate_zone_special_status_update__(zone, special_status)
             for zone in self.zones.values()
+            if zone.supports_special_status
         ]
 
         await self.__set_special_status__(special_status, zones)

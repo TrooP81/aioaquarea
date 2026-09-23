@@ -1,4 +1,4 @@
-ARG APP_VERSION=0.13.6
+ARG APP_VERSION=0.13.7
 ARG BUILD_REVISION=unknown
 
 # python:3.12.13-slim-trixie, pinned by the official multi-architecture digest.
@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev git && \
     rm -rf /var/lib/apt/lists/*
 
-COPY heatpump-optimizer/pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[all]"
+COPY heatpump-optimizer/pyproject.toml heatpump-optimizer/constraints.txt ./
+RUN pip install --no-cache-dir -c constraints.txt -e ".[all]"
 
 COPY heatpump-optimizer/ .
 
@@ -24,17 +24,17 @@ COPY aioaquarea/ /opt/aioaquarea-src/aioaquarea/
 
 # Install the project itself
 RUN pip install --no-cache-dir --force-reinstall --no-deps /opt/aioaquarea-src \
- && pip install --no-cache-dir --no-deps -e .
+    && pip install --no-cache-dir --no-deps -e .
 
 RUN useradd --create-home --shell /bin/bash appuser \
- && mkdir -p /app/models \
- && chown -R appuser:appuser /app/models
+    && mkdir -p /app/models \
+    && chown -R appuser:appuser /app/models
 
 ARG APP_VERSION
 ARG BUILD_REVISION
 LABEL org.opencontainers.image.version="${APP_VERSION}" \
-      org.opencontainers.image.revision="${BUILD_REVISION}" \
-      org.opencontainers.image.source="https://github.com/TrooP81/aioaquarea"
+    org.opencontainers.image.revision="${BUILD_REVISION}" \
+    org.opencontainers.image.source="https://github.com/TrooP81/aioaquarea"
 ENV APP_VERSION="${APP_VERSION}" \
     BUILD_REVISION="${BUILD_REVISION}"
 

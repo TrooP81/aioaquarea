@@ -367,7 +367,7 @@ async def set_learning_mode(body: LearningModeUpdate):
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
     from packages.core.settings_service import get_setting
-    from packages.ml.models import MODEL_DIR
+    from packages.ml.models import MODEL_DIR, DemandModel
     from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
 
@@ -386,7 +386,7 @@ async def get_optimizer_status():
 
     estimated_days = max(1, total_consumption // 96) if total_consumption > 0 else 0
     cop_samples = max(0, total_consumption - estimated_days)
-    demand_samples = total_consumption
+    demand_quality = await DemandModel().training_data_quality()
 
     def _version_to_iso(prefix: str, models: list) -> str | None:
         if not models:
@@ -414,7 +414,8 @@ async def get_optimizer_status():
         "demand_model": {
             "trained": optimizer_status["demand_trained"],
             "last_trained": _version_to_iso("demand_model_", demand_models),
-            "samples": demand_samples,
+            "samples": demand_quality["usable_samples"],
+            "data_quality": demand_quality,
         },
         "thermal_model": {
             "calibrated": thermal_model.params.last_calibrated is not None,

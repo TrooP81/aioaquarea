@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heatpump-optimizer"
-version = "0.13.6"
+version = "0.13.7"
 description = "Cost-optimizing controller for Panasonic Aquarea heat pumps"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,13 +18,13 @@ dependencies = [
     "redis[hiredis]>=5.0",
     "apscheduler>=3.10,<4",
     "structlog>=24.1",
-    "httpx>=0.27",
+    "httpx>=0.28.1,<0.29",
     "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]
 api = [
-    "fastapi>=0.110",
+    "fastapi>=0.141.1,<0.142",
     "uvicorn[standard]>=0.27",
 ]
 optimizer = [
@@ -45,7 +45,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
     "ruff==0.15.21",
-    "httpx>=0.27",
+    "httpx>=0.28.1,<0.29",
 ]
 
 [tool.setuptools.packages.find]

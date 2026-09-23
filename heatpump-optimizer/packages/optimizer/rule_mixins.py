@@ -19,6 +19,35 @@ from packages.optimizer.actions import ActionType
 logger = structlog.get_logger()
 
 
+def local_dhw_deadlines_in_horizon(
+    comfort_schedule: dict[str, list[int]],
+    horizon_start: dt.datetime,
+    tz_name: str | None,
+) -> list[tuple[dt.datetime, int]]:
+    """Return future DHW deadlines as UTC instants with their local hour."""
+    timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
+    if horizon_start.tzinfo is None:
+        horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
+    horizon_end = horizon_start + dt.timedelta(hours=24)
+    local_start = horizon_start.astimezone(timezone)
+    local_end = horizon_end.astimezone(timezone)
+    current_date = local_start.date()
+    deadlines: list[tuple[dt.datetime, int]] = []
+
+    while current_date <= local_end.date():
+        local_noon = dt.datetime.combine(current_date, dt.time(12), tzinfo=timezone)
+        for ready_hour in dhw_deadlines_from_schedule(
+            comfort_schedule, local_noon, tz_name=tz_name
+        ):
+            local_deadline = dt.datetime.combine(current_date, dt.time(ready_hour), tzinfo=timezone)
+            deadline = local_deadline.astimezone(dt.timezone.utc)
+            if horizon_start < deadline < horizon_end:
+                deadlines.append((deadline, ready_hour))
+        current_date += dt.timedelta(days=1)
+
+    return sorted(deadlines, key=lambda item: item[0])
+
+
 class SharedRuleHelpersMixin:
     COMFORT_SATISFIED_MARGIN_C = 0.3
 
@@ -272,37 +301,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         horizon_start: dt.datetime,
         tz_name: str | None,
     ) -> list[tuple[dt.datetime, int]]:
-        """Return future DHW deadlines as UTC instants with their local hour.
-
-        The comfort schedule stores local wall-clock hours.  Building a
-        deadline with ``horizon_start.replace(hour=...)`` accidentally treats
-        those local hours as UTC, shifting an Amsterdam 08:00 deadline to
-        10:00 in summer.  Enumerating local calendar days also means a plan
-        crossing midnight uses tomorrow's weekday/weekend schedule correctly.
-        """
-        timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
-        if horizon_start.tzinfo is None:
-            horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
-        horizon_end = horizon_start + dt.timedelta(hours=24)
-        local_start = horizon_start.astimezone(timezone)
-        local_end = horizon_end.astimezone(timezone)
-        current_date = local_start.date()
-        deadlines: list[tuple[dt.datetime, int]] = []
-
-        while current_date <= local_end.date():
-            local_noon = dt.datetime.combine(current_date, dt.time(12), tzinfo=timezone)
-            for ready_hour in dhw_deadlines_from_schedule(
-                comfort_schedule, local_noon, tz_name=tz_name
-            ):
-                local_deadline = dt.datetime.combine(
-                    current_date, dt.time(ready_hour), tzinfo=timezone
-                )
-                deadline = local_deadline.astimezone(dt.timezone.utc)
-                if horizon_start < deadline < horizon_end:
-                    deadlines.append((deadline, ready_hour))
-            current_date += dt.timedelta(days=1)
-
-        return sorted(deadlines, key=lambda item: item[0])
+        return local_dhw_deadlines_in_horizon(comfort_schedule, horizon_start, tz_name)
 
     def _project_tank_temperature(
         self,

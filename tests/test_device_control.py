@@ -82,6 +82,25 @@ async def test_post_device_operation_update_includes_zone_temperature_updates(
 
 
 @pytest.mark.asyncio
+async def test_post_device_set_special_status_omits_unset_temperatures(device_control):
+    await device_control.post_device_set_special_status(
+        "device-1",
+        None,
+        [ZoneTemperatureSetUpdate(zone_id=1, heat_set=None, cool_set=18)],
+    )
+
+    assert device_control._api_client.request.await_args.kwargs["json"] == {
+        "status": [
+            {
+                "deviceGuid": "device-1",
+                "specialStatus": 0,
+                "zoneStatus": [{"zoneId": 1, "coolSet": 18}],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
 async def test_post_device_set_quiet_mode_uses_transfer_payload(device_control):
     await device_control.post_device_set_quiet_mode("device-1", QuietMode.LEVEL2)
 

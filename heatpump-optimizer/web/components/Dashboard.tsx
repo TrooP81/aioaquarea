@@ -36,6 +36,11 @@ interface DashboardProps {
     today_cost_priced_amount: number;
     today_cost_coverage_pct: number;
     today_cost_complete: boolean;
+    space_heating_gate?: {
+      state?: string;
+      reason?: string;
+      profile_id?: string;
+    };
   } | null;
   indoorTemp: number | null;
   indoorSensorCount: number;
@@ -242,6 +247,10 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           </div>
           <div className="card-subtitle">
             Space heating: {status?.space_heating_active ? "confirmed active" : "not active"}
+          </div>
+          <div className="card-subtitle" data-testid="space-heating-gate">
+            Eligibility gate: {data?.space_heating_gate?.state ?? "UNKNOWN"}
+            {data?.space_heating_gate?.profile_id ? ` · ${data.space_heating_gate.profile_id}` : ""}
           </div>
           {optBrief?.planningData && !optBrief.planningData.control_allowed && (
             <div className="card-subtitle text-warning text-sm" title={optBrief.planningData.reasons.join(" ")}>
