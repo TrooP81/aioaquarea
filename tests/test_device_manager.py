@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -578,3 +579,30 @@ async def test_device_with_declared_tank_tolerates_missing_live_tank_status(
     await device.set_mode(UpdateOperationMode.HEAT)
 
     assert client.post_device_operation_update.await_args.args[4] == OperationStatus.OFF
+
+
+@pytest.mark.parametrize(
+    ("present", "valid", "expected"),
+    [
+        (True, True, DeviceAction.OFF),
+        (None, None, DeviceAction.OFF),
+        (False, False, DeviceAction.HEATING),
+        (True, False, DeviceAction.HEATING),
+    ],
+)
+def test_current_action_ignores_defaulted_off_operation_status(
+    present, valid, expected
+):
+    status = replace(
+        _device_status(
+            _zone_status(1, 21),
+            operation_status_present=present,
+            operation_status_valid=valid,
+        ),
+        operation_status=OperationStatus.OFF,
+    )
+    device = _device_impl(
+        "device-1", [_zone_info(1, "Living room")], status, SimpleNamespace()
+    )
+
+    assert device.current_action == expected

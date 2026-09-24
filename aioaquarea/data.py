@@ -353,7 +353,11 @@ class Device(ABC):
     @property
     def current_action(self) -> DeviceAction:
         """The current action the device is performing"""
-        if self.operation_status == OperationStatus.OFF:
+        # A missing/invalid operationStatus is defaulted to OFF; fall back to component state.
+        if (
+            self.operation_status == OperationStatus.OFF
+            and self.operation_status_valid is not False
+        ):
             return DeviceAction.OFF
 
         direction = self.current_direction
