@@ -55,17 +55,26 @@ Tracks fixes for the 2026-09-23 code audit of `aioaquarea/` and `heatpump-optimi
 | API-1 | api | OAuth `state` compared with `!=` | VERIFIED | `packages/api/routers/smartthings.py` | `test_rejects_mismatched_oauth_state` | `secrets.compare_digest`; empty-state case not separately tested |
 | CORE-6 | core | `CORS_ORIGINS` default port mismatch | VERIFIED | `.github/copilot-instructions.md` | n/a | Not a code bug: compose publishes web on `4444`; instructions corrected from `3500` |
 
+## Found after deployment
+
+| ID | Area | Summary | Status | Files changed | Tests | Notes |
+|---|---|---|---|---|---|---|
+| CORE-7 | core | `AquareaWrapper` read Panasonic credentials from `.env`, ignoring the Settings tab; failed login crash-looped poller/optimizer | FIXED | `packages/core/services/aquarea.py`, `packages/core/settings_service.py`, `packages/core/config.py`, `.env.example`, `README.md` | `tests/test_aquarea_service.py::TestPanasonicCredentialsFromSettings` | Credentials now Settings-only (DB); login is retried on next device access instead of crashing |
+
 ## Changelog
 
 - 2026-09-23 — Status document created; baseline recorded.
 - 2026-09-23 — Phase 1 VERIFIED. Library 100 passed; optimizer 721 passed, 35 skipped; black/ruff clean. Independent review: PASS (added garbage-string bool test from review).
 - 2026-09-23 — Phase 2 VERIFIED. Review found a LIB-5 regression in weekly timer and a POLL-1 callback race; both fixed. Library 109 passed; optimizer 727 passed, 35 skipped; black/ruff clean.
 - 2026-09-23 — Phase 3 VERIFIED. Library 110 passed; optimizer 733 passed, 34 skipped (skip delta is an environment-dependent symlink test); black/ruff clean. Independent review: PASS.
+- 2026-09-23 — Phases 1–3 committed and pushed as `f9a8ecc`; containers rebuilt.
+- 2026-09-23 — CORE-7 FIXED (not yet committed). Optimizer 736 passed, 35 skipped; ruff clean. Containers rebuilt; all services running and waiting for credentials.
 
 ## Remaining / not done
 
+- Enter Panasonic username/password in the dashboard Settings tab.
+- `SECRET_KEY`, `API_TOKEN` and `ENTSOE_API_TOKEN` in `.env` are still `.env.example` placeholders (`SECRET_KEY` must be the original value to load saved ML models).
 - E2E backend suite (`run-tests.bat`, needs Docker test stack) not run.
-- Nothing committed or pushed. The optimizer installs `aioaquarea` from `git+...@main`, so library fixes reach it only after they are pushed.
 - Before enabling `auto` / `milp_preferred`, run MILP in shadow mode for a day to confirm the OPT-1 DHW scheduling.
 - Library behaviour changes for external consumers (home-assistant-aquarea): LIB-2 (`AuthenticationError` propagates from consumption) and LIB-5 (non-JSON ≥400 raises `RequestFailedError`).
 - Accepted LOW: `RedisCircuitBreaker.record_failure` uses non-atomic `INCR` + `EXPIRE`.

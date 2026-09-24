@@ -62,10 +62,10 @@ Settings can be supplied via environment variables (typically through `.env`) an
 
 ### Credentials & data sources
 
+Panasonic Comfort Cloud username and password are entered in the dashboard **Settings** tab only; they are not read from `.env`.
+
 | Variable | Description |
 |----------|-------------|
-| `AQUAREA_USERNAME` | Panasonic Comfort Cloud email |
-| `AQUAREA_PASSWORD` | Panasonic Comfort Cloud password |
 | `PRICE_PROVIDER` | Price source: `entsoe` (default) or `tibber` |
 | `ENTSOE_API_TOKEN` | Free token from [ENTSO-E](https://transparency.entsoe.eu/) |
 | `ENTSOE_AREA` | Your bidding zone (e.g., `10Y1001A1001A46L` for SE3, `10YNL----------L` for NL) |

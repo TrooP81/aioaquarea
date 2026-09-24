@@ -12,10 +12,6 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://redis:6379/0"
 
-    # Panasonic Aquarea
-    aquarea_username: str = ""
-    aquarea_password: str = ""
-
     # Price feed
     price_provider: str = "entsoe"  # "entsoe" or "tibber"
     entsoe_api_token: str = ""

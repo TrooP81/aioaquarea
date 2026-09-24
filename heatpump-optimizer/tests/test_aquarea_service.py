@@ -23,6 +23,7 @@ from packages.core.services.aquarea import (
     PanasonicAdapterUnavailableError,
     PanasonicCachedStatusError,
     PanasonicCommandValidationError,
+    PanasonicCredentialsMissingError,
 )
 from packages.core.resilience import RedisCircuitBreaker
 
@@ -52,6 +53,7 @@ class FakeRedis:
 def _wrapper() -> AquareaWrapper:
     wrapper = AquareaWrapper()
     wrapper._client = AsyncMock()
+    wrapper._authenticated = True
     wrapper._read_limiter = SimpleNamespace(acquire=AsyncMock())
     wrapper._write_limiter = SimpleNamespace(acquire=AsyncMock())
     return wrapper
@@ -110,6 +112,67 @@ async def test_auth_breaker_uses_memory_when_redis_errors() -> None:
         await wrapper._authenticate()
 
     assert wrapper._client.login.await_count == 3
+
+
+def _settings_lookup(values: dict[str, str]):
+    async def lookup(key: str) -> str:
+        return values.get(key, "")
+
+    return lookup
+
+
+class TestPanasonicCredentialsFromSettings:
+    async def test_start_without_credentials_does_not_raise_or_login(self) -> None:
+        wrapper = AquareaWrapper()
+        with (
+            patch("packages.core.settings_service.get_setting", _settings_lookup({})),
+            patch("packages.core.settings_service.get_user_tz", AsyncMock(return_value="UTC")),
+            patch("packages.core.services.aquarea.aiohttp.ClientSession", MagicMock()),
+            patch("packages.core.services.aquarea.redis.from_url", MagicMock()),
+            patch("packages.core.services.aquarea.Client") as client_cls,
+        ):
+            await wrapper.start()
+
+        client_cls.assert_not_called()
+        assert wrapper._authenticated is False
+
+    async def test_start_survives_login_failure(self) -> None:
+        wrapper = AquareaWrapper()
+        client = AsyncMock()
+        client.login.side_effect = RuntimeError("401")
+        creds = {"aquarea_username": "user@example.com", "aquarea_password": "pw"}
+        with (
+            patch("packages.core.settings_service.get_setting", _settings_lookup(creds)),
+            patch("packages.core.settings_service.get_user_tz", AsyncMock(return_value="UTC")),
+            patch("packages.core.services.aquarea.aiohttp.ClientSession", MagicMock()),
+            patch("packages.core.services.aquarea.redis.from_url", MagicMock()),
+            patch("packages.core.services.aquarea.Client", return_value=client),
+        ):
+            await wrapper.start()
+
+        client.login.assert_awaited_once()
+        assert wrapper._authenticated is False
+
+    async def test_ensure_authenticated_uses_settings_credentials(self) -> None:
+        wrapper = AquareaWrapper()
+        client = AsyncMock()
+        creds = {"aquarea_username": " user@example.com ", "aquarea_password": "pw"}
+        with (
+            patch("packages.core.settings_service.get_setting", _settings_lookup(creds)),
+            patch("packages.core.services.aquarea.Client", return_value=client) as client_cls,
+        ):
+            await wrapper._ensure_authenticated()
+
+        assert client_cls.call_args.kwargs["username"] == "user@example.com"
+        assert client_cls.call_args.kwargs["password"] == "pw"
+        client.login.assert_awaited_once()
+        assert wrapper._authenticated is True
+
+    async def test_get_device_without_credentials_raises_clear_error(self) -> None:
+        wrapper = AquareaWrapper()
+        with patch("packages.core.settings_service.get_setting", _settings_lookup({})):
+            with pytest.raises(PanasonicCredentialsMissingError, match="Settings tab"):
+                await wrapper.get_device()
 
 
 @pytest.mark.asyncio

@@ -180,12 +180,10 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     # --- Panasonic credentials ---
     "aquarea_username": {
         "type": "secret",
-        "default_env": "aquarea_username",
         "description": "Panasonic Aquarea username",
     },
     "aquarea_password": {
         "type": "secret",
-        "default_env": "aquarea_password",
         "description": "Panasonic Aquarea password",
     },
     # --- Location ---

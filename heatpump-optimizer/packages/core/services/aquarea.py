@@ -115,6 +115,10 @@ class PanasonicCommandValidationError(ValueError):
     """Raised when a command is incompatible with the live device state."""
 
 
+class PanasonicCredentialsMissingError(RuntimeError):
+    """Raised when Panasonic credentials have not been entered in Settings."""
+
+
 class AquareaWrapper:
     """Wrapper around aioaquarea.Client for application use."""
 
@@ -136,11 +140,12 @@ class AquareaWrapper:
         self._circuit_breaker = CircuitBreaker()
         self._redis_circuit_breaker: RedisCircuitBreaker | None = None
         self._authenticated = False
+        self._credentials: tuple[str, str] | None = None
         self._weekly_timer = None
         self._weekly_timer_fetched_at: float | None = None
 
     async def start(self) -> None:
-        """Initialize session, redis, and authenticate."""
+        """Initialize session and redis; login failures are retried on device access."""
         from ..settings_service import get_user_tz
 
         self._session = aiohttp.ClientSession()
@@ -148,16 +153,38 @@ class AquareaWrapper:
         self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
         self._timezone = ZoneInfo(await get_user_tz())
 
-        self._client = Client(
-            session=self._session,
-            username=settings.aquarea_username,
-            password=settings.aquarea_password,
-            device_direct=True,
-            refresh_login=True,
-            environment=AquareaEnvironment.PRODUCTION,
-            timezone=self._timezone,
-        )
+        try:
+            await self._ensure_authenticated()
+        except PanasonicCredentialsMissingError as exc:
+            logger.warning("%s", exc)
+        except Exception as exc:
+            logger.warning("Panasonic login deferred until next device access: %s", exc)
 
+    async def _ensure_authenticated(self) -> None:
+        """Log in with the credentials saved in Settings unless already authenticated."""
+        if self._authenticated and self._client is not None:
+            return
+        from ..settings_service import get_setting
+
+        username = (await get_setting("aquarea_username")).strip()
+        password = await get_setting("aquarea_password")
+        if not username or not password:
+            raise PanasonicCredentialsMissingError(
+                "Panasonic credentials are not configured; add them in the Settings tab"
+            )
+        if self._client is None or self._credentials != (username, password):
+            self._client = Client(
+                session=self._session,
+                username=username,
+                password=password,
+                device_direct=True,
+                refresh_login=True,
+                environment=AquareaEnvironment.PRODUCTION,
+                timezone=self._timezone,
+            )
+            self._credentials = (username, password)
+            self._device = None
+            self._device_info = None
         await self._authenticate()
 
     async def stop(self) -> None:
@@ -221,6 +248,7 @@ class AquareaWrapper:
             if self._device is not None:
                 return self._device
 
+            await self._ensure_authenticated()
             await self._read_limiter.acquire()
             devices = await self._client.get_devices()
             if not devices:
@@ -252,8 +280,7 @@ class AquareaWrapper:
                 device_id = getattr(self._device_info, "device_id", None)
                 if device_id:
                     return str(device_id)
-            if self._client is None:
-                raise RuntimeError("Aquarea client has not been initialized")
+            await self._ensure_authenticated()
             await self._read_limiter.acquire()
             devices = await self._client.get_devices()
             if not devices:
