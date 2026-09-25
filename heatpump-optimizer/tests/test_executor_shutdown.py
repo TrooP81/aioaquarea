@@ -116,11 +116,15 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
         status_result.scalar_one_or_none.return_value = dt.datetime.now(dt.timezone.utc)
         executing_result = MagicMock()
         executing_result.scalars.return_value.all.return_value = [101, 102]
+        safety_result = MagicMock()
+        safety_result.scalar_one_or_none.return_value = None
 
-        # Override query, action query, claim update, executing reconciliation
-        # query, then cancellation update.
+        # Safety recovery, safety claim, override query, action query, claim
+        # update, executing reconciliation query, then cancellation update.
         mock_session.execute = AsyncMock(
             side_effect=[
+                None,
+                safety_result,
                 override_result,
                 actions_result,
                 None,

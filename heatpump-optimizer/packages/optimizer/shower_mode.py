@@ -6,7 +6,7 @@ import datetime as dt
 import json
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
@@ -19,6 +19,7 @@ from packages.core.models import (
     ShowerEventRecord,
 )
 from packages.core.settings_service import get_setting
+from packages.core.safety_reverts import unresolved_revert_predicate
 from packages.optimizer.data_access import get_prices
 from packages.optimizer.actions import ActionType
 
@@ -36,17 +37,22 @@ class ShowerDetector:
 
         async with get_session() as session:
             # Check for an already-active shower event
-            active_event = await self._get_active_event(session)
+            active_event = await self._get_active_event(session, record.device_id)
 
             if active_event:
                 await self._check_recovery(session, active_event, record)
             else:
                 await self._check_for_drop(session, record)
 
-    async def _get_active_event(self, session: AsyncSession) -> ShowerEventRecord | None:
+    async def _get_active_event(
+        self, session: AsyncSession, device_id: str
+    ) -> ShowerEventRecord | None:
         result = await session.execute(
             select(ShowerEventRecord)
-            .where(ShowerEventRecord.status == "active")
+            .where(
+                ShowerEventRecord.device_id == device_id,
+                ShowerEventRecord.status.in_(("active", "recovery_pending", "timeout_pending")),
+            )
             .order_by(ShowerEventRecord.started_at.desc())
             .limit(1)
         )
@@ -105,16 +111,51 @@ class ShowerDetector:
             )
             return
 
-        # Create active shower event
+        now = dt.datetime.now(dt.timezone.utc)
+        max_duration = int(await get_setting("shower_max_duration_minutes"))
+        expires_at = now + dt.timedelta(minutes=max_duration)
+
+        blocked = (
+            await session.execute(
+                select(PlanActionRecord.id)
+                .where(
+                    unresolved_revert_predicate(),
+                    PlanActionRecord.device_id == current.device_id,
+                    PlanActionRecord.action_type == str(ActionType.FORCE_DHW_OFF),
+                )
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if blocked is not None:
+            session.add(
+                ShowerEventRecord(
+                    started_at=current.ts,
+                    expires_at=current.ts,
+                    device_id=current.device_id,
+                    pre_shower_temp=prev.tank_temp,
+                    status="skipped_unresolved_revert",
+                )
+            )
+            logger.warning(
+                "shower_mode_trigger_blocked",
+                reason="blocked_by_unresolved_revert",
+                device_id=current.device_id,
+                action_id=blocked,
+            )
+            return
+
+        # Persist the event and both sides of the obligation in one transaction.
         event = ShowerEventRecord(
             started_at=current.ts,
             pre_shower_temp=prev.tank_temp,
             status="active",
+            device_id=current.device_id,
+            expires_at=expires_at,
         )
         session.add(event)
 
         # Inject immediate force_dhw_on action
-        now = dt.datetime.now(dt.timezone.utc)
         plan = PlanRecord(
             horizon_start=now,
             horizon_end=now + dt.timedelta(hours=1),
@@ -143,6 +184,19 @@ class ShowerDetector:
             status="pending",
         )
         session.add(action)
+        await session.flush()
+        event.activation_action_id = action.id
+        session.add(
+            PlanActionRecord(
+                plan_id=plan.id,
+                reverts_action_id=action.id,
+                scheduled_ts=expires_at,
+                action_type=str(ActionType.FORCE_DHW_OFF),
+                payload_json=json.dumps({"trigger": "shower_mode", "reason": "expiry"}),
+                device_id=current.device_id,
+                status="pending",
+            )
+        )
 
         # Audit log
         session.add(
@@ -174,87 +228,81 @@ class ShowerDetector:
         current: DeviceStatusRecord,
     ) -> None:
         """Check if the tank has recovered to pre-shower temperature, or timed out."""
-        max_duration = int(await get_setting("shower_max_duration_minutes"))
-
-        # Use record timestamp for elapsed calculation (testable, consistent)
-        elapsed = (current.ts - event.started_at).total_seconds() / 60
-        if elapsed >= max_duration:
-            event.status = "timeout"
-            event.recovered_at = current.ts
-            if current.force_dhw != 0:
-                await self._inject_dhw_off(session, "timeout", current.device_id)
+        if current.ts >= event.expires_at:
+            event.status = "timeout_pending"
+            await self._reschedule_linked_off(session, event, current.ts, "timeout")
             logger.warning(
                 "shower_mode_timeout",
-                elapsed_min=elapsed,
-                max_min=max_duration,
+                expires_at=event.expires_at.isoformat(),
             )
             return
 
         # Recovery check
         if current.tank_temp is not None and current.tank_temp >= event.pre_shower_temp:
-            event.status = "recovered"
-            event.recovered_at = current.ts
-            if current.force_dhw != 0:
-                await self._inject_dhw_off(session, "recovered", current.device_id)
+            event.status = "recovery_pending"
+            await self._reschedule_linked_off(session, event, current.ts, "recovered")
             logger.info(
                 "shower_mode_recovered",
                 tank_temp=current.tank_temp,
                 target=event.pre_shower_temp,
             )
 
-    async def _inject_dhw_off(self, session: AsyncSession, reason: str, device_id: str) -> None:
-        """Inject a force_dhw_off action to end the shower boost."""
-        now = dt.datetime.now(dt.timezone.utc)
-        plan = PlanRecord(
-            horizon_start=now,
-            horizon_end=now + dt.timedelta(hours=1),
-            plan_json="[]",
-            optimizer_version="shower_reactive",
-        )
-        await activate_plan(
-            session,
-            plan,
-            reason="shower_mode_reactive_override",
-        )
+    async def _reschedule_linked_off(
+        self, session: AsyncSession, event: ShowerEventRecord, now: dt.datetime, reason: str
+    ) -> None:
+        """Make the activation's durable revert immediately due without creating a plan."""
 
-        action = PlanActionRecord(
-            plan_id=plan.id,
-            scheduled_ts=now,
-            action_type=str(ActionType.FORCE_DHW_OFF),
-            payload_json=json.dumps({"trigger": "shower_mode", "reason": reason}),
-            device_id=device_id,
-            status="pending",
+        if event.activation_action_id is None:
+            return
+        await session.execute(
+            update(PlanActionRecord)
+            .where(
+                PlanActionRecord.reverts_action_id == event.activation_action_id,
+                PlanActionRecord.status == "pending",
+            )
+            .values(scheduled_ts=now, result_json=json.dumps({"reason": reason}))
         )
-        session.add(action)
 
     async def _is_peak_price(self, session: AsyncSession, ts: dt.datetime) -> bool:
         """Check if the current hour's price is in the top 5% of today's prices."""
         start_of_day = ts.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = start_of_day + dt.timedelta(days=1)
-
         prices = await get_prices(session, start_of_day, end_of_day)
         if not prices:
-            return False  # Fail open - allow boost if no price data
-
-        price_values = sorted(p for _, p in prices)
-
-        # If all prices are equal (flat tariff), never consider it peak
+            return False
+        price_values = sorted(price for _, price in prices)
         if len(set(price_values)) <= 1:
             return False
+        p95 = price_values[min(len(price_values) - 1, int(len(price_values) * 0.95))]
+        current_hour = ts.replace(minute=0, second=0, microsecond=0)
+        current_price = next(
+            (price for price_ts, price in prices if price_ts == current_hour), None
+        )
+        return current_price is not None and current_price >= p95
 
-        # 95th percentile threshold (top 5%)
-        idx = min(len(price_values) - 1, int(len(price_values) * 0.95))
-        p95 = price_values[idx]
 
-        # Find current hour's price
-        current_hour_start = ts.replace(minute=0, second=0, microsecond=0)
-        current_price = None
-        for price_ts, price in prices:
-            if price_ts == current_hour_start:
-                current_price = price
-                break
+async def reconcile_shower_expiry(now: dt.datetime | None = None) -> None:
+    """Move expired open shower obligations due using only persisted state."""
 
-        if current_price is None:
-            return False  # No price for this hour - fail open
-
-        return current_price >= p95
+    now = now or dt.datetime.now(dt.timezone.utc)
+    async with get_session() as session:
+        events = (
+            (
+                await session.execute(
+                    select(ShowerEventRecord)
+                    .where(
+                        ShowerEventRecord.status.in_(
+                            ("active", "recovery_pending", "timeout_pending")
+                        ),
+                        ShowerEventRecord.expires_at <= now,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        detector = ShowerDetector()
+        for event in events:
+            event.status = "timeout_pending"
+            await detector._reschedule_linked_off(session, event, now, "timeout")

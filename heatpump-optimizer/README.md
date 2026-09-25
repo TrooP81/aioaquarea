@@ -51,6 +51,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
    ```bash
    docker compose up -d
    ```
+   Cold starts are ordered automatically; for a running-stack upgrade run `docker compose stop optimizer poller` before `docker compose up -d`, and on a migrate lock timeout stop writers and retry.
 
 3. **Access the dashboard:**
    - Web UI: http://localhost:4444

@@ -13,7 +13,7 @@ import datetime as dt
 import json
 
 import structlog
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, case, func, select, update
 
 from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
@@ -26,6 +26,16 @@ from packages.core.models import (
     SpaceHeatingGateRecord,
 )
 from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS
+from packages.core.safety_reverts import (
+    dhw_embargoed,
+    due_revert_predicate,
+    is_restorative_action,
+    normalize_zone_id,
+    restore_baseline_target,
+    unresolved_revert_predicate,
+    zone_embargoed,
+    zone_matches_baseline,
+)
 from packages.core.services import AquareaWrapper
 from packages.core.settings_service import get_space_heating_gate_config
 from packages.core.space_heating_gate import SpaceHeatingGateState, resolve_effective_gate
@@ -39,6 +49,9 @@ VERIFY_POLL_INTERVAL_S = 10
 VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
 SHUTDOWN_CANCEL_REASON = "shutdown_cancelled"
+SAFETY_DISPATCH_MARGIN_S = 30
+SAFETY_ACTION_STUCK_AFTER = dt.timedelta(minutes=2)
+assert SAFETY_ACTION_STUCK_AFTER > dt.timedelta(seconds=VERIFY_TIMEOUT_S + SAFETY_DISPATCH_MARGIN_S)
 
 
 async def is_learning_mode_active() -> bool:
@@ -90,6 +103,15 @@ class PlanExecutor:
         actions: list[PlanActionRecord] = []
         now = dt.datetime.now(dt.timezone.utc)
 
+        safety_action = await self._claim_due_safety_action(now)
+        if safety_action is not None:
+            try:
+                await self._execute_safety_action(safety_action)
+            except asyncio.CancelledError:
+                await self._requeue_safety_action(safety_action, "shutdown_cancelled")
+                raise
+            return
+
         async with self._session_factory() as session:
             override_result = await session.execute(
                 select(OverrideRecord).where(
@@ -109,6 +131,7 @@ class PlanExecutor:
                     and_(
                         PlanActionRecord.status == "pending",
                         PlanActionRecord.scheduled_ts <= now,
+                        ~unresolved_revert_predicate(),
                         PlanRecord.status == ACTIVE_PLAN_STATUS,
                     )
                 )
@@ -187,6 +210,170 @@ class PlanExecutor:
             await self._reconcile_claimed_batch_cancelled(actions)
             raise
 
+    async def _claim_due_safety_action(self, now: dt.datetime) -> PlanActionRecord | None:
+        """Claim one oldest linked restore without depending on its parent plan."""
+
+        async with self._session_factory() as session:
+            attempts = func.coalesce(PlanActionRecord.safety_attempt_count, 0) + 1
+            await session.execute(
+                update(PlanActionRecord)
+                .where(
+                    unresolved_revert_predicate(),
+                    PlanActionRecord.status.in_(["executing", "dispatched"]),
+                    (PlanActionRecord.safety_claimed_at.is_(None))
+                    | (PlanActionRecord.safety_claimed_at <= now - SAFETY_ACTION_STUCK_AFTER),
+                )
+                .values(
+                    status="pending",
+                    safety_claimed_at=None,
+                    safety_attempt_count=attempts,
+                    safety_next_retry_at=case(
+                        (attempts <= 3, now + dt.timedelta(minutes=1)),
+                        else_=now + dt.timedelta(minutes=15),
+                    ),
+                    result_json=json.dumps({"reason": "stuck_safety_recovery"}),
+                )
+            )
+            action = (
+                await session.execute(
+                    select(PlanActionRecord)
+                    .where(
+                        due_revert_predicate(),
+                        PlanActionRecord.scheduled_ts <= now,
+                        (PlanActionRecord.safety_next_retry_at.is_(None))
+                        | (PlanActionRecord.safety_next_retry_at <= now),
+                    )
+                    .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if action is not None:
+                action.status = "executing"
+                action.safety_claimed_at = now
+            return action
+
+    async def _execute_safety_action(self, action: PlanActionRecord) -> None:
+        """Dispatch one safety restore with priority capacity and no redispatch."""
+
+        try:
+            payload = json.loads(action.payload_json) if action.payload_json else {}
+            action_type = ActionType(action.action_type)
+            precondition = await self._dispatch_precondition(action, action_type, payload)
+            if precondition is not None:
+                await self._requeue_safety_action(
+                    action, str(precondition.get("reason", "precondition"))
+                )
+                return
+            already_safe = await self._safety_already_safe(action, action_type, payload)
+            if already_safe:
+                await self._mark_verified(
+                    action,
+                    0,
+                    VerifyResult(
+                        ok=True,
+                        observed_value="already_safe",
+                        expected_value="already_safe",
+                        reason="already_safe",
+                    ),
+                )
+                return
+            handler = get_action_handler(action_type)
+            with self._wrapper.safety_write():
+                expected_state = await handler.dispatch(self._wrapper, payload) or {}
+            if expected_state.get("skip"):
+                await self._requeue_safety_action(
+                    action, str(expected_state.get("reason", "live_precondition"))
+                )
+                return
+            now = dt.datetime.now(dt.timezone.utc)
+            async with self._session_factory() as session:
+                await session.execute(
+                    update(PlanActionRecord)
+                    .where(PlanActionRecord.id == action.id)
+                    .values(
+                        status="dispatched",
+                        executed_at=now,
+                        expected_state_json=json.dumps(expected_state),
+                    )
+                )
+            result, attempts = await self._poll_until_verified(
+                action_id=action.id,
+                handler=handler,
+                payload=payload,
+                expected_state=expected_state,
+                attempts=0,
+            )
+            if result.ok:
+                await self._mark_verified(action, attempts, result)
+            else:
+                await self._requeue_safety_action(action, result.reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # safety failures are retried, never terminal
+            await self._requeue_safety_action(action, type(exc).__name__)
+
+    async def _safety_already_safe(
+        self, action: PlanActionRecord, action_type: ActionType, payload: dict
+    ) -> bool:
+        """Use fresh persisted evidence to finish a linked revert without a write."""
+
+        async with self._session_factory() as session:
+            status = (
+                await session.execute(
+                    select(DeviceStatusRecord)
+                    .where(DeviceStatusRecord.device_id == action.device_id)
+                    .order_by(DeviceStatusRecord.ts.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            source_action_id = getattr(action, "reverts_action_id", None)
+            source = (
+                await session.get(PlanActionRecord, source_action_id)
+                if source_action_id is not None
+                else None
+            )
+        if status is None:
+            return False
+        if action_type is ActionType.FORCE_DHW_OFF:
+            return status.force_dhw == 0
+        if action_type is not ActionType.ZONE_TEMP_RESTORE:
+            return False
+        baseline = restore_baseline_target(action)
+        source_payload = json.loads(source.payload_json) if source and source.payload_json else {}
+        source_baseline = source_payload.get("baseline_temperature")
+        if source_baseline is not None and not zone_matches_baseline(source_baseline, baseline):
+            logger.error(
+                "safety_restore_baseline_mismatch",
+                action_id=action.id,
+                source_action_id=source_action_id,
+                source_baseline=source_baseline,
+                restore_baseline=baseline,
+            )
+            raise ValueError("safety_restore_baseline_mismatch")
+        zone_id = normalize_zone_id(payload.get("zone_id"))
+        current_target = getattr(status, f"zone{zone_id}_target_temp", None)
+        return zone_matches_baseline(baseline, current_target)
+
+    async def _requeue_safety_action(self, action: PlanActionRecord, reason: str) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        attempts = int(action.safety_attempt_count or 0) + 1
+        delay = dt.timedelta(minutes=1 if attempts <= 3 else 15)
+        async with self._session_factory() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="pending",
+                    safety_attempt_count=attempts,
+                    safety_next_retry_at=now + delay,
+                    result_json=json.dumps({"reason": reason}),
+                )
+            )
+        logger.warning(
+            "safety_revert_requeued", action_id=action.id, attempts=attempts, reason=reason
+        )
+
     async def _reconcile_claimed_batch_cancelled(
         self, claimed_actions: list[PlanActionRecord]
     ) -> None:
@@ -255,6 +442,7 @@ class PlanExecutor:
                     "credentials_missing",
                     "device_status_missing",
                     "device_status_stale",
+                    "quality_check_failed",
                 }:
                     await self._defer_action(action, precondition)
                     return
@@ -379,7 +567,19 @@ class PlanExecutor:
             return {"reason": "action_device_unresolvable", "identity_error": type(exc).__name__}
         if action.device_id and action.device_id != selected_device_id:
             return {"reason": "action_device_unresolvable", "device_id": action.device_id}
-        quality = await self._device_quality_check()
+        try:
+            quality = await self._device_quality_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - readiness failures must block control
+            logger.error(
+                "action_device_data_quality_check_failed",
+                action_id=action.id,
+                action_type=action_type.value,
+                reason="quality_check_failed",
+                error_type=type(exc).__name__,
+            )
+            return {"reason": "quality_check_failed", "device_id": selected_device_id}
         if not quality["ready"]:
             return {"reason": quality["reasons"][0], "device_id": selected_device_id}
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
@@ -413,7 +613,39 @@ class PlanExecutor:
                 )
                 if set(fresh_ids) != {selected_device_id}:
                     return {"reason": "action_device_unresolvable", "device_id": selected_device_id}
-            if not is_room_heating_increase(action_type, payload, status):
+            heating_increase = is_room_heating_increase(action_type, payload, status)
+            if not is_restorative_action(action) and (
+                action_type is ActionType.FORCE_DHW_ON or heating_increase
+            ):
+                unresolved_actions = (
+                    (
+                        await session.execute(
+                            select(PlanActionRecord).where(unresolved_revert_predicate())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                embargo_action = {
+                    "action_type": action_type,
+                    "device_id": selected_device_id,
+                    "payload": payload,
+                }
+                if (
+                    action_type is ActionType.FORCE_DHW_ON
+                    and dhw_embargoed(unresolved_actions, selected_device_id)
+                ) or zone_embargoed(unresolved_actions, embargo_action, status):
+                    logger.warning(
+                        "action_blocked_by_unresolved_revert",
+                        action_id=action.id,
+                        action_type=action.action_type,
+                        device_id=selected_device_id,
+                    )
+                    return {
+                        "reason": "blocked_by_unresolved_revert",
+                        "device_id": selected_device_id,
+                    }
+            if not heating_increase:
                 return None
             gate_row = (
                 await session.execute(
@@ -615,7 +847,7 @@ class PlanExecutor:
         execute_due_actions.
         """
         now = dt.datetime.now(dt.timezone.utc)
-        cutoff = now - dt.timedelta(minutes=2)
+        cutoff = now - SAFETY_ACTION_STUCK_AFTER
         device_quality = await self._device_quality_check(now=now)
 
         async with self._session_factory() as session:
@@ -626,6 +858,7 @@ class PlanExecutor:
                     and_(
                         PlanActionRecord.status.in_(["pending", "executing"]),
                         PlanActionRecord.scheduled_ts <= cutoff,
+                        ~unresolved_revert_predicate(),
                         PlanRecord.status == ACTIVE_PLAN_STATUS,
                     )
                 )
@@ -644,7 +877,7 @@ class PlanExecutor:
 
             for action in stale:
                 reason = await self._diagnose_missed(session, action, latest_plan_id, now)
-                if not device_quality["ready"] and not self._is_energy_increasing(action):
+                if not device_quality["ready"] and is_restorative_action(action):
                     logger.info(
                         "action_expiry_deferred_device_data_quality",
                         action_id=action.id,
@@ -667,14 +900,6 @@ class PlanExecutor:
                     action_type=action.action_type,
                     diagnosis=reason.get("reason"),
                 )
-
-    @staticmethod
-    def _is_energy_increasing(action: PlanActionRecord) -> bool:
-        try:
-            action_type = ActionType(action.action_type)
-        except (TypeError, ValueError):
-            return True
-        return action_type not in {ActionType.FORCE_DHW_OFF, ActionType.QUIET_MODE_ON}
 
     @staticmethod
     async def _diagnose_missed(

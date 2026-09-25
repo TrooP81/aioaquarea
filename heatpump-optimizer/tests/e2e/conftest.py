@@ -28,7 +28,7 @@ os.environ.setdefault("AQUAREA_USERNAME", "test@test.com")
 os.environ.setdefault("AQUAREA_PASSWORD", "testpass")
 os.environ.setdefault("LATITUDE", "59.3293")
 os.environ.setdefault("LONGITUDE", "18.0686")
-os.environ.setdefault("MODEL_DIR", os.path.join(tempfile.gettempdir(), "heatpump-optimizer-models"))
+os.environ["MODEL_DIR"] = tempfile.mkdtemp(prefix="heatpump-optimizer-e2e-models-")
 
 from packages.api.main import app  # noqa: E402
 from packages.core.database import engine  # noqa: E402

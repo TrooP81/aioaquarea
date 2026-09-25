@@ -781,6 +781,23 @@ class TestAC10FreshnessSafety:
             await poller_main.retrain_comfort_model()
         model.train.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_AC10_2_periodic_training_skips_when_quality_check_fails(self):
+        import importlib
+
+        poller_main = importlib.import_module("packages.poller.main")
+        model = SimpleNamespace(arefresh_if_changed=AsyncMock(), train=AsyncMock())
+        with (
+            patch.object(poller_main, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch(
+                "packages.core.device_data_quality.get_device_data_quality",
+                new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+            ),
+            patch("packages.ml.comfort_model.comfort_model", model),
+        ):
+            await poller_main.retrain_comfort_model()
+        model.train.assert_not_awaited()
+
     def test_AC10_2_initial_training_is_after_device_quality_gate(self):
         import importlib
 
@@ -811,25 +828,53 @@ class TestAC10FreshnessSafety:
         assert values["status"] == "pending"
         assert "scheduled_ts" not in values
 
-    @pytest.mark.parametrize(
-        ("action_type", "increasing"),
-        [
-            (ActionType.FORCE_DHW_OFF, False),
-            (ActionType.FORCE_DHW_ON, True),
-            (ActionType.SET_TANK_TEMP, True),
-            ("unknown_action", True),
-        ],
-    )
-    def test_AC10_3_degraded_expiry_preserves_only_safe_actions(self, action_type, increasing):
-        action = SimpleNamespace(action_type=str(action_type))
-        assert PlanExecutor._is_energy_increasing(action) is increasing
+    @pytest.mark.asyncio
+    async def test_AC10_2_quality_check_failure_defers_action_without_device_write(self):
+        action = SimpleNamespace(
+            id=1,
+            action_type=str(ActionType.SET_TANK_TEMP),
+            device_id="device-a",
+            payload_json="{}",
+        )
+        session = MagicMock()
+        session.execute = AsyncMock()
+        wrapper = AsyncMock()
+        wrapper.get_selected_device_id = AsyncMock(return_value="device-a")
+        executor = PlanExecutor(
+            wrapper,
+            session_factory=lambda: _context(session),
+            learning_check=AsyncMock(return_value=False),
+            device_quality_check=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        with patch("packages.optimizer.executor_core.get_action_handler") as get_handler:
+            await executor._execute_action(action)
+
+        get_handler.assert_not_called()
+        statement = session.execute.await_args.args[0]
+        values = {key.key: value.value for key, value in statement._values.items()}
+        assert values["status"] == "pending"
+        assert json.loads(values["result_json"])["reason"] == "quality_check_failed"
+
+    def test_P2_AC13_degraded_expiry_preserves_only_linked_restores(self):
+        from packages.core.safety_reverts import is_restorative_action
+
+        assert is_restorative_action(
+            SimpleNamespace(action_type=str(ActionType.FORCE_DHW_OFF), reverts_action_id=1)
+        )
+        assert not is_restorative_action(
+            SimpleNamespace(action_type=str(ActionType.FORCE_DHW_OFF), reverts_action_id=None)
+        )
+        assert not is_restorative_action(
+            SimpleNamespace(action_type="unknown_action", reverts_action_id=None)
+        )
 
     @pytest.mark.asyncio
-    async def test_AC10_3_expiry_keeps_force_dhw_off_but_expires_degraded_increases(self):
+    async def test_P2_AC13_expiry_keeps_linked_restore_but_expires_untagged_actions(self):
         actions = [
             SimpleNamespace(
                 id=index,
                 action_type=action_type,
+                reverts_action_id=1 if action_type == str(ActionType.FORCE_DHW_OFF) else None,
                 scheduled_ts=dt.datetime(2026, 9, 24, 10, tzinfo=dt.timezone.utc),
             )
             for index, action_type in enumerate(
@@ -847,9 +892,7 @@ class TestAC10FreshnessSafety:
         latest_result = MagicMock()
         latest_result.scalar_one_or_none.return_value = 1
         session = MagicMock()
-        session.execute = AsyncMock(
-            side_effect=[stale_result, latest_result, MagicMock(), MagicMock(), MagicMock()]
-        )
+        session.execute = AsyncMock(side_effect=[stale_result, latest_result, *[MagicMock()] * 4])
         executor = PlanExecutor(
             AsyncMock(),
             session_factory=lambda: _context(session),
@@ -885,6 +928,50 @@ class TestAC10FreshnessSafety:
         )
         assert result["reason"] == "action_device_unresolvable"
         quality.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_AC10_2_initial_training_skipped_when_quality_check_raises(self):
+        import importlib
+
+        optimizer_main = importlib.import_module("packages.optimizer.main")
+        sentinel = "AC10_2_QUALITY_EXCEPTION_SENTINEL"
+        comfort_model = SimpleNamespace(is_trained=False, train=AsyncMock())
+        wrapper = AsyncMock()
+        scheduler = MagicMock()
+        shutdown_event = MagicMock()
+        shutdown_event.wait = AsyncMock()
+
+        with (
+            patch.object(optimizer_main, "_load_ml_models"),
+            patch("packages.core.logging.configure_logging"),
+            patch.object(
+                optimizer_main,
+                "get_device_data_quality",
+                new=AsyncMock(side_effect=RuntimeError(sentinel)),
+            ),
+            patch.object(optimizer_main, "comfort_model", comfort_model),
+            patch.object(optimizer_main, "AquareaWrapper", return_value=wrapper),
+            patch.object(optimizer_main, "create_scheduler", return_value=scheduler),
+            patch.object(optimizer_main, "utc_after", return_value=object()),
+            patch(
+                "packages.core.service_health.record_service_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch.object(optimizer_main, "_shutdown_runtime", new=AsyncMock()),
+            patch.object(optimizer_main.asyncio, "Event", return_value=shutdown_event),
+        ):
+            with capture_logs() as logs:
+                await optimizer_main.main()
+
+        comfort_model.train.assert_not_awaited()
+        assert any(
+            log.get("event") == "comfort_model_initial_training_quality_check_failed"
+            and log.get("reason") == "quality_check_failed"
+            for log in logs
+        )
+        assert sentinel not in repr(logs)
+        wrapper.start.assert_awaited_once()
+        scheduler.start.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_AC10_3_degraded_optimizer_does_not_supersede_a_plan(self):

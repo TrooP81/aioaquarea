@@ -17,11 +17,13 @@ from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
     ServiceHeartbeatRecord,
+    ShowerEventRecord,
     SpaceHeatingGateRecord,
 )
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.panasonic_diagnostics import project_panasonic_adapter_state
 from packages.core.service_health import service_heartbeat_details
+from packages.core.safety_reverts import normalize_zone_id, unresolved_revert_predicate
 from packages.core.settings_service import (
     get_bool_setting,
     get_int_setting,
@@ -59,6 +61,7 @@ def _alert(
     plan_id: int | None = None,
     action_id: int | None = None,
     href: str | None = None,
+    details: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "id": alert_id,
@@ -69,6 +72,7 @@ def _alert(
         "plan_id": plan_id,
         "action_id": action_id,
         "href": href,
+        "details": details,
     }
 
 
@@ -122,7 +126,9 @@ async def get_operational_alerts(
             (
                 await session.execute(
                     select(ServiceHeartbeatRecord).where(
-                        ServiceHeartbeatRecord.service.in_(["poller", "optimizer"])
+                        ServiceHeartbeatRecord.service.in_(
+                            ["poller", "optimizer", "safety_watchdog"]
+                        )
                     )
                 )
             )
@@ -147,10 +153,40 @@ async def get_operational_alerts(
             .scalars()
             .all()
         )
+        safety_action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(unresolved_revert_predicate(), PlanActionRecord.safety_attempt_count >= 3)
+                .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        blocked_shower_events = (
+            (
+                await session.execute(
+                    select(ShowerEventRecord)
+                    .where(ShowerEventRecord.status == "skipped_unresolved_revert")
+                    .order_by(ShowerEventRecord.started_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
         gate_rows = (await session.execute(select(SpaceHeatingGateRecord))).scalars().all()
 
     alerts: list[dict[str, object]] = []
     by_service = {row.service: row for row in heartbeat_rows}
+    watchdog = service_heartbeat_details(by_service.get("safety_watchdog"))
+    if int(watchdog.get("consecutive_failures", 0) or 0) >= 3:
+        alerts.append(
+            _alert(
+                "safety_watchdog_failing",
+                "critical",
+                "Safety watchdog is failing",
+                f"The shower safety watchdog has failed {watchdog['consecutive_failures']} consecutive cycles.",
+                action="Check optimizer database and watchdog logs.",
+            )
+        )
     for service in ("poller", "optimizer"):
         heartbeat = getattr(by_service.get(service), "updated_at", None)
         if heartbeat is None or heartbeat < service_cutoff:
@@ -201,6 +237,48 @@ async def get_operational_alerts(
                 plan_id=affected.plan_id,
                 action_id=affected.id,
                 href=f"/?view=plan&activity=failed#plan-action-{affected.id}",
+            )
+        )
+    if safety_action is not None:
+        result = service_heartbeat_details(None)
+        try:
+            result = json.loads(safety_action.result_json) if safety_action.result_json else {}
+        except (TypeError, ValueError):
+            pass
+        latest_blocked = (
+            blocked_shower_events[0].started_at.isoformat() if blocked_shower_events else None
+        )
+        payload = json.loads(safety_action.payload_json) if safety_action.payload_json else {}
+        zone = normalize_zone_id(payload.get("zone_id")) if "zone_id" in payload else None
+        age_seconds = max(0, int((now - safety_action.scheduled_ts).total_seconds()))
+        details = {
+            "device_id": safety_action.device_id,
+            "plan_id": safety_action.plan_id,
+            "action_id": safety_action.id,
+            "age_seconds": age_seconds,
+            "attempt_count": safety_action.safety_attempt_count,
+            "last_reason": result.get("reason", "unknown"),
+            "blocked_trigger_count": len(blocked_shower_events),
+            "latest_blocked_trigger_at": latest_blocked,
+        }
+        if zone is not None:
+            details["zone"] = zone
+        alerts.append(
+            _alert(
+                "safety_revert_unresolved",
+                "critical",
+                "Safety revert remains unresolved",
+                (
+                    f"Device {safety_action.device_id}; action #{safety_action.id}; "
+                    f"age {age_seconds} seconds; attempts {safety_action.safety_attempt_count}; "
+                    f"last reason {result.get('reason', 'unknown')}; blocked triggers "
+                    f"{len(blocked_shower_events)} (latest {latest_blocked})."
+                ),
+                action="Investigate the safety revert immediately.",
+                plan_id=safety_action.plan_id,
+                action_id=safety_action.id,
+                href=f"/?view=plan&activity=safety#plan-action-{safety_action.id}",
+                details=details,
             )
         )
 

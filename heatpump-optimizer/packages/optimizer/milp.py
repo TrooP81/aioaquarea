@@ -869,6 +869,7 @@ class MILPOptimizer:
                     {
                         "ts": ts.isoformat(),
                         "type": "force_dhw_on",
+                        "action_key": f"dhw:{ts.isoformat()}",
                         "payload": {
                             "reason": "milp_optimal",
                             "price": price_vals[h],
@@ -882,6 +883,7 @@ class MILPOptimizer:
                     {
                         "ts": (ts + dt.timedelta(minutes=dhw_minutes)).isoformat(),
                         "type": "force_dhw_off",
+                        "reverts_action_key": f"dhw:{ts.isoformat()}",
                         "payload": {"reason": "milp_slot_end"},
                     }
                 )

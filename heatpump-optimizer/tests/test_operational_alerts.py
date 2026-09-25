@@ -76,7 +76,10 @@ async def test_gate_failure_and_unknown_alerts_are_actionable() -> None:
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: heartbeat_rows)),
             SimpleNamespace(scalar_one_or_none=lambda: now),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [gate_row])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
         ]
     )
 
@@ -127,7 +130,10 @@ async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalar_one_or_none=lambda: None),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
         ]
     )
 

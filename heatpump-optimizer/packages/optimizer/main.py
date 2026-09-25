@@ -13,11 +13,18 @@ from packages.core.database import get_session
 from packages.core.models import (
     COPRecord,
     ConsumptionRecord,
+    DeviceStatusRecord,
     OptimizationRequestRecord,
     PlanActionRecord,
     PlanRecord,
 )
 from packages.core.plan_lifecycle import activate_plan
+from packages.core.safety_reverts import (
+    dhw_embargoed,
+    unresolved_revert_predicate,
+    validate_action_pair,
+    zone_embargoed,
+)
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.pricing import get_active_price_context
@@ -48,6 +55,17 @@ _ABANDONED_REQUEST_ERROR = (
 )
 _executor_shutdown_tasks: set[asyncio.Task[None]] = set()
 _EXECUTOR_SHUTDOWN_WAIT_S = 10
+
+
+def _validate_unique_restore_keys(restore_actions: list[dict]) -> None:
+    """Reject multiple restores that point at the same safety source key."""
+
+    seen_revert_keys: set[str] = set()
+    for action in restore_actions:
+        reverts_action_key = action["reverts_action_key"]
+        if reverts_action_key in seen_revert_keys:
+            raise ValueError(f"duplicate safety restore key: {reverts_action_key}")
+        seen_revert_keys.add(reverts_action_key)
 
 
 def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, object], ...]]:
@@ -275,7 +293,15 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             layer = await get_setting("optimizer_layer") or "rules_only"
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
             await comfort_model.arefresh_if_changed()
-            device_quality = await get_device_data_quality()
+            try:
+                device_quality = await get_device_data_quality()
+            except Exception as exc:  # noqa: BLE001 - readiness failures must block control
+                logger.error(
+                    "optimization_paused_device_data_quality_check_failed",
+                    reason="quality_check_failed",
+                    error_type=type(exc).__name__,
+                )
+                return None
             if not device_quality["ready"]:
                 logger.warning(
                     "optimization_paused_device_data_quality",
@@ -290,12 +316,16 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             if layer_name == "milp":
                 try:
                     input_quality = await get_planning_data_quality()
-                except Exception as exc:  # noqa: BLE001 - plan generation has its own data checks
-                    logger.warning("planning_data_quality_unavailable", error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - readiness failures must block control
+                    logger.error(
+                        "optimization_paused_planning_data_quality_check_failed",
+                        reason="quality_check_failed",
+                        error_type=type(exc).__name__,
+                    )
                     input_quality = {
-                        "control_allowed": True,
+                        "control_allowed": False,
                         "status": "unavailable",
-                        "reasons": ["Planning input quality could not be checked."],
+                        "reasons": ["quality_check_failed"],
                         "price": {},
                         "weather": {},
                     }
@@ -405,6 +435,63 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                         )
                         return existing_plan_id
 
+                unresolved_actions = (
+                    (
+                        await session.execute(
+                            select(PlanActionRecord).where(unresolved_revert_predicate())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                statuses = (
+                    (
+                        await session.execute(
+                            select(DeviceStatusRecord).order_by(DeviceStatusRecord.ts.desc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                latest_status = {}
+                for status in statuses:
+                    latest_status.setdefault(status.device_id, status)
+                blocked_keys: set[str] = set()
+                retained_actions: list[dict] = []
+                for raw_action in plan["actions"]:
+                    device_id = (
+                        raw_action.get("device_id")
+                        or plan.get("device_id")
+                        or snapshot.get("device_id")
+                    )
+                    action = {**raw_action, "device_id": str(device_id) if device_id else None}
+                    action_type = str(action.get("type"))
+                    reason = None
+                    if action_type == str(ActionType.FORCE_DHW_ON) and dhw_embargoed(
+                        unresolved_actions, action["device_id"]
+                    ):
+                        reason = "blocked_by_unresolved_dhw_revert"
+                    elif zone_embargoed(
+                        unresolved_actions, action, latest_status.get(action["device_id"])
+                    ):
+                        reason = "blocked_by_unresolved_zone_revert"
+                    if reason:
+                        if action.get("action_key"):
+                            blocked_keys.add(action["action_key"])
+                        logger.warning(
+                            "plan_action_embargoed",
+                            reason=reason,
+                            action_type=action_type,
+                            device_id=action["device_id"],
+                        )
+                        continue
+                    retained_actions.append(action)
+                plan["actions"] = [
+                    action
+                    for action in retained_actions
+                    if action.get("reverts_action_key") not in blocked_keys
+                ]
+
                 plan_record = PlanRecord(
                     horizon_start=plan["horizon_start"],
                     horizon_end=plan["horizon_end"],
@@ -422,21 +509,61 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 )
                 await activate_plan(session, plan_record)
 
+                action_rows: list[tuple[dict, PlanActionRecord]] = []
+                action_keys: dict[str, tuple[dict, PlanActionRecord]] = {}
+                restore_actions: list[dict] = []
                 for action in plan["actions"]:
-                    device_id = (
-                        action.get("device_id")
-                        or plan.get("device_id")
-                        or snapshot.get("device_id")
-                    )
+                    if action.get("reverts_action_key"):
+                        restore_actions.append(action)
+                        continue
+                    action_key = action.get("action_key")
+                    if action_key is not None and action_key in action_keys:
+                        raise ValueError(f"duplicate safety action key: {action_key}")
                     action_record = PlanActionRecord(
                         plan_id=plan_record.id,
                         scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
                         action_type=str(ActionType(action["type"])),
                         payload_json=json.dumps(action.get("payload", {})),
-                        device_id=str(device_id) if device_id else None,
+                        device_id=action["device_id"],
                         status="pending",
                     )
                     session.add(action_record)
+                    action_rows.append((action, action_record))
+                    if action_key is not None:
+                        action_keys[action_key] = (action, action_record)
+
+                await session.flush()
+                _validate_unique_restore_keys(restore_actions)
+                for action in restore_actions:
+                    reverts_action_key = action["reverts_action_key"]
+                    source = action_keys.get(reverts_action_key)
+                    if source is None:
+                        raise ValueError(f"unpaired safety restore: {reverts_action_key}")
+                    source_action, source_record = source
+                    validate_action_pair(source_action, action)
+                    action_record = PlanActionRecord(
+                        plan_id=plan_record.id,
+                        reverts_action_id=source_record.id,
+                        scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
+                        action_type=str(ActionType(action["type"])),
+                        payload_json=json.dumps(action.get("payload", {})),
+                        device_id=action["device_id"],
+                        status="pending",
+                    )
+                    session.add(action_record)
+
+                linked_sources = {action["reverts_action_key"] for action in restore_actions}
+                for action, _ in action_rows:
+                    if (
+                        str(action["type"])
+                        in {
+                            str(ActionType.FORCE_DHW_ON),
+                            str(ActionType.ZONE_TEMP_BOOST),
+                        }
+                        and action.get("action_key") not in linked_sources
+                    ):
+                        raise ValueError(f"unpaired safety source: {action.get('action_key')}")
+                await session.flush()
 
             _last_plan_generated_at = _time.monotonic()
 
@@ -532,10 +659,35 @@ async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
 
     executor = PlanExecutor(wrapper)
     try:
-        # Never "catch up" a command that belongs to an already-passed price
-        # interval. Expire it before claiming newly due actions instead.
-        await executor.expire_stale_actions()
-        await executor.execute_due_actions()
+        from packages.core.service_health import record_safety_watchdog_result
+        from packages.optimizer.shower_mode import reconcile_shower_expiry
+
+        try:
+            await reconcile_shower_expiry()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - later cycle steps remain independent
+            logger.exception("executor_step_failed", step="reconcile_shower_expiry", error=str(exc))
+            try:
+                await record_safety_watchdog_result(success=False, reason=type(exc).__name__)
+            except Exception as health_exc:  # noqa: BLE001
+                logger.exception("safety_watchdog_health_write_failed", error=str(health_exc))
+        else:
+            try:
+                await record_safety_watchdog_result(success=True)
+            except Exception as health_exc:  # noqa: BLE001
+                logger.exception("safety_watchdog_health_write_failed", error=str(health_exc))
+
+        for step_name, step in (
+            ("expire_stale_actions", executor.expire_stale_actions),
+            ("execute_due_actions", executor.execute_due_actions),
+        ):
+            try:
+                await step()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - each cycle phase is isolated
+                logger.exception("executor_step_failed", step=step_name, error=str(exc))
     finally:
         if current is not None:
             _executor_shutdown_tasks.discard(current)
@@ -600,13 +752,23 @@ async def main() -> None:
     # The comfort model's causal feature schema is versioned separately from
     # COP and demand. Train it once after a schema upgrade instead of running
     # an older, leaky checkpoint or waiting for a manual request.
-    device_quality = await get_device_data_quality()
-    if not device_quality["ready"]:
-        logger.warning("comfort_model_initial_training_paused", reasons=device_quality["reasons"])
-    elif not comfort_model.is_trained:
-        logger.info("comfort_model_initial_training_needed")
-        comfort_result = await comfort_model.train()
-        logger.info("comfort_model_initial_training_finished", **comfort_result)
+    try:
+        device_quality = await get_device_data_quality()
+    except Exception as exc:  # noqa: BLE001 - training requires verified device readiness
+        logger.error(
+            "comfort_model_initial_training_quality_check_failed",
+            reason="quality_check_failed",
+            error_type=type(exc).__name__,
+        )
+    else:
+        if not device_quality["ready"]:
+            logger.warning(
+                "comfort_model_initial_training_paused", reasons=device_quality["reasons"]
+            )
+        elif not comfort_model.is_trained:
+            logger.info("comfort_model_initial_training_needed")
+            comfort_result = await comfort_model.train()
+            logger.info("comfort_model_initial_training_finished", **comfort_result)
 
     wrapper = AquareaWrapper()
     await wrapper.start()

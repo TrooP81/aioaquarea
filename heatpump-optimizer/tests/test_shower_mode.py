@@ -37,6 +37,15 @@ def _make_status(ts, tank_temp, force_dhw=0, device_id="test-device"):
     return record
 
 
+def _extract_statement_values(statement):
+    return {
+        (key.key if hasattr(key, "key") else str(key)): (
+            value.value if hasattr(value, "value") else value
+        )
+        for key, value in statement._values.items()
+    }
+
+
 @pytest.fixture
 def detector():
     return ShowerDetector()
@@ -67,8 +76,10 @@ def sample_prices_with_peak(now):
 
 class TestShowerDetection:
     @pytest.mark.asyncio
-    async def test_shower_detected_on_sharp_drop(self, detector, now, sample_prices_flat):
-        """A drop >= threshold between consecutive polls triggers shower mode."""
+    async def test_P2_AC1_shower_drop_creates_linked_durable_off(
+        self, detector, now, sample_prices_flat
+    ):
+        """A shower activation persists an ON source and its linked OFF obligation."""
         prev_record = _make_status(now - dt.timedelta(minutes=5), tank_temp=55.0)
         current_record = _make_status(now, tank_temp=43.0)  # 12 deg C drop
 
@@ -91,9 +102,10 @@ class TestShowerDetection:
         async def mock_execute(stmt):
             call_count[0] += 1
             if call_count[0] == 1:
-                return mock_active_result  # active event query
-            else:
-                return mock_prev_result  # previous status query
+                return mock_active_result
+            if call_count[0] == 2:
+                return mock_prev_result
+            return MagicMock(scalar_one_or_none=MagicMock(return_value=None))
 
         mock_session.execute = mock_execute
 
@@ -105,7 +117,11 @@ class TestShowerDetection:
             mock_get_session.return_value = _AsyncContextManager(mock_session)
 
             async def setting_side_effect(key):
-                return {"shower_mode_enabled": "true", "shower_drop_threshold": "10"}.get(key, "")
+                return {
+                    "shower_mode_enabled": "true",
+                    "shower_drop_threshold": "10",
+                    "shower_max_duration_minutes": "60",
+                }.get(key, "")
 
             mock_get_setting.side_effect = setting_side_effect
             mock_get_prices.return_value = sample_prices_flat  # flat prices, not peak
@@ -118,11 +134,16 @@ class TestShowerDetection:
         assert events[0].status == "active"
         assert events[0].pre_shower_temp == 55.0
 
-        # Should have created a force_dhw_on action
+        assert events[0].device_id == current_record.device_id
+        assert events[0].expires_at is not None
+
         actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
-        assert len(actions) == 1
-        assert actions[0].action_type == "force_dhw_on"
-        payload = json.loads(actions[0].payload_json)
+        assert len(actions) == 2
+        source = next(action for action in actions if action.action_type == "force_dhw_on")
+        restore = next(action for action in actions if action.action_type == "force_dhw_off")
+        assert restore.reverts_action_id == source.id
+        assert restore.scheduled_ts == events[0].expires_at
+        payload = json.loads(source.payload_json)
         assert payload["trigger"] == "shower_mode"
         assert payload["pre_shower_temp"] == 55.0
 
@@ -181,26 +202,29 @@ class TestShowerDetection:
         # Nothing should happen - no session even opened
 
     @pytest.mark.asyncio
-    async def test_recovery_creates_dhw_off(self, detector, now):
-        """When tank recovers to pre-shower temp, force_dhw_off is injected."""
+    async def test_P2_AC2_recovery_reschedules_existing_linked_dhw_off(self, detector, now):
+        """Recovery makes the existing durable OFF action due without creating another."""
         active_event = ShowerEventRecord(
             id=1,
             started_at=now - dt.timedelta(minutes=15),
+            expires_at=now + dt.timedelta(minutes=45),
+            activation_action_id=42,
             pre_shower_temp=55.0,
             status="active",
         )
         current_record = _make_status(now, tank_temp=56.0, force_dhw=1)  # Recovered above 55
 
-        added_objects = []
-
         mock_session = SimpleNamespace()
-        mock_session.add = lambda obj: added_objects.append(obj)
+        mock_session.add = MagicMock()
         mock_session.flush = AsyncMock()
 
         mock_active_result = MagicMock()
         mock_active_result.scalar_one_or_none.return_value = active_event
 
+        executed_statements = []
+
         async def mock_execute(stmt):
+            executed_statements.append(stmt)
             return mock_active_result
 
         mock_session.execute = mock_execute
@@ -221,40 +245,36 @@ class TestShowerDetection:
 
             await detector.check(current_record)
 
-        # Event should be marked recovered
-        assert active_event.status == "recovered"
-        assert active_event.recovered_at is not None
-
-        # Should have a force_dhw_off action
-        actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
-        assert len(actions) == 1
-        assert actions[0].action_type == "force_dhw_off"
-        assert actions[0].device_id == current_record.device_id
-        payload = json.loads(actions[0].payload_json)
-        assert payload["trigger"] == "shower_mode"
-        assert payload["reason"] == "recovered"
+        assert active_event.status == "recovery_pending"
+        assert mock_session.add.call_count == 0
+        values = _extract_statement_values(executed_statements[-1])
+        assert values["scheduled_ts"] == now
+        assert json.loads(values["result_json"]) == {"reason": "recovered"}
 
     @pytest.mark.asyncio
-    async def test_timeout_after_max_duration(self, detector, now):
-        """After max duration without recovery, times out and injects force_dhw_off."""
+    async def test_P2_AC2_timeout_reschedules_existing_linked_dhw_off(self, detector, now):
+        """Timeout makes the existing durable OFF action due without duplication."""
         active_event = ShowerEventRecord(
             id=1,
             started_at=now - dt.timedelta(minutes=65),  # 65 min ago (exceeds 60 default)
+            expires_at=now - dt.timedelta(minutes=5),
+            activation_action_id=42,
             pre_shower_temp=55.0,
             status="active",
         )
         current_record = _make_status(now, tank_temp=50.0, force_dhw=1)  # Still below target
 
-        added_objects = []
-
         mock_session = SimpleNamespace()
-        mock_session.add = lambda obj: added_objects.append(obj)
+        mock_session.add = MagicMock()
         mock_session.flush = AsyncMock()
 
         mock_active_result = MagicMock()
         mock_active_result.scalar_one_or_none.return_value = active_event
 
+        executed_statements = []
+
         async def mock_execute(stmt):
+            executed_statements.append(stmt)
             return mock_active_result
 
         mock_session.execute = mock_execute
@@ -275,13 +295,11 @@ class TestShowerDetection:
 
             await detector.check(current_record)
 
-        assert active_event.status == "timeout"
-        actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
-        assert len(actions) == 1
-        assert actions[0].action_type == "force_dhw_off"
-        assert actions[0].device_id == current_record.device_id
-        payload = json.loads(actions[0].payload_json)
-        assert payload["reason"] == "timeout"
+        assert active_event.status == "timeout_pending"
+        assert mock_session.add.call_count == 0
+        values = _extract_statement_values(executed_statements[-1])
+        assert values["scheduled_ts"] == now
+        assert json.loads(values["result_json"]) == {"reason": "timeout"}
 
     @pytest.mark.asyncio
     async def test_recovery_does_not_stop_dhw_when_force_mode_was_never_started(
@@ -290,17 +308,16 @@ class TestShowerDetection:
         event = ShowerEventRecord(
             id=1,
             started_at=now - dt.timedelta(minutes=15),
+            expires_at=now + dt.timedelta(minutes=45),
             pre_shower_temp=55.0,
             status="active",
         )
         current = _make_status(now, tank_temp=56.0, force_dhw=0)
-        detector._inject_dhw_off = AsyncMock()
+        session = AsyncMock()
+        await detector._check_recovery(session, event, current)
 
-        with patch("packages.optimizer.shower_mode.get_setting", return_value="60"):
-            await detector._check_recovery(AsyncMock(), event, current)
-
-        assert event.status == "recovered"
-        detector._inject_dhw_off.assert_not_awaited()
+        assert event.status == "recovery_pending"
+        session.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skip_during_peak_price(self, detector, now, sample_prices_with_peak):
@@ -362,6 +379,7 @@ class TestShowerDetection:
         active_event = ShowerEventRecord(
             id=1,
             started_at=now - dt.timedelta(minutes=3),
+            expires_at=now + dt.timedelta(minutes=57),
             pre_shower_temp=55.0,
             status="active",
         )

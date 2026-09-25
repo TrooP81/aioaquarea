@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -211,10 +212,26 @@ class PlanActionRecord(Base):
     __table_args__ = (
         Index("ix_plan_actions_plan_id", "plan_id"),
         Index("ix_plan_actions_status_scheduled", "status", "scheduled_ts"),
+        Index(
+            "uq_plan_actions_reverts_action_id",
+            "reverts_action_id",
+            unique=True,
+            postgresql_where=text("reverts_action_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_plan_actions_safety_due",
+            "safety_next_retry_at",
+            "scheduled_ts",
+            "id",
+            postgresql_where=text("reverts_action_id IS NOT NULL AND status = 'pending'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     plan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    reverts_action_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plan_actions.id", ondelete="RESTRICT")
+    )
     scheduled_ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
     action_type: Mapped[str] = mapped_column(String(64))
     payload_json: Mapped[str] = mapped_column(Text)
@@ -225,6 +242,11 @@ class PlanActionRecord(Base):
     verify_attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_observed_json: Mapped[str | None] = mapped_column(Text)
     result_json: Mapped[str | None] = mapped_column(Text)
+    safety_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    safety_next_retry_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    safety_claimed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class OptimizationRequestRecord(Base):
@@ -359,7 +381,14 @@ class ShowerEventRecord(Base):
     """Reactive shower detection events — tracks DHW boost triggered by rapid tank temp drop."""
 
     __tablename__ = "shower_events"
-    __table_args__ = (Index("ix_shower_events_status", "status"),)
+    __table_args__ = (
+        Index("ix_shower_events_status", "status"),
+        Index(
+            "ix_shower_events_open_expiry",
+            "expires_at",
+            postgresql_where=text("status IN ('active', 'recovery_pending', 'timeout_pending')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     started_at: Mapped[dt.datetime] = mapped_column(
@@ -368,9 +397,14 @@ class ShowerEventRecord(Base):
     pre_shower_temp: Mapped[float] = mapped_column(Float, nullable=False)
     recovered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(
-        String(24), default="active"
+        String(32), default="active"
     )  # active / recovered / timeout / skipped_peak
     peak_price_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    device_id: Mapped[str | None] = mapped_column(String(128))
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    activation_action_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plan_actions.id", ondelete="RESTRICT")
+    )
 
 
 class AppLogRecord(Base):

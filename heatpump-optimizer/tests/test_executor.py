@@ -19,6 +19,7 @@ from packages.optimizer.executor import (
     VERIFY_TIMEOUT_S,
 )
 from packages.optimizer.executor_core import PlanExecutor as CorePlanExecutor
+from packages.core.safety_reverts import is_restorative_action
 
 
 def _zone(temp: int | None = None, heat_min: int | None = 20, heat_max: int | None = 65):
@@ -113,7 +114,8 @@ async def test_core_executors_keep_injected_session_factories_isolated():
         session = AsyncMock()
         empty_result = MagicMock()
         empty_result.scalars.return_value.all.return_value = []
-        session.execute = AsyncMock(side_effect=[empty_result, empty_result])
+        empty_result.scalar_one_or_none.return_value = None
+        session.execute = AsyncMock(side_effect=[None, empty_result, empty_result, empty_result])
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=session)
         context.__aexit__ = AsyncMock(return_value=False)
@@ -132,10 +134,10 @@ async def test_core_executors_keep_injected_session_factories_isolated():
         first_executor.execute_due_actions(), second_executor.execute_due_actions()
     )
 
-    first_factory.assert_called_once_with()
-    second_factory.assert_called_once_with()
-    assert first_session.execute.await_count == 2
-    assert second_session.execute.await_count == 2
+    assert first_factory.call_count == 2
+    assert second_factory.call_count == 2
+    assert first_session.execute.await_count == 4
+    assert second_session.execute.await_count == 4
 
 
 class TestRegistry:
@@ -675,7 +677,7 @@ class TestExecuteDueActions:
             override_result.scalars.return_value.all.return_value = [override_mock]
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = []
-            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result])
+            mock_session.execute = AsyncMock(side_effect=[None, override_result, actions_result])
 
             await executor.execute_due_actions()
 
@@ -702,14 +704,16 @@ class TestExecuteDueActions:
             override_result.scalars.return_value.all.return_value = [override_mock]
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = [action_mock]
+            safety_result = MagicMock()
+            safety_result.scalar_one_or_none.return_value = None
             mock_session.execute = AsyncMock(
-                side_effect=[override_result, actions_result, None, None]
+                side_effect=[None, safety_result, override_result, actions_result, None, None]
             )
 
             await executor.execute_due_actions()
 
         executor._wrapper.set_special_status.assert_not_awaited()
-        assert mock_session.execute.call_count == 4
+        assert mock_session.execute.call_count == 6
 
     @pytest.mark.asyncio
     async def test_due_actions_are_claimed_without_a_global_freshness_gate(self, executor):
@@ -723,13 +727,17 @@ class TestExecuteDueActions:
             override_result.scalars.return_value.all.return_value = []
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = [action_mock]
-            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result, None])
+            safety_result = MagicMock()
+            safety_result.scalar_one_or_none.return_value = None
+            mock_session.execute = AsyncMock(
+                side_effect=[None, safety_result, override_result, actions_result, None]
+            )
 
             with patch.object(executor, "_execute_action", new=AsyncMock()) as execute_action:
                 await executor.execute_due_actions()
 
         execute_action.assert_awaited_once_with(action_mock)
-        assert mock_session.execute.call_count == 3
+        assert mock_session.execute.call_count == 5
 
 
 @pytest.mark.asyncio
@@ -752,6 +760,8 @@ async def test_executor_allows_a_fresh_action_when_other_device_is_stale(executo
     status_result.scalar_one_or_none.return_value = status
     fresh_ids_result = MagicMock()
     fresh_ids_result.scalars.return_value.all.return_value = ["device-a"]
+    unresolved_result = MagicMock()
+    unresolved_result.scalars.return_value.all.return_value = []
     gate_result = MagicMock()
     gate_result.scalar_one_or_none.return_value = SimpleNamespace(
         state="ALLOWED",
@@ -760,7 +770,9 @@ async def test_executor_allows_a_fresh_action_when_other_device_is_stale(executo
         last_raw_outdoor_c=5.0,
     )
     mock_session = AsyncMock()
-    mock_session.execute = AsyncMock(side_effect=[status_result, fresh_ids_result, gate_result])
+    mock_session.execute = AsyncMock(
+        side_effect=[status_result, fresh_ids_result, unresolved_result, gate_result]
+    )
     context = MagicMock()
     context.__aenter__ = AsyncMock(return_value=mock_session)
     context.__aexit__ = AsyncMock(return_value=False)
@@ -777,7 +789,7 @@ async def test_executor_allows_a_fresh_action_when_other_device_is_stale(executo
         result = await executor._dispatch_precondition(action, ActionType.NORMAL_MODE_ON, {})
 
     assert result is None
-    assert mock_session.execute.await_count == 3
+    assert mock_session.execute.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -789,6 +801,8 @@ async def test_executor_blocks_room_heating_when_gate_is_blocked(executor):
     status_result.scalar_one_or_none.return_value = SimpleNamespace(
         zone1_target_temp=20, zone2_target_temp=20
     )
+    unresolved_result = MagicMock()
+    unresolved_result.scalars.return_value.all.return_value = []
     gate_result = MagicMock()
     gate_result.scalar_one_or_none.return_value = SimpleNamespace(
         state="BLOCKED",
@@ -797,7 +811,7 @@ async def test_executor_blocks_room_heating_when_gate_is_blocked(executor):
         last_raw_outdoor_c=16.0,
     )
     mock_session = AsyncMock()
-    mock_session.execute = AsyncMock(side_effect=[status_result, gate_result])
+    mock_session.execute = AsyncMock(side_effect=[status_result, unresolved_result, gate_result])
     context = MagicMock()
     context.__aenter__ = AsyncMock(return_value=mock_session)
     context.__aexit__ = AsyncMock(return_value=False)
@@ -840,7 +854,7 @@ async def test_executor_dhw_action_bypasses_room_heating_gate(executor):
 
     assert result is None
     gate_config.assert_not_awaited()
-    mock_session.execute.assert_awaited_once()
+    assert mock_session.execute.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -908,14 +922,16 @@ class TestLearningMode:
             override_result.scalars.return_value.all.return_value = []
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = [action_mock]
+            safety_result = MagicMock()
+            safety_result.scalar_one_or_none.return_value = None
             mock_session.execute = AsyncMock(
-                side_effect=[override_result, actions_result, None, None]
+                side_effect=[None, safety_result, override_result, actions_result, None, None]
             )
 
             await executor.execute_due_actions()
 
         executor._wrapper.force_dhw.assert_not_awaited()
-        assert mock_session.execute.call_count == 4
+        assert mock_session.execute.call_count == 6
 
     @pytest.mark.asyncio
     async def test_learning_mode_off_does_not_skip(self, executor):
@@ -934,13 +950,17 @@ class TestLearningMode:
             override_result.scalars.return_value.all.return_value = []
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = []
-            mock_session.execute = AsyncMock(side_effect=[override_result, actions_result])
+            safety_result = MagicMock()
+            safety_result.scalar_one_or_none.return_value = None
+            mock_session.execute = AsyncMock(
+                side_effect=[safety_result, override_result, actions_result]
+            )
 
             await executor.execute_due_actions()
 
-        # No overrides, no learning mode, no due actions → only the two queries ran.
+        # No safety action, no overrides, no learning mode, no due actions.
         executor._wrapper.force_dhw.assert_not_awaited()
-        assert mock_session.execute.call_count == 2
+        assert mock_session.execute.call_count == 3
 
 
 class TestConstants:
@@ -951,32 +971,20 @@ class TestConstants:
 
 
 class TestExpireStaleActions:
-    @pytest.mark.parametrize(
-        ("action_type", "payload", "expected"),
-        [
-            (ActionType.FORCE_DHW_ON, {}, True),
-            (ActionType.FORCE_DHW_OFF, {}, False),
-            (ActionType.SET_TANK_TEMP, {"temperature": 40}, True),
-            (ActionType.SET_TANK_TEMP, {"temperature": 65}, True),
-            (ActionType.SET_ZONE_HEAT_TEMPERATURE, {"temperature": 20}, True),
-            (ActionType.SET_ZONE_HEAT_TEMPERATURE, {"temperature": 45}, True),
-            (ActionType.ZONE_TEMP_BOOST, {}, True),
-            (ActionType.QUIET_MODE_ON, {}, False),
-            (ActionType.QUIET_MODE_OFF, {}, True),
-            (ActionType.ECO_MODE_ON, {}, True),
-            (ActionType.ECO_MODE_OFF, {}, True),
-            (ActionType.NORMAL_MODE_ON, {}, True),
-            (ActionType.COMFORT_MODE_ON, {}, True),
-        ],
-    )
-    def test_energy_increasing_expiry_predicate(self, action_type, payload, expected):
-        assert (
-            CorePlanExecutor._is_energy_increasing(_make_action(str(action_type), payload))
-            is expected
+    def test_P2_AC13_only_linked_restores_are_protected_from_expiry(self):
+        tagged_restore = SimpleNamespace(
+            action_type=str(ActionType.FORCE_DHW_OFF), reverts_action_id=1
+        )
+        untagged_off = SimpleNamespace(
+            action_type=str(ActionType.FORCE_DHW_OFF), reverts_action_id=None
+        )
+        untagged_quiet = SimpleNamespace(
+            action_type=str(ActionType.QUIET_MODE_ON), reverts_action_id=None
         )
 
-    def test_energy_increasing_expiry_predicate_fails_closed_for_unknown_action(self):
-        assert CorePlanExecutor._is_energy_increasing(_make_action("unknown_action")) is True
+        assert is_restorative_action(tagged_restore)
+        assert not is_restorative_action(untagged_off)
+        assert not is_restorative_action(untagged_quiet)
 
     @pytest.mark.asyncio
     async def test_no_stale_actions_is_noop(self, executor):

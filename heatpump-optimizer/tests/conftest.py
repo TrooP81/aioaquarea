@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import sys
 import tempfile
 import warnings
 from contextlib import suppress
@@ -18,6 +19,28 @@ TEST_API_TOKEN = "test-token"
 os.environ.setdefault("API_TOKEN", TEST_API_TOKEN)
 
 import aioaquarea  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep every unit test's model reads and writes in its own temporary directory."""
+    from packages.core.config import settings
+
+    model_dir = tmp_path / "_isolated_models"
+    model_dir.mkdir()
+    monkeypatch.setattr(settings, "model_dir", str(model_dir))
+    for module_name in (
+        "packages.ml.models_common",
+        "packages.ml.models",
+        "packages.ml.cop_model_core",
+        "packages.ml.demand_model_core",
+        "packages.ml.comfort_model",
+        "packages.ml.thermal",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module, "MODEL_DIR", model_dir)
+    return model_dir
 
 
 def pytest_configure() -> None:

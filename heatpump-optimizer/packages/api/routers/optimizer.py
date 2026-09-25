@@ -3,26 +3,40 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import structlog
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
 from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
 from packages.core.database import get_session
 from packages.core.models import (
     AuditLogRecord,
+    DeviceStatusRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
+    ShowerEventRecord,
+)
+from packages.core.device_data_quality import get_device_data_quality
+from packages.core.safety_reverts import (
+    UNRESOLVED_STATUSES,
+    restore_baseline_target,
+    zone_matches_baseline,
 )
 from packages.core.plan_outcome import measured_window_outcome, plan_measurement
 
 router = APIRouter()
+logger = structlog.get_logger()
 
 
 class LearningModeUpdate(BaseModel):
     enabled: bool
+
+
+class SafetyRevertResolveRequest(BaseModel):
+    reason: str
 
 
 def _json_object(value: str | None) -> dict[str, object]:
@@ -252,6 +266,88 @@ async def get_operations_alerts():
     from packages.core.operational_alerts import get_operational_alerts
 
     return await get_operational_alerts()
+
+
+@router.post("/api/operations/safety-reverts/{action_id}/resolve")
+async def resolve_safety_revert(action_id: int, request: SafetyRevertResolveRequest):
+    """Resolve a linked revert only when fresh persisted evidence proves it safe."""
+
+    reason = request.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="reason must be non-empty")
+    now = dt.datetime.now(dt.timezone.utc)
+    quality = await get_device_data_quality(now=now)
+    cutoff = now - dt.timedelta(seconds=int(quality["threshold_seconds"]))
+    async with get_session() as session:
+        action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    PlanActionRecord.id == action_id,
+                    PlanActionRecord.reverts_action_id.is_not(None),
+                    PlanActionRecord.status.in_(UNRESOLVED_STATUSES),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if action is None:
+            raise HTTPException(status_code=404, detail="Safety revert not found")
+        status = (
+            await session.execute(
+                select(DeviceStatusRecord)
+                .where(
+                    DeviceStatusRecord.device_id == action.device_id,
+                    DeviceStatusRecord.ts >= cutoff,
+                )
+                .order_by(DeviceStatusRecord.ts.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if status is None:
+            raise HTTPException(status_code=409, detail="Fresh device status is required")
+        safe = action.action_type == "force_dhw_off" and status.force_dhw == 0
+        if action.action_type == "zone_temp_restore":
+            source = await session.get(PlanActionRecord, action.reverts_action_id)
+            payload = _json_object(action.payload_json)
+            zone_id = int(payload.get("zone_id", 1) or 1)
+            baseline = restore_baseline_target(action)
+            source_payload = _json_object(source.payload_json if source else None)
+            source_baseline = source_payload.get("baseline_temperature")
+            if source_baseline is not None and not zone_matches_baseline(source_baseline, baseline):
+                logger.error(
+                    "safety_restore_baseline_mismatch",
+                    action_id=action.id,
+                    source_action_id=action.reverts_action_id,
+                    source_baseline=source_baseline,
+                    restore_baseline=baseline,
+                )
+                raise HTTPException(status_code=409, detail="Safety restore baseline mismatch")
+            current = getattr(status, f"zone{zone_id}_target_temp", None)
+            safe = zone_matches_baseline(baseline, current)
+        if not safe:
+            raise HTTPException(
+                status_code=409, detail="Persisted status does not prove safe state"
+            )
+        action.status = "executed"
+        action.executed_at = now
+        action.result_json = json.dumps({"reason": "manually_resolved", "note": reason})
+        await session.execute(
+            update(ShowerEventRecord)
+            .where(ShowerEventRecord.activation_action_id == action.reverts_action_id)
+            .values(status="resolved", recovered_at=now)
+        )
+        session.add(
+            AuditLogRecord(
+                actor="authenticated_api",
+                action="manual_safety_revert_resolution",
+                target_device=action.device_id,
+                payload_json=json.dumps(
+                    {"action_id": action.id, "reason": reason, "status_ts": status.ts.isoformat()}
+                ),
+                result="manually_resolved",
+            )
+        )
+    return {"status": "resolved", "action_id": action_id}
 
 
 @router.post("/api/overrides")

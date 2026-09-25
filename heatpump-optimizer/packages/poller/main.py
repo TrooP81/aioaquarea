@@ -397,7 +397,15 @@ async def retrain_comfort_model() -> None:
         from packages.core.device_data_quality import get_device_data_quality
 
         await comfort_model.arefresh_if_changed()
-        device_quality = await get_device_data_quality()
+        try:
+            device_quality = await get_device_data_quality()
+        except Exception as exc:  # noqa: BLE001 - training requires verified device readiness
+            logger.error(
+                "comfort_model_retrain_quality_check_failed",
+                reason="quality_check_failed",
+                error_type=type(exc).__name__,
+            )
+            return
         if not device_quality["ready"]:
             logger.warning("comfort_model_retrain_paused", reasons=device_quality["reasons"])
             return
@@ -443,7 +451,7 @@ async def main() -> None:
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
-    wrapper = AquareaWrapper()
+    wrapper = AquareaWrapper(read_only=True)
     await wrapper.start()
 
     scheduler = create_scheduler()

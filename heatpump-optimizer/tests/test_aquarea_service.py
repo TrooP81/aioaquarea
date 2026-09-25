@@ -60,6 +60,37 @@ def _wrapper() -> AquareaWrapper:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,args",
+    [
+        ("set_mode", (None,)),
+        ("set_tank_temperature", (45,)),
+        ("set_quiet_mode", (None,)),
+        ("force_dhw", (True,)),
+        ("set_powerful_time", (None,)),
+        ("set_force_heater", (None,)),
+        ("set_holiday_timer", (None,)),
+        ("request_defrost", ()),
+        ("set_zone_heat_temperature", (1, 30)),
+        ("set_special_status", ("ECO",)),
+        ("clear_special_status", ()),
+    ],
+)
+async def test_read_only_wrapper_rejects_all_mutating_methods_without_io(method, args) -> None:
+    wrapper = AquareaWrapper(read_only=True)
+    wrapper._client = AsyncMock()
+    wrapper._read_limiter = SimpleNamespace(acquire=AsyncMock())
+    wrapper._write_limiter = SimpleNamespace(acquire=AsyncMock())
+
+    with pytest.raises(PermissionError, match="read-only"):
+        await getattr(wrapper, method)(*args)
+
+    wrapper._read_limiter.acquire.assert_not_awaited()
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    wrapper._client.get_devices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cached_device_does_not_consume_read_budget() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(status_data_mode=StatusDataMode.LIVE)

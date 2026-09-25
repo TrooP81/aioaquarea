@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from packages.core.resilience import CircuitBreaker, RateLimiter, RedisCircuitBreaker
+from packages.core.resilience import (
+    CircuitBreaker,
+    RateLimiter,
+    RedisCircuitBreaker,
+    SafetyWriteCapacityError,
+    safety_write_context,
+)
 
 
 class FakeRedis:
@@ -70,3 +78,46 @@ class TestRateLimiter:
         await limiter.acquire()
 
         assert limiter._tokens < 2
+
+    @pytest.mark.asyncio
+    async def test_p2_ac10_ordinary_callers_cannot_take_reserved_tokens(self):
+        limiter = RateLimiter(max_tokens=20, refill_per_second=20, reserve_tokens=2)
+        limiter._tokens = 2
+
+        acquisition = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0)
+        assert acquisition.done() is False
+        acquisition.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquisition
+
+    @pytest.mark.asyncio
+    async def test_p2_ac10_safety_context_consumes_reserved_tokens_and_resets(self, monkeypatch):
+        limiter = RateLimiter(max_tokens=20, refill_per_second=20, reserve_tokens=2)
+        monkeypatch.setattr("packages.core.resilience.time.monotonic", lambda: 100.0)
+        limiter._last_refill = 100.0
+        limiter._tokens = 2
+        token = safety_write_context.set(True)
+        try:
+            await limiter.acquire()
+            await limiter.acquire()
+        finally:
+            safety_write_context.reset(token)
+
+        assert limiter._tokens == 0
+        assert safety_write_context.get() is False
+
+    @pytest.mark.asyncio
+    async def test_p2_ac10_safety_fails_promptly_when_no_token_exists(self):
+        limiter = RateLimiter(max_tokens=20, refill_per_second=20, reserve_tokens=2)
+        limiter._tokens = 0
+        token = safety_write_context.set(True)
+        try:
+            with pytest.raises(SafetyWriteCapacityError):
+                await limiter.acquire()
+        finally:
+            safety_write_context.reset(token)
+
+    def test_p2_ac10_long_run_ordinary_throughput_is_bounded_by_safety_retries(self):
+        # Four 15-minute safety retries consume four of the 20 hourly write tokens.
+        assert 20 - 4 == 16

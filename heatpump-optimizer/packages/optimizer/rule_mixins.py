@@ -468,6 +468,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.FORCE_DHW_ON),
+                    "action_key": f"dhw:{slot_start.isoformat()}",
                     "payload": {
                         "reason": f"thermal_optimized_before_{ready_hour}:00",
                         "predicted_minutes": round(projected_prediction.estimated_minutes),
@@ -481,6 +482,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": off_time.isoformat(),
                         "type": str(ActionType.FORCE_DHW_OFF),
+                        "reverts_action_key": f"dhw:{slot_start.isoformat()}",
                         "payload": {"reason": "dhw_target_reached"},
                     }
                 )
@@ -557,6 +559,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             {
                 "ts": slot_start.isoformat(),
                 "type": str(ActionType.FORCE_DHW_ON),
+                "action_key": f"dhw_opportunistic:{slot_start.isoformat()}",
                 "payload": {
                     "reason": (f"opportunistic_cheap_slot_{slot_price:.4f}_eur"),
                     "predicted_minutes": round(prediction.estimated_minutes),
@@ -571,6 +574,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.FORCE_DHW_OFF),
+                    "reverts_action_key": f"dhw_opportunistic:{slot_start.isoformat()}",
                     "payload": {"reason": "opportunistic_top_up_complete"},
                 }
             )
@@ -772,6 +776,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             {
                 "ts": slot_start.isoformat(),
                 "type": str(ActionType.ZONE_TEMP_BOOST),
+                "action_key": f"zone_boost:{slot_start.isoformat()}",
                 "payload": {
                     "offset": boost_temperature - baseline_temperature,
                     "baseline_temperature": baseline_temperature,
@@ -791,6 +796,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             {
                 "ts": (slot_start + dt.timedelta(hours=1)).isoformat(),
                 "type": str(ActionType.ZONE_TEMP_RESTORE),
+                "reverts_action_key": f"zone_boost:{slot_start.isoformat()}",
                 "payload": {
                     "temperature": baseline_temperature,
                     "boost_temperature": boost_temperature,
@@ -963,6 +969,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
+                    "action_key": f"zone_preheat:{slot_start.isoformat()}",
                     "payload": {
                         "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
@@ -977,6 +984,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
+                    "reverts_action_key": f"zone_preheat:{slot_start.isoformat()}",
                     "payload": {
                         "temperature": baseline_temperature,
                         "boost_temperature": boost_temperature,
@@ -1118,6 +1126,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
+                    "action_key": f"zone_guardrail:{slot_start.isoformat()}",
                     "payload": {
                         "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
@@ -1133,6 +1142,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
+                    "reverts_action_key": f"zone_guardrail:{slot_start.isoformat()}",
                     "payload": {
                         "temperature": baseline_temperature,
                         "boost_temperature": boost_temperature,
@@ -1175,6 +1185,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": horizon_start.isoformat(),
                         "type": str(ActionType.ZONE_TEMP_BOOST),
+                        "action_key": f"zone_cooling:{horizon_start.isoformat()}",
                         "payload": {
                             "offset": boost_temperature - baseline_temperature,
                             "baseline_temperature": baseline_temperature,
@@ -1190,6 +1201,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
                         "type": str(ActionType.ZONE_TEMP_RESTORE),
+                        "reverts_action_key": f"zone_cooling:{horizon_start.isoformat()}",
                         "payload": {
                             "temperature": baseline_temperature,
                             "boost_temperature": boost_temperature,

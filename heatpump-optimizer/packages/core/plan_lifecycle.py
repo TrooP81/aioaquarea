@@ -28,6 +28,25 @@ async def activate_plan(
     first-ever plan, when there is no existing row to lock.
     """
 
+    active_ids = await supersede_active_plan(session, reason=reason)
+    plan.status = ACTIVE_PLAN_STATUS
+    session.add(plan)
+    await session.flush()
+    if active_ids:
+        await session.execute(
+            update(PlanRecord)
+            .where(PlanRecord.id.in_(active_ids))
+            .values(superseded_by_plan_id=plan.id)
+        )
+
+
+async def supersede_active_plan(
+    session: AsyncSession,
+    *,
+    reason: str = "replaced_by_new_optimization",
+) -> list[int]:
+    """Supersede active plans while retaining explicitly linked restores."""
+
     now = dt.datetime.now(dt.timezone.utc)
     active_rows = (
         (
@@ -47,6 +66,7 @@ async def activate_plan(
                 and_(
                     PlanActionRecord.plan_id.in_(active_ids),
                     PlanActionRecord.status == "pending",
+                    PlanActionRecord.reverts_action_id.is_(None),
                 )
             )
             .values(
@@ -67,16 +87,7 @@ async def activate_plan(
             )
         )
 
-    plan.status = ACTIVE_PLAN_STATUS
-    session.add(plan)
-    await session.flush()
-
-    if active_ids:
-        await session.execute(
-            update(PlanRecord)
-            .where(PlanRecord.id.in_(active_ids))
-            .values(superseded_by_plan_id=plan.id)
-        )
+    return active_ids
 
 
 def active_plan_query(now: dt.datetime):

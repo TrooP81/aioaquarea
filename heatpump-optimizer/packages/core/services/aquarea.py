@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import datetime as dt
 import logging
 import math
@@ -27,7 +28,7 @@ from aioaquarea.data import StatusDataMode
 
 from ..config import settings
 from ..panasonic_special_status import optimizer_special_status_supported
-from ..resilience import CircuitBreaker, RateLimiter, RedisCircuitBreaker
+from ..resilience import CircuitBreaker, RateLimiter, RedisCircuitBreaker, safety_write_context
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,8 @@ class PanasonicCredentialsMissingError(RuntimeError):
 class AquareaWrapper:
     """Wrapper around aioaquarea.Client for application use."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, read_only: bool = False) -> None:
+        self._read_only = read_only
         self._client: Client | None = None
         self._session: aiohttp.ClientSession | None = None
         self._redis: redis.Redis | None = None
@@ -136,7 +138,9 @@ class AquareaWrapper:
         self._adapter_failure_device_id: str | None = None
         self._adapter_failure_reason = "unknown"
         self._read_limiter = RateLimiter(max_tokens=30, refill_per_second=30 / 3600)
-        self._write_limiter = RateLimiter(max_tokens=20, refill_per_second=20 / 3600)
+        self._write_limiter = RateLimiter(
+            max_tokens=20, refill_per_second=20 / 3600, reserve_tokens=2
+        )
         self._circuit_breaker = CircuitBreaker()
         self._redis_circuit_breaker: RedisCircuitBreaker | None = None
         self._authenticated = False
@@ -159,6 +163,16 @@ class AquareaWrapper:
             logger.warning("%s", exc)
         except Exception as exc:
             logger.warning("Panasonic login deferred until next device access: %s", exc)
+
+    @contextmanager
+    def safety_write(self):
+        """Allow exactly one safety dispatch to consume reserved write capacity."""
+
+        token = safety_write_context.set(True)
+        try:
+            yield
+        finally:
+            safety_write_context.reset(token)
 
     async def _ensure_authenticated(self) -> None:
         """Log in with the credentials saved in Settings unless already authenticated."""
@@ -398,6 +412,8 @@ class AquareaWrapper:
     async def _get_writable_device(self):
         """Require a recent live adaptor response before any cloud write."""
 
+        self._require_write_permission()
+
         device = await self.get_device()
         if device.status_data_mode == StatusDataMode.CACHED:
             self._last_live_status_at = None
@@ -409,6 +425,12 @@ class AquareaWrapper:
         ):
             device = await self.refresh_device()
         return device
+
+    def _require_write_permission(self) -> None:
+        if self._read_only:
+            raise PermissionError(
+                "AquareaWrapper is read-only; mutating commands are not permitted"
+            )
 
     async def _prepare_write(self):
         """Reserve write capacity without letting the live preflight go stale."""
@@ -423,11 +445,13 @@ class AquareaWrapper:
             raise PanasonicCachedStatusError()
 
     async def set_mode(self, mode) -> None:
+        self._require_write_permission()
         device = await self._prepare_write()
         await device.set_mode(mode)
         logger.info("Set mode to %s", mode)
 
     async def set_tank_temperature(self, temperature: int) -> None:
+        self._require_write_permission()
         device = await self._get_writable_device()
         tank = self._validate_tank_temperature(device, temperature)
         if tank.target_temperature == temperature:
@@ -468,6 +492,7 @@ class AquareaWrapper:
         return tank
 
     async def set_quiet_mode(self, mode):
+        self._require_write_permission()
         command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
@@ -486,6 +511,7 @@ class AquareaWrapper:
         return result if command_result_type and isinstance(result, command_result_type) else True
 
     async def force_dhw(self, state):
+        self._require_write_permission()
         command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
@@ -505,29 +531,34 @@ class AquareaWrapper:
 
     async def set_powerful_time(self, duration: PowerfulTime) -> None:
         """Set Panasonic's bounded 30/60/90 minute powerful mode."""
+        self._require_write_permission()
         device = await self._prepare_write()
         await device.set_powerful_time(duration)
         logger.info("Set powerful mode to %s", duration)
 
     async def set_force_heater(self, state: ForceHeater) -> None:
         """Enable or disable Panasonic's auxiliary-heater override."""
+        self._require_write_permission()
         device = await self._prepare_write()
         await device.set_force_heater(state)
         logger.info("Set force heater to %s", state)
 
     async def set_holiday_timer(self, state: HolidayTimer) -> None:
         """Enable or disable the Panasonic holiday timer."""
+        self._require_write_permission()
         device = await self._prepare_write()
         await device.set_holiday_timer(state)
         logger.info("Set holiday timer to %s", state)
 
     async def request_defrost(self) -> None:
         """Request defrost; the device entity suppresses an already-active request."""
+        self._require_write_permission()
         device = await self._prepare_write()
         await device.request_defrost()
         logger.info("Requested defrost")
 
     async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
+        self._require_write_permission()
         resolved_zone_id = zone_id or 1
         device = await self._get_writable_device()
         zone = self._validate_zone_heat_temperature(device, resolved_zone_id, temperature)
@@ -583,6 +614,7 @@ class AquareaWrapper:
         return zone
 
     async def set_special_status(self, status: str) -> None:
+        self._require_write_permission()
         from aioaquarea.data import SpecialStatus
 
         modes = {"ECO": SpecialStatus.ECO, "COMFORT": SpecialStatus.COMFORT}
@@ -607,6 +639,7 @@ class AquareaWrapper:
         logger.info("Set special status to %s", status)
 
     async def clear_special_status(self) -> None:
+        self._require_write_permission()
         device = await self._get_writable_device()
         self._validate_special_status_support(device)
         if device.special_status is None:

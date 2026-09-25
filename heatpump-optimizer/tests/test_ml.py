@@ -17,6 +17,9 @@ class _FakeResult:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return self
+
     def scalar_one_or_none(self):
         return None
 
@@ -727,7 +730,7 @@ class TestOrchestratorFallback:
                 with (
                     patch(
                         "packages.optimizer.main.get_session",
-                        _mock_get_session([_FakeResult([]), _FakeResult([])]),
+                        _mock_get_session([_FakeResult([]), _FakeResult([]), _FakeResult([])]),
                     ),
                     patch(
                         "packages.optimizer.main.get_active_price_context",
@@ -807,6 +810,86 @@ class TestOrchestratorFallback:
 
                     # MILP failed, so rules should have been called
                     MockRules.return_value.generate_plan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_planning_quality_check_failure_blocks_plan(self):
+        """An unavailable planning-quality gate must not permit a rules fallback."""
+        from packages.optimizer.main import run_optimization
+
+        optimizer = AsyncMock()
+        with (
+            patch(
+                "packages.optimizer.main.get_setting",
+                new=AsyncMock(return_value="milp_preferred"),
+            ),
+            patch(
+                "packages.optimizer.main._select_optimizer",
+                new=AsyncMock(return_value=("milp", optimizer)),
+            ),
+            patch(
+                "packages.optimizer.main.comfort_model",
+                SimpleNamespace(arefresh_if_changed=AsyncMock()),
+            ),
+            patch(
+                "packages.optimizer.main.get_device_data_quality",
+                new=AsyncMock(return_value={"ready": True, "reasons": []}),
+            ),
+            patch(
+                "packages.optimizer.main.get_planning_data_quality",
+                new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+            ),
+            patch("packages.optimizer.main.logger") as logger,
+        ):
+            assert await run_optimization() is None
+
+        optimizer.generate_plan.assert_not_awaited()
+        logger.error.assert_called_once_with(
+            "optimization_paused_planning_data_quality_check_failed",
+            reason="quality_check_failed",
+            error_type="RuntimeError",
+        )
+
+    @pytest.mark.asyncio
+    async def test_milp_failure_fallback_remains_behind_device_gate(self):
+        """A failed MILP cannot reach its rules fallback when readiness is unavailable."""
+        from packages.optimizer.main import run_optimization
+
+        milp = AsyncMock()
+        with (
+            patch(
+                "packages.optimizer.main.get_setting",
+                new=AsyncMock(return_value="milp_preferred"),
+            ),
+            patch(
+                "packages.optimizer.main._select_optimizer",
+                new=AsyncMock(return_value=("milp", milp)),
+            ),
+            patch(
+                "packages.optimizer.main.comfort_model",
+                SimpleNamespace(arefresh_if_changed=AsyncMock()),
+            ),
+            patch(
+                "packages.optimizer.main.get_device_data_quality",
+                new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+            ),
+            patch("packages.optimizer.main.RulesOptimizer") as rules,
+        ):
+            assert await run_optimization() is None
+
+        milp.generate_plan.assert_not_awaited()
+        rules.return_value.generate_plan.assert_not_called()
+
+
+def test_model_dir_is_isolated_to_pytest_tmp(isolate_model_dir: Path) -> None:
+    """Unit tests must never resolve model artifacts through the production directory."""
+    from packages.core.config import settings
+    from packages.ml import comfort_model, models_common, thermal
+
+    expected = isolate_model_dir.resolve()
+    assert Path(settings.model_dir).resolve() == expected
+    assert models_common.MODEL_DIR.resolve() == expected
+    assert comfort_model.MODEL_DIR.resolve() == expected
+    assert thermal.MODEL_DIR.resolve() == expected
 
 
 class TestDirectionAwareCOP:

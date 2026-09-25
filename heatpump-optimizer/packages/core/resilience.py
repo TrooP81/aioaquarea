@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+safety_write_context: ContextVar[bool] = ContextVar("safety_write_context", default=False)
+
+
+class SafetyWriteCapacityError(RuntimeError):
+    """Raised when a safety write has no immediately available capacity."""
 
 
 @dataclass
@@ -17,22 +24,27 @@ class RateLimiter:
 
     max_tokens: int = 30
     refill_per_second: float = 30 / 3600
+    reserve_tokens: int = 0
     _tokens: float = field(init=False, default=30)
     _last_refill: float = field(init=False, default_factory=time.monotonic)
+    _lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     async def acquire(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self.max_tokens, self._tokens + elapsed * self.refill_per_second)
-        self._last_refill = now
-
-        if self._tokens < 1:
-            wait = (1 - self._tokens) / self.refill_per_second
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(self.max_tokens, self._tokens + elapsed * self.refill_per_second)
+                self._last_refill = now
+                floor = 0 if safety_write_context.get() else self.reserve_tokens
+                if self._tokens >= floor + 1:
+                    self._tokens -= 1
+                    return
+                if safety_write_context.get():
+                    raise SafetyWriteCapacityError("safety write capacity exhausted")
+                wait = (floor + 1 - self._tokens) / self.refill_per_second
             logger.warning("Rate limit: waiting %.1fs before next API call", wait)
             await asyncio.sleep(wait)
-            self._tokens = 0
-        else:
-            self._tokens -= 1
 
 
 class CircuitBreaker:
