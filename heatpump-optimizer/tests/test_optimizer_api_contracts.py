@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from packages.api.schemas import DashboardResponse
+from packages.api.routers.dashboard import get_dashboard
 from packages.api.routers.models_router import get_heat_curve_advice
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig
@@ -56,6 +57,68 @@ def test_dashboard_response_serializes_space_heating_gate_evidence() -> None:
         "off_threshold_c": 15.0,
         "fingerprint_matches": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_uses_data_quality_threshold_for_status_freshness() -> None:
+    empty_status_result = SimpleNamespace(scalar_one_or_none=lambda: None)
+    empty_price_result = SimpleNamespace(one_or_none=lambda: None)
+    empty_consumption_result = SimpleNamespace(one_or_none=lambda: None)
+    empty_records_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    empty_prices_result = SimpleNamespace(all=lambda: [])
+    empty_plan_result = SimpleNamespace(scalar_one_or_none=lambda: None)
+    empty_override_result = SimpleNamespace(scalar_one_or_none=lambda: None)
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                empty_status_result,
+                empty_price_result,
+                empty_consumption_result,
+                empty_records_result,
+                empty_prices_result,
+                empty_plan_result,
+                empty_override_result,
+            ]
+        )
+    )
+    freshness_check = MagicMock(return_value=False)
+
+    with (
+        patch(
+            "packages.api.routers.dashboard.get_device_data_quality",
+            new=AsyncMock(return_value={"threshold_seconds": 900}),
+        ) as get_device_data_quality,
+        patch("packages.api.routers.dashboard.get_user_tz", new=AsyncMock(return_value="UTC")),
+        patch("packages.api.routers.dashboard.get_price_area", new=AsyncMock(return_value="FI")),
+        patch(
+            "packages.api.routers.dashboard.get_space_heating_gate_config",
+            new=AsyncMock(return_value=MagicMock()),
+        ),
+        patch(
+            "packages.api.routers.dashboard.resolve_effective_gate",
+            return_value=SimpleNamespace(
+                state="UNKNOWN",
+                reason_code="no_data",
+                profile_id=None,
+                on_operator=None,
+                off_operator=None,
+                base_c=None,
+                on_threshold_c=None,
+                off_threshold_c=None,
+                last_raw_outdoor_c=None,
+                fingerprint_matches=None,
+            ),
+        ),
+        patch("packages.api.routers.dashboard.get_session", return_value=_session_context(session)),
+        patch(
+            "packages.api.routers.dashboard.device_status_is_fresh",
+            freshness_check,
+        ),
+    ):
+        await get_dashboard()
+
+    get_device_data_quality.assert_awaited_once()
+    assert freshness_check.call_args.kwargs["threshold_seconds"] == 900
 
 
 @pytest.mark.asyncio

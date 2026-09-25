@@ -141,6 +141,10 @@ run_production_restore() {
                 --command="SELECT version_num FROM alembic_version" | grep -Eq "^[0-9]+$"
             psql -v ON_ERROR_STOP=1 --tuples-only --no-align --dbname="$PGDATABASE" \
                 --command="SELECT to_regclass('"'"'public.device_status'"'"') IS NOT NULL AND to_regclass('"'"'public.plans'"'"') IS NOT NULL" | grep -qx "t"
+            psql -v ON_ERROR_STOP=1 --tuples-only --no-align --dbname="$PGDATABASE" --command="SELECT EXISTS (SELECT 1 FROM settings WHERE key='"'"'aquarea_username'"'"' AND value <> '"'"''"'"') AND EXISTS (SELECT 1 FROM settings WHERE key='"'"'aquarea_password'"'"' AND value <> '"'"''"'"')" | grep -qx "t" || {
+                echo "Restored database has no configured Panasonic credentials; services will remain stopped." >&2
+                exit 1
+            }
         '
     production_compose run --rm --no-deps migrate alembic current
     trap - EXIT HUP INT TERM

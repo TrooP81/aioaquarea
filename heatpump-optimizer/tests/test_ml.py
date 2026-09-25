@@ -735,6 +735,10 @@ class TestOrchestratorFallback:
                             return_value=SimpleNamespace(area="NL", currency="EUR", source="test")
                         ),
                     ),
+                    patch(
+                        "packages.optimizer.main.get_device_data_quality",
+                        AsyncMock(return_value={"ready": True, "reasons": []}),
+                    ),
                 ):
                     await run_optimization()
 
@@ -793,6 +797,10 @@ class TestOrchestratorFallback:
                                     area="NL", currency="EUR", source="test"
                                 )
                             ),
+                        ),
+                        patch(
+                            "packages.optimizer.main.get_device_data_quality",
+                            AsyncMock(return_value={"ready": True, "reasons": []}),
                         ),
                     ):
                         await run_optimization()

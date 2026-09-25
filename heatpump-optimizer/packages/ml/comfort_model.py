@@ -1,4 +1,4 @@
-"""Comfort model — learns (water_temp, outdoor_temp, weather) → indoor air temp.
+"""Comfort model ÔÇö learns (water_temp, outdoor_temp, weather) ÔåÆ indoor air temp.
 
 Also provides the *inverse*: given a target indoor temperature, what water supply
 temperature should the heat pump deliver?
@@ -6,8 +6,11 @@ temperature should the heat pump deliver?
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from dataclasses import dataclass
+import pickle
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +27,7 @@ from sqlalchemy import and_, select
 
 from packages.core.database import get_session
 from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
-from packages.core.heating_evidence import has_confirmed_space_heating
+from packages.core.heating_evidence import classify_space_heating, has_confirmed_space_heating
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading
 from packages.core.config import settings as app_settings
 from packages.core.settings_service import get_all_settings
@@ -55,10 +58,12 @@ MIN_CONTROL_ACTIVE_HEATING_ROWS = 20
 MIN_CONTROL_MARGIN_C = 0.15
 MAX_CONTROL_MARGIN_C = 0.45
 
+MIN_CONTROL_ACTIVE_INPUT_BUCKETS = 4
+MIN_CONTROL_ACTIVE_INPUT_RANGE_C = 3.0
 # Earlier artifacts were trained with nearest-neighbour indoor and status
 # samples, which could select values recorded *after* the feature timestamp.
 # Keep them separate from the causal dataset definition below.
-COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_causal_v6_component_evidence_"
+COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_causal_v7_component_evidence_"
 COMFORT_MODEL_ARTIFACT_GLOB = f"{COMFORT_MODEL_ARTIFACT_PREFIX}*.pkl"
 
 # Candidate lags surround the one-hour planning step and are selected with a
@@ -84,7 +89,7 @@ MAX_ZONE_WATER_TEMP = 65.0
 # More heat input (water temp), warmer outside, more sun, and a warmer current
 # indoor temperature can only raise (or hold) the predicted indoor temperature;
 # stronger wind can only lower (or hold) it. This guarantees, for example, that a
-# heating forecast is never below the no-heating baseline — even when training
+# heating forecast is never below the no-heating baseline ÔÇö even when training
 # data is noisy.
 _MONOTONIC_CST = [1, 1, 1, 1, 1, -1, 1, 0, 0, -1, 0, 0, 1, 0]
 _INDOOR_TEMPERATURE_FEATURE_INDEX = 12
@@ -105,20 +110,20 @@ class ComfortModel:
     Predicts indoor air temperature from heat-pump operating conditions.
 
     Features (per sample):
-        - zone1_temp (water supply temperature °C)
+        - zone1_temp (water supply temperature ┬░C)
         - reported heat-curve target plus current and recent confirmed
           space-heating fractions
-        - outdoor_temp (°C)
+        - outdoor_temp (┬░C)
         - wind_speed (m/s)
-        - irradiance / solar (W/m²)
-        - precipitation (mm/h), humidity (%), and cloud cover (0–1)
+        - irradiance / solar (W/m┬▓)
+        - precipitation (mm/h), humidity (%), and cloud cover (0ÔÇô1)
         - hour_sin, hour_cos (cyclical hour of day)
         - current indoor temperature and its one-hour trend
 
     Target:
-        - indoor air temperature (°C) from SmartThings sensor
+        - indoor air temperature (┬░C) from SmartThings sensor
 
-    Training data is joined causally — each target is paired only with
+    Training data is joined causally ÔÇö each target is paired only with
     DeviceStatusRecord, WeatherRecord, and indoor observations that existed
     before the target time.  The heat-pump state is shifted by the selected
     thermal lag so the input precedes the response.
@@ -133,6 +138,9 @@ class ComfortModel:
         self._thermal_lag_minutes: int = DEFAULT_THERMAL_LAG_MINUTES
         self._last_dataset_evidence: dict[str, Any] = {"active_heating_rows": 0}
         self._training_notice: str | None = None
+        self._artifact_fingerprint: tuple[Path, int, int] | None = None
+        self._artifact_refresh_reason: str | None = "artifact_missing"
+        self._artifact_lock = threading.Lock()
 
     def reset(self) -> None:
         """Discard the trained model and learned metadata."""
@@ -281,6 +289,22 @@ class ComfortModel:
                 "active_heating_rows": active_heating_rows or 0,
                 "minimum_active_heating_rows": MIN_CONTROL_ACTIVE_HEATING_ROWS,
             }
+        active_input_buckets = self._metrics.get("active_input_buckets")
+        active_input_range_c = self._metrics.get("active_input_range_c")
+        if (
+            not isinstance(active_input_buckets, int)
+            or active_input_buckets < MIN_CONTROL_ACTIVE_INPUT_BUCKETS
+            or not isinstance(active_input_range_c, (float, int))
+            or active_input_range_c < MIN_CONTROL_ACTIVE_INPUT_RANGE_C
+        ):
+            return {
+                "ready": False,
+                "reason": "insufficient_heat_input_variance",
+                "active_input_buckets": active_input_buckets or 0,
+                "minimum_active_input_buckets": MIN_CONTROL_ACTIVE_INPUT_BUCKETS,
+                "active_input_range_c": active_input_range_c or 0.0,
+                "minimum_active_input_range_c": MIN_CONTROL_ACTIVE_INPUT_RANGE_C,
+            }
         baseline_mae = self._metrics.get("baseline_mae")
         if isinstance(baseline_mae, (float, int)) and mae >= baseline_mae:
             return {
@@ -324,7 +348,7 @@ class ComfortModel:
             raise ImportError("scikit-learn is required for the comfort model")
 
         if thermal_lag_minutes is not None:
-            # Explicit lag — train once
+            # Explicit lag ÔÇö train once
             self._thermal_lag_minutes = thermal_lag_minutes
             return await self._train_with_current_lag()
 
@@ -372,7 +396,7 @@ class ComfortModel:
         """Train once using the currently set ``_thermal_lag_minutes``.
 
         Metrics are computed on a chronological hold-out (the most recent
-        ``_VALIDATION_FRACTION`` of samples) so the reported MAE/R² reflect
+        ``_VALIDATION_FRACTION`` of samples) so the reported MAE/R┬▓ reflect
         out-of-sample accuracy rather than how well the model memorised the
         training set. The deployed model is then refit on *all* available
         samples for the best possible predictions.
@@ -402,7 +426,7 @@ class ComfortModel:
             )
             validated = True
         else:
-            # Too few rows to hold out — fall back to in-sample metrics.
+            # Too few rows to hold out ÔÇö fall back to in-sample metrics.
             tmp = self._build_regressor()
             tmp.fit(X, y)
             y_pred = tmp.predict(X)
@@ -466,6 +490,12 @@ class ComfortModel:
             "baseline_mae": round(float(baseline_mae), 3),
             "prior_deployed_mae": round(float(prior_mae), 3) if prior_mae is not None else None,
             "active_heating_rows": self._last_dataset_evidence.get("active_heating_rows", 0),
+            "active_input_buckets": self._last_dataset_evidence.get("active_input_buckets", 0),
+            "active_input_range_c": self._last_dataset_evidence.get("active_input_range_c", 0.0),
+            "zone_water_temp_source": "Panasonic zoneStatus.temperatureNow",
+            "flat_active_heating_rows_excluded": self._last_dataset_evidence.get(
+                "flat_active_heating_rows_excluded", 0
+            ),
             "sensor_strategy": self._last_dataset_evidence.get("sensor_strategy", "unknown"),
             "source_sensor_count": self._last_dataset_evidence.get("source_sensor_count", 0),
         }
@@ -664,7 +694,7 @@ class ComfortModel:
     def _save(self) -> None:
         from packages.ml.safe_persistence import safe_dump
 
-        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         path = MODEL_DIR / f"{COMFORT_MODEL_ARTIFACT_PREFIX}{ts}.pkl"
         safe_dump(
             {
@@ -679,50 +709,111 @@ class ComfortModel:
             path,
         )
         prune_old_models(COMFORT_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
+        stat = path.stat()
+        self._artifact_fingerprint = (path, stat.st_mtime_ns, stat.st_size)
+        self._artifact_refresh_reason = None
         logger.info("comfort_model_saved", path=str(path))
 
     def load_latest(self) -> bool:
         """Load the most recent saved model.  Returns True if loaded."""
+        return self.refresh_if_changed(force=True)
+
+    @property
+    def artifact_refresh_reason(self) -> str | None:
+        """The latest shared-artifact refresh outcome, safe for status endpoints."""
+
+        return self._artifact_refresh_reason
+
+    def refresh_if_changed(self, *, force: bool = False) -> bool:
+        """Install a newer valid shared artifact without replacing a known-good model."""
         from packages.ml.safe_persistence import safe_load
 
-        models = sorted(MODEL_DIR.glob(COMFORT_MODEL_ARTIFACT_GLOB))
-        if not models:
-            legacy_models = list(MODEL_DIR.glob("comfort_model_*.pkl"))
-            if legacy_models:
-                self._training_notice = (
-                    "A previous comfort-model artifact uses an older feature schema and was "
-                    "retired safely. Retrain to use confirmed heating evidence."
-                )
-            return False
         try:
-            data = safe_load(models[-1])
-        except ValueError:
-            logger.warning("comfort_model_integrity_failed", path=str(models[-1]))
-            return False
-        candidate = data["model"]
-        if getattr(candidate, "n_features_in_", None) != len(_MONOTONIC_CST):
-            logger.info(
-                "comfort_model_load_skip", path=str(models[-1]), reason="obsolete_feature_schema"
-            )
-            return False
-        self._model = candidate
-        direct_models = data.get("direct_models", {})
-        self._direct_models = (
-            {
-                int(horizon): model
-                for horizon, model in direct_models.items()
-                if int(horizon) in DIRECT_FORECAST_HORIZONS_MINUTES
-                and getattr(model, "n_features_in_", None) == len(_MONOTONIC_CST)
-            }
-            if isinstance(direct_models, dict)
-            else {}
-        )
-        self._metrics = data.get("metrics", {})
-        self._last_trained = data.get("trained_at")
-        self._training_samples = data.get("samples", 0)
-        self._thermal_lag_minutes = data.get("thermal_lag", DEFAULT_THERMAL_LAG_MINUTES)
-        self._training_notice = None
-        return True
+            models = sorted(MODEL_DIR.glob(COMFORT_MODEL_ARTIFACT_GLOB), reverse=True)
+        except OSError:
+            models = []
+        if not models:
+            try:
+                legacy_models = list(MODEL_DIR.glob("comfort_model_*.pkl"))
+            except OSError:
+                legacy_models = []
+            with self._artifact_lock:
+                self._artifact_refresh_reason = "artifact_missing"
+                if legacy_models:
+                    self._training_notice = (
+                        "A previous comfort-model artifact uses an older feature schema and was "
+                        "retired safely. Retrain to use confirmed heating evidence."
+                    )
+                return False
+
+        for path in models:
+            try:
+                stat = path.stat()
+                fingerprint = (path, stat.st_mtime_ns, stat.st_size)
+            except (FileNotFoundError, OSError):
+                continue
+            with self._artifact_lock:
+                if not force and fingerprint == self._artifact_fingerprint:
+                    return False
+            try:
+                data = safe_load(path)
+                candidate = data["model"]
+                if getattr(candidate, "n_features_in_", None) != len(_MONOTONIC_CST):
+                    continue
+            except (
+                AttributeError,
+                EOFError,
+                FileNotFoundError,
+                ImportError,
+                IndexError,
+                KeyError,
+                OSError,
+                pickle.UnpicklingError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                logger.warning(
+                    "comfort_model_integrity_failed",
+                    artifact=path.name,
+                    exception_type=type(exc).__name__,
+                )
+                with self._artifact_lock:
+                    self._artifact_refresh_reason = "artifact_integrity_failed"
+                continue
+
+            with self._artifact_lock:
+                try:
+                    current_stat = path.stat()
+                except (FileNotFoundError, OSError):
+                    continue
+                if (path, current_stat.st_mtime_ns, current_stat.st_size) != fingerprint:
+                    continue
+                self._model = candidate
+                direct_models = data.get("direct_models", {})
+                self._direct_models = (
+                    {
+                        int(horizon): model
+                        for horizon, model in direct_models.items()
+                        if int(horizon) in DIRECT_FORECAST_HORIZONS_MINUTES
+                        and getattr(model, "n_features_in_", None) == len(_MONOTONIC_CST)
+                    }
+                    if isinstance(direct_models, dict)
+                    else {}
+                )
+                self._metrics = data.get("metrics", {})
+                self._last_trained = data.get("trained_at")
+                self._training_samples = data.get("samples", 0)
+                self._thermal_lag_minutes = data.get("thermal_lag", DEFAULT_THERMAL_LAG_MINUTES)
+                self._training_notice = None
+                self._artifact_fingerprint = fingerprint
+                self._artifact_refresh_reason = None
+                return True
+        return False
+
+    async def arefresh_if_changed(self, *, force: bool = False) -> bool:
+        """Refresh a shared artifact without blocking the async event loop."""
+
+        return await asyncio.to_thread(self.refresh_if_changed, force=force)
 
     # ------------------------------------------------------------------
     # Dataset builder
@@ -840,6 +931,9 @@ class ComfortModel:
         X_rows = []
         y_rows = []
         active_heating_rows = 0
+        active_inputs: list[float] = []
+        flat_active_status_times = self._flat_active_status_times(statuses)
+        flat_active_heating_rows_excluded = 0
 
         for reading in readings:
             target_ts = reading.timestamp - lag
@@ -857,11 +951,26 @@ class ComfortModel:
             if gap > 900:
                 continue
 
-            is_active_heating = has_confirmed_space_heating(status)
+            evidence = classify_space_heating(
+                operation_status=getattr(status, "operation_status", None),
+                mode=getattr(status, "mode", None),
+                direction=getattr(status, "direction", None),
+                pump_duty=getattr(status, "pump_duty", None),
+                device_action=getattr(status, "device_action", None),
+                defrost_active=getattr(status, "defrost_active", None),
+                zone1_operation_status=getattr(status, "zone1_operation_status", None),
+                zone2_operation_status=getattr(status, "zone2_operation_status", None),
+            )
+            if evidence.code in {"domestic_hot_water", "cooling", "defrost"}:
+                continue
+            is_active_heating = evidence.active
             recent_heat_fraction = self._recent_heat_fraction(statuses, status_times, idx, t_sec)
 
             zone_water_temp = status.zone1_temp
             outdoor_temp = status.outdoor_temp
+            if is_active_heating and status.ts in flat_active_status_times:
+                flat_active_heating_rows_excluded += 1
+                continue
 
             # Weather at the response slot is a forecast input available when
             # the plan is created.  The old one-hour model accidentally used
@@ -888,8 +997,10 @@ class ComfortModel:
                     humidity = 60.0 if humidity is None else humidity
                     cloud_cover = getattr(w, "cloud_cover", 0.5)
                     cloud_cover = 0.5 if cloud_cover is None else cloud_cover
-            if zone_water_temp is None or outdoor_temp is None:
+            if outdoor_temp is None:
                 continue
+            if not is_active_heating:
+                zone_water_temp = outdoor_temp
 
             # Previous indoor temperature available at the lag-shifted time.
             # This deliberately uses the latest earlier sample rather than a
@@ -902,6 +1013,16 @@ class ComfortModel:
             indoor_trend = self._indoor_trend(reading_times, reading_temps, t_sec, prev_idx)
 
             hour = reading.timestamp.hour
+            zone_target_temp = (
+                effective_zone_target_temperature(
+                    status.zone1_target_temp,
+                    outdoor_temp,
+                    config=heat_curve,
+                    fallback_c=zone_water_temp,
+                )
+                if is_active_heating
+                else outdoor_temp
+            )
             features = self._make_features(
                 zone_water_temp,
                 outdoor_temp,
@@ -912,12 +1033,7 @@ class ComfortModel:
                 precipitation=precipitation,
                 humidity=humidity,
                 cloud_cover=cloud_cover,
-                zone_target_temp=effective_zone_target_temperature(
-                    status.zone1_target_temp,
-                    outdoor_temp,
-                    config=heat_curve,
-                    fallback_c=zone_water_temp,
-                ),
+                zone_target_temp=zone_target_temp,
                 space_heating_fraction=1.0 if is_active_heating else 0.0,
                 recent_heat_fraction=recent_heat_fraction,
                 indoor_trend_c_per_hour=indoor_trend,
@@ -926,10 +1042,16 @@ class ComfortModel:
             y_rows.append(reading.temperature)
             if is_active_heating:
                 active_heating_rows += 1
+                active_inputs.append(float(zone_water_temp))
 
         n = len(X_rows)
         self._last_dataset_evidence = {
             "active_heating_rows": active_heating_rows,
+            "active_input_buckets": len({round(value * 2) / 2 for value in active_inputs}),
+            "active_input_range_c": round(max(active_inputs) - min(active_inputs), 3)
+            if active_inputs
+            else 0.0,
+            "flat_active_heating_rows_excluded": flat_active_heating_rows_excluded,
             "sensor_strategy": sensor_strategy,
             "source_sensor_count": source_sensor_count,
         }
@@ -937,6 +1059,40 @@ class ComfortModel:
             return np.array([]), np.array([]), 0
 
         return np.array(X_rows), np.array(y_rows), n
+
+    @staticmethod
+    def _flat_active_status_times(statuses: list[DeviceStatusRecord]) -> set[dt.datetime]:
+        """Identify six-hour, twelve-sample active runs with no useful heat input variance."""
+
+        flat_times: set[dt.datetime] = set()
+        start = 0
+        while start < len(statuses):
+            end = start
+            values: list[float] = []
+            while end < len(statuses):
+                status = statuses[end]
+                evidence = classify_space_heating(
+                    operation_status=getattr(status, "operation_status", None),
+                    mode=getattr(status, "mode", None),
+                    direction=getattr(status, "direction", None),
+                    pump_duty=getattr(status, "pump_duty", None),
+                    device_action=getattr(status, "device_action", None),
+                    defrost_active=getattr(status, "defrost_active", None),
+                    zone1_operation_status=getattr(status, "zone1_operation_status", None),
+                    zone2_operation_status=getattr(status, "zone2_operation_status", None),
+                )
+                if not evidence.active or status.zone1_temp is None:
+                    break
+                values.append(float(status.zone1_temp))
+                if max(values) - min(values) > 0.1 + 1e-9:
+                    break
+                end += 1
+            if end - start >= 12 and (statuses[end - 1].ts - statuses[start].ts) >= dt.timedelta(
+                hours=6
+            ):
+                flat_times.update(status.ts for status in statuses[start:end])
+            start = max(end, start + 1)
+        return flat_times
 
     # ------------------------------------------------------------------
     # Feature engineering

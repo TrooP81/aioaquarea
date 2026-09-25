@@ -394,6 +394,13 @@ async def retrain_comfort_model() -> None:
             return
 
         from packages.ml.comfort_model import comfort_model
+        from packages.core.device_data_quality import get_device_data_quality
+
+        await comfort_model.arefresh_if_changed()
+        device_quality = await get_device_data_quality()
+        if not device_quality["ready"]:
+            logger.warning("comfort_model_retrain_paused", reasons=device_quality["reasons"])
+            return
 
         lag_str = await get_string_setting("thermal_lag_minutes")
         lag = int(lag_str) if lag_str else None

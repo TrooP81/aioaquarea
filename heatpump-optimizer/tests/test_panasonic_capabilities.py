@@ -43,7 +43,7 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
     result = build_panasonic_capabilities(
         latest_status=_status(now),
         poller_heartbeat=SimpleNamespace(updated_at=now - dt.timedelta(seconds=20)),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -73,9 +73,9 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
 def test_stale_status_blocks_every_command_without_hiding_capabilities() -> None:
     now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
     result = build_panasonic_capabilities(
-        latest_status=_status(now, ts=now - dt.timedelta(minutes=6)),
+        latest_status=_status(now, ts=now - dt.timedelta(minutes=16)),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -89,7 +89,7 @@ def test_missing_tank_limits_blocks_target_write_but_keeps_tank_support() -> Non
     result = build_panasonic_capabilities(
         latest_status=_status(now, tank_heat_min=None, tank_heat_max=None),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -105,7 +105,7 @@ def test_missing_zone_limits_blocks_target_write_but_keeps_zone_support() -> Non
     result = build_panasonic_capabilities(
         latest_status=_status(now, zone1_heat_min=None, zone1_heat_max=None),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -120,7 +120,7 @@ def test_unsafe_special_status_metadata_blocks_optimizer_command() -> None:
     result = build_panasonic_capabilities(
         latest_status=_status(now, special_status_supported=False),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -134,7 +134,7 @@ def test_missing_observation_reports_unknown_device_support() -> None:
     result = build_panasonic_capabilities(
         latest_status=None,
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -153,7 +153,7 @@ def test_stale_poller_heartbeat_blocks_otherwise_fresh_device() -> None:
     result = build_panasonic_capabilities(
         latest_status=_status(now),
         poller_heartbeat=SimpleNamespace(updated_at=now - dt.timedelta(minutes=4)),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         now=now,
     )
 
@@ -167,7 +167,7 @@ def test_fresh_adapter_outage_is_exposed_and_blocks_commands() -> None:
     result = build_panasonic_capabilities(
         latest_status=_status(now, ts=now - dt.timedelta(minutes=20)),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         adapter_state={
             "status": "backoff",
             "device_id": "device-1",
@@ -191,7 +191,7 @@ def test_stale_adapter_outage_does_not_override_live_availability() -> None:
     result = build_panasonic_capabilities(
         latest_status=_status(now),
         poller_heartbeat=SimpleNamespace(updated_at=now),
-        poll_interval_seconds=300,
+        device_status_threshold_seconds=900,
         adapter_state={
             "status": "unavailable",
             "observed_at": (now - dt.timedelta(hours=1)).isoformat(),

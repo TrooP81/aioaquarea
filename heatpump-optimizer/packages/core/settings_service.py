@@ -349,6 +349,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "description": "Currency of the manual electricity price",
         "options": ["EUR", "SEK", "NOK", "DKK", "GBP", "USD", "CHF", "PLN", "CZK", "HUF"],
     },
+    "device_status_max_age_minutes": {
+        "type": "int",
+        "default": "15",
+        "description": "Maximum device-status age for control readiness (minutes, 5-60)",
+    },
     "manual_outdoor_temp": {
         "type": "float",
         "default": "10.0",

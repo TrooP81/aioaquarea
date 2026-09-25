@@ -16,6 +16,7 @@ import structlog
 from sqlalchemy import and_, select, update
 
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
@@ -38,14 +39,6 @@ VERIFY_POLL_INTERVAL_S = 10
 VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
 SHUTDOWN_CANCEL_REASON = "shutdown_cancelled"
-
-
-def _device_status_freshness_cutoff(now: dt.datetime) -> dt.datetime:
-    """Allow normal poll jitter, but never dispatch against stale pump state."""
-    from packages.core.config import settings
-
-    max_age_seconds = max(int(settings.poll_interval_seconds) * 3, 15 * 60)
-    return now - dt.timedelta(seconds=max_age_seconds)
 
 
 async def is_learning_mode_active() -> bool:
@@ -84,11 +77,13 @@ class PlanExecutor:
         session_factory=get_session,
         sleep=asyncio.sleep,
         learning_check=is_learning_mode_active,
+        device_quality_check=get_device_data_quality,
     ):
         self._wrapper = wrapper
         self._session_factory = session_factory
         self._sleep = sleep
         self._learning_check = learning_check
+        self._device_quality_check = device_quality_check
 
     async def execute_due_actions(self) -> None:
         """Find and execute all actions whose scheduled time has passed."""
@@ -256,6 +251,13 @@ class PlanExecutor:
             action_type = ActionType(action.action_type)
             precondition = await self._dispatch_precondition(action, action_type, payload)
             if precondition is not None:
+                if precondition["reason"] in {
+                    "credentials_missing",
+                    "device_status_missing",
+                    "device_status_stale",
+                }:
+                    await self._defer_action(action, precondition)
+                    return
                 await self._skip_action(action, precondition)
                 return
             handler = get_action_handler(action_type)
@@ -351,6 +353,21 @@ class PlanExecutor:
                 )
             )
 
+    async def _defer_action(self, action: PlanActionRecord, result: dict[str, object]) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .where(PlanActionRecord.status == "executing")
+                .values(status="pending", result_json=json.dumps(result))
+            )
+        logger.warning(
+            "action_deferred_device_data_quality",
+            action_id=action.id,
+            action_type=action.action_type,
+            reason=result["reason"],
+        )
+
     async def _dispatch_precondition(
         self, action, action_type, payload
     ) -> dict[str, object] | None:
@@ -362,7 +379,12 @@ class PlanExecutor:
             return {"reason": "action_device_unresolvable", "identity_error": type(exc).__name__}
         if action.device_id and action.device_id != selected_device_id:
             return {"reason": "action_device_unresolvable", "device_id": action.device_id}
-        cutoff = _device_status_freshness_cutoff(dt.datetime.now(dt.timezone.utc))
+        quality = await self._device_quality_check()
+        if not quality["ready"]:
+            return {"reason": quality["reasons"][0], "device_id": selected_device_id}
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            seconds=quality["threshold_seconds"]
+        )
         async with self._session_factory() as session:
             status = (
                 await session.execute(
@@ -594,6 +616,7 @@ class PlanExecutor:
         """
         now = dt.datetime.now(dt.timezone.utc)
         cutoff = now - dt.timedelta(minutes=2)
+        device_quality = await self._device_quality_check(now=now)
 
         async with self._session_factory() as session:
             result = await session.execute(
@@ -621,6 +644,13 @@ class PlanExecutor:
 
             for action in stale:
                 reason = await self._diagnose_missed(session, action, latest_plan_id, now)
+                if not device_quality["ready"] and not self._is_energy_increasing(action):
+                    logger.info(
+                        "action_expiry_deferred_device_data_quality",
+                        action_id=action.id,
+                        reasons=device_quality["reasons"],
+                    )
+                    continue
                 await session.execute(
                     update(PlanActionRecord)
                     .where(PlanActionRecord.id == action.id)
@@ -637,6 +667,14 @@ class PlanExecutor:
                     action_type=action.action_type,
                     diagnosis=reason.get("reason"),
                 )
+
+    @staticmethod
+    def _is_energy_increasing(action: PlanActionRecord) -> bool:
+        try:
+            action_type = ActionType(action.action_type)
+        except (TypeError, ValueError):
+            return True
+        return action_type not in {ActionType.FORCE_DHW_OFF, ActionType.QUIET_MODE_ON}
 
     @staticmethod
     async def _diagnose_missed(

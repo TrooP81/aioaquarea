@@ -254,7 +254,7 @@ def _enforce_physical_ordering(
 
     Note: the managed forecast is intentionally allowed to dip *below* the base
     forecast overnight (it reflects the comfort-schedule setback), so it is not
-    clamped up to the base — only to the no-heating floor.
+    clamped up to the base ÔÇö only to the no-heating floor.
     """
     key = "predicted_indoor_temp"
     n = min(len(forecast), len(forecast_with_plan), len(forecast_no_heating))
@@ -268,6 +268,7 @@ def _enforce_physical_ordering(
 async def get_comfort_model_status():
     from packages.ml.comfort_model import comfort_model
 
+    await comfort_model.arefresh_if_changed()
     return {
         "trained": comfort_model.is_trained,
         "control_ready": comfort_model.is_ready_for_control,
@@ -278,6 +279,7 @@ async def get_comfort_model_status():
         "training_samples": comfort_model.training_samples,
         "metrics": comfort_model.metrics,
         "training_notice": comfort_model.training_notice,
+        "artifact_refresh_reason": comfort_model.artifact_refresh_reason,
         "control_margin_c": comfort_model.control_margin_c,
         "passive_forecast": {
             str(horizon): comfort_model.passive_forecast_readiness(horizon)
@@ -295,6 +297,7 @@ async def trigger_comfort_model_training():
     from packages.ml.comfort_model import comfort_model
 
     _log = structlog.get_logger()
+    await comfort_model.arefresh_if_changed()
     lag_str = await get_setting("thermal_lag_minutes")
     lag = int(lag_str) if lag_str else None
 
@@ -335,6 +338,7 @@ async def predict_indoor_temp(
 ):
     from packages.ml.comfort_model import comfort_model
 
+    await comfort_model.arefresh_if_changed()
     if not comfort_model.is_trained:
         raise HTTPException(status_code=409, detail="Comfort model not yet trained")
 
@@ -599,8 +603,8 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     # Prefer the actual optimizer plan: the MILP chose *when* to reheat DHW based
     # on price/COP, so the "with heating" curve should follow those scheduled
     # cycles rather than a generic deadband. In learning mode the executor
-    # dispatches nothing — the plan is created but not run, so the tank follows
-    # the heat pump's native behaviour — so we fall back to the deadband estimate
+    # dispatches nothing ÔÇö the plan is created but not run, so the tank follows
+    # the heat pump's native behaviour ÔÇö so we fall back to the deadband estimate
     # and flag it instead of pretending the plan drives the tank.
     learning_mode = await is_learning_mode_active()
     dhw_minutes_per_hour = [0.0] * hours
@@ -649,7 +653,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         )
     else:
         # No executable plan (or learning mode): fall back to the comfort-schedule
-        # deadband — coast to the per-hour floor and reheat to target.
+        # deadband ÔÇö coast to the per-hour floor and reheat to target.
         tank_heating_curve = thermal_model.predict_managed_tank_curve(
             current_temp=current_tank,
             outdoor_temp=outdoor,
@@ -1328,15 +1332,13 @@ async def readiness():
 
     import os
 
-    from packages.core.config import settings
     from packages.core.models import ServiceHeartbeatRecord
+    from packages.core.device_data_quality import get_device_data_quality
 
     now = dt.datetime.now(dt.timezone.utc)
     service_cutoff = now - dt.timedelta(minutes=3)
     backup_max_age_seconds = int(os.getenv("BACKUP_MAX_AGE_SECONDS", str(26 * 3600)))
     backup_cutoff = now - dt.timedelta(seconds=backup_max_age_seconds)
-    device_max_age_seconds = max(int(settings.poll_interval_seconds) * 3, 15 * 60)
-    device_cutoff = now - dt.timedelta(seconds=device_max_age_seconds)
     async with get_session() as session:
         rows = (
             (
@@ -1349,16 +1351,12 @@ async def readiness():
             .scalars()
             .all()
         )
-        latest_device_status = (
-            await session.execute(
-                select(DeviceStatusRecord.ts).order_by(DeviceStatusRecord.ts.desc()).limit(1)
-            )
-        ).scalar_one_or_none()
 
     by_service = {row.service: row.updated_at for row in rows}
     from packages.core.planning_data_quality import get_planning_data_quality
 
     planning_data_quality = await get_planning_data_quality(now=now)
+    device_quality = await get_device_data_quality(now=now)
     stale = [
         service
         for service, cutoff in {
@@ -1368,7 +1366,7 @@ async def readiness():
         }.items()
         if by_service.get(service) is None or by_service[service] < cutoff
     ]
-    if latest_device_status is None or latest_device_status < device_cutoff:
+    if not device_quality["ready"]:
         stale.append("device_status")
     if not planning_data_quality["control_allowed"]:
         stale.append("planning_inputs")
@@ -1378,9 +1376,7 @@ async def readiness():
             detail={
                 "status": "degraded",
                 "stale": stale,
-                "latest_device_status": latest_device_status.isoformat()
-                if latest_device_status
-                else None,
+                "device_data_quality": _device_data_quality_payload(device_quality),
                 "planning_data_quality": planning_data_quality,
             },
         )
@@ -1388,13 +1384,22 @@ async def readiness():
         "status": "ready",
         "services": {service: by_service[service].isoformat() for service in by_service},
         "data": {
-            "latest_device_status": latest_device_status.isoformat(),
-            "age_seconds": round((now - latest_device_status).total_seconds()),
-            "stale_after_seconds": device_max_age_seconds,
+            **_device_data_quality_payload(device_quality),
         },
         "backup": {
             "last_success": by_service["backup"].isoformat(),
             "stale_after_seconds": backup_max_age_seconds,
         },
         "planning_data_quality": planning_data_quality,
+    }
+
+
+def _device_data_quality_payload(quality: dict) -> dict:
+    timestamp = quality["timestamp"]
+    return {
+        "credentials_configured": quality["credentials_configured"],
+        "latest_device_status": timestamp.isoformat() if timestamp else None,
+        "age_seconds": quality["age_seconds"],
+        "stale_after_seconds": quality["threshold_seconds"],
+        "reasons": quality["reasons"],
     }

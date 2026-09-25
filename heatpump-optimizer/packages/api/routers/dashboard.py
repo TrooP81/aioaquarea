@@ -15,6 +15,7 @@ from packages.api.schemas import (
     StatsResponse,
 )
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.plan_lifecycle import active_plan_query
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
 from packages.core.models import (
@@ -29,7 +30,6 @@ from packages.core.operational_alerts import device_status_is_fresh
 from packages.core.plan_outcome import cumulative_counter_delta, hour_start
 from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
-    get_int_setting,
     get_space_heating_gate_config,
     get_user_tz,
     local_date,
@@ -45,7 +45,7 @@ async def get_dashboard():
     now = dt.datetime.now(dt.timezone.utc)
     timezone_name = await get_user_tz()
     today_start = local_day_start_utc(now, timezone_name)
-    poll_interval = await get_int_setting("poll_interval_seconds")
+    device_quality = await get_device_data_quality(now=now)
 
     async with get_session() as session:
         status_result = await session.execute(
@@ -163,7 +163,7 @@ async def get_dashboard():
     status_fresh = device_status_is_fresh(
         status.ts if status is not None else None,
         now=now,
-        poll_interval_seconds=poll_interval,
+        threshold_seconds=int(device_quality["threshold_seconds"]),
     )
     gate = resolve_effective_gate(gate_row, await get_space_heating_gate_config())
     status_timestamp = status.ts if status is not None else None

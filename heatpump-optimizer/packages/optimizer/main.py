@@ -19,6 +19,7 @@ from packages.core.models import (
 )
 from packages.core.plan_lifecycle import activate_plan
 from packages.core.planning_data_quality import get_planning_data_quality
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.pricing import get_active_price_context
 from packages.core.services import AquareaWrapper
 from packages.core.scheduling import create_scheduler, utc_after
@@ -273,6 +274,14 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
         try:
             layer = await get_setting("optimizer_layer") or "rules_only"
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
+            await comfort_model.arefresh_if_changed()
+            device_quality = await get_device_data_quality()
+            if not device_quality["ready"]:
+                logger.warning(
+                    "optimization_paused_device_data_quality",
+                    reasons=device_quality["reasons"],
+                )
+                return None
 
             # Rules are deliberately kept available as the conservative
             # fallback.  The richer ML/MILP plan needs a complete, fresh
@@ -591,7 +600,10 @@ async def main() -> None:
     # The comfort model's causal feature schema is versioned separately from
     # COP and demand. Train it once after a schema upgrade instead of running
     # an older, leaky checkpoint or waiting for a manual request.
-    if not comfort_model.is_trained:
+    device_quality = await get_device_data_quality()
+    if not device_quality["ready"]:
+        logger.warning("comfort_model_initial_training_paused", reasons=device_quality["reasons"])
+    elif not comfort_model.is_trained:
         logger.info("comfort_model_initial_training_needed")
         comfort_result = await comfort_model.train()
         logger.info("comfort_model_initial_training_finished", **comfort_result)

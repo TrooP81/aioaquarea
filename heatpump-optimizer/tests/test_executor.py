@@ -78,7 +78,11 @@ def mock_wrapper():
 
 @pytest.fixture
 def executor(mock_wrapper):
-    return PlanExecutor(mock_wrapper)
+    instance = PlanExecutor(mock_wrapper)
+    instance._device_quality_check = AsyncMock(
+        return_value={"ready": True, "reasons": [], "threshold_seconds": 900}
+    )
+    return instance
 
 
 def _make_action(action_type: str, payload: dict | None = None, scheduled_ts=None):
@@ -326,14 +330,14 @@ class TestExecuteAction:
         executor._dispatch_precondition = AsyncMock(
             return_value={"reason": "device_status_stale", "device_id": "device-a"}
         )
-        executor._skip_action = AsyncMock()
+        executor._defer_action = AsyncMock()
 
         await executor._execute_action(action)
 
         executor._dispatch_precondition.assert_awaited_once_with(
             action, ActionType.FORCE_DHW_ON, {}
         )
-        executor._skip_action.assert_awaited_once()
+        executor._defer_action.assert_awaited_once()
         mock_wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -840,7 +844,7 @@ async def test_executor_dhw_action_bypasses_room_heating_gate(executor):
 
 
 @pytest.mark.asyncio
-async def test_executor_skips_force_dhw_when_selected_device_status_is_stale(
+async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_stale(
     executor, mock_wrapper
 ):
     status_result = MagicMock()
@@ -856,7 +860,7 @@ async def test_executor_skips_force_dhw_when_selected_device_status_is_stale(
         await executor._execute_action(action)
 
     skipped_values = _extract_stmt_values(mock_session.execute.await_args_list[1].args[0])
-    assert skipped_values["status"] == "skipped"
+    assert skipped_values["status"] == "pending"
     assert json.loads(skipped_values["result_json"]) == {
         "reason": "device_status_stale",
         "device_id": "device-a",
@@ -947,6 +951,33 @@ class TestConstants:
 
 
 class TestExpireStaleActions:
+    @pytest.mark.parametrize(
+        ("action_type", "payload", "expected"),
+        [
+            (ActionType.FORCE_DHW_ON, {}, True),
+            (ActionType.FORCE_DHW_OFF, {}, False),
+            (ActionType.SET_TANK_TEMP, {"temperature": 40}, True),
+            (ActionType.SET_TANK_TEMP, {"temperature": 65}, True),
+            (ActionType.SET_ZONE_HEAT_TEMPERATURE, {"temperature": 20}, True),
+            (ActionType.SET_ZONE_HEAT_TEMPERATURE, {"temperature": 45}, True),
+            (ActionType.ZONE_TEMP_BOOST, {}, True),
+            (ActionType.QUIET_MODE_ON, {}, False),
+            (ActionType.QUIET_MODE_OFF, {}, True),
+            (ActionType.ECO_MODE_ON, {}, True),
+            (ActionType.ECO_MODE_OFF, {}, True),
+            (ActionType.NORMAL_MODE_ON, {}, True),
+            (ActionType.COMFORT_MODE_ON, {}, True),
+        ],
+    )
+    def test_energy_increasing_expiry_predicate(self, action_type, payload, expected):
+        assert (
+            CorePlanExecutor._is_energy_increasing(_make_action(str(action_type), payload))
+            is expected
+        )
+
+    def test_energy_increasing_expiry_predicate_fails_closed_for_unknown_action(self):
+        assert CorePlanExecutor._is_energy_increasing(_make_action("unknown_action")) is True
+
     @pytest.mark.asyncio
     async def test_no_stale_actions_is_noop(self, executor):
         with patch("packages.optimizer.executor.get_session") as mock_gs:

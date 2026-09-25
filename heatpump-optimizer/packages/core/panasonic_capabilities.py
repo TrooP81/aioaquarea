@@ -26,20 +26,20 @@ def build_panasonic_capabilities(
     *,
     latest_status: Any | None,
     poller_heartbeat: Any | None,
-    poll_interval_seconds: int,
+    device_status_threshold_seconds: int,
     adapter_state: dict[str, object] | None = None,
     now: dt.datetime | None = None,
 ) -> dict[str, object]:
     """Describe mapped commands without opening another Panasonic session."""
 
     now = _as_utc(now) or dt.datetime.now(dt.timezone.utc)
-    stale_after_seconds = max(int(poll_interval_seconds), 60)
+    stale_after_seconds = max(int(device_status_threshold_seconds), 60)
     status_at = _as_utc(getattr(latest_status, "ts", None))
     heartbeat_at = _as_utc(getattr(poller_heartbeat, "updated_at", None))
     adapter = project_panasonic_adapter_state(
         adapter_state,
         now=now,
-        stale_after_seconds=max(int(poll_interval_seconds) * 3, 15 * 60),
+        stale_after_seconds=stale_after_seconds,
     )
 
     if heartbeat_at is None:

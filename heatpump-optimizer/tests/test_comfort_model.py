@@ -39,6 +39,34 @@ class TestComfortModelUntrained:
         assert result is None
 
 
+class TestComfortArtifactRefresh:
+    def test_AC8_3_missing_artifact_reports_reason(self, tmp_path, monkeypatch):
+        model = ComfortModel()
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        assert model.refresh_if_changed() is False
+        assert model.artifact_refresh_reason == "artifact_missing"
+
+    def test_AC8_3_bad_newest_artifact_keeps_last_known_good(self, tmp_path, monkeypatch):
+        model = ComfortModel()
+        good = MagicMock(n_features_in_=14)
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        monkeypatch.setattr(
+            "packages.ml.safe_persistence.safe_load",
+            MagicMock(side_effect=[{"model": good}, ValueError("bad HMAC")]),
+        )
+        good_path = tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl"
+        bad_path = tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl"
+        good_path.write_bytes(b"good")
+
+        assert model.refresh_if_changed() is True
+        bad_path.write_bytes(b"partial")
+
+        assert model.refresh_if_changed() is False
+        assert model._model is good
+        assert model.artifact_refresh_reason == "artifact_integrity_failed"
+
+
 class TestPassiveDirectForecastReadiness:
     def test_direct_passive_forecast_can_be_ready_without_heating_control(self):
         model = ComfortModel()
@@ -48,6 +76,8 @@ class TestPassiveDirectForecastReadiness:
             "direct_horizons": {"60": {"status": "trained", "mae": 0.6}},
             # No active heating evidence: full heating control remains blocked.
             "active_heating_rows": 0,
+            "active_input_buckets": 4,
+            "active_input_range_c": 3.0,
         }
 
         assert model.is_ready_for_control is False
@@ -83,6 +113,8 @@ class TestComfortControlReadiness:
         assert model.control_readiness["reason"] == "insufficient_active_heating_evidence"
 
         model._metrics["active_heating_rows"] = 20
+        model._metrics["active_input_buckets"] = 4
+        model._metrics["active_input_range_c"] = 3.0
         model._metrics["baseline_mae"] = 0.3
         assert model.control_readiness["reason"] == "not_better_than_persistence_baseline"
 
@@ -97,11 +129,33 @@ class TestComfortControlReadiness:
             "mae": 0.6,
             "r2": 0.3,
             "active_heating_rows": 30,
+            "active_input_buckets": 4,
+            "active_input_range_c": 3.0,
             "baseline_mae": 0.8,
         }
 
         assert model.is_ready_for_control is True
         assert model.control_margin_c == 0.45
+
+    def test_AC9_3_requires_heat_input_variance(self):
+        model = ComfortModel()
+        model._model = object()
+        model._metrics = {
+            "validated": True,
+            "mae": 0.3,
+            "r2": 0.5,
+            "active_heating_rows": 20,
+            "active_input_buckets": 3,
+            "active_input_range_c": 3.0,
+            "baseline_mae": 0.5,
+        }
+
+        assert model.control_readiness["reason"] == "insufficient_heat_input_variance"
+        model._metrics["active_input_buckets"] = 4
+        model._metrics["active_input_range_c"] = 2.9
+        assert model.control_readiness["reason"] == "insufficient_heat_input_variance"
+        model._metrics["active_input_range_c"] = 3.0
+        assert model.is_ready_for_control is True
 
 
 class TestComfortModelFeatures:

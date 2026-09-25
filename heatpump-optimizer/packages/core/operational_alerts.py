@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -11,6 +12,7 @@ import structlog
 from sqlalchemy import select
 
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
@@ -35,7 +37,7 @@ def device_status_is_fresh(
     observed_at: dt.datetime | None,
     *,
     now: dt.datetime,
-    poll_interval_seconds: int,
+    threshold_seconds: int,
 ) -> bool:
     """Return whether a device observation is recent enough to call live."""
 
@@ -43,7 +45,7 @@ def device_status_is_fresh(
         return False
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
-    cutoff = now - dt.timedelta(seconds=max(poll_interval_seconds * 3, 15 * 60))
+    cutoff = now - dt.timedelta(seconds=threshold_seconds)
     return observed_at >= cutoff
 
 
@@ -109,7 +111,10 @@ async def get_operational_alerts(
     if not enabled:
         return {"enabled": False, "generated_at": now.isoformat(), "alerts": []}
 
-    poll_interval = await get_int_setting("poll_interval_seconds")
+    poll_interval, device_quality = await asyncio.gather(
+        get_int_setting("poll_interval_seconds"),
+        get_device_data_quality(now=now),
+    )
     service_cutoff = now - dt.timedelta(minutes=3)
     action_since = now - dt.timedelta(hours=24)
     async with get_session() as session:
@@ -162,7 +167,7 @@ async def get_operational_alerts(
     adapter = project_panasonic_adapter_state(
         poller_details.get("panasonic_adapter"),
         now=now,
-        stale_after_seconds=max(poll_interval * 3, 15 * 60),
+        stale_after_seconds=int(device_quality["threshold_seconds"]),
     )
     adapter_alert = _panasonic_adapter_alert(adapter)
     if adapter_alert:
@@ -171,7 +176,7 @@ async def get_operational_alerts(
         not device_status_is_fresh(
             latest_device,
             now=now,
-            poll_interval_seconds=poll_interval,
+            threshold_seconds=int(device_quality["threshold_seconds"]),
         )
         and adapter_alert is None
     ):

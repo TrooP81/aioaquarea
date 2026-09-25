@@ -171,6 +171,82 @@ class TestRestoreScript:
         assert "Timed out waiting for database readiness before restore" in production_body
         assert production_body.index("up -d --wait db") < production_body.index("backup \\")
 
+    def test_AC10_1_restore_requires_panasonic_credentials_without_printing_values(self) -> None:
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        assert "aquarea_username" in script
+        assert "aquarea_password" in script
+        assert "Restored database has no configured Panasonic credentials" in script
+
+    def test_AC10_1_missing_credentials_stop_services_without_printing_values(
+        self, tmp_path: Path
+    ) -> None:
+        archive_name = "heatpump-20990101T000000Z.dump"
+        archive = SCRIPT.parents[1] / "backups" / archive_name
+        command_log = tmp_path / "docker.log"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        docker = bin_dir / "docker"
+        docker.write_text(
+            f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{command_log}"
+last=''
+for argument do last=$argument; done
+case "$*" in
+    *"ps --services --status running"*|*"up -d --wait db"*|*"exec -T db pg_isready"*) exit 0 ;;
+    *"backup-verify sh -ceu"*) exit 0 ;;
+    *" backup sh -ceu "*) POSTGRES_DB="${{POSTGRES_DB:-heatpump}}" sh -ceu "$last"; exit $? ;;
+    *" stop"*) exit 0 ;;
+esac
+exit 0
+''',
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+        for command in ("pg_restore", "dropdb", "createdb"):
+            executable = bin_dir / command
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+        psql = bin_dir / "psql"
+        psql.write_text(
+            """#!/bin/sh
+case "$*" in
+    *version_num*) printf '123\\n' ;;
+    *to_regclass*) printf 't\\n' ;;
+    *aquarea_username*) printf 'f\\n' ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        psql.chmod(0o755)
+        secret = "never-print-this-panasonic-secret"
+        archive.parent.mkdir(exist_ok=True)
+        archive.write_bytes(b"stub archive")
+        try:
+            result = subprocess.run(
+                ["sh", str(SCRIPT), "--production", archive_name],
+                cwd=SCRIPT.parents[1],
+                input=f"RESTORE {archive_name}\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                    "AQUAREA_USERNAME": secret,
+                    "AQUAREA_PASSWORD": secret,
+                },
+            )
+        finally:
+            archive.unlink(missing_ok=True)
+
+        assert result.returncode != 0
+        logged_commands = command_log.read_text(encoding="utf-8")
+        assert " stop" in logged_commands
+        assert secret not in result.stdout
+        assert secret not in result.stderr
+        assert secret not in logged_commands
+
     @pytest.mark.parametrize(
         ("variable", "value", "message"),
         [

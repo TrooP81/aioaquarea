@@ -84,6 +84,10 @@ async def test_gate_failure_and_unknown_alerts_are_actionable() -> None:
         patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),
         patch("packages.core.operational_alerts.get_int_setting", AsyncMock(return_value=60)),
         patch(
+            "packages.core.operational_alerts.get_device_data_quality",
+            AsyncMock(return_value={"threshold_seconds": 900}),
+        ),
+        patch(
             "packages.core.operational_alerts.get_planning_data_quality",
             AsyncMock(return_value={"control_allowed": True}),
         ),
@@ -106,12 +110,12 @@ async def test_gate_failure_and_unknown_alerts_are_actionable() -> None:
     assert "space_heating_gate_unknown_device-a" in alert_ids
 
 
-def test_device_status_freshness_uses_shared_polling_threshold() -> None:
+def test_device_status_freshness_uses_shared_effective_threshold() -> None:
     now = dt.datetime(2026, 8, 19, 10, tzinfo=dt.timezone.utc)
 
-    assert device_status_is_fresh(now - dt.timedelta(minutes=14), now=now, poll_interval_seconds=60)
+    assert device_status_is_fresh(now - dt.timedelta(minutes=14), now=now, threshold_seconds=900)
     assert not device_status_is_fresh(
-        now - dt.timedelta(minutes=16), now=now, poll_interval_seconds=60
+        now - dt.timedelta(minutes=16), now=now, threshold_seconds=900
     )
 
 
@@ -130,6 +134,10 @@ async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -
     with (
         patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),
         patch("packages.core.operational_alerts.get_int_setting", AsyncMock(return_value=60)),
+        patch(
+            "packages.core.operational_alerts.get_device_data_quality",
+            AsyncMock(return_value={"threshold_seconds": 900}),
+        ),
         patch(
             "packages.core.operational_alerts.get_planning_data_quality",
             AsyncMock(return_value={"control_allowed": True}),
