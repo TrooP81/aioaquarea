@@ -1,4 +1,4 @@
-"""Comfort model ÔÇö learns (water_temp, outdoor_temp, weather) ÔåÆ indoor air temp.
+"""Comfort model — learns (water_temp, outdoor_temp, weather) → indoor air temp.
 
 Also provides the *inverse*: given a target indoor temperature, what water supply
 temperature should the heat pump deliver?
@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from dataclasses import dataclass
+import hashlib
 import pickle
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -23,9 +25,9 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
 
-from packages.core.database import get_session
+from packages.core.database import engine, get_session
 from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
 from packages.core.heating_evidence import classify_space_heating, has_confirmed_space_heating
 from packages.core.models import DeviceStatusRecord, WeatherRecord, IndoorTempReading
@@ -55,16 +57,29 @@ DEFAULT_THERMAL_LAG_MINUTES = 60
 MAX_CONTROL_MAE_C = 0.60
 MIN_CONTROL_R2 = 0.15
 MIN_CONTROL_ACTIVE_HEATING_ROWS = 20
+MIN_CONTROL_ACTIVE_INPUT_BUCKETS = 4
+MIN_CONTROL_ACTIVE_INPUT_RANGE_C = 3.0
 MIN_CONTROL_MARGIN_C = 0.15
 MAX_CONTROL_MARGIN_C = 0.45
 
-MIN_CONTROL_ACTIVE_INPUT_BUCKETS = 4
-MIN_CONTROL_ACTIVE_INPUT_RANGE_C = 3.0
 # Earlier artifacts were trained with nearest-neighbour indoor and status
 # samples, which could select values recorded *after* the feature timestamp.
 # Keep them separate from the causal dataset definition below.
-COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_causal_v7_component_evidence_"
+COMFORT_MODEL_ARTIFACT_PREFIX = "comfort_model_weather_delta_v7_window_heat_"
 COMFORT_MODEL_ARTIFACT_GLOB = f"{COMFORT_MODEL_ARTIFACT_PREFIX}*.pkl"
+COMFORT_MODEL_FEATURE_SCHEMA = "weather_delta_v7_window_heat_controlled"
+COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA = "weather_delta_v7_window_heat_passive_no_clock"
+FORECAST_QUALITY_GATE_SCHEMA = "indoor_forecast_v3"
+FORECAST_QUALITY_GATE_SCHEMA_V4_DELTA_WINDOW_HEAT = "indoor_forecast_v4_delta_window_heat"
+FORECAST_QUALITY_REQUIRED_HORIZONS = (1, 3, 6, 12, 24)
+COMFORT_MODEL_FORMAT_VERSION = 7
+COMFORT_MODEL_TARGET_KIND = "delta_temperature_c"
+COMFORT_MODEL_CONSTRAINT_VERSION = "window_heat_v1"
+COMFORT_MODEL_KNOT_RANGE = (5.0, 35.0)
+COMFORT_MODEL_PROJECTION_EPSILON = 0.01
+_TRAINING_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"comfort_model_training_v1").digest()[:8], "big", signed=True
+)
 
 # Candidate lags surround the one-hour planning step and are selected with a
 # chronological validation split.
@@ -89,10 +104,32 @@ MAX_ZONE_WATER_TEMP = 65.0
 # More heat input (water temp), warmer outside, more sun, and a warmer current
 # indoor temperature can only raise (or hold) the predicted indoor temperature;
 # stronger wind can only lower (or hold) it. This guarantees, for example, that a
-# heating forecast is never below the no-heating baseline ÔÇö even when training
+# heating forecast is never below the no-heating baseline — even when training
 # data is noisy.
-_MONOTONIC_CST = [1, 1, 1, 1, 1, -1, 1, 0, 0, -1, 0, 0, 1, 0]
+_MONOTONIC_CST = [1, 1, 1, 1, 1, -1, 1, 0, 0, -1, 0, 0, -1, 0]
 _INDOOR_TEMPERATURE_FEATURE_INDEX = 12
+_PASSIVE_MONOTONIC_CST = [1, -1, 1, 0, 0, -1, 0, -1, 0, 0, -1, 0]
+CONTROLLED_FEATURE_NAMES = (
+    "mean_supply_lift",
+    "mean_target_lift",
+    "window_heat_fraction",
+    "final_hour_heat_fraction",
+    "outdoor_temp",
+    "wind_speed",
+    "irradiance",
+    "precipitation",
+    "humidity",
+    "cloud_cover",
+    "hour_sin",
+    "hour_cos",
+    "issue_indoor_temp",
+    "issue_indoor_trend",
+)
+PASSIVE_FEATURE_NAMES = tuple(
+    name for index, name in enumerate(CONTROLLED_FEATURE_NAMES) if index not in (10, 11)
+)
+WINDOW_COVERAGE_MINIMUM = 0.80
+_STATUS_INTERVAL_MAX_SECONDS = 15 * 60
 
 # Fraction of (time-ordered) samples held out at the end for honest validation.
 _VALIDATION_FRACTION = 0.2
@@ -105,33 +142,358 @@ class _IndoorObservation:
     temperature: float
 
 
+@dataclass(frozen=True)
+class WindowDataset:
+    controlled: dict[int, tuple[np.ndarray, np.ndarray]]
+    passive: dict[int, tuple[np.ndarray, np.ndarray]]
+    evidence: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ComfortModelCandidate:
+    """A complete checkpoint which can be installed as one in-memory operation."""
+
+    model: Any
+    direct_models: dict[int, Any]
+    passive_direct_models: dict[int, Any]
+    metrics: dict[str, Any]
+    samples: int
+    thermal_lag_minutes: int
+    training_notice: str | None
+
+
+def _finite(value: object, default: float) -> float:
+    return float(value) if isinstance(value, (int, float)) and np.isfinite(value) else default
+
+
+def _confirmed_absent(status: Any) -> bool:
+    evidence = classify_space_heating(
+        operation_status=getattr(status, "operation_status", None),
+        mode=getattr(status, "mode", None),
+        direction=getattr(status, "direction", None),
+        pump_duty=getattr(status, "pump_duty", None),
+        device_action=getattr(status, "device_action", None),
+        defrost_active=getattr(status, "defrost_active", None),
+        zone1_operation_status=getattr(status, "zone1_operation_status", None),
+        zone2_operation_status=getattr(status, "zone2_operation_status", None),
+    )
+    return evidence.code in {"device_off", "idle", "domestic_hot_water", "cooling", "defrost"}
+
+
+def build_window_dataset(
+    readings: list[_IndoorObservation],
+    statuses: list[Any],
+    weathers: list[Any],
+    horizons: tuple[int, ...],
+) -> WindowDataset:
+    """Build DB-free, duration-weighted v7 training rows from plain records."""
+    controlled_rows: dict[int, list[np.ndarray]] = {horizon: [] for horizon in horizons}
+    controlled_targets: dict[int, list[float]] = {horizon: [] for horizon in horizons}
+    passive_rows: dict[int, list[np.ndarray]] = {horizon: [] for horizon in horizons}
+    passive_targets: dict[int, list[float]] = {horizon: [] for horizon in horizons}
+    ordered_readings = sorted(readings, key=lambda row: row.timestamp)
+    ordered_statuses = sorted(statuses, key=lambda row: row.ts)
+    ordered_weather = sorted(weathers, key=lambda row: row.ts)
+    accepted = rejected_coverage = 0
+    for target in ordered_readings:
+        for horizon in horizons:
+            issue_ts = target.timestamp - dt.timedelta(minutes=horizon)
+            issue_candidates = [row for row in ordered_readings if row.timestamp <= issue_ts]
+            if (
+                not issue_candidates
+                or (issue_ts - issue_candidates[-1].timestamp).total_seconds() > 900
+            ):
+                continue
+            issue = issue_candidates[-1]
+            intervals: list[tuple[Any, float]] = []
+            covered = active = final_active = 0.0
+            for index, status in enumerate(ordered_statuses):
+                next_ts = (
+                    ordered_statuses[index + 1].ts
+                    if index + 1 < len(ordered_statuses)
+                    else target.timestamp
+                )
+                start, end = max(status.ts, issue_ts), min(next_ts, target.timestamp)
+                seconds = (end - start).total_seconds()
+                if (
+                    seconds <= 0
+                    or (next_ts - status.ts).total_seconds() > _STATUS_INTERVAL_MAX_SECONDS
+                ):
+                    continue
+                intervals.append((status, seconds))
+                covered += seconds
+                if has_confirmed_space_heating(status):
+                    active += seconds
+                    if end > target.timestamp - dt.timedelta(hours=1):
+                        final_active += (
+                            end - max(start, target.timestamp - dt.timedelta(hours=1))
+                        ).total_seconds()
+            duration = (target.timestamp - issue_ts).total_seconds()
+            if duration <= 0 or covered / duration < WINDOW_COVERAGE_MINIMUM:
+                rejected_coverage += 1
+                continue
+            weather = min(
+                ordered_weather,
+                key=lambda row: abs((row.ts - target.timestamp).total_seconds()),
+                default=None,
+            )
+            if weather is None or abs((weather.ts - target.timestamp).total_seconds()) > 7200:
+                continue
+            supply_sum = target_sum = 0.0
+            passive_window = (
+                covered >= duration
+                and bool(intervals)
+                and all(_confirmed_absent(status) for status, _ in intervals)
+            )
+            for status, seconds in intervals:
+                if has_confirmed_space_heating(status):
+                    supply_sum += (
+                        max(
+                            _finite(getattr(status, "zone1_temp", None), 0.0) - issue.temperature,
+                            0.0,
+                        )
+                        * seconds
+                    )
+                    target_sum += (
+                        max(
+                            _finite(getattr(status, "zone1_target_temp", None), 0.0)
+                            - issue.temperature,
+                            0.0,
+                        )
+                        * seconds
+                    )
+            older = [
+                row
+                for row in ordered_readings
+                if row.timestamp <= issue.timestamp - dt.timedelta(hours=1)
+            ]
+            trend = (
+                (issue.temperature - older[-1].temperature)
+                / max((issue.timestamp - older[-1].timestamp).total_seconds() / 3600.0, 1.0)
+                if older
+                else 0.0
+            )
+            row = ComfortModel._controlled_window_features(
+                mean_supply_lift=supply_sum / duration,
+                mean_target_lift=target_sum / duration,
+                window_heat_fraction=active / duration,
+                final_hour_heat_fraction=final_active / min(duration, 3600.0),
+                outdoor_temp=_finite(
+                    getattr(weather, "temperature", None),
+                    _finite(getattr(intervals[-1][0], "outdoor_temp", None), 0.0),
+                ),
+                wind_speed=_finite(getattr(weather, "wind_speed", None), 3.0),
+                irradiance=_finite(getattr(weather, "irradiance", None), 0.0),
+                precipitation=_finite(getattr(weather, "precipitation", None), 0.0),
+                humidity=_finite(getattr(weather, "humidity", None), 60.0),
+                cloud_cover=_finite(getattr(weather, "cloud_cover", None), 0.5),
+                hour=target.timestamp.hour,
+                issue_indoor_temp=issue.temperature,
+                issue_indoor_trend=trend,
+            )
+            delta = float(target.temperature - issue.temperature)
+            controlled_rows[horizon].append(row)
+            controlled_targets[horizon].append(delta)
+            if passive_window:
+                passive_rows[horizon].append(ComfortModel._passive_window_features(row))
+                passive_targets[horizon].append(delta)
+            accepted += 1
+    return WindowDataset(
+        {h: (np.asarray(controlled_rows[h]), np.asarray(controlled_targets[h])) for h in horizons},
+        {h: (np.asarray(passive_rows[h]), np.asarray(passive_targets[h])) for h in horizons},
+        {"window_rows": accepted, "rejected_incomplete_windows": rejected_coverage},
+    )
+
+
+def build_candidate_bundle(dataset: WindowDataset) -> dict[str, Any]:
+    """Fit B1 candidates without reading a DB or mutating a ComfortModel."""
+    from sklearn.metrics import mean_absolute_error, r2_score
+
+    controlled_models: dict[int, Any] = {}
+    passive_models: dict[int, Any] = {}
+    metrics: dict[str, Any] = {"direct_horizons": {}, "passive_horizons": {}}
+    for family, rows, constraints, models, metric_key in (
+        ("controlled", dataset.controlled, _MONOTONIC_CST, controlled_models, "direct_horizons"),
+        ("passive", dataset.passive, _PASSIVE_MONOTONIC_CST, passive_models, "passive_horizons"),
+    ):
+        for horizon, (features, targets) in rows.items():
+            if len(targets) < MIN_TRAINING_ROWS:
+                metrics[metric_key][str(horizon)] = {
+                    "status": "insufficient_data",
+                    "samples": len(targets),
+                }
+                continue
+            split = int(len(targets) * (1 - _VALIDATION_FRACTION))
+            evaluator = make_monotonic_regressor(constraints)
+            evaluator.fit(features[:split], targets[:split])
+            predicted = evaluator.predict(features[split:])
+            model = make_monotonic_regressor(constraints)
+            model.fit(features, targets)
+            models[horizon] = model
+            metrics[metric_key][str(horizon)] = {
+                "status": "trained",
+                "samples": len(targets),
+                "mae": round(float(mean_absolute_error(targets[split:], predicted)), 3),
+                "r2": round(float(r2_score(targets[split:], predicted)), 3),
+            }
+    metrics.update(dataset.evidence)
+    metrics["feature_names"] = list(CONTROLLED_FEATURE_NAMES)
+    metrics["passive_feature_names"] = list(PASSIVE_FEATURE_NAMES)
+    metrics["constraint_version"] = COMFORT_MODEL_CONSTRAINT_VERSION
+    notice = None
+    if not passive_models:
+        notice = (
+            "passive_model_unavailable:no_zero_heating_windows;passive_forecast=physics_fallback"
+        )
+    return {
+        "controlled_models": controlled_models,
+        "passive_models": passive_models,
+        "metrics": metrics,
+        "notice": notice,
+    }
+
+
+def build_candidate(
+    dataset: WindowDataset, thermal_lag_minutes: int | None
+) -> ComfortModelCandidate | None:
+    """Build a v7 checkpoint from materialized inputs without touching model state."""
+    bundle = build_candidate_bundle(dataset)
+    controlled_models = bundle["controlled_models"]
+    primary_horizon = DIRECT_FORECAST_HORIZONS_MINUTES[0]
+    primary_model = controlled_models.get(primary_horizon)
+    if primary_model is None:
+        return None
+    primary_metrics = bundle["metrics"]["direct_horizons"][str(primary_horizon)]
+    metrics = {
+        **bundle["metrics"],
+        "mae": primary_metrics.get("mae"),
+        "r2": primary_metrics.get("r2"),
+        "validated": True,
+        "delta_target": True,
+        "thermal_lag_min": thermal_lag_minutes or primary_horizon,
+        "training_horizon_minutes": primary_horizon,
+        "forecast_quality_feature_schema": COMFORT_MODEL_FEATURE_SCHEMA,
+        "forecast_quality_gate_schema": FORECAST_QUALITY_GATE_SCHEMA_V4_DELTA_WINDOW_HEAT,
+    }
+    return ComfortModelCandidate(
+        model=primary_model,
+        direct_models=controlled_models,
+        passive_direct_models=bundle["passive_models"],
+        metrics=metrics,
+        samples=int(primary_metrics["samples"]),
+        thermal_lag_minutes=thermal_lag_minutes or primary_horizon,
+        training_notice=bundle["notice"],
+    )
+
+
+class TrainingLockLease(Protocol):
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+    async def invalidate(self) -> None: ...
+
+    async def health_check(self) -> bool: ...
+
+    async def close(self) -> None: ...
+
+
+class TrainingLock(Protocol):
+    async def acquire(self) -> TrainingLockLease | None: ...
+
+
+class _PostgresTrainingLockLease:
+    def __init__(self, connection: Any, transaction: Any) -> None:
+        self.connection = connection
+        self.transaction = transaction
+
+    async def commit(self) -> None:
+        try:
+            await self.transaction.commit()
+        except BaseException:
+            await self.connection.invalidate()
+            raise
+
+    async def rollback(self) -> None:
+        try:
+            await self.transaction.rollback()
+        except BaseException:
+            await self.connection.invalidate()
+            raise
+
+    async def invalidate(self) -> None:
+        await self.connection.invalidate()
+
+    async def health_check(self) -> bool:
+        await self.connection.execute(text("SELECT 1"))
+        return True
+
+    async def close(self) -> None:
+        await self.connection.close()
+
+
+class PostgresTrainingLock:
+    """Non-blocking transaction advisory lock for cross-process training."""
+
+    def __init__(self) -> None:
+        self.reason = "training_lock_unavailable"
+
+    async def acquire(self) -> TrainingLockLease | None:
+        if engine.dialect.name != "postgresql":
+            return None
+        connection = await engine.connect()
+        transaction = await connection.begin()
+        try:
+            result = await connection.execute(
+                text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _TRAINING_LOCK_KEY}
+            )
+            acquired = result.scalar_one_or_none()
+            if not isinstance(acquired, bool) or not acquired:
+                self.reason = (
+                    "training_in_progress" if acquired is False else "training_lock_unavailable"
+                )
+                await transaction.rollback()
+                await connection.close()
+                return None
+            self.reason = "acquired"
+            return _PostgresTrainingLockLease(connection, transaction)
+        except BaseException:
+            try:
+                await transaction.rollback()
+            except BaseException:
+                await connection.invalidate()
+            await connection.close()
+            raise
+
+
 class ComfortModel:
     """
     Predicts indoor air temperature from heat-pump operating conditions.
 
     Features (per sample):
-        - zone1_temp (water supply temperature ┬░C)
+        - zone1_temp (water supply temperature °C)
         - reported heat-curve target plus current and recent confirmed
           space-heating fractions
-        - outdoor_temp (┬░C)
+        - outdoor_temp (°C)
         - wind_speed (m/s)
-        - irradiance / solar (W/m┬▓)
-        - precipitation (mm/h), humidity (%), and cloud cover (0ÔÇô1)
+        - irradiance / solar (W/m²)
+        - precipitation (mm/h), humidity (%), and cloud cover (0–1)
         - hour_sin, hour_cos (cyclical hour of day)
         - current indoor temperature and its one-hour trend
 
     Target:
-        - indoor air temperature (┬░C) from SmartThings sensor
+        - indoor air temperature (°C) from SmartThings sensor
 
-    Training data is joined causally ÔÇö each target is paired only with
+    Training data is joined causally — each target is paired only with
     DeviceStatusRecord, WeatherRecord, and indoor observations that existed
     before the target time.  The heat-pump state is shifted by the selected
     thermal lag so the input precedes the response.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, lock_strategy: TrainingLock | None = None) -> None:
         self._model: Any | None = None
         self._direct_models: dict[int, Any] = {}
+        self._passive_direct_models: dict[int, Any] = {}
         self._metrics: dict[str, Any] = {}
         self._last_trained: dt.datetime | None = None
         self._training_samples: int = 0
@@ -141,11 +503,14 @@ class ComfortModel:
         self._artifact_fingerprint: tuple[Path, int, int] | None = None
         self._artifact_refresh_reason: str | None = "artifact_missing"
         self._artifact_lock = threading.Lock()
+        self._training_lock = asyncio.Lock()
+        self._lock_strategy = lock_strategy or PostgresTrainingLock()
 
     def reset(self) -> None:
         """Discard the trained model and learned metadata."""
         self._model = None
         self._direct_models = {}
+        self._passive_direct_models = {}
         self._metrics = {}
         self._last_trained = None
         self._training_samples = 0
@@ -182,14 +547,17 @@ class ComfortModel:
         is observation-only pending verified space-heating intervals.
         """
 
-        if not self.is_trained or not self._direct_models:
-            return {"ready": False, "reason": "no_direct_forecast_model"}
-        horizon = min(
-            self._direct_models,
-            key=lambda candidate: abs(candidate - int(forecast_horizon_minutes)),
-        )
-        direct_metrics = self._metrics.get("direct_horizons", {})
-        metrics = direct_metrics.get(str(horizon), {}) if isinstance(direct_metrics, dict) else {}
+        if not self.is_trained or not self._passive_direct_models:
+            return {"ready": False, "reason": "passive_model_unavailable"}
+        horizon = int(forecast_horizon_minutes)
+        if horizon not in self._passive_direct_models:
+            return {
+                "ready": False,
+                "reason": "direct_forecast_horizon_unavailable",
+                "horizon_minutes": horizon,
+            }
+        passive_metrics = self._metrics.get("passive_horizons", {})
+        metrics = passive_metrics.get(str(horizon), {}) if isinstance(passive_metrics, dict) else {}
         mae = metrics.get("mae") if isinstance(metrics, dict) else None
         if metrics.get("status") != "trained" or not isinstance(mae, (int, float)):
             return {
@@ -219,32 +587,76 @@ class ComfortModel:
         humidity: float = 60.0,
         cloud_cover: float = 0.5,
         forecast_horizon_minutes: int,
+        max_change_c_per_hour: float = 0.5,
     ) -> tuple[float | None, dict[str, Any]]:
         """Direct weather-aware indoor forecast with no space heating input."""
 
         readiness = self.passive_forecast_readiness(forecast_horizon_minutes)
         if not readiness["ready"]:
             return None, readiness
-        predicted = self.predict_indoor_temp(
-            zone_water_temp=outdoor_temp,
-            outdoor_temp=outdoor_temp,
-            wind_speed=wind_speed,
-            irradiance=irradiance,
-            hour=hour,
-            indoor_temp=indoor_temp,
-            precipitation=precipitation,
-            humidity=humidity,
-            cloud_cover=cloud_cover,
-            zone_target_temp=outdoor_temp,
-            space_heating_fraction=0.0,
-            recent_heat_fraction=0.0,
-            forecast_horizon_minutes=forecast_horizon_minutes,
+        features = self._passive_window_features(
+            self._make_features(
+                zone_water_temp=outdoor_temp,
+                outdoor_temp=outdoor_temp,
+                wind_speed=wind_speed,
+                irradiance=irradiance,
+                hour=hour,
+                indoor_temp=indoor_temp,
+                precipitation=precipitation,
+                humidity=humidity,
+                cloud_cover=cloud_cover,
+                zone_target_temp=outdoor_temp,
+                space_heating_fraction=0.0,
+                recent_heat_fraction=0.0,
+            )
         )
+        horizon = int(readiness["horizon_minutes"])
+        model = self._passive_direct_models[horizon]
+        delta = self._project_prediction(model, features, indoor_temp, indoor_feature_index=10)
+        if delta is None:
+            return None, {"ready": False, "reason": "projection_failed"}
+        elapsed_hours = horizon / 60.0
+        delta = self._clamp_passive_change(delta, elapsed_hours, max_change_c_per_hour)
+        predicted = indoor_temp + delta
         return predicted, readiness
 
     @property
     def metrics(self) -> dict[str, Any]:
         return dict(self._metrics)
+
+    def record_forecast_quality_gate(
+        self,
+        gate: dict[str, object],
+        *,
+        schema: str,
+        required_horizons: tuple[int, ...],
+        passes_required: int,
+        failures_required: int,
+        evaluation_id: str | None = None,
+        evaluation_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Persist the fail-closed planning gate beside validated model metrics."""
+        from packages.ml.forecast_quality import apply_control_gate_hysteresis
+
+        if (
+            evaluation_id is not None
+            and self._metrics.get("forecast_quality_gate_evaluation_id") == evaluation_id
+            and isinstance(self._metrics.get("forecast_quality_gate"), dict)
+        ):
+            return dict(self._metrics["forecast_quality_gate"])
+        state = apply_control_gate_hysteresis(
+            gate,
+            self._metrics,
+            schema=schema,
+            required_horizons=required_horizons,
+            passes_required=passes_required,
+            failures_required=failures_required,
+            evaluation_context=evaluation_context,
+        )
+        self._metrics["forecast_quality_gate"] = state
+        if evaluation_id is not None:
+            self._metrics["forecast_quality_gate_evaluation_id"] = evaluation_id
+        return state
 
     @property
     def training_notice(self) -> str | None:
@@ -336,6 +748,259 @@ class ComfortModel:
         return round(min(MAX_CONTROL_MARGIN_C, max(MIN_CONTROL_MARGIN_C, float(mae) * 0.75)), 2)
 
     async def train(self, thermal_lag_minutes: int | None = None) -> dict[str, Any]:
+        """Train once with process-local and PostgreSQL single-flight protection."""
+        if self._training_lock.locked():
+            return {"status": "training_in_progress"}
+        async with self._training_lock:
+            started = time.monotonic()
+            lease: TrainingLockLease | None = None
+            temp_path: Path | None = None
+            published = False
+            finalized = False
+            try:
+                lease = await self._lock_strategy.acquire()
+            except BaseException:
+                self._training_notice = "training_lock_unavailable"
+                logger.warning("comfort_model_training_skipped", reason="training_lock_unavailable")
+                return {"status": "training_skipped", "reason": "training_lock_unavailable"}
+            if lease is None:
+                reason = getattr(self._lock_strategy, "reason", "training_lock_unavailable")
+                if reason == "training_in_progress":
+                    return {"status": "training_in_progress"}
+                self._training_notice = "training_lock_unavailable"
+                logger.warning("comfort_model_training_skipped", reason="training_lock_unavailable")
+                return {"status": "training_skipped", "reason": "training_lock_unavailable"}
+            try:
+                dataset = await self._materialize_window_dataset()
+                candidate = await asyncio.to_thread(build_candidate, dataset, thermal_lag_minutes)
+                if candidate is None:
+                    if thermal_lag_minutes is not None:
+                        self._thermal_lag_minutes = thermal_lag_minutes
+                    return {
+                        "status": "insufficient_data",
+                        "rows": len(
+                            dataset.controlled.get(DIRECT_FORECAST_HORIZONS_MINUTES[0], ((), ()))[1]
+                        ),
+                        "required": MIN_TRAINING_ROWS,
+                    }
+                prior_mae = read_mae_baseline("comfort")
+                candidate_mae = candidate.metrics.get("mae")
+                if (
+                    self.is_trained
+                    and isinstance(prior_mae, (float, int))
+                    and isinstance(candidate_mae, (float, int))
+                    and candidate_mae > prior_mae
+                ):
+                    return {
+                        "status": "regressed",
+                        "samples": candidate.samples,
+                        "mae": candidate_mae,
+                        "prior_deployed_mae": round(float(prior_mae), 3),
+                    }
+                artifact = self._candidate_artifact(candidate)
+                artifact_path = self._new_artifact_path()
+                serialization = asyncio.create_task(
+                    asyncio.to_thread(self._write_candidate_temp, artifact, artifact_path)
+                )
+                try:
+                    temp_path = await asyncio.shield(serialization)
+                except asyncio.CancelledError:
+                    # The worker cannot publish; await its only side effect so it can be removed.
+                    temp_path = await asyncio.shield(serialization)
+                    raise
+                if not await lease.health_check():
+                    self._training_notice = "training_lock_unavailable"
+                    return {"status": "training_skipped", "reason": "training_lock_unavailable"}
+                self._publish_candidate_temp(temp_path, artifact_path)
+                published = True
+                self._install_candidate(candidate, artifact_path)
+                result = {
+                    "status": "trained",
+                    "samples": candidate.samples,
+                    **self._metrics,
+                    "training_notice": self._training_notice,
+                }
+                try:
+                    await lease.commit()
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    await lease.invalidate()
+                    finalized = True
+                    raise
+                except Exception:
+                    # The candidate is already atomically installed. Keep it, but expose recovery.
+                    await lease.invalidate()
+                    self._training_notice = "training_lock_finalize_recovered"
+                    result = {**result, "training_notice": self._training_notice}
+                finalized = True
+                return result
+            except BaseException as training_error:
+                if finalized:
+                    raise
+                try:
+                    await lease.rollback()
+                except BaseException as rollback_error:
+                    finalized = True
+                    await lease.invalidate()
+                    raise rollback_error from training_error
+                finalized = True
+                raise
+            finally:
+                if not finalized:
+                    try:
+                        await lease.rollback()
+                    except BaseException:
+                        await lease.invalidate()
+                if temp_path is not None and not published:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("comfort_model_temp_cleanup_failed")
+                logger.info(
+                    "comfort_model_training_lock_released",
+                    lock_held_seconds=round(time.monotonic() - started, 3),
+                    phase="published" if published else "not_published",
+                )
+                await lease.close()
+
+    async def _materialize_window_dataset(self) -> WindowDataset:
+        """Read DB state once and return only plain inputs for off-loop fitting."""
+        # Legacy unit tests override the old loader with already-materialized arrays.
+        if "_build_dataset" in self.__dict__:
+            features, targets, _ = await self._build_dataset()
+            empty = (np.array([]), np.array([]))
+            return WindowDataset(
+                {
+                    horizon: (features, targets)
+                    if horizon == DIRECT_FORECAST_HORIZONS_MINUTES[0]
+                    else empty
+                    for horizon in DIRECT_FORECAST_HORIZONS_MINUTES
+                },
+                {horizon: empty for horizon in DIRECT_FORECAST_HORIZONS_MINUTES},
+                {"active_heating_rows": 0},
+            )
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
+        values = await get_all_settings()
+        reference_sensor_id = str(values.get("comfort_reference_sensor_id") or "").strip()
+        weather_provider = str(values.get("weather_provider") or "open-meteo")
+        async with get_session() as session:
+            reading_result = await session.execute(
+                select(IndoorTempReading)
+                .where(IndoorTempReading.timestamp >= cutoff)
+                .where(IndoorTempReading.is_stale.is_(False))
+                .order_by(IndoorTempReading.timestamp)  # noqa: E712
+            )
+            readings, strategy, sensor_count = self._select_indoor_observations(
+                reading_result.scalars().all(), reference_sensor_id
+            )
+            if not readings:
+                empty = {
+                    horizon: (np.array([]), np.array([]))
+                    for horizon in DIRECT_FORECAST_HORIZONS_MINUTES
+                }
+                return WindowDataset(
+                    empty,
+                    dict(empty),
+                    {
+                        "active_heating_rows": 0,
+                        "sensor_strategy": strategy,
+                        "source_sensor_count": sensor_count,
+                    },
+                )
+            status_result = await session.execute(
+                select(DeviceStatusRecord)
+                .where(DeviceStatusRecord.ts >= readings[0].timestamp - dt.timedelta(hours=12))
+                .where(DeviceStatusRecord.ts <= readings[-1].timestamp)
+                .order_by(DeviceStatusRecord.ts)
+            )
+            weather_result = await session.execute(
+                select(WeatherRecord)
+                .where(WeatherRecord.ts >= readings[0].timestamp)
+                .where(WeatherRecord.ts <= readings[-1].timestamp)
+                .where(WeatherRecord.source == weather_provider)
+                .order_by(WeatherRecord.ts)
+            )
+        dataset = build_window_dataset(
+            readings,
+            status_result.scalars().all(),
+            weather_result.scalars().all(),
+            DIRECT_FORECAST_HORIZONS_MINUTES,
+        )
+        return WindowDataset(
+            dataset.controlled,
+            dataset.passive,
+            {**dataset.evidence, "sensor_strategy": strategy, "source_sensor_count": sensor_count},
+        )
+
+    @staticmethod
+    def _write_candidate_temp(artifact: dict[str, Any], artifact_path: Path) -> Path:
+        from packages.ml.safe_persistence import safe_write_temp
+
+        return safe_write_temp(artifact, artifact_path)
+
+    @staticmethod
+    def _publish_candidate_temp(temp_path: Path, artifact_path: Path) -> None:
+        from packages.ml.safe_persistence import safe_publish_temp
+
+        safe_publish_temp(temp_path, artifact_path)
+
+    @staticmethod
+    def _new_artifact_path() -> Path:
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        return MODEL_DIR / f"{COMFORT_MODEL_ARTIFACT_PREFIX}{timestamp}.pkl"
+
+    def _candidate_artifact(self, candidate: ComfortModelCandidate) -> dict[str, Any]:
+        return {
+            "model": candidate.model,
+            "direct_models": candidate.direct_models,
+            "passive_direct_models": candidate.passive_direct_models,
+            "metrics": candidate.metrics,
+            "trained_at": dt.datetime.now(dt.timezone.utc),
+            "samples": candidate.samples,
+            "thermal_lag": candidate.thermal_lag_minutes,
+            "feature_schema": COMFORT_MODEL_FEATURE_SCHEMA,
+            "format_version": COMFORT_MODEL_FORMAT_VERSION,
+            "target_kind": COMFORT_MODEL_TARGET_KIND,
+            "feature_names": list(CONTROLLED_FEATURE_NAMES),
+            "passive_feature_names": list(PASSIVE_FEATURE_NAMES),
+            "passive_feature_schema": COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
+            "controlled_constraints": _MONOTONIC_CST,
+            "passive_constraints": _PASSIVE_MONOTONIC_CST,
+            "constraint_version": COMFORT_MODEL_CONSTRAINT_VERSION,
+            "direct_horizons_minutes": DIRECT_FORECAST_HORIZONS_MINUTES,
+            "knot_range": COMFORT_MODEL_KNOT_RANGE,
+            "projection_epsilon": COMFORT_MODEL_PROJECTION_EPSILON,
+        }
+
+    def _install_candidate(self, candidate: ComfortModelCandidate, artifact_path: Path) -> None:
+        metrics = dict(candidate.metrics)
+        prior_gate = self._metrics.get("forecast_quality_gate")
+        if (
+            self._metrics.get("forecast_quality_feature_schema") == COMFORT_MODEL_FEATURE_SCHEMA
+            and self._metrics.get("forecast_quality_gate_schema")
+            == FORECAST_QUALITY_GATE_SCHEMA_V4_DELTA_WINDOW_HEAT
+            and isinstance(prior_gate, dict)
+            and prior_gate.get("schema") == FORECAST_QUALITY_GATE_SCHEMA_V4_DELTA_WINDOW_HEAT
+            and tuple(prior_gate.get("required_horizons", ())) == FORECAST_QUALITY_REQUIRED_HORIZONS
+        ):
+            metrics["forecast_quality_gate"] = prior_gate
+            evaluation_id = self._metrics.get("forecast_quality_gate_evaluation_id")
+            if isinstance(evaluation_id, str):
+                metrics["forecast_quality_gate_evaluation_id"] = evaluation_id
+        stat = artifact_path.stat()
+        with self._artifact_lock:
+            self._model = candidate.model
+            self._direct_models = candidate.direct_models
+            self._passive_direct_models = candidate.passive_direct_models
+            self._metrics = metrics
+            self._thermal_lag_minutes = candidate.thermal_lag_minutes
+            self._last_dataset_evidence = dict(candidate.metrics)
+            self._last_trained = dt.datetime.now(dt.timezone.utc)
+            self._training_samples = candidate.samples
+            self._training_notice = candidate.training_notice
+            self._artifact_fingerprint = (artifact_path, stat.st_mtime_ns, stat.st_size)
+            self._artifact_refresh_reason = None
+
+    async def _train_unlocked(self, thermal_lag_minutes: int | None = None) -> dict[str, Any]:
         """
         Train (or retrain) the comfort model from the database.
 
@@ -348,9 +1013,13 @@ class ComfortModel:
             raise ImportError("scikit-learn is required for the comfort model")
 
         if thermal_lag_minutes is not None:
-            # Explicit lag ÔÇö train once
+            # Explicit lag — train once
             self._thermal_lag_minutes = thermal_lag_minutes
             return await self._train_with_current_lag()
+
+        # v7 models are trained directly at the planner's supported anchors.
+        self._thermal_lag_minutes = DIRECT_FORECAST_HORIZONS_MINUTES[0]
+        return await self._train_with_current_lag()
 
         # --- Auto-detect optimal thermal lag ---
         best_lag: int = DEFAULT_THERMAL_LAG_MINUTES
@@ -396,12 +1065,46 @@ class ComfortModel:
         """Train once using the currently set ``_thermal_lag_minutes``.
 
         Metrics are computed on a chronological hold-out (the most recent
-        ``_VALIDATION_FRACTION`` of samples) so the reported MAE/R┬▓ reflect
+        ``_VALIDATION_FRACTION`` of samples) so the reported MAE/R² reflect
         out-of-sample accuracy rather than how well the model memorised the
         training set. The deployed model is then refit on *all* available
         samples for the best possible predictions.
         """
         X, y, n_rows = await self._build_dataset()
+
+        bundle = getattr(self, "_window_candidate_bundle", None)
+        if bundle is not None:
+            self._window_candidate_bundle = None
+            controlled_models = bundle["controlled_models"]
+            if not controlled_models:
+                return {
+                    "status": "insufficient_data",
+                    "rows": n_rows,
+                    "required": MIN_TRAINING_ROWS,
+                }
+            self._model = controlled_models[DIRECT_FORECAST_HORIZONS_MINUTES[0]]
+            self._direct_models = controlled_models
+            self._passive_direct_models = bundle["passive_models"]
+            self._metrics = {
+                **bundle["metrics"],
+                "mae": bundle["metrics"]["direct_horizons"]["60"].get("mae"),
+                "r2": bundle["metrics"]["direct_horizons"]["60"].get("r2"),
+                "validated": True,
+                "delta_target": True,
+                "forecast_quality_feature_schema": COMFORT_MODEL_FEATURE_SCHEMA,
+                "forecast_quality_gate_schema": FORECAST_QUALITY_GATE_SCHEMA_V4_DELTA_WINDOW_HEAT,
+            }
+            self._training_notice = bundle["notice"]
+            self._last_trained = dt.datetime.now(dt.timezone.utc)
+            self._training_samples = n_rows
+            if persist:
+                self._save()
+            return {
+                "status": "trained",
+                "samples": n_rows,
+                **self._metrics,
+                "training_notice": self._training_notice,
+            }
 
         if n_rows < MIN_TRAINING_ROWS:
             return {
@@ -426,7 +1129,7 @@ class ComfortModel:
             )
             validated = True
         else:
-            # Too few rows to hold out ÔÇö fall back to in-sample metrics.
+            # Too few rows to hold out — fall back to in-sample metrics.
             tmp = self._build_regressor()
             tmp.fit(X, y)
             y_pred = tmp.predict(X)
@@ -481,6 +1184,7 @@ class ComfortModel:
 
         self._model = model
         self._training_notice = None
+        previous_metrics = self._metrics
         self._metrics = {
             "mae": round(float(mae), 3),
             "r2": round(float(r2), 3),
@@ -498,7 +1202,22 @@ class ComfortModel:
             ),
             "sensor_strategy": self._last_dataset_evidence.get("sensor_strategy", "unknown"),
             "source_sensor_count": self._last_dataset_evidence.get("source_sensor_count", 0),
+            "forecast_quality_feature_schema": COMFORT_MODEL_FEATURE_SCHEMA,
+            "forecast_quality_gate_schema": FORECAST_QUALITY_GATE_SCHEMA,
         }
+        previous_gate = previous_metrics.get("forecast_quality_gate")
+        if (
+            isinstance(previous_gate, dict)
+            and previous_gate.get("schema") == FORECAST_QUALITY_GATE_SCHEMA
+            and tuple(previous_gate.get("required_horizons", ()))
+            == FORECAST_QUALITY_REQUIRED_HORIZONS
+            and previous_metrics.get("forecast_quality_feature_schema")
+            in (None, COMFORT_MODEL_FEATURE_SCHEMA)
+        ):
+            self._metrics["forecast_quality_gate"] = previous_gate
+            evaluation_id = previous_metrics.get("forecast_quality_gate_evaluation_id")
+            if isinstance(evaluation_id, str):
+                self._metrics["forecast_quality_gate_evaluation_id"] = evaluation_id
         self._last_trained = dt.datetime.now(dt.timezone.utc)
         self._training_samples = n_rows
 
@@ -608,13 +1327,131 @@ class ComfortModel:
             indoor_trend_c_per_hour=indoor_trend_c_per_hour,
         )
         model = self._model
-        if forecast_horizon_minutes is not None and self._direct_models:
-            horizon = min(
-                self._direct_models,
-                key=lambda candidate: abs(candidate - int(forecast_horizon_minutes)),
-            )
+        if forecast_horizon_minutes is not None:
+            horizon = int(forecast_horizon_minutes)
+            if horizon not in self._direct_models:
+                return None
             model = self._direct_models[horizon]
-        return float(model.predict(features.reshape(1, -1))[0])
+        raw = float(model.predict(features.reshape(1, -1))[0])
+        if not self._metrics.get("delta_target"):
+            return raw
+        issue = float(features[_INDOOR_TEMPERATURE_FEATURE_INDEX])
+        projected = self._project_prediction(model, features, issue)
+        return None if projected is None else issue + projected
+
+    @classmethod
+    def _project_prediction(
+        cls,
+        model: Any,
+        features: np.ndarray,
+        issue_temp: float,
+        *,
+        indoor_feature_index: int = _INDOOR_TEMPERATURE_FEATURE_INDEX,
+    ) -> float | None:
+        """Evaluate and project a delta curve once, then interpolate at issue temperature."""
+        knots = np.arange(COMFORT_MODEL_KNOT_RANGE[0], COMFORT_MODEL_KNOT_RANGE[1] + 1.0)
+        rows = np.tile(np.asarray(features, dtype=float), (len(knots), 1))
+        rows[:, indoor_feature_index] = knots
+        try:
+            curve = cls.project_delta_curve(np.asarray(model.predict(rows), dtype=float))
+        except (TypeError, ValueError):
+            return None
+        if curve is None:
+            return None
+        if issue_temp < knots[0]:
+            return float(curve[0] + (issue_temp - knots[0]) * (curve[1] - curve[0]))
+        if issue_temp > knots[-1]:
+            return float(curve[-1] + (issue_temp - knots[-1]) * (curve[-1] - curve[-2]))
+        return float(np.interp(issue_temp, knots, curve))
+
+    @staticmethod
+    def _clamp_passive_change(
+        delta_c: float, elapsed_hours: float, limit_c_per_hour: float
+    ) -> float:
+        limit = max(0.0, float(limit_c_per_hour)) * max(0.0, float(elapsed_hours))
+        return max(-limit, min(limit, float(delta_c)))
+
+    @staticmethod
+    def _pav(values: np.ndarray, *, increasing: bool) -> np.ndarray:
+        """Euclidean isotonic projection using deterministic pool-adjacent violators."""
+        work = np.asarray(values, dtype=float)
+        if not increasing:
+            work = -work
+        blocks: list[list[float]] = []
+        for value in work:
+            blocks.append([float(value), 1.0])
+            while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
+                total, count = blocks.pop()
+                blocks[-1][0] += total
+                blocks[-1][1] += count
+        projected = np.concatenate([np.full(int(count), total / count) for total, count in blocks])
+        return projected if increasing else -projected
+
+    @classmethod
+    def project_delta_curve(cls, raw_deltas: np.ndarray) -> np.ndarray | None:
+        """Project direct delta estimates onto the bounded monotone constraint set."""
+        raw = np.asarray(raw_deltas, dtype=float)
+        knots = np.arange(COMFORT_MODEL_KNOT_RANGE[0], COMFORT_MODEL_KNOT_RANGE[1] + 1.0)
+        if raw.shape != knots.shape or not np.all(np.isfinite(raw)):
+            return None
+        residual_a = np.zeros_like(raw)
+        residual_b = np.zeros_like(raw)
+        current = raw.copy()
+        slope = 1.0 - COMFORT_MODEL_PROJECTION_EPSILON
+        for _ in range(1000):
+            prior = current.copy()
+            first = cls._pav(current + residual_a, increasing=False)
+            residual_a = current + residual_a - first
+            shifted = first + residual_b + slope * knots
+            second = cls._pav(shifted, increasing=True) - slope * knots
+            residual_b = first + residual_b - second
+            current = second
+            decreasing_violation = max(0.0, float(np.max(np.diff(current))))
+            increasing_violation = max(0.0, float(-np.min(np.diff(current + slope * knots))))
+            if (
+                np.max(np.abs(current - prior)) <= 1e-10
+                and decreasing_violation <= 1e-10
+                and increasing_violation <= 1e-10
+            ):
+                return current if np.all(np.isfinite(current)) else None
+        return None
+
+    @staticmethod
+    def _controlled_window_features(
+        *,
+        mean_supply_lift: float,
+        mean_target_lift: float,
+        window_heat_fraction: float,
+        final_hour_heat_fraction: float,
+        outdoor_temp: float,
+        wind_speed: float,
+        irradiance: float,
+        precipitation: float,
+        humidity: float,
+        cloud_cover: float,
+        hour: int,
+        issue_indoor_temp: float,
+        issue_indoor_trend: float,
+    ) -> np.ndarray:
+        return ComfortModel._make_features(
+            mean_supply_lift,
+            outdoor_temp,
+            wind_speed,
+            irradiance,
+            hour,
+            indoor_temp=issue_indoor_temp,
+            precipitation=precipitation,
+            humidity=humidity,
+            cloud_cover=cloud_cover,
+            zone_target_temp=mean_target_lift,
+            space_heating_fraction=window_heat_fraction,
+            recent_heat_fraction=final_hour_heat_fraction,
+            indoor_trend_c_per_hour=issue_indoor_trend,
+        )
+
+    @staticmethod
+    def _passive_window_features(controlled_features: np.ndarray) -> np.ndarray:
+        return np.delete(np.asarray(controlled_features, dtype=float), [10, 11])
 
     def required_zone_temp(
         self,
@@ -700,11 +1537,38 @@ class ComfortModel:
             {
                 "model": self._model,
                 "direct_models": self._direct_models,
+                "passive_direct_models": self._passive_direct_models,
                 "metrics": self._metrics,
                 "trained_at": self._last_trained,
                 "samples": self._training_samples,
                 "thermal_lag": self._thermal_lag_minutes,
-                "feature_schema": "causal_v4_hourly_heat_and_trend",
+                "feature_schema": COMFORT_MODEL_FEATURE_SCHEMA,
+                "format_version": COMFORT_MODEL_FORMAT_VERSION,
+                "target_kind": COMFORT_MODEL_TARGET_KIND,
+                "feature_names": [
+                    "mean_supply_lift",
+                    "mean_target_lift",
+                    "window_heat_fraction",
+                    "final_hour_heat_fraction",
+                    "outdoor_temp",
+                    "wind_speed",
+                    "irradiance",
+                    "precipitation",
+                    "humidity",
+                    "cloud_cover",
+                    "hour_sin",
+                    "hour_cos",
+                    "issue_indoor_temp",
+                    "issue_indoor_trend",
+                ],
+                "passive_feature_names": list(PASSIVE_FEATURE_NAMES),
+                "passive_feature_schema": COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
+                "controlled_constraints": _MONOTONIC_CST,
+                "passive_constraints": _PASSIVE_MONOTONIC_CST,
+                "constraint_version": COMFORT_MODEL_CONSTRAINT_VERSION,
+                "direct_horizons_minutes": DIRECT_FORECAST_HORIZONS_MINUTES,
+                "knot_range": COMFORT_MODEL_KNOT_RANGE,
+                "projection_epsilon": COMFORT_MODEL_PROJECTION_EPSILON,
             },
             path,
         )
@@ -758,6 +1622,22 @@ class ComfortModel:
             try:
                 data = safe_load(path)
                 candidate = data["model"]
+                if (
+                    data.get("format_version") != COMFORT_MODEL_FORMAT_VERSION
+                    or data.get("target_kind") != COMFORT_MODEL_TARGET_KIND
+                    or data.get("feature_schema") != COMFORT_MODEL_FEATURE_SCHEMA
+                    or data.get("passive_feature_schema") != COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA
+                    or tuple(data.get("feature_names", ())) != CONTROLLED_FEATURE_NAMES
+                    or tuple(data.get("passive_feature_names", ())) != PASSIVE_FEATURE_NAMES
+                    or data.get("controlled_constraints") != _MONOTONIC_CST
+                    or data.get("passive_constraints") != _PASSIVE_MONOTONIC_CST
+                    or data.get("constraint_version") != COMFORT_MODEL_CONSTRAINT_VERSION
+                    or tuple(data.get("direct_horizons_minutes", ()))
+                    != DIRECT_FORECAST_HORIZONS_MINUTES
+                    or tuple(data.get("knot_range", ())) != COMFORT_MODEL_KNOT_RANGE
+                    or data.get("projection_epsilon") != COMFORT_MODEL_PROJECTION_EPSILON
+                ):
+                    raise ValueError("incompatible comfort-model artifact")
                 if getattr(candidate, "n_features_in_", None) != len(_MONOTONIC_CST):
                     continue
             except (
@@ -800,6 +1680,17 @@ class ComfortModel:
                     if isinstance(direct_models, dict)
                     else {}
                 )
+                passive_models = data.get("passive_direct_models", {})
+                self._passive_direct_models = (
+                    {
+                        int(horizon): model
+                        for horizon, model in passive_models.items()
+                        if int(horizon) in DIRECT_FORECAST_HORIZONS_MINUTES
+                        and getattr(model, "n_features_in_", None) == len(_PASSIVE_MONOTONIC_CST)
+                    }
+                    if isinstance(passive_models, dict)
+                    else {}
+                )
                 self._metrics = data.get("metrics", {})
                 self._last_trained = data.get("trained_at")
                 self._training_samples = data.get("samples", 0)
@@ -832,6 +1723,60 @@ class ComfortModel:
         return index if index >= 0 else None
 
     async def _build_dataset(self) -> tuple[np.ndarray, np.ndarray, int]:
+        """Load records, then delegate all v7 feature construction to a pure helper."""
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
+        values = await get_all_settings()
+        reference_sensor_id = str(values.get("comfort_reference_sensor_id") or "").strip()
+        weather_provider = str(values.get("weather_provider") or "open-meteo")
+        async with get_session() as session:
+            reading_result = await session.execute(
+                select(IndoorTempReading)
+                .where(IndoorTempReading.timestamp >= cutoff)
+                .where(IndoorTempReading.is_stale.is_(False))
+                .order_by(IndoorTempReading.timestamp)  # noqa: E712
+            )
+            raw_readings = reading_result.scalars().all()
+            readings, strategy, sensor_count = self._select_indoor_observations(
+                raw_readings, reference_sensor_id
+            )
+            if not readings:
+                self._last_dataset_evidence = {
+                    "active_heating_rows": 0,
+                    "sensor_strategy": strategy,
+                    "source_sensor_count": sensor_count,
+                }
+                return np.array([]), np.array([]), 0
+            status_result = await session.execute(
+                select(DeviceStatusRecord)
+                .where(DeviceStatusRecord.ts >= readings[0].timestamp - dt.timedelta(hours=12))
+                .where(DeviceStatusRecord.ts <= readings[-1].timestamp)
+                .order_by(DeviceStatusRecord.ts)
+            )
+            weather_result = await session.execute(
+                select(WeatherRecord)
+                .where(WeatherRecord.ts >= readings[0].timestamp)
+                .where(WeatherRecord.ts <= readings[-1].timestamp)
+                .where(WeatherRecord.source == weather_provider)
+                .order_by(WeatherRecord.ts)
+            )
+            dataset = build_window_dataset(
+                readings,
+                status_result.scalars().all(),
+                weather_result.scalars().all(),
+                DIRECT_FORECAST_HORIZONS_MINUTES,
+            )
+        features, targets = dataset.controlled.get(
+            self._thermal_lag_minutes, (np.array([]), np.array([]))
+        )
+        self._last_dataset_evidence = {
+            **dataset.evidence,
+            "sensor_strategy": strategy,
+            "source_sensor_count": sensor_count,
+        }
+        self._window_candidate_bundle = build_candidate_bundle(dataset) if HAS_SKLEARN else None
+        return features, targets, len(targets)
+
+    async def _build_dataset_legacy(self) -> tuple[np.ndarray, np.ndarray, int]:
         """
         Join indoor_temp_reading + device_status + weather on time, shifting
         by thermal lag so we correlate *past* water temp with *current* air temp.

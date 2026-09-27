@@ -9,7 +9,7 @@ import json
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
@@ -30,9 +30,31 @@ from packages.core.settings_service import (
     get_setting,
     set_setting,
 )
+from packages.optimizer.executor_core import SAFETY_ACTION_STUCK_AFTER
 
 logger = structlog.get_logger()
 _WEBHOOK_THROTTLE = dt.timedelta(minutes=30)
+SAFETY_REVERT_PENDING_ALERT_AFTER = dt.timedelta(seconds=120)
+SEASONAL_SAFETY_DEFERRAL_ALERT_AFTER = dt.timedelta(hours=24)
+
+
+async def _safety_revert_cause_hint(now: dt.datetime) -> str:
+    """Best-effort context only; it must never suppress a DB-backed alert."""
+
+    try:
+        if await get_bool_setting("learning_mode_enabled"):
+            return "learning_mode"
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status(now=now)
+        if seasonal.get("observe_only_active") or seasonal.get(
+            "seasonal_blocked_by_unresolved_safety_revert"
+        ):
+            return "seasonal"
+    except Exception:
+        logger.exception("safety_revert_pending_cause_lookup_failed")
+        return "lookup_error"
+    return "unknown"
 
 
 def device_status_is_fresh(
@@ -121,6 +143,7 @@ async def get_operational_alerts(
     )
     service_cutoff = now - dt.timedelta(minutes=3)
     action_since = now - dt.timedelta(hours=24)
+    stale_claim_cutoff = now - SAFETY_ACTION_STUCK_AFTER
     async with get_session() as session:
         heartbeat_rows = (
             (
@@ -157,6 +180,21 @@ async def get_operational_alerts(
             await session.execute(
                 select(PlanActionRecord)
                 .where(unresolved_revert_predicate(), PlanActionRecord.safety_attempt_count >= 3)
+                .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        pending_unclaimed_safety_action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    unresolved_revert_predicate(),
+                    PlanActionRecord.scheduled_ts <= now - SAFETY_REVERT_PENDING_ALERT_AFTER,
+                    or_(
+                        PlanActionRecord.safety_claimed_at.is_(None),
+                        PlanActionRecord.safety_claimed_at <= stale_claim_cutoff,
+                    ),
+                )
                 .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
                 .limit(1)
             )
@@ -281,6 +319,52 @@ async def get_operational_alerts(
                 details=details,
             )
         )
+
+    if pending_unclaimed_safety_action is not None:
+        age_seconds = max(
+            0, int((now - pending_unclaimed_safety_action.scheduled_ts).total_seconds())
+        )
+        alerts.append(
+            _alert(
+                "safety_revert_pending_unclaimed",
+                "critical",
+                "Safety revert is pending without an active claim",
+                (
+                    f"Safety action #{pending_unclaimed_safety_action.id} has been due for "
+                    f"{age_seconds} seconds without a current safety claim."
+                ),
+                action="Investigate the safety worker and restore the device state.",
+                plan_id=pending_unclaimed_safety_action.plan_id,
+                action_id=pending_unclaimed_safety_action.id,
+                href=f"/?view=plan&activity=safety#plan-action-{pending_unclaimed_safety_action.id}",
+                details={
+                    "device_id": pending_unclaimed_safety_action.device_id,
+                    "plan_id": pending_unclaimed_safety_action.plan_id,
+                    "action_id": pending_unclaimed_safety_action.id,
+                    "age_seconds": age_seconds,
+                    "cause_hint": await _safety_revert_cause_hint(now),
+                },
+            )
+        )
+
+    try:
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status(now=now)
+        if int(seasonal.get("seasonal_deferred_seconds") or 0) >= int(
+            SEASONAL_SAFETY_DEFERRAL_ALERT_AFTER.total_seconds()
+        ):
+            alerts.append(
+                _alert(
+                    "seasonal_calibration_blocked_by_safety_revert",
+                    "warning",
+                    "Seasonal calibration is blocked by a safety revert",
+                    "Observe-only calibration will resume after the unresolved safety revert closes.",
+                    action="Resolve the outstanding safety revert before collecting seasonal evidence.",
+                )
+            )
+    except Exception:
+        logger.exception("seasonal_calibration_alert_lookup_failed")
 
     unknown_grace = dt.timedelta(seconds=max(poll_interval * 3, 60 * 60))
     for gate_row in gate_rows:

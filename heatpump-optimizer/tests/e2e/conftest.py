@@ -115,6 +115,41 @@ async def seed_device_status(db_session: AsyncSession):
 
 
 @pytest_asyncio.fixture(loop_scope="session")
+async def seed_panasonic_mode_parity_statuses(db_session: AsyncSession):
+    """Persist the representative Panasonic operation-mode corpus for parity checks."""
+
+    modes = [
+        None,
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "heat",
+        "cool",
+        "auto_heat",
+        "AUTO_COOL",
+        "ExtendedOperationMode.HEAT",
+        "ExtendedOperationMode.AUTO_COOL",
+        "malformed",
+    ]
+    now = dt.datetime.now(dt.timezone.utc)
+    records = [
+        DeviceStatusRecord(
+            ts=now,
+            device_id=f"mode-parity-{mode_index}-{operation_status}",
+            mode=mode,
+            operation_status=operation_status,
+        )
+        for mode_index, mode in enumerate(modes)
+        for operation_status in (None, 0, 1)
+    ]
+    db_session.add_all(records)
+    await db_session.commit()
+    return records
+
+
+@pytest_asyncio.fixture(loop_scope="session")
 async def seed_prices(db_session: AsyncSession):
     """Seed 24 hours of price data."""
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)

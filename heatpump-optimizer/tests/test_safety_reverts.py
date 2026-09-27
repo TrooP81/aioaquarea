@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from packages.core.safety_reverts import (
     dhw_embargoed,
     normalize_zone_id,
+    unresolved_revert_device_ids,
+    unresolved_revert_summary,
     validate_action_pair,
     zone_embargoed,
     zone_matches_baseline,
@@ -84,3 +88,42 @@ class TestSafetyRevertEmbargo:
         assert zone_embargoed(actions, increase, status)
         assert not zone_embargoed(actions, other_zone, status)
         assert not zone_embargoed(actions, other_device, status)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_revert_summary_is_bounded_and_reports_oldest_age():
+    now = dt.datetime(2026, 9, 27, 12, tzinfo=dt.timezone.utc)
+    oldest = now - dt.timedelta(seconds=180)
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(one=lambda: (2, oldest)),
+                SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: ["force_dhw_off"])),
+            ]
+        )
+    )
+
+    summary = await unresolved_revert_summary(session, now=now)
+
+    assert summary == {
+        "count": 2,
+        "oldest_scheduled_at": oldest,
+        "oldest_age_seconds": 180,
+        "action_types": ["force_dhw_off"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_unresolved_revert_device_ids_reports_bounded_overflow():
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: ["device-a", "device-b", "device-c"])
+            )
+        )
+    )
+
+    device_ids, overflowed = await unresolved_revert_device_ids(session, limit=2)
+
+    assert device_ids == {"device-a", "device-b"}
+    assert overflowed is True

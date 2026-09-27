@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from packages.core.space_heating_gate import SpaceHeatingGateState
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
+from packages.optimizer.milp import MILPOptimizer
 
 
 def _make_prices(hours=24, base_price=0.10):
@@ -109,6 +111,22 @@ class TestMILPSolver:
             price = action["payload"]["price"]
             assert price <= 0.20  # Not in the most expensive hours
 
+    def test_milp_solution_duty_is_not_augmented_by_baseline(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            current_indoor_temp=20.0,
+            indoor_targets=[20.0],
+        )
+
+        point = plan["forecast_snapshot"]["forecast_with_plan"][0]
+        assert point["source"] == "milp_solution"
+        assert "baseline_heating_fraction" not in point
+        assert "space_heating_source" not in point
+
     def test_milp_snapshot_preserves_its_solved_and_no_heating_trajectories(self):
         """The UI must be able to display the exact scenario the MILP solved."""
         from packages.optimizer.milp import MILPOptimizer
@@ -138,6 +156,193 @@ class TestMILPSolver:
             for plan_row, baseline_row in zip(planned, no_heating)
         )
         assert snapshot["price_forecast"][0]["price_eur_per_kwh"] == prices[0][1]
+        assert snapshot["version"] == "indoor_forecast_v4"
+
+    def test_overheat_cap_does_not_create_a_hard_floor(self):
+        from packages.optimizer.milp import MILPOptimizer
+
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            current_indoor_temp=17.0,
+            indoor_targets=[18.0],
+            indoor_rates=[(1.0, -0.5)],
+            room_overheat_active=[True],
+            floor_protection_duty=[1.0],
+        )
+
+        fraction = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert fraction <= 1.0
+
+    def test_overheat_cap_with_blocked_gate_remains_feasible(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            current_indoor_temp=17.0,
+            indoor_targets=[18.0],
+            indoor_rates=[(1.0, -0.5)],
+            gate_states=[SpaceHeatingGateState.BLOCKED],
+            room_overheat_active=[True],
+            floor_protection_duty=[0.5],
+        )
+
+        fraction = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert fraction == pytest.approx(0.0)
+
+    def test_overheat_cap_handles_mixed_allowed_and_blocked_gate_hours(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=2),
+            _make_weather(hours=2),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0, 0.0],
+            current_tank_temp=48.0,
+            current_indoor_temp=17.0,
+            indoor_targets=[18.0, 18.0],
+            indoor_rates=[(1.0, -0.5), (1.0, -0.5)],
+            gate_states=[SpaceHeatingGateState.ALLOWED, SpaceHeatingGateState.BLOCKED],
+            room_overheat_active=[True, True],
+            floor_protection_duty=[0.5, 0.5],
+        )
+
+        fractions = [
+            row["space_heating_fraction"] for row in plan["forecast_snapshot"]["forecast_with_plan"]
+        ]
+        assert fractions[0] > 0.5
+        assert fractions[1] == pytest.approx(0.0)
+
+    def test_non_overheat_solution_remains_feasible_and_unconstrained(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[6.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[False],
+            floor_protection_duty=[0.0],
+        )
+
+        assert plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"] > 0.0
+
+    def test_overheat_cap_blocks_heat_above_floor_requirement(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[True],
+            floor_protection_duty=[0.25],
+        )
+
+        fraction = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert fraction <= 0.25
+
+    def test_generate_plan_envelope_overheat_sets_cap(self):
+        floor_duties = [0.25]
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[True],
+            floor_protection_duty=floor_duties,
+        )
+
+        retained_heat = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert retained_heat <= floor_duties[0]
+
+    def test_envelope_failure_disables_cap(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[6.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[False],
+            floor_protection_duty=[0.0],
+        )
+
+        fraction = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert fraction > 0.0
+
+    def test_cumulative_demand_vs_cap_feasible_via_slack(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[12.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[True],
+            floor_protection_duty=[0.0],
+        )
+
+        assert plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"] > 0.0
+
+    def test_fractional_retry_uses_remaining_shared_budget(self):
+        optimizer = MILPOptimizer()
+        optimizer.SOLVER_TIMEOUT_SECONDS = 1
+
+        clock = iter([0.0, 0.6, 1.1])
+
+        def advance_clock():
+            return next(clock)
+
+        def mark_infeasible(problem, _solver):
+            problem.status = __import__("pulp").constants.LpStatusInfeasible
+
+        with (
+            patch("packages.optimizer.milp.time.monotonic", side_effect=advance_clock),
+            patch("pulp.LpProblem.solve", new=mark_infeasible),
+            pytest.raises(SolverTimeoutError, match="shared timeout budget"),
+        ):
+            optimizer._solve(
+                _make_prices(hours=1),
+                _make_weather(hours=1),
+                cop_fn=lambda temperature, hour=12: 3.0,
+                demand_per_hour=[0.0],
+                current_tank_temp=48.0,
+            )
+
+    def test_no_third_cbc_call(self):
+        optimizer = MILPOptimizer()
+        calls = []
+        original = __import__("pulp").LpProblem.solve
+
+        def record_solve(problem, solver):
+            calls.append(solver)
+            return original(problem, solver)
+
+        with patch("pulp.LpProblem.solve", record_solve):
+            optimizer._solve(
+                _make_prices(hours=1),
+                _make_weather(hours=1),
+                cop_fn=lambda temperature, hour=12: 3.0,
+                demand_per_hour=[0.0],
+                current_tank_temp=48.0,
+            )
+
+        assert len(calls) == 1
+
+    def test_cold_hour_overheat_remains_feasible(self):
+        plan = MILPOptimizer()._solve(
+            _make_prices(hours=1),
+            _make_freezing_weather(hours=1),
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+            room_overheat_active=[True],
+            floor_protection_duty=[0.0],
+        )
+
+        fraction = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+        assert fraction == pytest.approx(0.2)
 
     def test_milp_respects_tank_deadline(self):
         """Tank should be warm enough by deadline hours."""
@@ -437,6 +642,27 @@ class TestMILPSolver:
         assert first_call["wind_speed"] == 9.0
         assert first_call["irradiance"] == 450.0
         assert first_call["precipitation"] == 1.25
+
+    def test_comfort_rates_use_target_timestamp_weather(self):
+        ts = _make_prices(hours=1)[0][0]
+        comfort = MagicMock()
+        comfort.predict_indoor_temp.side_effect = [19.8, 20.2]
+
+        with patch("packages.optimizer.milp.comfort_model", comfort):
+            MILPOptimizer._precompute_indoor_rates(
+                prices=[(ts, 0.1)],
+                weather=[(ts, 5.0)],
+                current_indoor=20.0,
+                heat_curve_water_temp=35.0,
+                weather_full=[
+                    {"ts": ts, "temperature": 1.0},
+                    {"ts": ts + dt.timedelta(hours=1), "temperature": 9.0},
+                ],
+            )
+
+        first_call = comfort.predict_indoor_temp.call_args_list[0].kwargs
+        assert first_call["outdoor_temp"] == 9.0
+        assert first_call["hour"] == (ts + dt.timedelta(hours=1)).hour
 
     def test_milp_infeasible_raises(self):
         """MILP should raise InfeasibleError when constraints are impossible."""

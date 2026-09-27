@@ -12,6 +12,7 @@ from packages.core.settings_service import (
     get_bool_setting,
     get_float_setting,
     get_int_setting,
+    get_setting,
     set_settings_bulk,
 )
 
@@ -54,18 +55,49 @@ async def get_seasonal_calibration_status(
     # as a seasonal transition.
     enough_readings = int(readings or 0) >= 24
     heating_season = bool(enough_readings and average_c is not None and average_c <= threshold_c)
+    safety_deferred_since: dt.datetime | None = None
+    unresolved_summary = {"count": 0}
+    if enabled and heating_season:
+        from packages.core.safety_reverts import unresolved_revert_summary
+
+        async with get_session() as session:
+            unresolved_summary = await unresolved_revert_summary(session, now=now)
+        if int(unresolved_summary["count"]) > 0:
+            raw_deferred_since = await get_setting("_seasonal_calibration_safety_deferred_since")
+            try:
+                safety_deferred_since = dt.datetime.fromisoformat(raw_deferred_since)
+                if safety_deferred_since.tzinfo is None:
+                    safety_deferred_since = safety_deferred_since.replace(tzinfo=dt.timezone.utc)
+            except (TypeError, ValueError):
+                safety_deferred_since = now
+                await set_settings_bulk(
+                    {"_seasonal_calibration_safety_deferred_since": now.isoformat()}
+                )
+        elif await get_setting("_seasonal_calibration_safety_deferred_since"):
+            await set_settings_bulk({"_seasonal_calibration_safety_deferred_since": ""})
+    elif await get_setting("_seasonal_calibration_safety_deferred_since"):
+        await set_settings_bulk({"_seasonal_calibration_safety_deferred_since": ""})
+
     if not enough_readings:
         reason = "waiting_for_recent_outdoor_data"
     elif not heating_season:
         reason = "waiting_for_heating_season"
     elif not enabled:
         reason = "available_but_not_enabled"
+    elif safety_deferred_since is not None:
+        reason = "blocked_by_unresolved_safety_revert"
     else:
         reason = "observe_only_seasonal_calibration_active"
 
+    deferred_seconds = (
+        max(0, int((now - safety_deferred_since).total_seconds()))
+        if safety_deferred_since is not None
+        else None
+    )
+
     return {
         "enabled": enabled,
-        "observe_only_active": bool(enabled and heating_season),
+        "observe_only_active": bool(enabled and heating_season and safety_deferred_since is None),
         "heating_season_detected": heating_season,
         "reason": reason,
         "average_outdoor_c": average_c,
@@ -74,6 +106,12 @@ async def get_seasonal_calibration_status(
         "activation_threshold_c": threshold_c,
         "auto_train": auto_train,
         "auto_exit": auto_exit,
+        "seasonal_blocked_by_unresolved_safety_revert": safety_deferred_since is not None,
+        "seasonal_first_deferred_at": (
+            safety_deferred_since.isoformat() if safety_deferred_since is not None else None
+        ),
+        "seasonal_deferred_seconds": deferred_seconds,
+        "open_revert_obligations": unresolved_summary,
     }
 
 

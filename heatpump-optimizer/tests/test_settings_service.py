@@ -196,6 +196,15 @@ class TestValidateSettingValue:
     def test_get_setting_spec_returns_registered_spec(self):
         assert get_setting_spec("tank_min_temp") is SETTING_SPECS["tank_min_temp"]
 
+    @pytest.mark.parametrize("value", ["0", "1", "0.35"])
+    def test_fraction_accepts_zero_one_and_midpoint(self, value):
+        validate_setting_value("space_heating_default_fraction", value)
+
+    @pytest.mark.parametrize("value", ["-0.01", "1.01", "no", "nan", "inf", "-inf"])
+    def test_fraction_rejects_negative_above_one_nonnumeric_and_nonfinite(self, value):
+        with pytest.raises(ValueError):
+            validate_setting_value("space_heating_default_fraction", value)
+
 
 class TestIsMaskedSecret:
     def test_masked_secret_detected(self):

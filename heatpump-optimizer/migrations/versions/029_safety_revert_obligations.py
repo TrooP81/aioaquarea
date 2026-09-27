@@ -62,7 +62,8 @@ def upgrade() -> None:
     )
     op.add_column("plan_actions", sa.Column("reverts_action_id", sa.Integer(), nullable=True))
     op.add_column(
-        "plan_actions", sa.Column("safety_attempt_count", sa.Integer(), nullable=False, server_default="0")
+        "plan_actions",
+        sa.Column("safety_attempt_count", sa.Integer(), nullable=False, server_default="0"),
     )
     op.add_column("plan_actions", sa.Column("safety_next_retry_at", sa.DateTime(timezone=True)))
     op.add_column("plan_actions", sa.Column("safety_claimed_at", sa.DateTime(timezone=True)))
@@ -90,7 +91,9 @@ def upgrade() -> None:
     )
 
     op.add_column("shower_events", sa.Column("device_id", sa.String(length=128), nullable=True))
-    op.add_column("shower_events", sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column(
+        "shower_events", sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True)
+    )
     op.add_column("shower_events", sa.Column("activation_action_id", sa.Integer(), nullable=True))
     op.create_foreign_key(
         "fk_shower_events_activation_action_id",
@@ -113,10 +116,14 @@ def upgrade() -> None:
         sa.text("SELECT id, started_at, expires_at FROM shower_events WHERE status = 'active'")
     ).mappings()
     for event in active_events:
-        device_rows = connection.execute(
-            sa.text("SELECT device_id FROM device_status WHERE ts = :started_at"),
-            {"started_at": event["started_at"]},
-        ).scalars().all()
+        device_rows = (
+            connection.execute(
+                sa.text("SELECT device_id FROM device_status WHERE ts = :started_at"),
+                {"started_at": event["started_at"]},
+            )
+            .scalars()
+            .all()
+        )
         if len(device_rows) != 1:
             raise RuntimeError(
                 f"cannot infer unique device_id for legacy shower event {event['id']}"
@@ -176,9 +183,7 @@ def upgrade() -> None:
         "ix_shower_events_open_expiry",
         "shower_events",
         ["expires_at"],
-        postgresql_where=sa.text(
-            "status IN ('active', 'recovery_pending', 'timeout_pending')"
-        ),
+        postgresql_where=sa.text("status IN ('active', 'recovery_pending', 'timeout_pending')"),
     )
 
 

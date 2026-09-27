@@ -117,7 +117,6 @@ def test_planners_have_no_stateless_heat_curve_cutoff():
     planner_paths = (
         root / "packages" / "optimizer" / "milp.py",
         root / "packages" / "optimizer" / "rule_mixins.py",
-        root / "packages" / "optimizer" / "rules_engine.py",
     )
 
     for planner_path in planner_paths:

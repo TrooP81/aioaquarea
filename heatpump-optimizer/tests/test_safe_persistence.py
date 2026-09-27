@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from packages.core.config import settings
-from packages.ml.safe_persistence import _validate_path, safe_dump, safe_load
+from packages.ml.safe_persistence import (
+    _validate_path,
+    safe_dump,
+    safe_load,
+    safe_publish_temp,
+    safe_write_temp,
+)
 
 
 @pytest.fixture
@@ -25,6 +31,18 @@ def test_signed_model_round_trip(model_dir: Path) -> None:
     safe_dump({"version": 1, "weights": [1.0, 2.0]}, path)
 
     assert safe_load(path) == {"version": 1, "weights": [1.0, 2.0]}
+
+
+def test_signed_temp_artifact_is_not_visible_until_published(model_dir: Path) -> None:
+    path = model_dir / "model.pkl"
+    temp_path = safe_write_temp({"version": 2}, path)
+
+    assert temp_path.exists()
+    assert not path.exists()
+
+    safe_publish_temp(temp_path, path)
+
+    assert safe_load(path) == {"version": 2}
 
 
 def test_rejects_parent_traversal(model_dir: Path) -> None:

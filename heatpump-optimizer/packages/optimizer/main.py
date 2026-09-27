@@ -768,7 +768,10 @@ async def main() -> None:
         elif not comfort_model.is_trained:
             logger.info("comfort_model_initial_training_needed")
             comfort_result = await comfort_model.train()
-            logger.info("comfort_model_initial_training_finished", **comfort_result)
+            if comfort_result.get("status") in {"training_in_progress", "training_skipped"}:
+                logger.info("comfort_model_initial_training_deferred", **comfort_result)
+            else:
+                logger.info("comfort_model_initial_training_finished", **comfort_result)
 
     wrapper = AquareaWrapper()
     await wrapper.start()

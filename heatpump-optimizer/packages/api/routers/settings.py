@@ -65,6 +65,18 @@ class ComfortScheduleUpdate(BaseModel):
     weekend: list[int]
 
 
+async def get_baseline_promotion_readiness() -> bool:
+    """Read promotion evidence without allowing scorer failures to promote."""
+    try:
+        from packages.ml.forecast_quality import get_forecast_scorecard
+
+        scorecard = await get_forecast_scorecard()
+        comparison = scorecard.get("baseline_comparison", {})
+        return comparison.get("promotion_ready") is True
+    except Exception:
+        return False
+
+
 @router.get("/api/settings")
 async def get_settings():
     values = await get_all_settings()
@@ -88,7 +100,9 @@ async def get_settings():
 
 @router.put("/api/settings")
 async def update_settings(body: SettingsUpdate):
-    invalid_keys = [k for k in body.settings if k not in SETTINGS_SCHEMA]
+    invalid_keys = [
+        key for key in body.settings if key.startswith("_") or key not in SETTINGS_SCHEMA
+    ]
     if invalid_keys:
         raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
 
@@ -107,6 +121,17 @@ async def update_settings(body: SettingsUpdate):
             errors[key] = str(exc)
     if errors:
         raise HTTPException(status_code=400, detail={"invalid_values": errors})
+
+    if "space_heating_baseline_mode" in cleaned:
+        persisted = await get_all_settings()
+        current_mode = persisted.get("space_heating_baseline_mode", "shadow")
+        requested_mode = cleaned["space_heating_baseline_mode"]
+        if current_mode != "on" and requested_mode == "on":
+            if not await get_baseline_promotion_readiness():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Baseline promotion evidence is not ready",
+                )
 
     gate_setting_keys = {
         "heat_curve_heating_off_outdoor_c",

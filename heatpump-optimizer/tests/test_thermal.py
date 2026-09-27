@@ -513,6 +513,194 @@ class TestIndoorCurve:
         curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=6)
         assert all(entry["source"] == "linear_rates" for entry in curve)
 
+    def test_curve_interpolates_delta(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 23.0, 26.0, 32.0]
+        comfort.predict_passive_indoor_temp.side_effect = [
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+        ]
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(12)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[1.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+            )
+
+        assert curve is not None
+        assert curve[0]["predicted_indoor_temp"] == 21.0
+        assert curve[1]["predicted_indoor_temp"] == 22.0
+        assert curve[1]["segment_kind"] == "interpolated"
+        assert curve[2]["predicted_indoor_temp"] == 23.0
+
+    def test_curve_blends_to_anchored_physics(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 22.0, 23.0, 24.0]
+        comfort.predict_passive_indoor_temp.side_effect = [(20.0, {"ready": True})] * 4
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(24)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 24,
+                heating_fractions=[1.0] * 24,
+                weather_forecast=weather,
+                hours=24,
+            )
+
+        assert curve is not None
+        assert curve[11]["predicted_indoor_temp"] == 24.0
+        assert curve[12]["source"] == "comfort_model_physics_continuation"
+        assert curve[12]["segment_kind"] == "physics_continuation"
+
+    def test_no_heat_curve_is_cumulatively_nonincreasing(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 22.0, 23.0, 24.0]
+        comfort.predict_passive_indoor_temp.side_effect = [
+            (21.0, {"ready": True}),
+            (22.0, {"ready": True}),
+            (23.0, {"ready": True}),
+            (24.0, {"ready": True}),
+        ]
+        weather = [
+            {"outdoor_temp": 5.0 - hour, "irradiance": 0.0, "hour": hour} for hour in range(12)
+        ]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[0.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+            )
+
+        assert curve is not None
+        assert all(point["source"] == "comfort_model_passive_direct" for point in curve)
+        assert all(
+            current["predicted_indoor_temp"] <= previous["predicted_indoor_temp"]
+            for previous, current in zip(curve, curve[1:])
+        )
+
+    def test_hybrid_curve_passes_configured_passive_change_limit(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [20.0] * 4
+
+        def passive_forecast(**kwargs):
+            return (
+                20.0 + kwargs["max_change_c_per_hour"] * kwargs["forecast_horizon_minutes"] / 60,
+                {"ready": True},
+            )
+
+        comfort.predict_passive_indoor_temp.side_effect = passive_forecast
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(12)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[0.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+                max_passive_change_c_per_hour=0.2,
+            )
+
+        assert curve is not None
+        assert curve[0]["predicted_indoor_temp"] == 20.2
+        assert all(
+            call.kwargs["max_change_c_per_hour"] == 0.2
+            for call in comfort.predict_passive_indoor_temp.call_args_list
+        )
+
+    def test_candidate_curve_requires_complete_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={60: MagicMock()},
+        )
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            candidate = model.predict_indoor_candidate_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[0.0],
+                weather_forecast=[{"outdoor_temp": 5.0, "hour": 1}],
+                hours=1,
+            )
+
+        assert candidate is None
+
+    def test_candidate_curve_allows_controlled_forecast_without_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={},
+        )
+        comfort.predict_indoor_temp.return_value = 20.4
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            candidate = model.predict_indoor_candidate_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[1.0],
+                weather_forecast=[{"outdoor_temp": 5.0, "hour": 1}],
+                hours=1,
+            )
+
+        assert candidate is not None
+        assert candidate[0]["source"] == "comfort_model_controlled"
+
+    def test_live_no_heating_uses_physics_without_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={},
+        )
+        comfort.predict_indoor_temp.return_value = 20.4
+        weather = [{"outdoor_temp": 5.0, "hour": 1}]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            no_heating = model.predict_indoor_controlled_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[0.0],
+                weather_forecast=weather,
+                hours=1,
+                use_learned_forecast=True,
+            )
+            with_plan = model.predict_indoor_controlled_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[1.0],
+                weather_forecast=weather,
+                hours=1,
+                use_learned_forecast=True,
+            )
+
+        assert no_heating[0]["source"] == "linear_controlled"
+        assert with_plan[0]["source"] == "comfort_model_controlled"
+
     def test_indoor_curve_cooling_without_heating(self):
         """With low water temp, indoor should cool toward outdoor."""
         model = ThermalModel()

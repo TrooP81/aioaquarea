@@ -23,6 +23,8 @@ from packages.core.device_data_quality import get_device_data_quality
 from packages.core.safety_reverts import (
     UNRESOLVED_STATUSES,
     restore_baseline_target,
+    serialize_unresolved_revert_summary,
+    unresolved_revert_summary,
     zone_matches_baseline,
 )
 from packages.core.plan_outcome import measured_window_outcome, plan_measurement
@@ -416,7 +418,36 @@ async def _learning_mode_status() -> dict[str, object]:
         except ValueError:
             since_iso = None
 
-    return {"enabled": enabled, "since": since_iso, "days_elapsed": days_elapsed}
+    now = dt.datetime.now(dt.timezone.utc)
+    async with get_session() as session:
+        obligations = await unresolved_revert_summary(session, now=now)
+    obligations = serialize_unresolved_revert_summary(obligations)
+    seasonal: dict[str, object] = {}
+    state_reliable = True
+    try:
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status(now=now)
+    except Exception:
+        logger.exception("learning_mode_seasonal_status_lookup_failed")
+        state_reliable = False
+    sources = ["manual"] if enabled else []
+    if seasonal.get("observe_only_active"):
+        sources.append("seasonal")
+    return {
+        "enabled": enabled,
+        "since": since_iso,
+        "days_elapsed": days_elapsed,
+        "effective_active": bool(sources),
+        "sources": sources,
+        "state_reliable": state_reliable,
+        "open_revert_obligations": obligations,
+        "seasonal_blocked_by_unresolved_safety_revert": bool(
+            seasonal.get("seasonal_blocked_by_unresolved_safety_revert")
+        ),
+        "seasonal_first_deferred_at": seasonal.get("seasonal_first_deferred_at"),
+        "seasonal_deferred_seconds": seasonal.get("seasonal_deferred_seconds"),
+    }
 
 
 @router.get("/api/learning-mode")
@@ -426,7 +457,7 @@ async def get_learning_mode():
 
 
 @router.post("/api/learning-mode")
-async def set_learning_mode(body: LearningModeUpdate):
+async def set_learning_mode(body: LearningModeUpdate, force: bool = Query(False)):
     """Enable or disable observe-only learning mode.
 
     While enabled the optimizer keeps generating plans but the executor dispatches
@@ -437,6 +468,16 @@ async def set_learning_mode(body: LearningModeUpdate):
 
     was_enabled = await get_bool_setting("learning_mode_enabled")
     now = dt.datetime.now(dt.timezone.utc)
+    obligation_snapshot: dict[str, object] | None = None
+    if body.enabled:
+        async with get_session() as session:
+            obligation_snapshot = await unresolved_revert_summary(session, now=now)
+        obligation_snapshot = serialize_unresolved_revert_summary(obligation_snapshot)
+        if int(obligation_snapshot["count"]) > 0 and not force:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "unresolved_safety_reverts", "obligations": obligation_snapshot},
+            )
 
     updates = {"learning_mode_enabled": "true" if body.enabled else "false"}
     if body.enabled and not was_enabled:
@@ -451,7 +492,13 @@ async def set_learning_mode(body: LearningModeUpdate):
             AuditLogRecord(
                 actor="user",
                 action="set_learning_mode",
-                payload_json=json.dumps({"enabled": body.enabled}),
+                payload_json=json.dumps(
+                    {
+                        "enabled": body.enabled,
+                        "force": force,
+                        "obligations": obligation_snapshot,
+                    },
+                ),
                 result="enabled" if body.enabled else "disabled",
             )
         )

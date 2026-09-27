@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import desc, select
+import structlog
 
 from packages.api._helpers import get_price_area
 from packages.api.schemas import IndoorForecastResponse
@@ -24,6 +25,85 @@ from packages.core.models import (
 from packages.ml.forecast_quality import get_forecast_scorecard as build_forecast_scorecard
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
+
+
+def _forecast_status_from_quality(forecast_quality: dict[str, object]) -> str:
+    """Keep presentation fail-closed when learned control is not permitted."""
+    return "available" if forecast_quality.get("control_allowed") else "fallback"
+
+
+def _safe_room_comfort_envelope(control_temperature, *, comfort_temp_max: float):
+    """Treat room-envelope failures as absent evidence, without exposing readings."""
+    from packages.core.control_temperature import build_room_comfort_envelope
+
+    try:
+        return build_room_comfort_envelope(control_temperature, comfort_temp_max=comfort_temp_max)
+    except Exception as exc:  # noqa: BLE001 - presentation must fail closed
+        logger.warning("room_comfort_envelope_unavailable", error_type=type(exc).__name__)
+        return None
+
+
+def _build_active_plan_comfort_assessment(
+    *,
+    plan_snapshot: dict[str, Any],
+    planned_actions: list[dict[str, Any]],
+    heat_curve,
+    gate_projections,
+    room_envelope,
+    comfort_temp_min: float,
+) -> dict[str, Any]:
+    """Assess an active plan against fresh room evidence, not saved room state."""
+    from packages.core.comfort_assessment import build_comfort_assessment
+
+    return build_comfort_assessment(
+        forecast=plan_snapshot.get("forecast_with_plan", []),
+        targets=plan_snapshot.get("target_schedule", []),
+        weather=plan_snapshot.get("weather_forecast", []),
+        planned_actions=planned_actions,
+        heat_curve=heat_curve,
+        gate_projections=gate_projections,
+        forecast_status=plan_snapshot.get("forecast_status", "unavailable"),
+        room_envelope=room_envelope,
+        comfort_temp_min=comfort_temp_min,
+    )
+
+
+async def _read_live_forecast_quality() -> dict[str, object]:
+    """Evaluate the shared gate without advancing its persisted hysteresis."""
+    from packages.ml.comfort_model import comfort_model
+    from packages.ml.forecast_quality import (
+        apply_control_gate_hysteresis,
+        evaluate_live_control_gate,
+    )
+
+    metrics = comfort_model.metrics
+
+    def read_only_record_gate(
+        gate: dict[str, object],
+        *,
+        schema: str,
+        required_horizons: tuple[int, ...],
+        passes_required: int,
+        failures_required: int,
+        evaluation_id: str | None = None,
+        evaluation_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        del evaluation_id
+        return apply_control_gate_hysteresis(
+            gate,
+            metrics,
+            schema=schema,
+            required_horizons=required_horizons,
+            passes_required=passes_required,
+            failures_required=failures_required,
+            evaluation_context=evaluation_context,
+        )
+
+    return await evaluate_live_control_gate(
+        model_metrics=metrics,
+        record_gate=read_only_record_gate,
+    )
 
 
 @router.get("/api/thermal/forecast-scorecard")
@@ -101,6 +181,9 @@ def _plan_forecast_window(
     if not isinstance(snapshot, dict) or snapshot.get("version") not in {
         "indoor_forecast_v1",
         "indoor_forecast_v2",
+        "indoor_forecast_v3",
+        "indoor_forecast_v4",
+        "indoor_forecast_v5",
     }:
         return None
 
@@ -163,6 +246,9 @@ def _plan_forecast_window(
                     "source": source.get("source"),
                     "model_source": source.get("model_source"),
                     "space_heating_fraction": source.get("space_heating_fraction"),
+                    "baseline_heating_fraction": source.get("baseline_heating_fraction"),
+                    "baseline_heating_source": source.get("baseline_heating_source"),
+                    "space_heating_source": source.get("space_heating_source"),
                     "prediction_lower_c": source.get("prediction_lower_c"),
                     "prediction_upper_c": source.get("prediction_upper_c"),
                     "prediction_interval_status": source.get("prediction_interval_status"),
@@ -221,6 +307,11 @@ def _plan_forecast_window(
     except (TypeError, ValueError):
         current_indoor = None
 
+    legacy_snapshot = snapshot.get("version") in {
+        "indoor_forecast_v1",
+        "indoor_forecast_v2",
+        "indoor_forecast_v3",
+    }
     return {
         "current_indoor": current_indoor,
         "forecast": forecast,
@@ -229,12 +320,23 @@ def _plan_forecast_window(
         "target_schedule": targets,
         "weather_forecast": weather,
         "price_forecast": prices,
-        "forecast_status": "available",
+        "forecast_status": "legacy"
+        if legacy_snapshot
+        else snapshot.get("forecast_status", "unavailable"),
         "forecast_unavailable_reason": None,
         "forecast_provenance": {
             "control_input": snapshot.get("control_input", {}),
             "heat_curve": snapshot.get("heat_curve", {}),
         },
+        "observed_history": snapshot.get("observed_history", []),
+        "sensor_basis": snapshot.get("sensor_basis", {}),
+        "forecast_quality": snapshot.get(
+            "forecast_quality", {"status": "legacy"} if legacy_snapshot else {}
+        ),
+        "space_heating_baseline": snapshot.get("space_heating_baseline", {}),
+        "room_comfort": snapshot.get(
+            "room_comfort", {"status": "legacy"} if legacy_snapshot else {}
+        ),
     }
 
 
@@ -254,7 +356,7 @@ def _enforce_physical_ordering(
 
     Note: the managed forecast is intentionally allowed to dip *below* the base
     forecast overnight (it reflects the comfort-schedule setback), so it is not
-    clamped up to the base ÔÇö only to the no-heating floor.
+    clamped up to the base — only to the no-heating floor.
     """
     key = "predicted_indoor_temp"
     n = min(len(forecast), len(forecast_with_plan), len(forecast_no_heating))
@@ -305,6 +407,8 @@ async def trigger_comfort_model_training():
         result = await comfort_model.train(thermal_lag_minutes=lag)
         result["control_ready"] = comfort_model.is_ready_for_control
         result["control_readiness"] = comfort_model.control_readiness
+        if result.get("status") in {"training_in_progress", "training_skipped"}:
+            _log.info("comfort_train_deferred", **result)
     except Exception as exc:
         _log.error("comfort_train_error", error=str(exc), traceback=traceback.format_exc())
         result = {"error": f"Training failed: {exc}"}
@@ -603,8 +707,8 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     # Prefer the actual optimizer plan: the MILP chose *when* to reheat DHW based
     # on price/COP, so the "with heating" curve should follow those scheduled
     # cycles rather than a generic deadband. In learning mode the executor
-    # dispatches nothing ÔÇö the plan is created but not run, so the tank follows
-    # the heat pump's native behaviour ÔÇö so we fall back to the deadband estimate
+    # dispatches nothing — the plan is created but not run, so the tank follows
+    # the heat pump's native behaviour — so we fall back to the deadband estimate
     # and flag it instead of pretending the plan drives the tank.
     learning_mode = await is_learning_mode_active()
     dhw_minutes_per_hour = [0.0] * hours
@@ -653,7 +757,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         )
     else:
         # No executable plan (or learning mode): fall back to the comfort-schedule
-        # deadband ÔÇö coast to the per-hour floor and reheat to target.
+        # deadband — coast to the per-hour floor and reheat to target.
         tank_heating_curve = thermal_model.predict_managed_tank_curve(
             current_temp=current_tank,
             outdoor_temp=outdoor,
@@ -913,7 +1017,9 @@ async def get_heat_curve_advice():
 @router.get("/api/thermal/indoor-forecast", response_model=IndoorForecastResponse)
 async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     from packages.core.comfort_assessment import build_comfort_assessment
-    from packages.core.control_temperature import get_control_temperature
+    from packages.core.control_temperature import (
+        get_control_temperature,
+    )
     from packages.core.settings_service import (
         get_comfort_schedule,
         get_heat_curve_config,
@@ -925,6 +1031,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     from packages.ml.thermal import thermal_model
 
     thermal_model.load_latest()
+    forecast_quality = await _read_live_forecast_quality()
     price_area = await get_price_area()
     async with get_session() as session:
         status_result = await session.execute(
@@ -1031,6 +1138,11 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             )
 
     heat_curve = await get_heat_curve_config()
+    comfort_temp_min = float(await get_setting("comfort_temp_min") or 20.0)
+    comfort_temp_max = float(await get_setting("comfort_temp_max") or 22.0)
+    room_envelope = _safe_room_comfort_envelope(
+        control_temperature, comfort_temp_max=comfort_temp_max
+    )
     from packages.core.space_heating_gate import project_gate_states, resolve_effective_gate
 
     gate_config = await get_space_heating_gate_config()
@@ -1126,14 +1238,13 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             display_status = "aging"
         else:
             display_status = "fresh"
-        assessment = build_comfort_assessment(
-            forecast=plan_snapshot.get("forecast_with_plan", []),
-            targets=plan_snapshot.get("target_schedule", []),
-            weather=snapshot_weather,
+        assessment = _build_active_plan_comfort_assessment(
+            plan_snapshot=plan_snapshot,
             planned_actions=planned_actions,
             heat_curve=heat_curve,
             gate_projections=gate_projections,
-            forecast_status=plan_snapshot.get("forecast_status", "available"),
+            room_envelope=room_envelope,
+            comfort_temp_min=comfort_temp_min,
         )
         return {
             "current_indoor": snapshot_indoor if snapshot_indoor is not None else current_indoor,
@@ -1148,7 +1259,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "forecast_source": "active_plan"
             if plan_snapshot.get("forecast_status") != "unavailable"
             else "unavailable",
-            "forecast_status": plan_snapshot.get("forecast_status", "available"),
+            "forecast_status": plan_snapshot.get("forecast_status", "unavailable"),
             "forecast_unavailable_reason": plan_snapshot.get("forecast_unavailable_reason"),
             "plan_id": active_plan.id,
             "plan_created_at": active_plan.created_at,
@@ -1164,6 +1275,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "sensor_age_seconds": sensor_age_seconds,
             "current_vs_plan_delta_c": current_vs_plan_delta_c,
             "space_heating_gate": gate_payload,
+            "forecast_quality": forecast_quality,
         }
 
     if current_indoor is None:
@@ -1189,6 +1301,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                 if control_temperature.latest_reading is not None
                 else None
             ),
+            "forecast_quality": forecast_quality,
         }
 
     # Schedule-aware comfort setpoint per hour, matching the optimizer: the home
@@ -1231,6 +1344,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         zone_water_temps=zone_water_temps,
         weather_forecast=weather_forecast,
         hours=hours,
+        use_learned_forecast=bool(forecast_quality.get("control_allowed")),
     )
     # "No heating" baseline: the home with the heat pump fully off, drifting
     # toward outdoor through its envelope. A pure physical free-float, rather
@@ -1272,7 +1386,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         "price_forecast": price_forecast,
         "planned_actions": planned_actions,
         "forecast_source": "live_estimate",
-        "forecast_status": "available",
+        "forecast_status": _forecast_status_from_quality(forecast_quality),
         "forecast_unavailable_reason": None,
         "plan_id": active_plan.id if active_plan else None,
         "plan_created_at": active_plan.created_at if active_plan else None,
@@ -1283,7 +1397,34 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             planned_actions=planned_actions,
             heat_curve=heat_curve,
             gate_projections=gate_projections,
+            forecast_status=_forecast_status_from_quality(forecast_quality),
+            room_envelope=room_envelope,
+            comfort_temp_min=comfort_temp_min,
         ),
+        "observed_history": (
+            [
+                {
+                    "hour": 0,
+                    "ts": control_temperature.latest_reading.isoformat(),
+                    "temperature": current_indoor,
+                }
+            ]
+            if current_indoor is not None and control_temperature.latest_reading is not None
+            else []
+        ),
+        "sensor_basis": {
+            "method": "reference_sensor"
+            if control_temperature.reference_sensor_id
+            else "selected_sensor_median",
+            "label": control_temperature.reference_sensor_label or "Selected sensor median",
+        },
+        "room_comfort": {
+            "basis_temperature": room_envelope.basis_temperature if room_envelope else None,
+            "fresh_inlier_min": room_envelope.fresh_inlier_min if room_envelope else None,
+            "fresh_inlier_max": room_envelope.fresh_inlier_max if room_envelope else None,
+            "affected_rooms": list(room_envelope.rooms_above_max) if room_envelope else [],
+        },
+        "forecast_quality": forecast_quality,
         "forecast_provenance": {
             "current_live_indoor_c": current_indoor,
             "control_input": {

@@ -31,25 +31,33 @@ def _validate_path(path: Path) -> Path:
     return resolved
 
 
-def safe_dump(obj: Any, path: Path) -> None:
-    """Serialize object to file with HMAC integrity tag."""
+def safe_write_temp(obj: Any, path: Path) -> Path:
+    """Serialize a signed artifact to a temporary file beside *path*."""
     resolved = _validate_path(path)
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     mac = hmac.new(_get_signing_key(), data, hashlib.sha256).digest()
+    with NamedTemporaryFile(
+        mode="wb", dir=resolved.parent, prefix=f".{resolved.name}.", delete=False
+    ) as temp:
+        temp.write(mac + data)
+        temp.flush()
+        return Path(temp.name)
 
-    # Write then atomically replace so a reader in another service never sees
-    # a partial model during a concurrent calibration.
-    temp_path: Path | None = None
+
+def safe_publish_temp(temp_path: Path, path: Path) -> None:
+    """Atomically publish a previously signed temporary artifact."""
+    resolved = _validate_path(path)
+    resolved_temp = _validate_path(temp_path)
+    resolved_temp.replace(resolved)
+
+
+def safe_dump(obj: Any, path: Path) -> None:
+    """Serialize object to file with HMAC integrity tag."""
+    temp_path = safe_write_temp(obj, path)
     try:
-        with NamedTemporaryFile(
-            mode="wb", dir=resolved.parent, prefix=f".{resolved.name}.", delete=False
-        ) as temp:
-            temp.write(mac + data)
-            temp.flush()
-            temp_path = Path(temp.name)
-        temp_path.replace(resolved)
+        safe_publish_temp(temp_path, path)
     finally:
-        if temp_path is not None and temp_path.exists():
+        if temp_path.exists():
             temp_path.unlink()
 
 

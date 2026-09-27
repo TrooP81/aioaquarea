@@ -289,7 +289,7 @@ npm run test:e2e:live
 ## Safety
 
 - Manual override **always wins** over the optimizer
-- **Learning mode** suppresses all device commands while enabled (optimizer observes only) — useful for safely collecting training data
+- **Learning mode** suppresses all device commands while enabled (optimizer observes only) — useful for safely collecting training data. Unresolved safety restores wait until control resumes, so normal activation is blocked until they close; forcing activation is exceptional and audited.
 - Rate limiter prevents API abuse (30 reads/h, 20 writes/h)
 - Circuit breaker disables auth for 15 min after 3 failures
 - All actions are audit-logged

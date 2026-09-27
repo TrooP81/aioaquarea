@@ -105,4 +105,57 @@ test.describe("Learning Mode", () => {
     await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();
     await expect(page.locator(".override-banner")).toContainText("Learning mode active");
   });
+
+  test("shows pending restore warning and cancels force activation", async ({ page }) => {
+    await mockCommon(page);
+    let postCount = 0;
+    await page.route("**/api/learning-mode", (route) => {
+      if (route.request().method() === "POST") {
+        postCount += 1;
+        return route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: { code: "unresolved_safety_reverts", obligations: { count: 1 } } }),
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ enabled: false, since: null, days_elapsed: null, open_revert_obligations: { count: 1, oldest_age_seconds: 180, action_types: ["force_dhw_off"] } }),
+      });
+    });
+    let dialogs = 0;
+    page.on("dialog", (dialog) => {
+      dialogs += 1;
+      return dialogs === 1 ? dialog.accept() : dialog.dismiss();
+    });
+    await page.goto("/");
+    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("button", { name: "Turn On Learning Mode" }).click();
+
+    await expect(page.getByText("Safety restores wait until control resumes.")).toBeVisible();
+    expect(postCount).toBe(1);
+  });
+
+  test("confirms and retries forced activation after a 409", async ({ page }) => {
+    await mockCommon(page);
+    const requests: string[] = [];
+    await page.route("**/api/learning-mode*", (route) => {
+      if (route.request().method() === "POST") {
+        requests.push(route.request().url());
+        if (requests.length === 1) {
+          return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ detail: { obligations: { count: 1 } } }) });
+        }
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, since: new Date().toISOString(), days_elapsed: 0, open_revert_obligations: { count: 1, oldest_age_seconds: 180, action_types: ["force_dhw_off"] } }) });
+      }
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: false, since: null, days_elapsed: null, open_revert_obligations: { count: 1, oldest_age_seconds: 180, action_types: ["force_dhw_off"] } }) });
+    });
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.goto("/");
+    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("button", { name: "Turn On Learning Mode" }).click();
+
+    await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();
+    expect(requests[1]).toContain("force=true");
+  });
 });

@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from packages.optimizer import InfeasibleError, SolverTimeoutError
+
 
 class _FakeResult:
     def __init__(self, rows):
@@ -748,10 +750,12 @@ class TestOrchestratorFallback:
                 MockRules.return_value.generate_plan.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_milp_failure_falls_back_to_rules(self):
+    @pytest.mark.parametrize(
+        "failure", [SolverTimeoutError("timeout"), InfeasibleError("infeasible")]
+    )
+    async def test_milp_failure_falls_back_to_rules(self, failure):
         """When MILP raises, the orchestrator should fall back to rules."""
         from packages.optimizer.main import run_optimization
-        from packages.optimizer import DataIncompleteError
 
         mock_plan = {
             "horizon_start": dt.datetime.now(dt.timezone.utc),
@@ -770,7 +774,7 @@ class TestOrchestratorFallback:
                 "packages.optimizer.main._select_optimizer", new_callable=AsyncMock
             ) as mock_select:
                 mock_milp = AsyncMock()
-                mock_milp.generate_plan = AsyncMock(side_effect=DataIncompleteError("no prices"))
+                mock_milp.generate_plan = AsyncMock(side_effect=failure)
                 mock_select.return_value = ("milp", mock_milp)
 
                 with patch("packages.optimizer.main.RulesOptimizer") as MockRules:

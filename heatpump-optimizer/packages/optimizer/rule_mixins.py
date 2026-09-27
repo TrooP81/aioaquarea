@@ -224,6 +224,9 @@ class SharedRuleHelpersMixin:
         current_water_temp: float,
         heat_curve: HeatCurveConfig | None = None,
         weather_full: list[dict] | None = None,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
     ) -> dict[dt.datetime, float]:
         """Predict indoor temperature with no planned space heating.
 
@@ -249,9 +252,11 @@ class SharedRuleHelpersMixin:
         curve = thermal_model.predict_indoor_controlled_curve(
             current_indoor=current_indoor_temp,
             zone_water_temps=zone_water_temps,
-            heating_fractions=[0.0] * len(weather_forecast),
+            heating_fractions=baseline_heating_fractions or [0.0] * len(weather_forecast),
             weather_forecast=weather_forecast,
             hours=len(weather_forecast),
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
         )
         return {ts: float(row["predicted_indoor_temp"]) for ts, row in zip(timestamps, curve)}
 
@@ -604,6 +609,9 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         gate_evidence: list[tuple[dt.datetime, object]] | None,
         *,
         gate_control_enabled: bool,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
     ) -> list[dict]:
         """Bank cheap heat in the building without exceeding the comfort target."""
 
@@ -745,10 +753,21 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                         current_indoor=current_indoor_temp,
                         zone_water_temps=zone_water_temps,
                         heating_fractions=[
-                            1.0 if weather_ts == candidate_ts else 0.0 for weather_ts, _ in weather
+                            max(
+                                (
+                                    baseline_heating_fractions[index]
+                                    if baseline_heating_fractions
+                                    and index < len(baseline_heating_fractions)
+                                    else 0.0
+                                ),
+                                1.0 if weather_ts == candidate_ts else 0.0,
+                            )
+                            for index, (weather_ts, _) in enumerate(weather)
                         ],
                         weather_forecast=weather_forecast,
                         hours=len(weather),
+                        use_learned_forecast=use_learned_forecast,
+                        max_passive_change_c_per_hour=max_passive_change_c_per_hour,
                     )
                     peak = max(float(point["predicted_indoor_temp"]) for point in curve)
                     if (
@@ -827,6 +846,9 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         comfort_temp_max: float = 22.0,
         *,
         gate_control_enabled: bool = False,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
     ) -> list[dict]:
         actions = []
         if not weather:
@@ -840,6 +862,9 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             current_water_temp,
             heat_curve,
             weather_full,
+            use_learned_forecast,
+            max_passive_change_c_per_hour,
+            baseline_heating_fractions,
         )
         cold_risk: tuple[dt.datetime, float, float] | None = None
         for index, (ts, outdoor_temp) in enumerate(weather):
@@ -878,6 +903,9 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 current_zone_heat_max,
                 gate_evidence,
                 gate_control_enabled=gate_control_enabled,
+                use_learned_forecast=use_learned_forecast,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                baseline_heating_fractions=baseline_heating_fractions,
             )
 
         if gate_control_enabled and not self._has_valid_gate_projections(weather, gate_projections):
@@ -1017,6 +1045,10 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         gate_projections: list | None = None,
         *,
         gate_control_enabled: bool = False,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
+        floor_heating_fractions: list[float] | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
         if not weather:
@@ -1045,12 +1077,23 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         # snapshot.  ``predict_indoor_curve`` treats a warm zone-water target
         # as active heating, which could hide a future comfort miss here while
         # the chart correctly showed the home coasting.
-        curve = thermal_model.predict_indoor_controlled_curve(
+        expected_curve = thermal_model.predict_indoor_controlled_curve(
             current_indoor=current_indoor_temp,
             zone_water_temps=curve_supply_temps,
-            heating_fractions=[0.0] * hours,
+            heating_fractions=baseline_heating_fractions or [0.0] * hours,
             weather_forecast=weather_forecast,
             hours=hours,
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+        )
+        minimum_curve = thermal_model.predict_indoor_controlled_curve(
+            current_indoor=current_indoor_temp,
+            zone_water_temps=curve_supply_temps,
+            heating_fractions=floor_heating_fractions or [0.0] * hours,
+            weather_forecast=weather_forecast,
+            hours=hours,
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
         )
 
         for h in range(hours):
@@ -1064,10 +1107,20 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 # so do not create an action the pump cannot execute.
                 continue
 
-            predicted_indoor = (
-                curve[h]["predicted_indoor_temp"] if h < len(curve) else current_indoor_temp
+            expected_indoor = (
+                expected_curve[h]["predicted_indoor_temp"]
+                if h < len(expected_curve)
+                else current_indoor_temp
+            )
+            floor_indoor = (
+                minimum_curve[h]["predicted_indoor_temp"]
+                if h < len(minimum_curve)
+                else current_indoor_temp
             )
             target = max(comfort_temp_target, comfort_temp_min)
+            predicted_indoor = (
+                floor_indoor if floor_indoor < comfort_temp_min - 0.3 else expected_indoor
+            )
             if predicted_indoor >= target or target - predicted_indoor < 0.3:
                 continue
 
@@ -1364,6 +1417,9 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         gate_projections: list | None = None,
         *,
         gate_control_enabled: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
+        use_learned_forecast: bool = False,
     ) -> list[dict]:
         actions = []
         if not prices or special_status_supported is not True:
@@ -1396,6 +1452,9 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                 current_water_temp,
                 heat_curve,
                 weather_full,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                baseline_heating_fractions=baseline_heating_fractions,
+                use_learned_forecast=use_learned_forecast,
             )
             if current_indoor_temp is not None and comfort_temp_target is not None
             else {}

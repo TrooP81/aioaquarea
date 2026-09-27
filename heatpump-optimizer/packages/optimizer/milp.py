@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import math
+import time
 from typing import Any
 
 from sqlalchemy import select
@@ -16,7 +17,11 @@ except ImportError:
 
 from packages.core.config import settings
 from packages.core.database import get_session
-from packages.core.control_temperature import get_control_temperature
+from packages.core.control_temperature import (
+    build_forecast_observation_metadata,
+    build_room_comfort_envelope,
+    get_control_temperature,
+)
 from packages.core.time_slots import next_hour_boundary
 from packages.core.settings_service import (
     get_comfort_schedule,
@@ -36,10 +41,15 @@ from packages.ml.thermal import thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
 from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
+from packages.optimizer.rules_engine import minimum_floor_protection_duties
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+async def _return_scorecard(scorecard: dict[str, Any]) -> dict[str, Any]:
+    return scorecard
 
 
 def _dhw_deadline_offsets(
@@ -74,6 +84,7 @@ class MILPOptimizer:
     # deliberately far above any realistic energy saving, but keeps the model
     # feasible when a measured cold start cannot physically recover in one hour.
     COMFORT_VIOLATION_PENALTY = 1000.0
+    OVERHEAT_VIOLATION_PENALTY = 900.0
 
     def __init__(self, cop_model=None, demand_model=None):
         """
@@ -120,12 +131,17 @@ class MILPOptimizer:
         # rules only when an otherwise executable ML plan is about to rely on
         # a recently inaccurate forecast.
         from packages.ml.forecast_quality import (
+            evaluate_live_control_gate,
             get_forecast_scorecard,
             prediction_intervals_for_weather,
         )
 
         scorecard = await get_forecast_scorecard()
-        quality_gate = scorecard["quality_gate"]
+        quality_gate = await evaluate_live_control_gate(
+            model_metrics=comfort_model.metrics,
+            record_gate=comfort_model.record_forecast_quality_gate,
+            scorecard_loader=lambda: _return_scorecard(scorecard),
+        )
         if not quality_gate["control_allowed"]:
             logger.warning("milp_forecast_quality_fallback", gate=quality_gate)
             raise DataIncompleteError("Recent indoor forecasts did not pass the live quality gate")
@@ -205,6 +221,12 @@ class MILPOptimizer:
         comfort_temp_min = float(
             await get_setting("comfort_temp_min") or getattr(settings, "comfort_temp_min", 18.0)
         )
+        comfort_temp_max = float(
+            await get_setting("comfort_temp_max") or getattr(settings, "comfort_temp_max", 25.0)
+        )
+        room_envelope = build_room_comfort_envelope(
+            control_temperature, comfort_temp_max=comfort_temp_max
+        )
         indoor_targets = []
         operational_indoor_targets = []
         reported_indoor_targets = []
@@ -279,6 +301,25 @@ class MILPOptimizer:
                     sample_h0_loss=round(indoor_rates[0][1], 3),
                 )
 
+        rate_pairs = indoor_rates or [
+            (
+                thermal_model._indoor_heating_rate(float(weather[h][1])),
+                thermal_model._indoor_cooling_rate(float(weather[h][1])),
+            )
+            for h in range(len(prices))
+        ]
+        room_overheat_active = bool(room_envelope.rooms_above_max)
+        floor_protection_duty = minimum_floor_protection_duties(
+            basis_temperature=room_envelope.basis_temperature,
+            comfort_temp_min=comfort_temp_min,
+            indoor_rates=rate_pairs,
+        )
+        if not room_overheat_active:
+            floor_protection_duty = [0.0] * len(prices)
+        elif room_envelope.basis_temperature is None:
+            logger.warning("milp_room_envelope_unavailable_overheat_cap_disabled")
+            room_overheat_active = False
+
         # Solve synchronously in a thread to avoid blocking the event loop
         plan = await asyncio.to_thread(
             self._solve,
@@ -303,6 +344,8 @@ class MILPOptimizer:
             uncertainty_margins,
             forecast_adjustments["hourly_regimes"],
             [evidence.state for evidence in gate_projections],
+            [room_overheat_active] * len(prices),
+            floor_protection_duty,
         )
         if plan and isinstance(plan.get("forecast_snapshot"), dict):
             snapshot = plan["forecast_snapshot"]
@@ -335,6 +378,29 @@ class MILPOptimizer:
                 "bias_correction": scorecard.get("bias_correction", {}),
                 "condition_adjustments": forecast_adjustments,
                 "prediction_intervals": intervals,
+            }
+            snapshot["control_input"] = {
+                "available": control_temperature.is_usable,
+                "confidence": control_temperature.confidence,
+                "reason": control_temperature.reason,
+                "reference_sensor_id": control_temperature.reference_sensor_id,
+                "reference_sensor_label": control_temperature.reference_sensor_label,
+                "sensor_ids": [sensor.device_id for sensor in control_temperature.sensors],
+                "observed_at": control_temperature.latest_reading.isoformat()
+                if control_temperature.latest_reading is not None
+                else None,
+            }
+            snapshot.update(
+                build_forecast_observation_metadata(
+                    control_temperature,
+                    horizon_start=horizon_start,
+                )
+            )
+            snapshot["room_comfort"] = {
+                "basis_temperature": room_envelope.basis_temperature,
+                "fresh_inlier_min": room_envelope.fresh_inlier_min,
+                "fresh_inlier_max": room_envelope.fresh_inlier_max,
+                "room_overheat_active": room_overheat_active,
             }
         if plan is not None and last_status is not None:
             plan["device_id"] = last_status.device_id
@@ -531,15 +597,15 @@ class MILPOptimizer:
         indoor = current_indoor
 
         for h in range(len(prices)):
-            hour_ts = prices[h][0]
+            target_ts = prices[h][0] + dt.timedelta(hours=1)
             fallback_outdoor = (
                 weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
             )
             conditions = MILPOptimizer._forecast_conditions(
-                weather_full, hour_ts, fallback_temperature=fallback_outdoor
+                weather_full, target_ts, fallback_temperature=fallback_outdoor
             )
             outdoor = conditions["temperature"]
-            hour_of_day = hour_ts.hour
+            hour_of_day = target_ts.hour
 
             # No-heating: water at outdoor temp (radiators not contributing)
             pred_no_heat = comfort_model.predict_indoor_temp(
@@ -626,6 +692,8 @@ class MILPOptimizer:
         condition_uncertainty_margins_c: list[float] | None = None,
         forecast_regimes: list[list[str]] | None = None,
         gate_states: list[SpaceHeatingGateState | str] | None = None,
+        room_overheat_active: list[bool] | None = None,
+        floor_protection_duty: list[float] | None = None,
     ) -> dict[str, Any]:
         """
         Solve the optimization problem (runs in a thread).
@@ -753,6 +821,7 @@ class MILPOptimizer:
             else:
                 prob += pulp.lpSum(x_dhw) <= 20
 
+            minimum_run_floors: list[float] = []
             for h in range(H):
                 gate_allows = (
                     gate_states is None
@@ -761,10 +830,15 @@ class MILPOptimizer:
                 )
                 if not gate_allows:
                     prob += x_sh[h] == 0
+                    minimum_run_floors.append(0.0)
                 elif temps[h] < -10:
                     prob += x_sh[h] >= 0.5
+                    minimum_run_floors.append(0.5)
                 elif temps[h] < 0:
                     prob += x_sh[h] >= 0.2
+                    minimum_run_floors.append(0.2)
+                else:
+                    minimum_run_floors.append(0.0)
 
             cumulative_demand_kwh = 0.0
             for h, demand_kw in enumerate(demand_profile_kw):
@@ -800,32 +874,60 @@ class MILPOptimizer:
             comfort_penalty = pulp.lpSum(
                 self.COMFORT_VIOLATION_PENALTY * comfort_slack[h] for h in range(H + 1)
             )
+            overheat_slack = [pulp.LpVariable(f"overheat_slack_{h}", lowBound=0) for h in range(H)]
+            for h in range(H):
+                if (
+                    room_overheat_active is not None
+                    and h < len(room_overheat_active)
+                    and room_overheat_active[h]
+                ):
+                    floor_duty = (
+                        float(floor_protection_duty[h])
+                        if floor_protection_duty is not None and h < len(floor_protection_duty)
+                        else 0.0
+                    )
+                    cap_h = max(minimum_run_floors[h], min(1.0, max(0.0, floor_duty)))
+                    prob += x_sh[h] <= cap_h + overheat_slack[h]
+            overheat_penalty = pulp.lpSum(
+                self.OVERHEAT_VIOLATION_PENALTY * overheat_slack[h] for h in range(H)
+            )
             activation_tie_break = pulp.lpSum(y_dhw) * 1e-6 if y_dhw else 0
-            prob.setObjective(energy_cost + comfort_penalty + activation_tie_break)
+            prob.setObjective(
+                energy_cost + comfort_penalty + overheat_penalty + activation_tie_break
+            )
             return (
                 prob,
                 x_dhw,
                 x_sh,
                 energy_cost,
                 comfort_slack,
+                overheat_slack,
                 t_indoor,
                 indoor_dynamics,
                 indoor_init,
             )
 
-        solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=self.SOLVER_TIMEOUT_SECONDS)
+        started_at = time.monotonic()
+
+        def solve_with_remaining_budget(problem):
+            remaining = self.SOLVER_TIMEOUT_SECONDS - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise SolverTimeoutError("CBC solver shared timeout budget exhausted")
+            problem.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=remaining))
+
         (
             prob,
             x_dhw,
             x_sh,
             energy_cost_objective,
             comfort_slack,
+            _overheat_slack,
             t_indoor,
             indoor_dynamics,
             indoor_init,
         ) = build_model(False)
         logger.info("milp_solving", dhw_mode="binary")
-        prob.solve(solver)
+        solve_with_remaining_budget(prob)
 
         if prob.status == pulp.constants.LpStatusInfeasible:
             logger.info("milp_dhw_fractional_fallback", binary_status=prob.status)
@@ -835,11 +937,12 @@ class MILPOptimizer:
                 x_sh,
                 energy_cost_objective,
                 comfort_slack,
+                _overheat_slack,
                 t_indoor,
                 indoor_dynamics,
                 indoor_init,
             ) = build_model(True)
-            prob.solve(solver)
+            solve_with_remaining_budget(prob)
 
         if prob.status == pulp.constants.LpStatusNotSolved:
             raise SolverTimeoutError(
@@ -1069,7 +1172,7 @@ class MILPOptimizer:
                 weather[h][1] if h < len(weather) and weather[h][1] is not None else 5.0
             )
             conditions = self._forecast_conditions(
-                weather_full, slot_start, fallback_temperature=fallback_outdoor
+                weather_full, state_ts, fallback_temperature=fallback_outdoor
             )
             indoor_forecast.append(
                 {
@@ -1111,7 +1214,7 @@ class MILPOptimizer:
             )
             weather_forecast.append(
                 {
-                    "ts": slot_start.isoformat(),
+                    "ts": state_ts.isoformat(),
                     "outdoor_temp": conditions["temperature"],
                     "wind_speed": conditions["wind_speed"],
                     "irradiance": conditions["irradiance"],
@@ -1121,7 +1224,7 @@ class MILPOptimizer:
                     "regimes": forecast_regimes[h]
                     if forecast_regimes and h < len(forecast_regimes)
                     else [],
-                    "hour": slot_start.hour,
+                    "hour": state_ts.hour,
                 }
             )
             price_forecast.append(
@@ -1145,7 +1248,7 @@ class MILPOptimizer:
             "comfort_shortfall": comfort_shortfall,
             "indoor_forecast": indoor_forecast,
             "forecast_snapshot": {
-                "version": "indoor_forecast_v1",
+                "version": "indoor_forecast_v4",
                 "current_indoor": round(indoor_init, 1),
                 "forecast": indoor_forecast,
                 "forecast_with_plan": indoor_forecast,

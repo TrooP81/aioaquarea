@@ -853,6 +853,7 @@ class ThermalModel:
         zone_water_temps: list[float],
         weather_forecast: list[dict],
         hours: int = 24,
+        use_learned_forecast: bool = False,
     ) -> list[dict]:
         """
         Predict indoor air temperature evolution over the planning horizon.
@@ -887,7 +888,7 @@ class ThermalModel:
             cloud_cover = float(wx.get("cloud_cover", 0.5) or 0.5)
             hour_of_day = wx.get("hour", (h % 24))
 
-            if comfort_model.is_ready_for_control:
+            if use_learned_forecast and comfort_model.is_ready_for_control:
                 use_direct = bool(comfort_model.direct_forecast_horizons_minutes)
                 predicted = comfort_model.predict_indoor_temp(
                     zone_water_temp=water_temp,
@@ -948,6 +949,8 @@ class ThermalModel:
         heating_fractions: list[float],
         weather_forecast: list[dict],
         hours: int = 24,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
     ) -> list[dict]:
         """Predict indoor temperature under an explicit per-hour heat plan.
 
@@ -959,6 +962,30 @@ class ThermalModel:
         that the compressor will heat the house for the full hour.
         """
         from packages.ml.comfort_model import comfort_model
+
+        passive_horizons = {60, 180, 360, 720}
+        passive_artifacts_available = set(comfort_model._passive_direct_models) == passive_horizons
+        try:
+            no_heating_plan = all(
+                max(0.0, min(1.0, float(value))) == 0.0 for value in heating_fractions[:hours]
+            )
+        except (TypeError, ValueError):
+            no_heating_plan = False
+        use_learned_for_curve = use_learned_forecast and not (
+            no_heating_plan and not passive_artifacts_available
+        )
+
+        if use_learned_for_curve and comfort_model.is_ready_for_control:
+            learned_curve = self._predict_indoor_hybrid_curve(
+                current_indoor=current_indoor,
+                zone_water_temps=zone_water_temps,
+                heating_fractions=heating_fractions,
+                weather_forecast=weather_forecast,
+                hours=hours,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+            )
+            if learned_curve is not None:
+                return learned_curve
 
         curve = []
         indoor = current_indoor
@@ -982,7 +1009,7 @@ class ThermalModel:
             cloud_cover = float(0.5 if cloud_cover_raw is None else cloud_cover_raw)
             hour_of_day = wx.get("hour", h % 24)
 
-            if comfort_model.is_ready_for_control:
+            if use_learned_for_curve and comfort_model.is_ready_for_control:
                 no_heat = comfort_model.predict_indoor_temp(
                     zone_water_temp=outdoor,
                     outdoor_temp=outdoor,
@@ -1034,7 +1061,7 @@ class ThermalModel:
             # They are trained on the configured room input plus weather at the
             # requested lead time, so a 12-hour forecast cannot accumulate 11
             # one-hour fallback errors.
-            if fraction == 0.0:
+            if use_learned_for_curve and fraction == 0.0:
                 passive, readiness = comfort_model.predict_passive_indoor_temp(
                     outdoor_temp=outdoor,
                     wind_speed=wind,
@@ -1045,6 +1072,7 @@ class ThermalModel:
                     humidity=humidity,
                     cloud_cover=cloud_cover,
                     forecast_horizon_minutes=(h + 1) * 60,
+                    max_change_c_per_hour=max_passive_change_c_per_hour,
                 )
                 if passive is not None:
                     # A direct model should follow measured inertia, not make a
@@ -1087,6 +1115,219 @@ class ThermalModel:
             )
             recent_heat_fraction = round(0.65 * recent_heat_fraction + 0.35 * fraction, 3)
 
+        return curve
+
+    def predict_indoor_candidate_curve(
+        self,
+        current_indoor: float,
+        zone_water_temps: list[float],
+        heating_fractions: list[float],
+        weather_forecast: list[dict],
+        hours: int = 24,
+        max_passive_change_c_per_hour: float = 0.5,
+    ) -> list[dict] | None:
+        """Return a complete learned candidate without consulting the live gate."""
+        from packages.ml.comfort_model import comfort_model
+
+        if not comfort_model.is_ready_for_control or set(
+            comfort_model.direct_forecast_horizons_minutes
+        ) != {60, 180, 360, 720}:
+            return None
+        try:
+            no_heating_plan = all(
+                max(0.0, min(1.0, float(value))) == 0.0 for value in heating_fractions[:hours]
+            )
+        except (TypeError, ValueError):
+            return None
+        if no_heating_plan and set(comfort_model._passive_direct_models) != {60, 180, 360, 720}:
+            return None
+        return self._predict_indoor_hybrid_curve(
+            current_indoor=current_indoor,
+            zone_water_temps=zone_water_temps,
+            heating_fractions=heating_fractions,
+            weather_forecast=weather_forecast,
+            hours=hours,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+        )
+
+    def _predict_indoor_hybrid_curve(
+        self,
+        *,
+        current_indoor: float,
+        zone_water_temps: list[float],
+        heating_fractions: list[float],
+        weather_forecast: list[dict],
+        hours: int,
+        max_passive_change_c_per_hour: float = 0.5,
+    ) -> list[dict] | None:
+        """Assemble v7 direct anchors, interpolated deltas, and anchored physics."""
+        from packages.ml.comfort_model import comfort_model
+
+        if (
+            not zone_water_temps
+            or not weather_forecast
+            or hours <= 0
+            or not comfort_model.is_ready_for_control
+            or set(comfort_model.direct_forecast_horizons_minutes) != {60, 180, 360, 720}
+        ):
+            return None
+
+        def inputs(hour: int) -> tuple[float, float, dict, float]:
+            index = min(hour - 1, len(weather_forecast) - 1)
+            wx = weather_forecast[index]
+            water = float(zone_water_temps[min(hour - 1, len(zone_water_temps) - 1)])
+            fraction = (
+                max(0.0, min(1.0, float(heating_fractions[hour - 1])))
+                if hour <= len(heating_fractions)
+                else 0.0
+            )
+            outdoor = wx.get("outdoor_temp", 5.0)
+            return water, fraction, wx, float(5.0 if outdoor is None else outdoor)
+
+        def weather_values(wx: dict) -> tuple[float, float, float, float, float, float, int]:
+            return (
+                float(0.0 if wx.get("wind_speed") is None else wx.get("wind_speed", 3.0)),
+                float(0.0 if wx.get("irradiance") is None else wx.get("irradiance", 0.0)),
+                float(0.0 if wx.get("precipitation") is None else wx.get("precipitation", 0.0)),
+                float(60.0 if wx.get("humidity") is None else wx.get("humidity", 60.0)),
+                float(0.5 if wx.get("cloud_cover") is None else wx.get("cloud_cover", 0.5)),
+                float(5.0 if wx.get("outdoor_temp") is None else wx.get("outdoor_temp", 5.0)),
+                int(0 if wx.get("hour") is None else wx.get("hour", 0)),
+            )
+
+        anchors: dict[int, float] = {}
+        passive_anchors: dict[int, float] = {}
+        use_passive = all(
+            max(0.0, min(1.0, float(value))) == 0.0 for value in heating_fractions[:hours]
+        )
+        for anchor_hour in (1, 3, 6, 12):
+            if anchor_hour > hours:
+                continue
+            water, fraction, wx, outdoor = inputs(anchor_hour)
+            wind, irradiance, precipitation, humidity, cloud_cover, _, hour_of_day = weather_values(
+                wx
+            )
+            recent = sum(
+                max(0.0, min(1.0, float(value)))
+                for value in heating_fractions[max(0, anchor_hour - 3) : anchor_hour]
+            ) / min(3, anchor_hour)
+            controlled = comfort_model.predict_indoor_temp(
+                zone_water_temp=water,
+                zone_target_temp=water,
+                outdoor_temp=outdoor,
+                wind_speed=wind,
+                irradiance=irradiance,
+                precipitation=precipitation,
+                humidity=humidity,
+                cloud_cover=cloud_cover,
+                hour=hour_of_day,
+                indoor_temp=current_indoor,
+                space_heating_fraction=sum(heating_fractions[:anchor_hour]) / anchor_hour,
+                recent_heat_fraction=recent,
+                forecast_horizon_minutes=anchor_hour * 60,
+            )
+            if controlled is None:
+                return None
+            anchors[anchor_hour] = float(controlled) - current_indoor
+            if use_passive:
+                passive, passive_readiness = comfort_model.predict_passive_indoor_temp(
+                    outdoor_temp=outdoor,
+                    wind_speed=wind,
+                    irradiance=irradiance,
+                    precipitation=precipitation,
+                    humidity=humidity,
+                    cloud_cover=cloud_cover,
+                    hour=hour_of_day,
+                    indoor_temp=current_indoor,
+                    forecast_horizon_minutes=anchor_hour * 60,
+                    max_change_c_per_hour=max_passive_change_c_per_hour,
+                )
+                if passive is None or not passive_readiness.get("ready"):
+                    return None
+                passive_anchors[anchor_hour] = float(passive) - current_indoor
+
+        curve: list[dict] = []
+        learned_indoor = current_indoor
+        passive_indoor = current_indoor
+        previous_weather: tuple[float, float] | None = None
+        for hour in range(1, min(hours, 12) + 1):
+            lower = max(anchor for anchor in anchors if anchor <= hour)
+            upper = min(anchor for anchor in anchors if anchor >= hour)
+            weight = 0.0 if lower == upper else (hour - lower) / (upper - lower)
+            controlled_delta = anchors[lower] + weight * (anchors[upper] - anchors[lower])
+            learned_indoor = current_indoor + controlled_delta
+            if use_passive:
+                passive_delta = passive_anchors[lower] + weight * (
+                    passive_anchors[upper] - passive_anchors[lower]
+                )
+                passive_indoor = current_indoor + passive_delta
+            _water, fraction, wx, outdoor = inputs(hour)
+            irradiance = float(wx.get("irradiance", 0.0) or 0.0)
+            if (
+                fraction == 0.0
+                and previous_weather is not None
+                and outdoor <= previous_weather[0]
+                and irradiance <= previous_weather[1]
+            ):
+                passive_indoor = min(passive_indoor, curve[-1]["predicted_indoor_temp"])
+                learned_indoor = min(learned_indoor, curve[-1]["predicted_indoor_temp"])
+            previous_weather = (outdoor, irradiance)
+            curve.append(
+                {
+                    "hour": hour,
+                    "predicted_indoor_temp": round(
+                        passive_indoor if use_passive else learned_indoor, 3
+                    ),
+                    "source": (
+                        "comfort_model_passive_direct"
+                        if use_passive
+                        else "comfort_model_controlled"
+                    ),
+                    "segment_kind": "direct" if lower == upper else "interpolated",
+                    "space_heating_fraction": round(fraction, 3),
+                }
+            )
+
+        for hour in range(13, hours + 1):
+            water, fraction, wx, outdoor = inputs(hour)
+            irradiance = float(wx.get("irradiance", 0.0) or 0.0)
+            cooling = self._indoor_cooling_rate(outdoor)
+            delta = max(learned_indoor - outdoor, 0.0)
+            no_heat_rate = cooling * (delta / 15.0 if delta < 15.0 else 1.0) + _solar_gain_c(
+                irradiance
+            )
+            heating_rate = (
+                self._indoor_heating_rate(outdoor) + _solar_gain_c(irradiance)
+                if water > learned_indoor + 5.0
+                else no_heat_rate
+            )
+            learned_indoor += no_heat_rate + fraction * (heating_rate - no_heat_rate)
+            learned_indoor = max(learned_indoor, outdoor)
+            passive_indoor += no_heat_rate
+            passive_indoor = max(passive_indoor, outdoor)
+            if (
+                use_passive
+                and previous_weather is not None
+                and outdoor <= previous_weather[0]
+                and irradiance <= previous_weather[1]
+            ):
+                passive_indoor = min(passive_indoor, curve[-1]["predicted_indoor_temp"])
+            previous_weather = (outdoor, irradiance)
+            curve.append(
+                {
+                    "hour": hour,
+                    "predicted_indoor_temp": round(
+                        passive_indoor if use_passive else learned_indoor, 3
+                    ),
+                    "source": (
+                        "comfort_model_passive_physics_continuation"
+                        if use_passive
+                        else "comfort_model_physics_continuation"
+                    ),
+                    "segment_kind": "physics_continuation",
+                    "space_heating_fraction": round(fraction, 3),
+                }
+            )
         return curve
 
     def predict_temperature_curve(

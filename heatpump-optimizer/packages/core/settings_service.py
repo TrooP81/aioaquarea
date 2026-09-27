@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,8 @@ class SettingSpec:
     default: str = ""
     default_env: str | None = None
     options: tuple[str, ...] | None = None
+    min_value: float | None = None
+    max_value: float | None = None
 
     def serialize_default(self) -> str:
         return self.default
@@ -105,6 +108,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": "true",
         "description": "End seasonal observe-only mode after demand and indoor-heating evidence have both trained successfully",
+    },
+    "_seasonal_calibration_safety_deferred_since": {
+        "type": "str",
+        "default": "",
+        "description": "First unresolved-safety-revert seasonal deferral timestamp (internal)",
     },
     "outcome_experiments_enabled": {
         "type": "bool",
@@ -238,6 +246,31 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "comfort_temp_max",
         "description": "Comfort zone maximum (°C)",
     },
+    "indoor_forecast_min_r2": {
+        "type": "float",
+        "default": "0.15",
+        "description": "Minimum R² required for learned indoor forecast control",
+    },
+    "indoor_forecast_min_persistence_improvement_c": {
+        "type": "float",
+        "default": "0.1",
+        "description": "Minimum improvement over persistence for indoor forecast control (°C)",
+    },
+    "indoor_forecast_max_abs_bias_c": {
+        "type": "float",
+        "default": "0.5",
+        "description": "Maximum absolute bias for learned indoor forecast control (°C)",
+    },
+    "indoor_forecast_gate_passes_required": {
+        "type": "int",
+        "default": "2",
+        "description": "Consecutive passing scorecards required before learned indoor control",
+    },
+    "indoor_forecast_gate_failures_required": {
+        "type": "int",
+        "default": "1",
+        "description": "Consecutive failed scorecards before learned indoor control is disabled",
+    },
     # --- Controller heat curve (recorded from Panasonic controller) ---
     "heat_curve_outdoor_cold_c": {
         "type": "float",
@@ -269,6 +302,19 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "WH_MXC12J9E8_J_DEFAULT",
         "description": "Room-heating eligibility behavior profile",
         "options": ["WH_MXC12J9E8_J_DEFAULT"],
+    },
+    "space_heating_baseline_mode": {
+        "type": "str",
+        "default": "shadow",
+        "description": "Historical automatic room-heating baseline rollout mode",
+        "options": ["off", "shadow", "on"],
+    },
+    "space_heating_default_fraction": {
+        "type": "float",
+        "default": "0.35",
+        "description": "Fallback automatic room-heating duty fraction",
+        "min_value": 0.0,
+        "max_value": 1.0,
     },
     "space_heating_gate_on_offset_c": {
         "type": "float",
@@ -324,6 +370,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "poll_interval_seconds",
         "description": "Device poll interval (seconds)",
     },
+    "device_status_max_age_minutes": {
+        "type": "int",
+        "default": "15",
+        "description": "Maximum device-status age for control readiness (minutes, 5-60)",
+    },
     # --- Display ---
     "currency": {
         "type": "str",
@@ -348,11 +399,6 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "EUR",
         "description": "Currency of the manual electricity price",
         "options": ["EUR", "SEK", "NOK", "DKK", "GBP", "USD", "CHF", "PLN", "CZK", "HUF"],
-    },
-    "device_status_max_age_minutes": {
-        "type": "int",
-        "default": "15",
-        "description": "Maximum device-status age for control readiness (minutes, 5-60)",
     },
     "manual_outdoor_temp": {
         "type": "float",
@@ -448,6 +494,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "",
         "description": "Thermal lag override (minutes). Leave empty to auto-detect from data",
     },
+    "indoor_forecast_max_passive_change_c_per_hour": {
+        "type": "float",
+        "default": "0.5",
+        "description": "Maximum learned passive indoor-temperature change per hour (C)",
+    },
     # --- Comfort schedule ---
     "comfort_schedule": {
         "type": "json",
@@ -481,6 +532,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         default=str(schema.get("default", "")),
         default_env=schema.get("default_env"),
         options=tuple(schema["options"]) if schema.get("options") else None,
+        min_value=schema.get("min_value"),
+        max_value=schema.get("max_value"),
     )
     for key, schema in SETTINGS_SCHEMA.items()
 }
@@ -536,9 +589,19 @@ def validate_setting_value(key: str, value: str) -> None:
 
     if spec.value_type in {"int", "float", "bool"}:
         try:
-            spec.parse(value)
+            parsed = spec.parse(value)
         except ValueError as exc:
             raise ValueError(f"{key} must be a valid {spec.value_type} ({exc})") from exc
+        if spec.min_value is not None or spec.max_value is not None:
+            if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+                raise ValueError(f"{key} must be a finite numeric value")
+            numeric = float(parsed)
+            if not math.isfinite(numeric):
+                raise ValueError(f"{key} must be finite")
+            if spec.min_value is not None and numeric < spec.min_value:
+                raise ValueError(f"{key} must be at least {spec.min_value}")
+            if spec.max_value is not None and numeric > spec.max_value:
+                raise ValueError(f"{key} must be at most {spec.max_value}")
 
 
 def _default_setting_value(spec: SettingSpec) -> str:

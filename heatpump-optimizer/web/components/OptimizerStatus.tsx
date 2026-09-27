@@ -284,6 +284,21 @@ export function OptimizerStatus() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Training failed");
       if (data.error) throw new Error(data.error);
+      if (data.status === "training_in_progress") {
+        setTrainMsg({ text: "Training already in progress", tone: "info" });
+        await refresh();
+        return;
+      }
+      if (data.status === "training_skipped") {
+        setTrainMsg({ text: `Training skipped: ${data.reason ?? "unavailable"}`, tone: "error" });
+        await refresh();
+        return;
+      }
+      if (data.training_notice === "training_lock_finalize_recovered") {
+        setTrainMsg({ text: "Training completed: lock finalization recovered", tone: "success" });
+        await refresh();
+        return;
+      }
       const reason = typeof data.control_readiness?.reason === "string"
         ? data.control_readiness.reason.replace(/_/g, " ")
         : "validation is still pending";
@@ -355,12 +370,12 @@ export function OptimizerStatus() {
       plain: "Predicts how efficiently the pump runs at different temperatures",
       state: status.cop_model.trained
         ? (
-            status.cop_model.metrics?.mae != null
+          status.cop_model.metrics?.mae != null
             && status.cop_model.metrics?.baseline_mae != null
             && status.cop_model.metrics.mae < status.cop_model.metrics.baseline_mae
-              ? "validated"
-              : "trained"
-          )
+            ? "validated"
+            : "trained"
+        )
         : "collecting",
       lastTrained: status.cop_model.last_trained,
       detail: `${status.cop_model.source_records ?? 0} energy readings${status.cop_model.metrics?.mae != null ? ` · forward CV MAE ${status.cop_model.metrics.mae.toFixed(3)} COP${status.cop_model.metrics.cv_std != null ? ` · ±${status.cop_model.metrics.cv_std.toFixed(3)}` : ""}` : " · validation score will appear after the next training run"}`,

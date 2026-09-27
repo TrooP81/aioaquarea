@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from packages.core.panasonic_control_state import classify_panasonic_operation_mode
+
 
 @dataclass(frozen=True)
 class SpaceHeatingEvidence:
@@ -43,7 +45,13 @@ def classify_space_heating(
     if device_action == "IDLE" or direction == "IDLE":
         return SpaceHeatingEvidence(False, "idle")
     active_zone = zone1_operation_status == 1 or zone2_operation_status == 1
-    if str(mode) in {"1", "3"} and direction == "PUMP" and pump_duty == 1 and active_zone:
+    if (
+        classify_panasonic_operation_mode(mode) == "heating"
+        and str(mode) in {"1", "3"}
+        and direction == "PUMP"
+        and pump_duty == 1
+        and active_zone
+    ):
         return SpaceHeatingEvidence(True, "component_space_heating")
     if operation_status == 0:
         return SpaceHeatingEvidence(False, "device_off")

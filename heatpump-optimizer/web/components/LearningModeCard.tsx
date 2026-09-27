@@ -6,6 +6,15 @@ interface LearningModeState {
   enabled: boolean;
   since: string | null;
   days_elapsed: number | null;
+  effective_active: boolean;
+  sources: string[];
+  state_reliable: boolean;
+  open_revert_obligations: {
+    count: number;
+    oldest_scheduled_at: string | null;
+    oldest_age_seconds: number | null;
+    action_types: string[];
+  };
 }
 
 interface ModelsReady {
@@ -28,6 +37,13 @@ function formatDuration(days: number | null): string {
   }
   const whole = Math.floor(days);
   return `${whole} day${whole !== 1 ? "s" : ""}`;
+}
+
+function formatAge(seconds: number | null): string {
+  if (seconds == null) return "unknown";
+  if (seconds < 60) return `${seconds} seconds`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} minute${minutes !== 1 ? "s" : ""}`;
 }
 
 export function LearningModeCard({ onChange }: { onChange?: () => void }) {
@@ -71,11 +87,29 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
     setSaving(true);
     setMessage(null);
     try {
-      const res = await fetch("/api/learning-mode", {
+      let res = await fetch("/api/learning-mode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: next }),
       });
+      if (res.status === 409 && next) {
+        const blocked = await res.json().catch(() => ({}));
+        const obligations = blocked.detail?.obligations;
+        const count = obligations?.count ?? "an";
+        setMessage({
+          text: `${count} unresolved safety restore${count === 1 ? "" : "s"} must wait until control resumes.`,
+          ok: false,
+        });
+        const force = window.confirm(
+          "Safety restores are still unresolved. Force learning mode and delay those restores until learning mode is turned off?"
+        );
+        if (!force) return;
+        res = await fetch("/api/learning-mode?force=true", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
+        });
+      }
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || "Failed to update learning mode");
@@ -134,6 +168,21 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
                   : "Turn On Learning Mode"}
             </button>
           </div>
+
+          {state.open_revert_obligations?.count > 0 && (
+            <div className="model-card-details" style={{ marginTop: "1rem" }} role="status">
+              <div>
+                Pending safety restores: {state.open_revert_obligations.count}
+              </div>
+              <div>
+                Oldest restore age: {formatAge(state.open_revert_obligations.oldest_age_seconds)}
+              </div>
+              <div>
+                Restore types: {state.open_revert_obligations.action_types.join(", ") || "unknown"}
+              </div>
+              <div>Safety restores wait until control resumes.</div>
+            </div>
+          )}
 
           {state.enabled && (
             <div className="model-card-details" style={{ marginTop: "1rem" }}>

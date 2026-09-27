@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from packages.core.operational_alerts import _panasonic_adapter_alert, device_status_is_fresh
+from packages.core.operational_alerts import (
+    _panasonic_adapter_alert,
+    _safety_revert_cause_hint,
+    device_status_is_fresh,
+)
 from packages.core.operational_alerts import get_operational_alerts
 
 
@@ -20,6 +24,22 @@ class _AsyncContextManager:
 
     async def __aexit__(self, *args):
         return False
+
+
+def _pending_safety_alert_session(action):
+    session = SimpleNamespace()
+    session.execute = AsyncMock(
+        side_effect=[
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalar_one_or_none=lambda: action),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+            SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+        ]
+    )
+    return session
 
 
 def test_fresh_adapter_outage_builds_actionable_alert() -> None:
@@ -77,6 +97,7 @@ async def test_gate_failure_and_unknown_alerts_are_actionable() -> None:
             SimpleNamespace(scalar_one_or_none=lambda: now),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [gate_row])),
             SimpleNamespace(scalar_one_or_none=lambda: None),
@@ -131,6 +152,7 @@ async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -
             SimpleNamespace(scalar_one_or_none=lambda: None),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalar_one_or_none=lambda: None),
+            SimpleNamespace(scalar_one_or_none=lambda: None),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
             SimpleNamespace(scalar_one_or_none=lambda: None),
@@ -178,3 +200,166 @@ async def test_cancelled_actions_are_not_treated_as_failed_or_expired_alerts() -
     assert {"failed", "expired"}.issubset(status_values)
     assert "cancelled" not in status_values
     assert all(alert["id"] != "plan_actions_failed" for alert in result["alerts"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed_at", [None, dt.datetime(2026, 8, 19, 8, tzinfo=dt.timezone.utc)])
+async def test_pending_unclaimed_alert_includes_zero_attempt_and_stale_claim_cases(claimed_at):
+    now = dt.datetime(2026, 8, 19, 10, tzinfo=dt.timezone.utc)
+    action = SimpleNamespace(
+        id=41,
+        plan_id=7,
+        device_id="device-a",
+        scheduled_ts=now - dt.timedelta(seconds=121),
+        safety_attempt_count=0,
+        safety_claimed_at=claimed_at,
+    )
+    session = _pending_safety_alert_session(action)
+    with (
+        patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),
+        patch("packages.core.operational_alerts.get_int_setting", AsyncMock(return_value=60)),
+        patch(
+            "packages.core.operational_alerts.get_device_data_quality",
+            AsyncMock(return_value={"threshold_seconds": 900}),
+        ),
+        patch(
+            "packages.core.operational_alerts.get_planning_data_quality",
+            AsyncMock(return_value={"control_allowed": True}),
+        ),
+        patch("packages.ml.forecast_quality.get_forecast_scorecard", AsyncMock(return_value={})),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            AsyncMock(return_value={}),
+        ),
+        patch("packages.core.operational_alerts.service_heartbeat_details", return_value={}),
+        patch(
+            "packages.core.operational_alerts.project_panasonic_adapter_state",
+            return_value={"state_fresh": True, "status": "available"},
+        ),
+        patch(
+            "packages.core.operational_alerts._safety_revert_cause_hint",
+            AsyncMock(return_value="unknown"),
+        ),
+        patch(
+            "packages.core.operational_alerts.get_session",
+            return_value=_AsyncContextManager(session),
+        ),
+    ):
+        result = await get_operational_alerts(now=now)
+
+    alert = next(
+        alert for alert in result["alerts"] if alert["id"] == "safety_revert_pending_unclaimed"
+    )
+    assert alert["details"]["age_seconds"] == 121
+    assert alert["details"]["cause_hint"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("learning_result", "seasonal_result", "expected"),
+    [
+        (True, {}, "learning_mode"),
+        (False, {"observe_only_active": True}, "seasonal"),
+        (False, {}, "unknown"),
+    ],
+)
+async def test_safety_revert_cause_hint_reports_each_known_context(
+    learning_result, seasonal_result, expected
+):
+    with (
+        patch(
+            "packages.core.operational_alerts.get_bool_setting",
+            AsyncMock(return_value=learning_result),
+        ),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            AsyncMock(return_value=seasonal_result),
+        ),
+    ):
+        cause = await _safety_revert_cause_hint(dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc))
+
+    assert cause == expected
+
+
+@pytest.mark.asyncio
+async def test_pending_alert_survives_learning_lookup_failure():
+    now = dt.datetime(2026, 8, 19, 10, tzinfo=dt.timezone.utc)
+    action = SimpleNamespace(
+        id=42,
+        plan_id=8,
+        device_id="device-a",
+        scheduled_ts=now - dt.timedelta(seconds=121),
+        safety_attempt_count=0,
+        safety_claimed_at=None,
+    )
+    session = _pending_safety_alert_session(action)
+    bool_setting = AsyncMock(side_effect=[True, RuntimeError("settings unavailable")])
+    with (
+        patch("packages.core.operational_alerts.get_bool_setting", bool_setting),
+        patch("packages.core.operational_alerts.get_int_setting", AsyncMock(return_value=60)),
+        patch(
+            "packages.core.operational_alerts.get_device_data_quality",
+            AsyncMock(return_value={"threshold_seconds": 900}),
+        ),
+        patch(
+            "packages.core.operational_alerts.get_planning_data_quality",
+            AsyncMock(return_value={"control_allowed": True}),
+        ),
+        patch("packages.ml.forecast_quality.get_forecast_scorecard", AsyncMock(return_value={})),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            AsyncMock(return_value={}),
+        ),
+        patch("packages.core.operational_alerts.service_heartbeat_details", return_value={}),
+        patch(
+            "packages.core.operational_alerts.project_panasonic_adapter_state",
+            return_value={"state_fresh": True, "status": "available"},
+        ),
+        patch(
+            "packages.core.operational_alerts.get_session",
+            return_value=_AsyncContextManager(session),
+        ),
+    ):
+        result = await get_operational_alerts(now=now)
+
+    alert = next(
+        alert for alert in result["alerts"] if alert["id"] == "safety_revert_pending_unclaimed"
+    )
+    assert alert["details"]["cause_hint"] == "lookup_error"
+
+
+@pytest.mark.asyncio
+async def test_seasonal_safety_deferral_alert_starts_at_24_hours():
+    now = dt.datetime(2026, 8, 19, 10, tzinfo=dt.timezone.utc)
+    session = _pending_safety_alert_session(None)
+    with (
+        patch("packages.core.operational_alerts.get_bool_setting", AsyncMock(return_value=True)),
+        patch("packages.core.operational_alerts.get_int_setting", AsyncMock(return_value=60)),
+        patch(
+            "packages.core.operational_alerts.get_device_data_quality",
+            AsyncMock(return_value={"threshold_seconds": 900}),
+        ),
+        patch(
+            "packages.core.operational_alerts.get_planning_data_quality",
+            AsyncMock(return_value={"control_allowed": True}),
+        ),
+        patch("packages.ml.forecast_quality.get_forecast_scorecard", AsyncMock(return_value={})),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            AsyncMock(return_value={"seasonal_deferred_seconds": 24 * 60 * 60}),
+        ),
+        patch("packages.core.operational_alerts.service_heartbeat_details", return_value={}),
+        patch(
+            "packages.core.operational_alerts.project_panasonic_adapter_state",
+            return_value={"state_fresh": True, "status": "available"},
+        ),
+        patch(
+            "packages.core.operational_alerts.get_session",
+            return_value=_AsyncContextManager(session),
+        ),
+    ):
+        result = await get_operational_alerts(now=now)
+
+    assert any(
+        alert["id"] == "seasonal_calibration_blocked_by_safety_revert" for alert in result["alerts"]
+    )

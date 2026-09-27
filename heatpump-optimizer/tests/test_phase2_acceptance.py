@@ -23,7 +23,7 @@ from packages.core.service_health import (
     service_heartbeat_details,
 )
 from packages.optimizer.actions import ActionType, VerifyResult
-from packages.optimizer.executor_core import PlanExecutor
+from packages.optimizer.executor_core import LearningModeState, PlanExecutor
 from packages.optimizer.main import _validate_unique_restore_keys
 from packages.optimizer.shower_mode import ShowerDetector
 
@@ -116,22 +116,80 @@ class TestPhase2ExecutorAcceptance:
         )
 
     @pytest.mark.asyncio
-    async def test_P2_AC6_one_oldest_safety_claim_skips_ordinary_actions_in_learning_override(self):
+    async def test_L_AC1_learning_mode_blocks_all_claims_and_preserves_pending_safety_obligation(
+        self,
+    ):
         session = AsyncMock()
-        result = MagicMock()
-        result.scalar_one_or_none.return_value = _action()
-        session.execute = AsyncMock(return_value=result)
+        safety_action = _action()
         executor = PlanExecutor(
             AsyncMock(),
             session_factory=_factory(session),
-            learning_check=AsyncMock(return_value=True),
+            learning_check=AsyncMock(return_value=LearningModeState.ACTIVE),
         )
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
 
-        with patch.object(executor, "_execute_safety_action", new=AsyncMock()) as safety:
+        await executor.execute_due_actions()
+
+        executor._claim_due_safety_action.assert_not_awaited()
+        executor._execute_safety_action.assert_not_awaited()
+        executor._execute_action.assert_not_awaited()
+        assert safety_action.status == "pending"
+        assert safety_action.safety_attempt_count == 0
+        assert safety_action.safety_next_retry_at is None
+        session.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_L_AC4_first_control_enabled_cycle_executes_oldest_due_safety_only(self):
+        executor = PlanExecutor(
+            AsyncMock(),
+            session_factory=_factory(AsyncMock()),
+            learning_check=AsyncMock(return_value=LearningModeState.INACTIVE),
+        )
+        oldest_safety = _action(action_id=1)
+        executor._claim_due_safety_action = AsyncMock(return_value=oldest_safety)
+        executor._execute_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._claim_due_safety_action.assert_awaited_once()
+        executor._execute_safety_action.assert_awaited_once_with(oldest_safety)
+        executor._execute_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_L_AC7_seasonal_learning_blocks_all_claims(self):
+        executor = PlanExecutor(
+            AsyncMock(),
+            session_factory=_factory(AsyncMock()),
+            learning_check=AsyncMock(return_value=LearningModeState.ACTIVE),
+        )
+        executor._claim_due_safety_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._claim_due_safety_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_learning_lookup_error_runs_one_due_safety_revert_and_skips_ordinary(self):
+        executor = PlanExecutor(
+            AsyncMock(),
+            session_factory=_factory(AsyncMock()),
+            learning_check=AsyncMock(side_effect=ValueError("invalid learning state")),
+        )
+        safety_action = _action()
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
+
+        with capture_logs() as logs:
             await executor.execute_due_actions()
 
-        safety.assert_awaited_once()
-        assert session.execute.await_count == 2
+        executor._claim_due_safety_action.assert_awaited_once()
+        executor._execute_safety_action.assert_awaited_once_with(safety_action)
+        executor._execute_action.assert_not_awaited()
+        assert any(log["event"] == "learning_mode_state_unknown" for log in logs)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -724,6 +782,7 @@ class TestPhase2AlertAcceptance:
                 SimpleNamespace(scalar_one_or_none=lambda: now),
                 SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
                 SimpleNamespace(scalar_one_or_none=lambda: safety_action),
+                SimpleNamespace(scalar_one_or_none=lambda: None),
                 SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: list(blocked_events))),
                 SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
                 SimpleNamespace(scalar_one_or_none=lambda: None),

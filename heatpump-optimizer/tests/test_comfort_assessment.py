@@ -1,4 +1,5 @@
 from packages.core.comfort_assessment import build_comfort_assessment
+from packages.core.control_temperature import RoomComfortEnvelope
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig, resolve_effective_gate
 from types import SimpleNamespace
@@ -101,7 +102,7 @@ def test_unrelated_mode_action_is_not_used_to_explain_an_earlier_miss():
         heat_curve=HeatCurveConfig(heating_off_outdoor_c=13.0),
     )
 
-    assert assessment["controllability"]["status"] == "no_space_heat_planned"
+    assert assessment["controllability"]["status"] == "no_space_heat_expected"
 
 
 def test_setback_miss_does_not_claim_a_comfort_target_miss():
@@ -115,3 +116,56 @@ def test_setback_miss_does_not_claim_a_comfort_target_miss():
 
     assert assessment["state"] == "at_risk"
     assert assessment["first_miss"]["comfort_hour"] is False
+
+
+def test_simultaneous_under_min_and_over_max_reports_min_priority_conflict():
+    assessment = build_comfort_assessment(
+        forecast=[],
+        targets=[],
+        weather=[],
+        planned_actions=[],
+        heat_curve=HeatCurveConfig(),
+        room_envelope=RoomComfortEnvelope(19.0, 19.0, 23.0, ("bedroom",)),
+        comfort_temp_min=20.0,
+    )
+
+    assert assessment["state"] == "conflict"
+    assert assessment["reason_code"] == "comfort_conflict_min_priority"
+    assert assessment["min_comfort_active"] is True
+    assert assessment["room_overheat_active"] is True
+
+
+def test_room_overheat_alone_suppresses_discretionary_heat():
+    assessment = build_comfort_assessment(
+        forecast=[],
+        targets=[],
+        weather=[],
+        planned_actions=[],
+        heat_curve=HeatCurveConfig(),
+        room_envelope=RoomComfortEnvelope(21.0, 20.5, 23.0, ("bedroom",)),
+        comfort_temp_min=20.0,
+    )
+
+    assert assessment["state"] == "room_overheat_suppression"
+    assert assessment["reason_code"] == "room_overheat_suppression"
+
+
+def test_baseline_heat_insufficient_assessment():
+    assessment = build_comfort_assessment(
+        forecast=[
+            {
+                "hour": 1,
+                "predicted_indoor_temp": 19.0,
+                "space_heating_fraction": 0.35,
+                "baseline_heating_fraction": 0.35,
+                "space_heating_source": "baseline",
+                "baseline_heating_source": "history",
+            }
+        ],
+        targets=[{"hour": 1, "target": 20.0, "comfort_hour": True}],
+        weather=[{"outdoor_temp": 3.0}],
+        planned_actions=[],
+        heat_curve=HeatCurveConfig(),
+    )
+
+    assert assessment["controllability"]["status"] == "baseline_heat_insufficient"

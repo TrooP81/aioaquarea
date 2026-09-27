@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from enum import StrEnum
 
 import structlog
 from sqlalchemy import and_, case, func, select, update
@@ -54,30 +55,43 @@ SAFETY_ACTION_STUCK_AFTER = dt.timedelta(minutes=2)
 assert SAFETY_ACTION_STUCK_AFTER > dt.timedelta(seconds=VERIFY_TIMEOUT_S + SAFETY_DISPATCH_MARGIN_S)
 
 
-async def is_learning_mode_active() -> bool:
-    """Return True when observe-only learning mode is enabled.
+class LearningModeState(StrEnum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    UNKNOWN = "unknown"
 
-    In learning mode the executor dispatches no device commands so the heat pump
-    runs on its own native schedule, letting the poller collect clean, natural-
-    behaviour data for ML training over a long period. Defensive: any lookup error
-    is treated as "not active" so a transient settings failure never blocks control.
+
+async def resolve_learning_mode_state() -> LearningModeState:
+    """Resolve observe-only learning mode without treating lookup errors as inactive.
+
+    A lookup failure leaves ordinary control unsafe, but a pending restorative action
+    remains eligible for the executor's separate safety lane.
     """
     from packages.core.settings_service import get_bool_setting
 
     try:
         if await get_bool_setting("learning_mode_enabled"):
-            return True
+            return LearningModeState.ACTIVE
 
         from packages.ml.seasonal_learning import get_seasonal_calibration_status
 
         seasonal = await get_seasonal_calibration_status()
         if seasonal["observe_only_active"]:
             logger.info("executor_seasonal_calibration_active", **seasonal)
-            return True
-        return False
-    except Exception as exc:  # noqa: BLE001 - never let a settings error pause control
-        logger.warning("learning_mode_check_failed", error=str(exc))
-        return False
+            return LearningModeState.ACTIVE
+        return LearningModeState.INACTIVE
+    except Exception as exc:  # noqa: BLE001 - lookup failure must block ordinary control
+        logger.error(
+            "learning_mode_state_unknown",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return LearningModeState.UNKNOWN
+
+
+async def is_learning_mode_active() -> bool:
+    """Compatibility wrapper for callers that only need positive learning evidence."""
+    return await resolve_learning_mode_state() is LearningModeState.ACTIVE
 
 
 class PlanExecutor:
@@ -89,7 +103,7 @@ class PlanExecutor:
         *,
         session_factory=get_session,
         sleep=asyncio.sleep,
-        learning_check=is_learning_mode_active,
+        learning_check=resolve_learning_mode_state,
         device_quality_check=get_device_data_quality,
     ):
         self._wrapper = wrapper
@@ -103,6 +117,30 @@ class PlanExecutor:
         actions: list[PlanActionRecord] = []
         now = dt.datetime.now(dt.timezone.utc)
 
+        try:
+            learning_state = await self._learning_check()
+        except Exception as exc:  # noqa: BLE001 - injected checks must not admit ordinary work
+            logger.error(
+                "learning_mode_state_unknown",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            learning_state = LearningModeState.UNKNOWN
+        if learning_state is True:
+            learning_state = LearningModeState.ACTIVE
+        elif learning_state is False:
+            learning_state = LearningModeState.INACTIVE
+
+        # Positive observe-only learning leaves every action untouched, including
+        # restores. Unknown state permits only the existing single safety lane.
+        if learning_state is LearningModeState.ACTIVE:
+            logger.info(
+                "executor_learning_mode_active",
+                reason="observe-only training mode",
+                skipping=0,
+            )
+            return
+
         safety_action = await self._claim_due_safety_action(now)
         if safety_action is not None:
             try:
@@ -110,6 +148,10 @@ class PlanExecutor:
             except asyncio.CancelledError:
                 await self._requeue_safety_action(safety_action, "shutdown_cancelled")
                 raise
+            return
+
+        if learning_state is LearningModeState.UNKNOWN:
+            logger.info("executor_learning_mode_unknown_skipping_ordinary_actions")
             return
 
         async with self._session_factory() as session:
@@ -154,24 +196,6 @@ class PlanExecutor:
                     )
                     .values(status="executing")
                 )
-
-            if await self._learning_check():
-                logger.info(
-                    "executor_learning_mode_active",
-                    reason="observe-only training mode",
-                    skipping=len(actions),
-                )
-                for action in actions:
-                    await session.execute(
-                        update(PlanActionRecord)
-                        .where(PlanActionRecord.id == action.id)
-                        .values(
-                            status="skipped",
-                            executed_at=now,
-                            result_json=json.dumps({"reason": "learning_mode"}),
-                        )
-                    )
-                return
 
             if active_overrides and actions:
                 override_reason = active_overrides[0].reason or "manual override"

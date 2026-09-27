@@ -226,6 +226,9 @@ class IndoorForecastPointResponse(BaseModel):
     source: str | None = None
     model_source: str | None = None
     space_heating_fraction: float | None = Field(default=None, ge=0, le=1)
+    baseline_heating_fraction: float | None = Field(default=None, ge=0, le=1)
+    baseline_heating_source: str | None = None
+    space_heating_source: str | None = None
     prediction_lower_c: float | None = None
     prediction_upper_c: float | None = None
     prediction_interval_status: str | None = None
@@ -282,7 +285,7 @@ class IndoorForecastResponse(BaseModel):
     price_forecast: list[IndoorForecastPriceResponse]
     planned_actions: list[IndoorForecastActionResponse]
     forecast_source: str
-    forecast_status: str = "available"
+    forecast_status: str = "unavailable"
     forecast_unavailable_reason: str | None = None
     plan_id: int | None = None
     plan_created_at: dt.datetime | None = None
@@ -293,3 +296,8 @@ class IndoorForecastResponse(BaseModel):
     sensor_age_seconds: int | None = None
     current_vs_plan_delta_c: float | None = None
     space_heating_gate: dict = Field(default_factory=dict)
+    observed_history: list[dict] = Field(default_factory=list)
+    sensor_basis: dict = Field(default_factory=dict)
+    room_comfort: dict = Field(default_factory=dict)
+    forecast_quality: dict = Field(default_factory=dict)
+    space_heating_baseline: dict = Field(default_factory=dict)

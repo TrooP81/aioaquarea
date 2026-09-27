@@ -5,15 +5,20 @@ from __future__ import annotations
 import math
 import json
 from collections.abc import Iterable
+import datetime as dt
 from typing import Any
 
-from sqlalchemy import and_
+from sqlalchemy import and_, case, distinct, func, or_, select
+from sqlalchemy.orm import aliased
 
 from packages.core.models import PlanActionRecord
 from packages.optimizer.actions import ActionType
 from packages.optimizer.executor_gate import is_room_heating_increase
 
 UNRESOLVED_STATUSES = ("pending", "executing", "dispatched")
+MAX_UNRESOLVED_REVERT_ACTION_TYPES = 20
+MAX_UNRESOLVED_REVERT_DEVICE_IDS = 500
+MAX_HISTORICAL_REVERT_OVERLAPS = 500
 
 
 def is_restorative_action(action: Any) -> bool:
@@ -38,6 +43,128 @@ def due_revert_predicate():
         PlanActionRecord.reverts_action_id.is_not(None),
         PlanActionRecord.status == "pending",
     )
+
+
+async def unresolved_revert_summary(
+    session: Any,
+    *,
+    now: dt.datetime,
+) -> dict[str, object]:
+    """Return a bounded operational summary of unresolved restore obligations."""
+
+    count, oldest_scheduled_at = (
+        await session.execute(
+            select(
+                func.count(PlanActionRecord.id),
+                func.min(PlanActionRecord.scheduled_ts),
+            ).where(unresolved_revert_predicate())
+        )
+    ).one()
+    action_types = (
+        (
+            await session.execute(
+                select(distinct(PlanActionRecord.action_type))
+                .where(unresolved_revert_predicate())
+                .order_by(PlanActionRecord.action_type)
+                .limit(MAX_UNRESOLVED_REVERT_ACTION_TYPES)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    oldest_age_seconds = (
+        max(0, int((now - oldest_scheduled_at).total_seconds()))
+        if oldest_scheduled_at is not None
+        else None
+    )
+    return {
+        "count": int(count or 0),
+        "oldest_scheduled_at": oldest_scheduled_at,
+        "oldest_age_seconds": oldest_age_seconds,
+        "action_types": [str(action_type) for action_type in action_types],
+    }
+
+
+def serialize_unresolved_revert_summary(summary: dict[str, object]) -> dict[str, object]:
+    """Convert the unresolved-revert summary into a JSON-safe API payload."""
+
+    serialized = dict(summary)
+    oldest_scheduled_at = serialized.get("oldest_scheduled_at")
+    if isinstance(oldest_scheduled_at, dt.datetime):
+        if oldest_scheduled_at.tzinfo is None:
+            oldest_scheduled_at = oldest_scheduled_at.replace(tzinfo=dt.timezone.utc)
+        serialized["oldest_scheduled_at"] = oldest_scheduled_at.astimezone(
+            dt.timezone.utc
+        ).isoformat()
+    return serialized
+
+
+async def unresolved_revert_device_ids(
+    session: Any,
+    *,
+    limit: int = MAX_UNRESOLVED_REVERT_DEVICE_IDS,
+) -> tuple[set[str], bool]:
+    """Return unresolved device IDs and whether the bounded lookup overflowed."""
+
+    rows = (
+        (
+            await session.execute(
+                select(distinct(PlanActionRecord.device_id))
+                .where(unresolved_revert_predicate(), PlanActionRecord.device_id.is_not(None))
+                .order_by(PlanActionRecord.device_id)
+                .limit(limit + 1)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    overflowed = len(rows) > limit
+    return {str(device_id) for device_id in rows[:limit]}, overflowed
+
+
+async def historical_revert_overlap_rows(
+    session: Any,
+    *,
+    horizon_start: dt.datetime,
+    horizon_end: dt.datetime,
+    drift_margin: dt.timedelta,
+    limit: int = MAX_HISTORICAL_REVERT_OVERLAPS,
+) -> tuple[list[tuple[str, dt.datetime, str, dt.datetime | None]], bool]:
+    """Return bounded source/restore lifecycle rows that could overlap a horizon."""
+
+    restore = aliased(PlanActionRecord)
+    rows = (
+        await session.execute(
+            select(
+                PlanActionRecord.device_id,
+                PlanActionRecord.executed_at,
+                restore.status,
+                restore.executed_at,
+            )
+            .join(restore, restore.reverts_action_id == PlanActionRecord.id)
+            .where(PlanActionRecord.device_id.is_not(None))
+            .where(PlanActionRecord.executed_at.is_not(None))
+            .where(PlanActionRecord.executed_at <= horizon_end + drift_margin)
+            .where(
+                or_(
+                    PlanActionRecord.executed_at >= horizon_start - dt.timedelta(hours=24),
+                    restore.status.in_(UNRESOLVED_STATUSES),
+                    restore.executed_at >= horizon_start,
+                )
+            )
+            .order_by(
+                case(
+                    (restore.status.in_(UNRESOLVED_STATUSES), 0),
+                    (restore.executed_at >= horizon_start, 1),
+                    else_=2,
+                ),
+                PlanActionRecord.executed_at.desc(),
+            )
+            .limit(limit + 1)
+        )
+    ).all()
+    overflowed = len(rows) > limit
+    return list(rows[:limit]), overflowed
 
 
 def normalize_zone_id(zone_id: Any) -> int:

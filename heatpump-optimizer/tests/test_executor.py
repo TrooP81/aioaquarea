@@ -888,6 +888,18 @@ async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_s
 
 class TestLearningMode:
     @pytest.mark.asyncio
+    async def test_learning_mode_skips_due_safety_reverts_without_dispatch(self, executor):
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._learning_check = AsyncMock(return_value=True)
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._learning_check.assert_awaited_once()
+        executor._execute_safety_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_seasonal_calibration_only_pauses_commands_when_explicitly_active(self):
         from packages.optimizer.executor_core import is_learning_mode_active
 
@@ -905,33 +917,15 @@ class TestLearningMode:
 
     @pytest.mark.asyncio
     async def test_learning_mode_skips_due_actions_without_touching_device(self, executor):
-        action_mock = _make_action(str(ActionType.FORCE_DHW_ON))
+        executor._learning_check = AsyncMock(return_value=True)
+        executor._claim_due_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
 
-        with (
-            patch("packages.optimizer.executor.get_session") as mock_gs,
-            patch(
-                "packages.optimizer.executor.is_learning_mode_active",
-                new=AsyncMock(return_value=True),
-            ),
-        ):
-            mock_session = AsyncMock()
-            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+        await executor.execute_due_actions()
 
-            override_result = MagicMock()
-            override_result.scalars.return_value.all.return_value = []
-            actions_result = MagicMock()
-            actions_result.scalars.return_value.all.return_value = [action_mock]
-            safety_result = MagicMock()
-            safety_result.scalar_one_or_none.return_value = None
-            mock_session.execute = AsyncMock(
-                side_effect=[None, safety_result, override_result, actions_result, None, None]
-            )
-
-            await executor.execute_due_actions()
-
+        executor._claim_due_safety_action.assert_not_awaited()
+        executor._execute_action.assert_not_awaited()
         executor._wrapper.force_dhw.assert_not_awaited()
-        assert mock_session.execute.call_count == 6
 
     @pytest.mark.asyncio
     async def test_learning_mode_off_does_not_skip(self, executor):

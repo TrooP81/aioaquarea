@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from packages.core.heat_curve import HeatCurveConfig
+from packages.core.control_temperature import RoomComfortEnvelope
 from packages.core.space_heating_gate import EffectiveGateEvidence, SpaceHeatingGateState
 
 
@@ -25,6 +26,8 @@ def build_comfort_assessment(
     heat_curve: HeatCurveConfig,
     gate_projections: Sequence[EffectiveGateEvidence] | Sequence[Any] | None = None,
     forecast_status: str = "available",
+    room_envelope: RoomComfortEnvelope | None = None,
+    comfort_temp_min: float | None = None,
 ) -> dict[str, Any]:
     """Summarise target misses and provide bounded, manual-only advice.
 
@@ -35,10 +38,41 @@ def build_comfort_assessment(
     """
     if forecast_status != "available":
         return {
-            "state": "unavailable",
+            "state": "degraded" if forecast_status == "fallback" else "unavailable",
             "summary": "A fresh trusted indoor observation is required before comfort risk can be assessed.",
             "misses": [],
             "recommendations": [],
+        }
+
+    min_comfort_active = bool(
+        room_envelope is not None
+        and comfort_temp_min is not None
+        and room_envelope.basis_temperature is not None
+        and room_envelope.basis_temperature < comfort_temp_min
+    )
+    room_overheat_active = bool(room_envelope and room_envelope.rooms_above_max)
+    room_comfort = {
+        "min_comfort_active": min_comfort_active,
+        "room_overheat_active": room_overheat_active,
+        "affected_rooms": list(room_envelope.rooms_above_max) if room_envelope else [],
+    }
+    if min_comfort_active and room_overheat_active:
+        return {
+            "state": "conflict",
+            "reason_code": "comfort_conflict_min_priority",
+            "summary": "Minimum-comfort heat remains allowed while discretionary heat is suppressed.",
+            "misses": [],
+            "recommendations": [],
+            **room_comfort,
+        }
+    if room_overheat_active:
+        return {
+            "state": "room_overheat_suppression",
+            "reason_code": "room_overheat_suppression",
+            "summary": "Discretionary space heating is suppressed while a fresh room reading is above the configured maximum.",
+            "misses": [],
+            "recommendations": [],
+            **room_comfort,
         }
 
     misses: list[dict[str, Any]] = []
@@ -70,6 +104,9 @@ def build_comfort_assessment(
                 "comfort_hour": bool(target_row.get("comfort_hour")),
                 "outdoor_temp_c": round(outdoor_c, 1) if outdoor_c is not None else None,
                 "space_heating_fraction": point.get("space_heating_fraction"),
+                "baseline_heating_fraction": point.get("baseline_heating_fraction"),
+                "baseline_heating_source": point.get("baseline_heating_source"),
+                "space_heating_source": point.get("space_heating_source"),
                 "model_source": point.get("model_source") or point.get("source"),
                 "prediction_interval_status": point.get("prediction_interval_status"),
             }
@@ -81,6 +118,7 @@ def build_comfort_assessment(
             "summary": "The active forecast remains within the configured temperature targets.",
             "misses": [],
             "recommendations": [],
+            **room_comfort,
         }
 
     comfort_misses = [miss for miss in misses if miss["comfort_hour"]]
@@ -130,8 +168,14 @@ def build_comfort_assessment(
             f"Comfort target is forecast to be missed by up to {worst['shortfall_c']:.1f}°C. "
             "Space heating is blocked by recorded controller evidence."
         )
-    elif any(float(miss.get("space_heating_fraction") or 0.0) > 0 for miss in relevant):
-        controllability = "planned_heat_insufficient"
+    elif any(miss.get("space_heating_source") == "baseline" for miss in relevant):
+        controllability = "baseline_heat_insufficient"
+        summary = (
+            f"Comfort target is forecast to be missed by up to {worst['shortfall_c']:.1f}°C despite expected automatic space heating. "
+            "The system should re-plan rather than change controller settings automatically."
+        )
+    elif any(miss.get("space_heating_source") == "explicit_override" for miss in relevant):
+        controllability = "explicit_heat_insufficient"
         summary = (
             f"Comfort target is forecast to be missed by up to {worst['shortfall_c']:.1f}°C despite planned space heating. "
             "The system should re-plan rather than change controller settings automatically."
@@ -143,7 +187,7 @@ def build_comfort_assessment(
             "A mode change is scheduled, but it does not request space heating."
         )
     else:
-        controllability = "no_space_heat_planned"
+        controllability = "no_space_heat_expected"
         summary = f"Comfort target is forecast to be missed by up to {worst['shortfall_c']:.1f}°C and no space heat is planned."
 
     return {
@@ -157,4 +201,5 @@ def build_comfort_assessment(
         "worst_miss": worst,
         "misses": relevant,
         "recommendations": recommendations,
+        **room_comfort,
     }

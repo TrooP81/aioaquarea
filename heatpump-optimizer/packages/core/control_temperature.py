@@ -50,6 +50,67 @@ class SensorTemperature:
     timestamp: dt.datetime
 
 
+@dataclass(frozen=True)
+class RoomComfortEnvelope:
+    """Fresh inlier room evidence for comfort policy decisions."""
+
+    basis_temperature: float | None
+    fresh_inlier_min: float | None
+    fresh_inlier_max: float | None
+    rooms_above_max: tuple[str, ...] = ()
+
+
+def build_forecast_observation_metadata(
+    control_temperature: ControlTemperature,
+    *,
+    horizon_start: dt.datetime,
+) -> dict[str, object]:
+    """Build the immutable observation provenance saved with a forecast."""
+    if control_temperature.value is None:
+        return {
+            "scoring_schema": "forecast_outcome_v2_persistence_origin",
+            "issue_timestamp": horizon_start.isoformat(),
+            "sensor_basis": {},
+            "observed_history": [],
+        }
+    return {
+        "scoring_schema": "forecast_outcome_v2_persistence_origin",
+        "issue_timestamp": horizon_start.isoformat(),
+        "sensor_basis": {
+            "label": control_temperature.reference_sensor_label or "Median indoor temperature",
+            "kind": "reference" if control_temperature.reference_sensor_id else "median",
+        },
+        "observed_history": [
+            {
+                "hour": 0,
+                "ts": horizon_start.isoformat(),
+                "temperature": round(control_temperature.value, 1),
+            }
+        ],
+    }
+
+
+def build_room_comfort_envelope(
+    control_temperature: ControlTemperature,
+    *,
+    comfort_temp_max: float,
+) -> RoomComfortEnvelope:
+    """Project already-vetted sensors into an overheat policy envelope."""
+    sensors = control_temperature.sensors
+    temperatures = [sensor.temperature for sensor in sensors]
+    affected = tuple(
+        sensor.room or sensor.device_label or sensor.device_id
+        for sensor in sensors
+        if sensor.temperature > comfort_temp_max
+    )
+    return RoomComfortEnvelope(
+        basis_temperature=control_temperature.value,
+        fresh_inlier_min=min(temperatures) if temperatures else None,
+        fresh_inlier_max=max(temperatures) if temperatures else None,
+        rooms_above_max=affected,
+    )
+
+
 async def get_control_temperature(
     *,
     now: dt.datetime | None = None,

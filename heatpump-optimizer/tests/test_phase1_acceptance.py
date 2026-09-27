@@ -20,7 +20,20 @@ from packages.api.routers.models_router import readiness
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.heating_evidence import classify_space_heating
 from packages.core.operational_alerts import device_status_is_fresh
-from packages.ml.comfort_model import ComfortModel
+from packages.ml.comfort_model import (
+    COMFORT_MODEL_CONSTRAINT_VERSION,
+    COMFORT_MODEL_FORMAT_VERSION,
+    COMFORT_MODEL_KNOT_RANGE,
+    COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
+    COMFORT_MODEL_PROJECTION_EPSILON,
+    COMFORT_MODEL_TARGET_KIND,
+    DIRECT_FORECAST_HORIZONS_MINUTES,
+    CONTROLLED_FEATURE_NAMES,
+    PASSIVE_FEATURE_NAMES,
+    _MONOTONIC_CST,
+    _PASSIVE_MONOTONIC_CST,
+    ComfortModel,
+)
 from packages.optimizer.actions import ActionType
 from packages.optimizer.executor_core import PlanExecutor
 from packages.optimizer.rules import RulesOptimizer
@@ -43,6 +56,24 @@ def _quality_session(timestamp=None):
     session = MagicMock()
     session.execute = AsyncMock(return_value=result)
     return session
+
+
+def _v7_artifact(model):
+    return {
+        "model": model,
+        "format_version": COMFORT_MODEL_FORMAT_VERSION,
+        "target_kind": COMFORT_MODEL_TARGET_KIND,
+        "feature_schema": "weather_delta_v7_window_heat_controlled",
+        "feature_names": list(CONTROLLED_FEATURE_NAMES),
+        "passive_feature_schema": COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
+        "passive_feature_names": list(PASSIVE_FEATURE_NAMES),
+        "controlled_constraints": _MONOTONIC_CST,
+        "passive_constraints": _PASSIVE_MONOTONIC_CST,
+        "constraint_version": COMFORT_MODEL_CONSTRAINT_VERSION,
+        "direct_horizons_minutes": DIRECT_FORECAST_HORIZONS_MINUTES,
+        "knot_range": COMFORT_MODEL_KNOT_RANGE,
+        "projection_epsilon": COMFORT_MODEL_PROJECTION_EPSILON,
+    }
 
 
 class TestAC8ArtifactLifecycle:
@@ -92,10 +123,11 @@ class TestAC8ArtifactLifecycle:
         candidate = MagicMock(n_features_in_=14)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
         monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load", MagicMock(return_value={"model": candidate})
+            "packages.ml.safe_persistence.safe_load",
+            MagicMock(return_value=_v7_artifact(candidate)),
         )
-        first = tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl"
-        second = tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl"
+        first = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
+        second = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
         first.write_bytes(b"valid")
 
         assert model.refresh_if_changed() is True
@@ -162,13 +194,11 @@ class TestAC8ArtifactLifecycle:
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
         monkeypatch.setattr(
             "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[{"model": good}, ValueError("partial HMAC")]),
+            MagicMock(side_effect=[_v7_artifact(good), ValueError("partial HMAC")]),
         )
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl").write_bytes(b"good")
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(b"good")
         assert model.refresh_if_changed() is True
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl").write_bytes(
-            b"partial"
-        )
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl").write_bytes(b"partial")
         assert model.refresh_if_changed() is False
         assert model._model is good
         assert model.artifact_refresh_reason == "artifact_integrity_failed"
@@ -194,10 +224,10 @@ class TestAC8ArtifactLifecycle:
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
         monkeypatch.setattr(
             "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[{"model": good}, load_error]),
+            MagicMock(side_effect=[_v7_artifact(good), load_error]),
         )
-        good_path = tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl"
-        bad_path = tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl"
+        good_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
+        bad_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
         good_path.write_bytes(b"valid-signed-artifact")
         assert model.refresh_if_changed() is True
         bad_path.write_bytes(b"valid-signed-artifact")
@@ -225,16 +255,16 @@ class TestAC8ArtifactLifecycle:
             "packages.ml.safe_persistence.safe_load",
             MagicMock(
                 side_effect=[
-                    {"model": good},
+                    _v7_artifact(good),
                     ModuleNotFoundError("AC8_3_ASYNC_EXCEPTION_MESSAGE_SENTINEL"),
                 ]
             ),
         )
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl").write_bytes(
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(
             b"valid-signed-artifact"
         )
         assert await model.arefresh_if_changed() is True
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl").write_bytes(
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl").write_bytes(
             b"valid-signed-artifact"
         )
 
@@ -251,13 +281,13 @@ class TestAC8ArtifactLifecycle:
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
         monkeypatch.setattr(
             "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[{"model": good}, pickle.UnpicklingError("corrupt")]),
+            MagicMock(side_effect=[_v7_artifact(good), pickle.UnpicklingError("corrupt")]),
         )
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_1.pkl").write_bytes(
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(
             b"valid-signed-artifact"
         )
         assert model.refresh_if_changed() is True
-        (tmp_path / "comfort_model_weather_causal_v7_component_evidence_2.pkl").write_bytes(
+        (tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl").write_bytes(
             b"valid-signed-artifact"
         )
         app = FastAPI()
@@ -471,7 +501,7 @@ class TestAC9ComfortEvidence:
         assert evidence.active is False
 
     @pytest.mark.asyncio
-    async def test_AC9_4_passive_rows_use_ambient_water_and_target_temperatures(self):
+    async def test_AC9_4_passive_rows_without_target_weather_are_rejected(self):
         model = ComfortModel()
         start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         passive_rows = [
@@ -568,10 +598,8 @@ class TestAC9ComfortEvidence:
         ):
             features, _, row_count = await model._build_dataset()
 
-        expected_outdoor_temps = [row[1] for row in passive_rows]
-        assert row_count == len(expected_outdoor_temps)
-        assert features[:, 0].tolist() == expected_outdoor_temps
-        assert features[:, 1].tolist() == expected_outdoor_temps
+        assert row_count == 0
+        assert features.size == 0
 
     def test_AC9_5_old_prefix_is_ignored(self, tmp_path, monkeypatch):
         model = ComfortModel()

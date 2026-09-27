@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from packages.core.panasonic_control_state import (
+    classify_panasonic_operation_mode,
     panasonic_tank_heating_available,
     panasonic_zone_heating_available,
 )
@@ -76,3 +77,21 @@ def test_legacy_missing_status_flags_keep_complete_heat_circuit_available():
 def test_missing_device_status_disables_all_panasonic_load_control():
     assert panasonic_tank_heating_available(None) is False
     assert panasonic_zone_heating_available(None) is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (None, "other"),
+        (0, "other"),
+        (1, "heating"),
+        ("2", "cooling"),
+        ("3", "heating"),
+        ("heat", "heating"),
+        ("AUTO_COOL", "cooling"),
+        ("ExtendedOperationMode.AUTO_HEAT", "heating"),
+        ("malformed", "other"),
+    ],
+)
+def test_classify_panasonic_operation_mode(mode, expected):
+    assert classify_panasonic_operation_mode(mode) == expected

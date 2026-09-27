@@ -414,7 +414,10 @@ async def retrain_comfort_model() -> None:
         lag = int(lag_str) if lag_str else None
 
         result = await comfort_model.train(thermal_lag_minutes=lag)
-        logger.info("comfort_model_retrain", **result)
+        if result.get("status") in {"training_in_progress", "training_skipped"}:
+            logger.info("comfort_model_retrain_deferred", **result)
+        else:
+            logger.info("comfort_model_retrain", **result)
     except Exception as e:
         logger.error("comfort_model_retrain_failed", error=str(e))
 

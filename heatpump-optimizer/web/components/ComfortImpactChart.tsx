@@ -43,6 +43,8 @@ interface IndoorForecastData {
     ts?: string | null;
     predicted_indoor_temp: number;
     space_heating_fraction?: number;
+    baseline_heating_source?: "history" | "default" | "none";
+    space_heating_source?: "baseline" | "explicit_override" | "none";
     prediction_lower_c?: number | null;
     prediction_upper_c?: number | null;
   }>;
@@ -82,6 +84,7 @@ interface IndoorForecastData {
     controllability?: { status?: string; cutoff_c?: number };
     recommendations?: ComfortRecommendation[];
   };
+  space_heating_baseline?: { effective_mode?: "off" | "shadow" | "on" };
 }
 
 interface ChartPoint {
@@ -232,6 +235,18 @@ export function ComfortImpactChart() {
   const allCurvesOverlap = chartData.slice(1).every((point) =>
     point.indoor == null || point.noHeating == null || Math.abs(point.indoor - point.noHeating) < 0.05,
   );
+  const baselineMode = forecast?.space_heating_baseline?.effective_mode;
+  const forecastSources = forecast?.forecast_with_plan ?? [];
+  const baselineSource = forecastSources.find((point) => point.space_heating_source === "baseline")?.baseline_heating_source;
+  const baselineMessage = baselineMode === "shadow"
+    ? "Automatic room heat is being evaluated but does not affect this displayed plan."
+    : baselineSource === "history"
+      ? "Expected automatic room heat from recent history is included in this plan."
+      : baselineSource === "default"
+        ? "Expected automatic room heat uses the configured default in this plan."
+        : forecastSources.some((point) => point.space_heating_source === "explicit_override")
+          ? null
+          : baselineMode ? "No room heating is expected in this plan." : null;
   const controls = (forecast?.planned_actions ?? []).filter(
     (action) => CONTROL_ACTIONS[action.action_type] && action.hour > 0 && action.hour <= 24,
   );
@@ -325,7 +340,9 @@ export function ComfortImpactChart() {
         </div>
       )}
 
-      {allCurvesOverlap && (
+      {baselineMessage ? (
+        <p className="forecast-overlap-note">{baselineMessage}</p>
+      ) : allCurvesOverlap && (
         <p className="forecast-overlap-note">
           No room heating is planned, so Plan forecast and No heating are the same scenario.
         </p>
