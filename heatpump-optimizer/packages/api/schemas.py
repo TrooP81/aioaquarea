@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -183,6 +183,34 @@ class DashboardResponse(BaseModel):
     space_heating_gate: dict = Field(default_factory=dict)
     has_override: bool = False
     override_id: Optional[int] = None
+
+
+class ControlStateNoticeResponse(BaseModel):
+    code: str
+    severity: Literal["info", "warning", "danger"]
+    detail: str
+
+
+class ControlStateActionResponse(BaseModel):
+    kind: Literal["link", "request"]
+    label: str
+    href: str | None = None
+    endpoint: str | None = None
+    method: str | None = None
+
+
+class ControlStateResponse(BaseModel):
+    state: Literal["paused_by_user", "observing", "holding", "comfort_at_risk", "automatic"]
+    headline: str
+    detail: str
+    reason_code: str
+    since: dt.datetime | None = None
+    until: dt.datetime | None = None
+    override_id: int | None = None
+    active_override_count: int = 0
+    primary_action: ControlStateActionResponse | None = None
+    notices: list[ControlStateNoticeResponse] = Field(default_factory=list)
+    resolved_at: dt.datetime
 
 
 class SettingsUpdate(BaseModel):

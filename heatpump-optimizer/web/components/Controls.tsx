@@ -1,16 +1,15 @@
 "use client";
 
 import { useState } from "react";
+import { formatTime } from "@/lib/constants";
+import type { ControlState } from "@/lib/api-types";
 
-export function Controls() {
+export function Controls({ controlState, onChanged }: { controlState: ControlState | null; onChanged: () => Promise<void> }) {
   const [overrideHours, setOverrideHours] = useState(2);
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const createOverride = async () => {
-    if (!window.confirm(`Pause the optimizer for ${overrideHours} hour(s)? Manual overrides take priority over all scheduling.`)) {
-      return;
-    }
-
     const now = new Date();
     const end = new Date(now.getTime() + overrideHours * 60 * 60 * 1000);
 
@@ -27,6 +26,8 @@ export function Controls() {
       });
       if (res.ok) {
         setMessage({ text: `Optimizer paused for ${overrideHours} hours`, ok: true });
+        setConfirming(false);
+        await onChanged();
       } else {
         setMessage({ text: "Failed to create override", ok: false });
       }
@@ -59,11 +60,24 @@ export function Controls() {
             <option value={8}>8 hours</option>
             <option value={24}>24 hours</option>
           </select>
-          <button className="btn btn-primary" onClick={createOverride}>
+          <button className="btn btn-primary" onClick={() => setConfirming(true)} disabled={controlState?.state === "paused_by_user"}>
             Pause Optimizer
           </button>
         </div>
       </div>
+
+      {controlState?.state === "paused_by_user" && (
+        <p className="text-warning text-sm">
+          Paused until {formatTime(controlState.until)}. {controlState.active_override_count > 1 ? "Another active override remains after a resume." : "Resume is available in the header."}
+        </p>
+      )}
+      {confirming && (
+        <div className="banner banner--warning">
+          <p>Pause for {overrideHours} hour{overrideHours === 1 ? "" : "s"}, ending at {formatTime(new Date(Date.now() + overrideHours * 3_600_000))}?</p>
+          <button className="btn btn-primary" onClick={createOverride}>Confirm pause</button>
+          <button className="btn" onClick={() => setConfirming(false)}>Cancel</button>
+        </div>
+      )}
 
       {message && (
         <p style={{ color: message.ok ? "var(--success)" : "var(--danger)", fontSize: "0.875rem", marginTop: "1rem" }}>

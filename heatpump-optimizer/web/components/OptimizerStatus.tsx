@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { LAYER_LABELS } from "@/lib/constants";
+import { DataAge } from "./DataAge";
+import { LAYER_LABELS, reasonLabel, seasonalReasonLabel } from "@/lib/constants";
 
 interface ModelInfo {
   trained: boolean;
@@ -221,12 +222,6 @@ function layerBadgeClass(layer: string): string {
   return "opt-layer-badge";
 }
 
-function formatAge(seconds: number | null): string {
-  if (seconds == null) return "no device status";
-  if (seconds < 60) return "just now";
-  return `${Math.round(seconds / 60)} min ago`;
-}
-
 export function OptimizerStatus() {
   const [status, setStatus] = useState<OptimizerStatusData | null>(null);
   const [comfort, setComfort] = useState<ComfortInfo | null>(null);
@@ -300,7 +295,7 @@ export function OptimizerStatus() {
         return;
       }
       const reason = typeof data.control_readiness?.reason === "string"
-        ? data.control_readiness.reason.replace(/_/g, " ")
+        ? reasonLabel(data.control_readiness.reason)
         : "validation is still pending";
       setTrainMsg({
         text: data.control_ready
@@ -406,7 +401,7 @@ export function OptimizerStatus() {
         ? (status.thermal_model.indoor_heating_confidence === "learned" ? "validated" : "trained")
         : "collecting",
       lastTrained: status.thermal_model.last_calibrated,
-      detail: `Tank: ${status.thermal_model.tank_heating_rate} °C/h · ${status.thermal_model.confidence} · Indoor heat: ${status.thermal_model.indoor_heating_confidence} (${status.thermal_model.indoor_heating_samples} samples)${status.thermal_model.calibration_status?.zone_cooling ? ` · Zone cooling: ${status.thermal_model.calibration_status.zone_cooling.replace(/_/g, " ")}` : ""}`,
+      detail: `Tank: ${status.thermal_model.tank_heating_rate} °C/h · ${status.thermal_model.confidence} · Indoor heat: ${status.thermal_model.indoor_heating_confidence} (${status.thermal_model.indoor_heating_samples} samples)${status.thermal_model.calibration_status?.zone_cooling ? ` · Zone cooling: ${reasonLabel(status.thermal_model.calibration_status.zone_cooling)}` : ""}`,
       nextStep: status.thermal_model.indoor_heating_confidence === "learned"
         ? "Tank and indoor response have learned evidence."
         : "Tank calibration is available, but indoor heating still uses safe defaults until confirmed heating samples exist.",
@@ -425,7 +420,7 @@ export function OptimizerStatus() {
     const activeRows = typeof metrics.active_heating_rows === "number" ? metrics.active_heating_rows : null;
     const horizon = typeof metrics.training_horizon_minutes === "number" ? metrics.training_horizon_minutes : null;
     const sensorCount = typeof metrics.source_sensor_count === "number" ? metrics.source_sensor_count : null;
-    const sensorStrategy = typeof metrics.sensor_strategy === "string" ? metrics.sensor_strategy.replace(/_/g, " ") : null;
+    const sensorStrategy = typeof metrics.sensor_strategy === "string" ? reasonLabel(metrics.sensor_strategy) : null;
     const metricsStr = [
       mae && `MAE ${mae}°C`,
       r2 && `R² ${r2}`,
@@ -443,7 +438,7 @@ export function OptimizerStatus() {
           : comfort.training_notice ?? "Collecting data before indoor-temperature training can begin",
       state: comfort.control_ready ? "validated" : comfort.trained ? "trained" : "collecting",
       lastTrained: comfort.last_trained,
-      detail: `${comfort.training_samples} samples${metricsStr ? ` · ${metricsStr}` : ""}${comfort.control_margin_c ? ` · ${comfort.control_margin_c.toFixed(2)}°C planning reserve` : ""}${comfort.control_readiness?.reason ? ` · ${comfort.control_readiness.reason.replace(/_/g, " ")}` : ""}`,
+      detail: `${comfort.training_samples} samples${metricsStr ? ` · ${metricsStr}` : ""}${comfort.control_margin_c ? ` · ${comfort.control_margin_c.toFixed(2)}°C planning reserve` : ""}${comfort.control_readiness?.reason ? ` · ${reasonLabel(comfort.control_readiness.reason)}` : ""}`,
       nextStep: comfort.control_ready
         ? "Validated for control; the active decision layer still decides whether it is used."
         : comfort.trained
@@ -517,7 +512,7 @@ export function OptimizerStatus() {
         </div>
       )}
       <p className={dataFreshness.fresh ? "text-muted text-xs" : "text-warning text-sm"}>
-        Live pump status: {formatAge(dataFreshness.age_seconds)}
+        Live pump status: <DataAge timestamp={dataFreshness.latest_device_status} stale={!dataFreshness.fresh} />
         {!dataFreshness.fresh && " — automatic commands are paused until fresh data returns."}
       </p>
       {status.decision_readiness && (
@@ -546,10 +541,10 @@ export function OptimizerStatus() {
       )}
       {status.seasonal_calibration && (
         <p className={status.seasonal_calibration.observe_only_active ? "text-warning text-sm" : "text-muted text-xs"}>
-          Seasonal calibration: {status.seasonal_calibration.reason.replace(/_/g, " ")}
+          Seasonal calibration: {seasonalReasonLabel(status.seasonal_calibration.reason)}
           {status.seasonal_calibration.average_outdoor_c != null ? ` · recent outdoor average ${status.seasonal_calibration.average_outdoor_c.toFixed(1)}°C` : ""}
           {status.seasonal_calibration.observe_only_active && " — device commands are paused while natural heating data is collected."}
-          {status.seasonal_calibration.next_step ? ` Next: ${status.seasonal_calibration.next_step.replace(/_/g, " ")}.` : ""}
+          {status.seasonal_calibration.next_step ? ` Next: ${reasonLabel(status.seasonal_calibration.next_step)}.` : ""}
         </p>
       )}
       {status.seasonal_calibration?.enabled && (
@@ -619,7 +614,7 @@ export function OptimizerStatus() {
                       {evidence.overall.bias != null ? ` · bias ${evidence.overall.bias >= 0 ? "+" : ""}${evidence.overall.bias.toFixed(2)}°C` : ""}
                       {evidence.overall.p90_abs_error != null ? ` · P90 ${evidence.overall.p90_abs_error.toFixed(2)}°C` : ""}
                       <div className={gate?.control_allowed ? "text-muted text-xs" : "text-warning text-sm"}>
-                        {gate?.status === "failed" ? "Quality gate: " : "Evidence: "}{gate?.reason?.replace(/_/g, " ")}
+                        {gate?.status === "failed" ? "Quality gate: " : "Evidence: "}{reasonLabel(gate?.reason)}
                       </div>
                     </div>
                   )}
@@ -628,7 +623,7 @@ export function OptimizerStatus() {
             })}
             <div className="text-muted text-xs" style={{ marginTop: "0.6rem" }}>{forecastScorecard.note}</div>
             {forecastScorecard.exclusions && Object.values(forecastScorecard.exclusions).some((count) => count > 0) && (
-              <div className="text-muted text-xs">Excluded outcomes: {Object.entries(forecastScorecard.exclusions).map(([reason, count]) => `${count} ${reason.replace(/_/g, " ")}`).join(" · ")}</div>
+              <div className="text-muted text-xs">Excluded outcomes: {Object.entries(forecastScorecard.exclusions).map(([reason, count]) => `${count} ${reasonLabel(reason)}`).join(" · ")}</div>
             )}
           </div>
         </div>
@@ -691,15 +686,15 @@ export function OptimizerStatus() {
                   Rooms: {indoorTemp.sensors.map((sensor) => `${sensor.device_label || sensor.room || sensor.device_id} ${sensor.temperature.toFixed(1)}°C`).join(" · ")}
                 </div>
               )}
-              {indoorTemp.reason && <div className="text-warning text-sm">⚠ {indoorTemp.reason.replace(/_/g, " ")}</div>}
+              {indoorTemp.reason && <div className="text-warning text-sm">{reasonLabel(indoorTemp.reason)}</div>}
               {indoorTemp.last_fresh_reading && indoorTemp.last_fresh_reading !== indoorTemp.latest_reading && (
                 <div className="text-warning text-sm">
-                  ⚠ Sensor data stale — last fresh reading: {formatDate(indoorTemp.last_fresh_reading)}
+                  Sensor data stale: last fresh reading {formatDate(indoorTemp.last_fresh_reading)}
                 </div>
               )}
               {!indoorTemp.last_fresh_reading && (
                 <div className="text-warning text-sm">
-                  ⚠ No fresh sensor data received yet
+                  No fresh sensor data received yet
                 </div>
               )}
             </div>

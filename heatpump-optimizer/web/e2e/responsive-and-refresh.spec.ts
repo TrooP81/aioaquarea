@@ -54,6 +54,7 @@ const mockOptimizerStatus = {
 async function mockDashboardRequests(page: Page) {
   const routes: Array<[string | RegExp, unknown]> = [
     ["**/api/dashboard", mockDashboard],
+    ["**/api/control-state", { state: "automatic", headline: "Scheduled control remains active", detail: "Automatic dispatch remains active.", reason_code: "automatic", since: null, until: null, override_id: null, active_override_count: 0, primary_action: null, notices: [], resolved_at: new Date().toISOString() }],
     ["**/api/indoor-temp/latest", mockIndoorTemp],
     ["**/api/learning-mode", { enabled: false, since: null, days_elapsed: null }],
     ["**/api/optimizer/status", mockOptimizerStatus],
@@ -110,6 +111,28 @@ test.describe("Responsive Layout", () => {
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     await expect(page.locator(".header-actions .status-badge.online", { hasText: "Connected" })).toBeVisible();
+  });
+
+  test("overview leads with decision context and renders one indoor reading", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+
+    const decisionBeforeCost = await page.locator(".decision-summary").evaluate((decision) => {
+      const cost = document.querySelector("#dashboard-panel-overview h3.card-group-label");
+      return cost !== null && Boolean(decision.compareDocumentPosition(cost) & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+    expect(decisionBeforeCost).toBe(true);
+    await expect(page.getByText("21.5°C indoors", { exact: true })).toHaveCount(1);
+  });
+
+  test("unknown status code uses the explicit fallback copy", async ({ page }) => {
+    await page.route("**/api/thermal/forecast-scorecard", (route) =>
+      route.fulfill(jsonResponse({ plans_scored: 1, overall: { samples: 1, mae: 0.1, bias: 0, p90_abs_error: 0.2 }, horizons: [], regimes: {}, quality_gate: { status: "failed", control_allowed: false, reason: "mystery_code" }, note: "No forecast evidence" }))
+    );
+
+    await page.goto("/?view=status");
+
+    await expect(page.getByText(/Quality gate: Unrecognized status \(mystery_code\)/)).toBeVisible();
   });
 
   test("tablet layout renders without overflow", async ({ page }) => {
@@ -204,12 +227,12 @@ test.describe("Responsive Layout", () => {
     });
 
     await page.goto("/");
-    await page.getByRole("button", { name: "Poll Now" }).click();
-    await expect(page.getByRole("status")).toContainText("All data fetched successfully");
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    await expect(page.getByRole("status").filter({ hasText: "All data fetched successfully" })).toContainText("All data fetched successfully");
 
     succeed = false;
-    await page.getByRole("button", { name: "Poll Now" }).click();
-    await expect(page.locator('p[role="alert"]')).toContainText("prices: Prices unavailable");
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    await expect(page.locator('.banner[role="status"]').filter({ hasText: "prices: Prices unavailable" })).toContainText("prices: Prices unavailable");
   });
 
   test("status indicators expose text or accessible labels without relying on color", async ({ page }) => {
@@ -246,7 +269,7 @@ test.describe("Responsive Layout", () => {
   });
 
   test("responsive grids and primary controls fit the three required viewports", async ({ page }) => {
-    for (const [width, expectedColumns] of [[375, 2], [768, 2], [1280, 4]] as const) {
+    for (const [width, expectedColumns] of [[375, 2], [640, 1], [768, 2], [1280, 4]] as const) {
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/");
       const grid = page.locator("#dashboard-panel-overview > .grid").first();
@@ -262,7 +285,7 @@ test.describe("Responsive Layout", () => {
       expect(metrics.columns).toBe(expectedColumns);
       expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.width + 1);
 
-      const pollNow = page.getByRole("button", { name: "Poll Now" });
+      const pollNow = page.getByRole("button", { name: "Refresh from heat pump" });
       const pollRect = await pollNow.boundingBox();
       expect(pollRect?.height).toBeGreaterThanOrEqual(44);
     }

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import and_, desc, func, select
+import structlog
 
 from packages.api._helpers import get_price_area
 from packages.api.schemas import (
+    ControlStateResponse,
     ConsumptionResponse,
     DashboardResponse,
     DeviceSettingsResponse,
@@ -18,10 +21,14 @@ from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.plan_lifecycle import active_plan_query
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
+from packages.core.optimizer_control_state import (
+    ControlStateOverrideUnavailableError,
+    get_controlling_override,
+    resolve_control_state,
+)
 from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
-    OverrideRecord,
     PlanActionRecord,
     PriceRecord,
     SpaceHeatingGateRecord,
@@ -37,6 +44,7 @@ from packages.core.settings_service import (
 )
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 
 @router.get("/api/dashboard", response_model=DashboardResponse)
@@ -146,19 +154,8 @@ async def get_dashboard():
                 )
             ).scalar() or 0
 
-        override_result = await session.execute(
-            select(OverrideRecord.id)
-            .where(
-                and_(
-                    OverrideRecord.active,
-                    OverrideRecord.ts_from <= now,
-                    OverrideRecord.ts_to >= now,
-                )
-            )
-            .order_by(desc(OverrideRecord.id))
-            .limit(1)
-        )
-        active_override_id = override_result.scalar_one_or_none()
+        active_override = await get_controlling_override(session, now=now)
+        active_override_id = active_override.id if active_override is not None else None
 
     status_fresh = device_status_is_fresh(
         status.ts if status is not None else None,
@@ -301,6 +298,29 @@ async def get_dashboard():
         has_override=active_override_id is not None,
         override_id=active_override_id,
     )
+
+
+@router.get("/api/control-state", response_model=ControlStateResponse)
+async def get_control_state():
+    """Return the persisted optimizer control state without device I/O."""
+
+    comfort_assessment = None
+    try:
+        from packages.api.routers.models_router import get_indoor_forecast
+
+        forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
+        if isinstance(forecast, dict):
+            assessment = forecast.get("comfort_assessment")
+            comfort_assessment = assessment if isinstance(assessment, dict) else None
+    except Exception as exc:  # noqa: BLE001 - missing forecast must not alter dispatch messaging
+        logger.warning(
+            "control_state_comfort_assessment_unavailable",
+            error_type=type(exc).__name__,
+        )
+    try:
+        return await resolve_control_state(comfort_assessment=comfort_assessment)
+    except ControlStateOverrideUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Control state unavailable") from exc
 
 
 @router.get("/api/status/history", response_model=list[DeviceStatusResponse])

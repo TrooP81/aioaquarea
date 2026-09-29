@@ -267,6 +267,23 @@ test.describe("Price Chart", () => {
 });
 
 test.describe("Plan View", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.route("**/api/control-state", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          state: "automatic",
+          headline: "Scheduled control remains active",
+          detail: "Automatic dispatch remains active.",
+          reason_code: "automatic",
+          primary_action: null,
+          notices: [],
+        }),
+      })
+    );
+  });
+
   test("shows active plan info", async ({ page }) => {
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({
@@ -337,7 +354,7 @@ test.describe("Plan View", () => {
     // DecisionSummary is the dashboard's sole next-action presentation.
     const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
     await expect(decisionSummary).toBeVisible({ timeout: 10000 });
-    await expect(decisionSummary).toContainText("Active plan #42");
+    await expect(decisionSummary).toContainText("Heat hot water");
 
     await page.getByRole("tab", { name: "Plan" }).click();
 
@@ -380,7 +397,6 @@ test.describe("Plan View", () => {
     // DecisionSummary presents the no-plan state without a separate empty card.
     const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
     await expect(decisionSummary).toBeVisible({ timeout: 5000 });
-    await expect(decisionSummary).toContainText("No active plan");
     await expect(decisionSummary).toContainText("No pending command");
   });
 

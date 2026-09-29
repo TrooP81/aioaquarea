@@ -19,8 +19,10 @@ import { OperationalAlerts } from "@/components/OperationalAlerts";
 import { AppVersionBadge } from "@/components/AppVersionBadge";
 import { TabNavigation } from "@/components/TabNavigation";
 import { DecisionSummary } from "@/components/DecisionSummary";
+import { Banner } from "@/components/Banner";
+import { DataAge } from "@/components/DataAge";
+import type { ControlState } from "@/lib/api-types";
 import { SECTIONS, SectionId } from "@/lib/constants";
-import { useTimeFormat, formatTime } from "@/components/useTimeFormat";
 import Link from "next/link";
 
 interface DashboardData {
@@ -92,20 +94,66 @@ interface IndoorTempData {
   last_fresh_reading: string | null;
 }
 
-interface LearningModeData {
-  enabled: boolean;
-  since: string | null;
-  days_elapsed: number | null;
+const POLL_RESULT_SUCCESS_AUTO_DISMISS_MS = 6000;
+const CONTROL_STATE_NAMES = new Set<ControlState["state"]>([
+  "paused_by_user",
+  "observing",
+  "holding",
+  "comfort_at_risk",
+  "automatic",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
-const POLL_RESULT_SUCCESS_AUTO_DISMISS_MS = 6000;
+function isControlState(value: unknown): value is ControlState {
+  if (
+    !isRecord(value) ||
+    typeof value.headline !== "string" ||
+    typeof value.detail !== "string" ||
+    typeof value.state !== "string" ||
+    !CONTROL_STATE_NAMES.has(value.state as ControlState["state"]) ||
+    !Array.isArray(value.notices)
+  ) {
+    return false;
+  }
+  if (!value.notices.every((notice) => isRecord(notice) && typeof notice.detail === "string")) {
+    return false;
+  }
+  if (value.primary_action === null) return true;
+  if (!isRecord(value.primary_action) || typeof value.primary_action.label !== "string") return false;
+  if (value.primary_action.kind === "link") return true;
+  return (
+    value.primary_action.kind === "request" &&
+    typeof value.primary_action.endpoint === "string" &&
+    typeof value.primary_action.method === "string"
+  );
+}
+
+async function fetchOptionalJson<T>(
+  path: string,
+  validate?: (value: unknown) => value is T,
+): Promise<T | null> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 1_000);
+  try {
+    const response = await fetch(path, { signal: controller.signal });
+    if (!response.ok) return null;
+    const body: unknown = await response.json();
+    return !validate || validate(body) ? body as T : null;
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
-  const [learningMode, setLearningMode] = useState<LearningModeData | null>(null);
+  const [controlState, setControlState] = useState<ControlState | null>(null);
   const [loading, setLoading] = useState(true);
-  const timeFormat = useTimeFormat();
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
   const [pollResult, setPollResult] = useState<PollResult | null>(null);
@@ -122,14 +170,16 @@ export default function Home() {
 
   const fetchData = async () => {
     try {
-      const [dashRes, tempRes] = await Promise.all([
+      const [dashRes, tempRes, controlRes] = await Promise.all([
         fetch("/api/dashboard"),
-        fetch("/api/indoor-temp/latest").then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest"),
+        fetchOptionalJson("/api/control-state", isControlState),
       ]);
       if (!dashRes.ok) throw new Error(`API error: ${dashRes.status}`);
       const json = await dashRes.json();
       setData(json);
       setIndoorTemp(tempRes);
+      setControlState(controlRes);
       setError(null);
       setLastUpdated(new Date());
     } catch (e) {
@@ -139,21 +189,10 @@ export default function Home() {
     }
   };
 
-  const fetchLearningMode = async () => {
-    try {
-      const res = await fetch("/api/learning-mode");
-      setLearningMode(res.ok ? await res.json() : null);
-    } catch {
-      /* non-critical: banner just won't show */
-    }
-  };
-
   useEffect(() => {
     fetchData();
-    fetchLearningMode();
     const interval = setInterval(() => {
       fetchData();
-      fetchLearningMode();
     }, 30000);
     return () => clearInterval(interval);
   }, []);
@@ -207,9 +246,15 @@ export default function Home() {
   }, [pollResult]);
 
   const cancelOverride = async () => {
-    if (!data?.override_id) return;
+    const action = controlState?.primary_action;
+    if (
+      action?.kind !== "request" ||
+      action.method !== "DELETE" ||
+      typeof action.endpoint !== "string" ||
+      !/^\/api\/overrides\/\d+$/.test(action.endpoint)
+    ) return;
     try {
-      const res = await fetch(`/api/overrides/${data.override_id}`, { method: "DELETE" });
+      const res = await fetch(action.endpoint, { method: action.method });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       await fetchData();
     } catch (e) {
@@ -247,6 +292,23 @@ export default function Home() {
 
   return (
     <main id="main-content" className="dashboard" tabIndex={-1}>
+      <div className="header">
+        <h1>Heat Pump Optimizer</h1>
+        <div className="header-actions">
+          <AppVersionBadge />
+          {lastUpdated && (
+            <DataAge timestamp={lastUpdated.toISOString()} />
+          )}
+          <button className="btn" onClick={pollNow} disabled={polling}>
+            {polling ? "Refreshing..." : "Refresh from heat pump"}
+          </button>
+          <Link href="/settings" className="btn">Settings</Link>
+          <span className={`status-badge ${headerStatus}`}>
+            {headerStatusLabel}
+          </span>
+        </div>
+      </div>
+      <p className="refresh-allowance">Uses the Panasonic hourly read allowance.</p>
       <TabNavigation
         activeId={activeSection}
         ariaLabel="Dashboard workspace"
@@ -259,70 +321,27 @@ export default function Home() {
         <span>{activeSectionMeta.description}</span>
       </p>
 
-      <div className="header">
-        <h1>Heat Pump Optimizer</h1>
-        <div className="header-actions">
-          <AppVersionBadge />
-          {lastUpdated && (
-            <span className="last-updated">
-              Updated {formatTime(lastUpdated, timeFormat.hour12, { seconds: true })}
-            </span>
-          )}
-          <button className="btn btn-primary" onClick={pollNow} disabled={polling}>
-            {polling ? "Polling..." : "Poll Now"}
-          </button>
-          <Link href="/settings" className="btn">Settings</Link>
-          <span className={`status-badge ${headerStatus}`}>
-            {headerStatusLabel}
-          </span>
-        </div>
-      </div>
-
       {pollResult && (
-        <div
-          className="override-banner"
-          style={{
-            borderColor: pollResult.success ? "var(--success)" : "var(--warning, orange)",
-            background: pollResult.success ? "rgba(34,197,94,0.1)" : "rgba(251,191,36,0.1)",
-          }}
-        >
-          <p role={pollResult.success ? "status" : "alert"} aria-live={pollResult.success ? "polite" : undefined} style={{ color: pollResult.success ? "var(--success)" : "var(--warning)" }}>
-            {pollResult.message}
-          </p>
+        <Banner tone={pollResult.success ? "info" : "warning"}>
+          <p>{pollResult.message}</p>
           <button className="btn btn-sm" onClick={() => setPollResult(null)}>
             Dismiss
           </button>
-        </div>
+        </Banner>
       )}
 
       {error && (
-        <div className="override-banner" role="alert" style={{ borderColor: "var(--danger)", background: "rgba(239,68,68,0.1)" }}>
-          <p style={{ color: "var(--danger)" }}>API Error: {error}</p>
-        </div>
+        <Banner tone="danger"><p>API Error: {error}</p></Banner>
       )}
 
-      {data?.has_override && (
-        <div className="override-banner">
-          <p>⚠ Manual override active — optimizer paused</p>
-          <button className="btn btn-danger" onClick={cancelOverride}>Cancel Override</button>
-        </div>
-      )}
-
-      {learningMode?.enabled && (
-        <div
-          className="override-banner"
-          style={{ borderColor: "var(--success)", background: "rgba(34,197,94,0.1)" }}
-        >
-          <p style={{ color: "var(--success)" }}>
-            🎓 Learning mode active — optimizer is observing only (no device commands)
-            {learningMode.days_elapsed != null
-              ? ` · collecting data for ${learningMode.days_elapsed < 1
-                ? `${Math.round(learningMode.days_elapsed * 24)}h`
-                : `${Math.floor(learningMode.days_elapsed)}d`
-              }`
-              : ""}
-          </p>
-        </div>
+      {controlState && (
+        <Banner tone={controlState.state === "comfort_at_risk" ? "warning" : controlState.state === "automatic" ? "info" : "warning"}>
+          <p><strong>{controlState.headline}</strong> {controlState.detail}</p>
+          {controlState.primary_action?.kind === "request" && controlState.active_override_count === 1 && (
+            <button className="btn btn-danger" onClick={cancelOverride}>{controlState.primary_action.label}</button>
+          )}
+          {controlState.notices.map((notice) => <p key={notice.code}>{notice.detail}</p>)}
+        </Banner>
       )}
 
       {/* ── Overview section ── */}
@@ -333,9 +352,16 @@ export default function Home() {
         aria-labelledby="dashboard-tab-overview"
         hidden={activeSection !== "overview"}
       >
-        <DecisionSummary plan={data?.active_plan ?? null} indoorTemp={indoorTemp?.avg_temperature ?? null} />
+        <DecisionSummary
+          plan={data?.active_plan ?? null}
+          indoorTemp={indoorTemp?.avg_temperature ?? null}
+          indoorTimestamp={indoorTemp?.latest_reading ?? null}
+          indoorStale={indoorTemp?.last_fresh_reading !== indoorTemp?.latest_reading}
+          controlState={controlState}
+          onRetry={fetchData}
+        />
+        <Dashboard data={data} />
         <OperationalAlerts />
-        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
         <OutcomeSummary />
       </section>
 
@@ -347,8 +373,8 @@ export default function Home() {
         aria-labelledby="dashboard-tab-controls"
         hidden={activeSection !== "controls"}
       >
-        <Controls />
-        <LearningModeCard onChange={fetchLearningMode} />
+        <Controls controlState={controlState} onChanged={fetchData} />
+        <LearningModeCard onChange={fetchData} />
       </section>
 
       {/* ── Plan section ── */}

@@ -138,6 +138,62 @@ export const STATUS_DISPLAY: Record<string, StatusDisplay> = {
   expired: { text: "Missed", className: "skipped" },
 };
 
+function recognizedStatus(code: string | null | undefined, labels: Record<string, string>): string {
+  if (!code || !labels[code]) return `Unrecognized status (${code ?? "unknown"})`;
+  return labels[code];
+}
+
+export function actionStatusLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, Object.fromEntries(Object.entries(STATUS_DISPLAY).map(([key, value]) => [key, value.text])));
+}
+
+export function reasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    automatic: "Automatic scheduling",
+    active_override: "Active pause",
+    learning_mode_active: "Learning mode",
+    comfort_at_risk: "Comfort risk forecast",
+    new_plans_paused: "New plans paused",
+    control_state_unavailable: "Control state unavailable",
+  });
+}
+
+export function outdoorFallbackReasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    weather_unavailable: "Weather data is unavailable",
+    heat_pump_sensor_unavailable: "Heat-pump outdoor sensor is unavailable",
+    weather_stale: "Weather data is stale",
+  });
+}
+
+export function gateStateLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    ALLOWED: "Allowed",
+    BLOCKED: "Blocked",
+    UNKNOWN: "Unknown",
+  });
+}
+
+export function forecastDisplayStatusLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    fresh: "Fresh forecast",
+    aging: "Aging forecast",
+    stale: "Stale forecast",
+    diverged: "Forecast diverged",
+    unavailable: "Forecast unavailable",
+    checking: "Checking forecast",
+  });
+}
+
+export function seasonalReasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    inactive: "Seasonal calibration is inactive",
+    active: "Seasonal calibration is active",
+    blocked_by_unresolved_safety_revert: "Waiting for unresolved safety restores",
+    waiting_for_heating_season: "Waiting for heating season",
+  });
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  * Payload labels + formatting
  * ──────────────────────────────────────────────────────────────────────────── */

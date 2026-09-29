@@ -19,6 +19,7 @@ from packages.optimizer.executor import (
     VERIFY_TIMEOUT_S,
 )
 from packages.optimizer.executor_core import PlanExecutor as CorePlanExecutor
+from packages.optimizer.executor_core import LearningModeState
 from packages.core.safety_reverts import is_restorative_action
 
 
@@ -738,6 +739,68 @@ class TestExecuteDueActions:
 
         execute_action.assert_awaited_once_with(action_mock)
         assert mock_session.execute.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_pending_action_dispatches_when_planning_control_is_not_allowed(self, executor):
+        action_mock = _make_action(str(ActionType.FORCE_DHW_ON))
+        session = AsyncMock()
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        override_result = MagicMock()
+        override_result.scalars.return_value.all.return_value = []
+        actions_result = MagicMock()
+        actions_result.scalars.return_value.all.return_value = [action_mock]
+        session.execute = AsyncMock(side_effect=[override_result, actions_result, None])
+
+        executor._session_factory = MagicMock(return_value=context)
+        executor._learning_check = AsyncMock(return_value=False)
+        executor._claim_due_safety_action = AsyncMock(return_value=None)
+        executor._execute_action = AsyncMock()
+
+        with patch(
+            "packages.core.planning_data_quality.get_planning_data_quality",
+            new=AsyncMock(return_value={"control_allowed": False}),
+        ):
+            await executor.execute_due_actions()
+
+        executor._execute_action.assert_awaited_once_with(action_mock)
+
+    @pytest.mark.asyncio
+    async def test_paused_state_still_permits_a_due_safety_revert(self, executor):
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._learning_check = AsyncMock(return_value=False)
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._execute_safety_action.assert_awaited_once_with(safety_action)
+
+    @pytest.mark.asyncio
+    async def test_holding_state_still_permits_a_due_safety_revert(self, executor):
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._learning_check = AsyncMock(return_value=LearningModeState.UNKNOWN)
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._execute_safety_action.assert_awaited_once_with(safety_action)
+
+    @pytest.mark.asyncio
+    async def test_observing_suppresses_ordinary_and_safety_actions(self, executor):
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._learning_check = AsyncMock(return_value=LearningModeState.ACTIVE)
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._claim_due_safety_action.assert_not_awaited()
+        executor._execute_safety_action.assert_not_awaited()
+        executor._execute_action.assert_not_awaited()
 
 
 @pytest.mark.asyncio

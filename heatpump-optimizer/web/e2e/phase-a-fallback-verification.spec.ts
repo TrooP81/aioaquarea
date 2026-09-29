@@ -10,6 +10,19 @@ test("renders fallback indoor forecast warning without browser errors", async ({
     await page.route("**/api/**", (route) =>
         route.fulfill({ status: 200, contentType: "application/json", body: "{}" }),
     );
+    await page.route("**/api/control-state", (route) =>
+        route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+                state: "automatic",
+                headline: "Scheduled control remains active",
+                detail: "Automatic dispatch remains active.",
+                reason_code: "automatic",
+                notices: [],
+            }),
+        }),
+    );
     const json = (body: unknown) => ({
         status: 200,
         contentType: "application/json",

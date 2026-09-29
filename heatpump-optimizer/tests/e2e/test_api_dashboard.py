@@ -2,6 +2,10 @@
 
 import pytest
 from httpx import AsyncClient
+from packages.core.database import get_session
+from packages.core.models import OverrideRecord
+from packages.core.optimizer_control_state import ControlStateOverrideUnavailableError
+import datetime as dt
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -14,6 +18,63 @@ class TestHealth:
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestDashboard:
+    async def test_control_state_returns_503_when_active_override_confirmation_fails(
+        self, client: AsyncClient, monkeypatch
+    ):
+        from packages.api.routers import dashboard
+
+        async def unavailable(*_args, **_kwargs):
+            raise ControlStateOverrideUnavailableError()
+
+        monkeypatch.setattr(dashboard, "resolve_control_state", unavailable)
+
+        response = await client.get("/api/control-state")
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Control state unavailable"}
+
+    async def test_overlapping_overrides_select_highest_id_for_dashboard_and_control_state(
+        self, client: AsyncClient
+    ):
+        now = dt.datetime.now(dt.timezone.utc)
+        async with get_session() as session:
+            session.add_all(
+                [
+                    OverrideRecord(
+                        ts_from=now - dt.timedelta(hours=1),
+                        ts_to=now + dt.timedelta(hours=2),
+                        action_type="pause_all",
+                        reason="newer start, lower id",
+                        active=True,
+                    ),
+                    OverrideRecord(
+                        ts_from=now - dt.timedelta(hours=3),
+                        ts_to=now + dt.timedelta(hours=1),
+                        action_type="pause_all",
+                        reason="earlier start, higher id",
+                        active=True,
+                    ),
+                ]
+            )
+            await session.flush()
+            highest_id = (
+                await session.execute(
+                    __import__("sqlalchemy")
+                    .select(OverrideRecord.id)
+                    .order_by(OverrideRecord.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one()
+
+        dashboard, control_state = (
+            await client.get("/api/dashboard"),
+            await client.get("/api/control-state"),
+        )
+
+        assert dashboard.status_code == control_state.status_code == 200
+        assert dashboard.json()["has_override"] is True
+        assert dashboard.json()["override_id"] == control_state.json()["override_id"] == highest_id
+
     async def test_dashboard_empty_state(self, client: AsyncClient):
         """Dashboard returns valid response even with no data."""
         resp = await client.get("/api/dashboard")

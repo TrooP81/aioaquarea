@@ -46,7 +46,8 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.online")).toContainText("Connected");
-    await expect(page.getByTestId("space-heating-gate")).toContainText("BLOCKED");
+    await expect(page.getByText("Uses the Panasonic hourly read allowance.", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("space-heating-gate")).toContainText("Blocked");
   });
 
   test("shows disconnected when no device status", async ({ page }) => {
@@ -67,6 +68,8 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.offline")).toContainText("Disconnected");
+    await page.locator("summary", { hasText: "Heat pump details" }).click();
+    await expect(page.locator("details.heat-pump-details .data-age")).toHaveText("Unavailable");
   });
 
   test("shows stale readings messaging for an old device sample", async ({ page }) => {
@@ -99,8 +102,33 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.stale")).toContainText("Stale");
+    await page.locator("summary", { hasText: "Heat pump details" }).click();
     await expect(page.getByText("Latest readings", { exact: true })).toBeVisible();
     await expect(page.getByText(/Heat-pump readings are stale/)).toBeVisible();
+  });
+
+  test("DataAge distinguishes a fresh timestamp from a two-hour-old reading", async ({ page }) => {
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          current_status: { ts: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), device_id: "test-device", mode: "heat", operation_status: 1, outdoor_temp: 5, tank_temp: 48, tank_target_temp: 50, zone1_temp: 21, quiet_mode: 0, space_heating_active: false },
+          current_status_fresh: false,
+          current_status_age_seconds: 7200,
+          current_price: null,
+          today_kwh: 0,
+          today_cost_eur: 0,
+          active_plan: null,
+          has_override: false,
+        }),
+      })
+    );
+
+    await page.goto("/");
+    await expect(page.locator(".header-actions .data-age")).toHaveText("Updated just now");
+    await page.locator("summary", { hasText: "Heat pump details" }).click();
+    await expect(page.locator("details.heat-pump-details .data-age")).toHaveText("Updated 2 hours ago");
   });
 
   test("shows error banner on API failure", async ({ page }) => {
@@ -109,7 +137,7 @@ test.describe("Dashboard", () => {
     );
 
     await page.goto("/");
-    await expect(page.locator(".override-banner")).toContainText("API Error");
+    await expect(page.locator(".banner--danger")).toContainText("API Error");
   });
 
   test("auto-dismisses successful poll-result banner and keeps failure banner manually dismissible", async ({ page }) => {
@@ -174,13 +202,13 @@ test.describe("Dashboard", () => {
     });
 
     await page.goto("/");
-    await page.getByRole("button", { name: "Poll Now" }).click();
-    const successBanner = page.locator(".override-banner", { hasText: "All data fetched successfully" });
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    const successBanner = page.locator(".banner", { hasText: "All data fetched successfully" });
     await expect(successBanner).toBeVisible();
     await expect(successBanner).toHaveCount(0, { timeout: 9000 });
 
-    await page.getByRole("button", { name: "Poll Now" }).click();
-    const failureBanner = page.locator(".override-banner", { hasText: "weather: timeout" });
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    const failureBanner = page.locator(".banner", { hasText: "weather: timeout" });
     await expect(failureBanner).toBeVisible();
     await page.getByRole("button", { name: "Dismiss" }).click();
     await expect(failureBanner).toHaveCount(0);

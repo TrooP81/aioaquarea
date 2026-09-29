@@ -401,9 +401,11 @@ async def cancel_override(override_id: int):
 
 async def _learning_mode_status() -> dict[str, object]:
     """Return learning-mode state plus how long it has been collecting data."""
-    from packages.core.settings_service import get_bool_setting, get_setting
+    from packages.core.learning_state import get_learning_state_details
+    from packages.core.settings_service import get_setting
 
-    enabled = await get_bool_setting("learning_mode_enabled")
+    learning, seasonal = await get_learning_state_details()
+    enabled = learning.manual_enabled
     since_raw = await get_setting("learning_mode_since")
     since_iso: str | None = since_raw or None
     days_elapsed: float | None = None
@@ -422,17 +424,8 @@ async def _learning_mode_status() -> dict[str, object]:
     async with get_session() as session:
         obligations = await unresolved_revert_summary(session, now=now)
     obligations = serialize_unresolved_revert_summary(obligations)
-    seasonal: dict[str, object] = {}
-    state_reliable = True
-    try:
-        from packages.ml.seasonal_learning import get_seasonal_calibration_status
-
-        seasonal = await get_seasonal_calibration_status(now=now)
-    except Exception:
-        logger.exception("learning_mode_seasonal_status_lookup_failed")
-        state_reliable = False
     sources = ["manual"] if enabled else []
-    if seasonal.get("observe_only_active"):
+    if learning.seasonal_active:
         sources.append("seasonal")
     return {
         "enabled": enabled,
@@ -440,7 +433,7 @@ async def _learning_mode_status() -> dict[str, object]:
         "days_elapsed": days_elapsed,
         "effective_active": bool(sources),
         "sources": sources,
-        "state_reliable": state_reliable,
+        "state_reliable": learning.reliable,
         "open_revert_obligations": obligations,
         "seasonal_blocked_by_unresolved_safety_revert": bool(
             seasonal.get("seasonal_blocked_by_unresolved_safety_revert")

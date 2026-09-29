@@ -43,6 +43,12 @@ async function mockCommon(page: import("@playwright/test").Page) {
   await page.route("**/api/optimizer/status", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(optimizerStatus) })
   );
+  await page.route("**/api/control-state", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ state: "automatic", headline: "Scheduled control remains active", detail: "Automatic dispatch remains active.", reason_code: "automatic", notices: [] }) })
+  );
+  await page.route("**/api/indoor-temp/latest", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ avg_temperature: null, latest_reading: null, sensor_count: 0, last_fresh_reading: null }) })
+  );
 }
 
 test.describe("Learning Mode", () => {
@@ -57,7 +63,9 @@ test.describe("Learning Mode", () => {
     );
 
     await page.goto("/");
-    await expect(page.locator(".override-banner")).toContainText("Learning mode active");
+    await page.getByRole("tab", { name: "Controls" }).click();
+    await expect(page.getByRole("status").filter({ hasText: "Learning" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();
   });
 
   test("no learning-mode banner when disabled", async ({ page }) => {
@@ -71,7 +79,8 @@ test.describe("Learning Mode", () => {
     );
 
     await page.goto("/");
-    await expect(page.locator(".override-banner")).toHaveCount(0);
+    await page.getByRole("tab", { name: "Controls" }).click();
+    await expect(page.locator(".banner").filter({ hasText: "Learning mode enabled" })).toHaveCount(0);
   });
 
   test("can turn learning mode on from the card", async ({ page }) => {
@@ -103,7 +112,7 @@ test.describe("Learning Mode", () => {
     await toggle.click();
 
     await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();
-    await expect(page.locator(".override-banner")).toContainText("Learning mode active");
+    await expect(page.locator(".banner").filter({ hasText: "Learning mode enabled" })).toBeVisible();
   });
 
   test("shows pending restore warning and cancels force activation", async ({ page }) => {

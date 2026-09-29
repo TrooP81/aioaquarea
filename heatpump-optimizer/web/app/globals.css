@@ -35,6 +35,57 @@ body {
   padding: 2rem;
 }
 
+.refresh-allowance,
+.data-age {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.refresh-allowance {
+  margin: -1.4rem 0 1rem;
+}
+
+.data-age--stale {
+  color: var(--warning);
+}
+
+.heat-pump-details {
+  margin-bottom: 2rem;
+}
+
+.heat-pump-details>summary {
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+}
+
+.banner {
+  align-items: center;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  padding: 0.75rem 1rem;
+}
+
+.banner--info {
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.banner--warning {
+  border-color: var(--warning);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.banner--danger {
+  border-color: var(--danger);
+  background: rgba(239, 68, 68, 0.12);
+}
+
 .header {
   display: flex;
   justify-content: space-between;
@@ -336,9 +387,9 @@ body {
 .plan-next-callout {
   margin-top: 1rem;
   padding: 0.75rem 1rem;
-  background: rgba(59,130,246,0.08);
+  background: rgba(59, 130, 246, 0.08);
   border-radius: 0.5rem;
-  border: 1px solid rgba(59,130,246,0.2);
+  border: 1px solid rgba(59, 130, 246, 0.2);
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -410,7 +461,7 @@ body {
 }
 
 .plan-show-all-btn:hover {
-  background: rgba(59,130,246,0.08);
+  background: rgba(59, 130, 246, 0.08);
 }
 
 /* Loading skeleton */
@@ -430,8 +481,13 @@ body {
 }
 
 @keyframes plan-shimmer {
-  0%   { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+  0% {
+    background-position: 200% 0;
+  }
+
+  100% {
+    background-position: -200% 0;
+  }
 }
 
 /* Error state */
@@ -458,7 +514,7 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
   color: var(--accent);
-  background: rgba(59,130,246,0.12);
+  background: rgba(59, 130, 246, 0.12);
   padding: 0.15rem 0.5rem;
   border-radius: 4px;
 }
@@ -761,18 +817,18 @@ body {
   background: color-mix(in srgb, var(--card-bg) 84%, var(--bg));
 }
 
-.chart-details > summary {
+.chart-details>summary {
   padding: 1rem 1.25rem;
   color: var(--text);
   cursor: pointer;
   font-weight: 600;
 }
 
-.chart-details > summary::marker {
+.chart-details>summary::marker {
   color: var(--accent);
 }
 
-.chart-details--hot-water > summary {
+.chart-details--hot-water>summary {
   color: var(--text-muted);
 }
 
@@ -785,7 +841,7 @@ body {
   margin-bottom: 1rem;
 }
 
-.chart-detail-content > :last-child {
+.chart-detail-content> :last-child {
   margin-bottom: 0;
 }
 
@@ -822,7 +878,7 @@ body {
 }
 
 .plan-history-row:hover {
-  background: rgba(59,130,246,0.05);
+  background: rgba(59, 130, 246, 0.05);
 }
 
 .plan-history-date {
@@ -843,7 +899,7 @@ body {
   font-weight: 600;
   padding: 0.15rem 0.5rem;
   border-radius: 9999px;
-  background: rgba(148,163,184,0.15);
+  background: rgba(148, 163, 184, 0.15);
   color: var(--text-muted);
   white-space: nowrap;
 }
@@ -918,12 +974,14 @@ body {
 .plan-action-explanation-row {
   margin-top: 0.1rem;
 }
+
 .plan-action-explanation {
   font-size: 0.72rem;
   font-style: italic;
   color: var(--fg);
   opacity: 0.65;
 }
+
 .plan-action-explanation--failed {
   color: #ef4444;
   opacity: 0.85;
@@ -1453,12 +1511,29 @@ body {
 }
 
 /* ── Utility text classes ── */
-.text-muted { color: var(--text-muted); }
-.text-danger { color: var(--danger); }
-.text-success { color: var(--success); }
-.text-sm { font-size: 0.875rem; }
-.text-xs { font-size: 0.75rem; }
-.text-center { text-align: center; }
+.text-muted {
+  color: var(--text-muted);
+}
+
+.text-danger {
+  color: var(--danger);
+}
+
+.text-success {
+  color: var(--success);
+}
+
+.text-sm {
+  font-size: 0.875rem;
+}
+
+.text-xs {
+  font-size: 0.75rem;
+}
+
+.text-center {
+  text-align: center;
+}
 
 /* ── Optimizer Status component ── */
 .status-dot {
@@ -1580,9 +1655,17 @@ body {
   margin-top: 0.5rem;
 }
 
-.train-msg--success { color: var(--success); }
-.train-msg--info { color: var(--warning); }
-.train-msg--error { color: var(--danger); }
+.train-msg--success {
+  color: var(--success);
+}
+
+.train-msg--info {
+  color: var(--warning);
+}
+
+.train-msg--error {
+  color: var(--danger);
+}
 
 .indoor-temp-heading {
   font-size: 0.875rem;
@@ -1716,6 +1799,19 @@ body {
 }
 
 @media (max-width: 640px) {
+  .header-actions {
+    min-width: 0;
+  }
+
+  .header-actions>* {
+    max-width: 100%;
+  }
+
+  .decision-summary-grid,
+  .workspace-panel .grid {
+    grid-template-columns: 1fr;
+  }
+
   .plan-activity-item {
     grid-template-columns: 0.75rem minmax(0, 1fr);
   }
@@ -1730,6 +1826,7 @@ body {
     grid-column: 2;
   }
 }
+
 /* Decision-first overview */
 .decision-summary {
   margin: 1rem 0;
@@ -1773,7 +1870,7 @@ body {
   margin-top: 1rem;
 }
 
-.decision-summary-grid > div {
+.decision-summary-grid>div {
   min-width: 0;
   padding: 0.8rem;
   border-radius: 9px;
@@ -1936,7 +2033,7 @@ body {
   font-size: 0.75rem;
 }
 
-.plan-history-inline-diff span + span::before {
+.plan-history-inline-diff span+span::before {
   content: "·";
   margin-right: 0.6rem;
 }
@@ -1973,13 +2070,33 @@ body {
   font-size: 0.68rem;
 }
 
-.model-capability--ready { color: #86efac; border-color: rgba(34, 197, 94, 0.5); }
-.model-capability--learning { color: #fbbf24; border-color: rgba(245, 158, 11, 0.5); }
-.model-capability--waiting { color: var(--text-muted); }
-.model-next-step { margin-top: 0.55rem; color: var(--text-muted); }
+.model-capability--ready {
+  color: #86efac;
+  border-color: rgba(34, 197, 94, 0.5);
+}
+
+.model-capability--learning {
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+.model-capability--waiting {
+  color: var(--text-muted);
+}
+
+.model-next-step {
+  margin-top: 0.55rem;
+  color: var(--text-muted);
+}
+
 .model-card-badge--active,
-.model-card-badge--validated { color: #86efac; }
-.model-card-badge--trained { color: #fbbf24; }
+.model-card-badge--validated {
+  color: #86efac;
+}
+
+.model-card-badge--trained {
+  color: #fbbf24;
+}
 
 /* Safer settings editor */
 .settings-action-bar--sticky {

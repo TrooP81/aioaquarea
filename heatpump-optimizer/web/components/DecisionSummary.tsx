@@ -2,9 +2,12 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ACTION_LABELS, formatTime } from "@/lib/constants";
+import { ACTION_LABELS, forecastDisplayStatusLabel, formatTime } from "@/lib/constants";
+import { Banner } from "./Banner";
+import { DataAge } from "./DataAge";
 import { usePlanActions } from "./usePlanActions";
 import { useTimeFormat } from "./useTimeFormat";
+import type { ControlState } from "@/lib/api-types";
 
 interface DecisionSummaryProps {
   plan: {
@@ -12,6 +15,10 @@ interface DecisionSummaryProps {
     optimizer_version: string;
   } | null;
   indoorTemp: number | null;
+  indoorTimestamp: string | null;
+  indoorStale: boolean;
+  controlState: ControlState | null;
+  onRetry: () => void;
 }
 
 interface ForecastBrief {
@@ -46,22 +53,35 @@ function explainReason(payload: Record<string, unknown> | undefined): string {
     .replace(/\b\d+\.\d{3,}\b/g, (value) => Number(value).toFixed(2));
 }
 
-export function DecisionSummary({ plan, indoorTemp }: DecisionSummaryProps) {
+export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale, controlState, onRetry }: DecisionSummaryProps) {
   const { actions, loading: actionsLoading } = usePlanActions(plan?.id);
   const [forecast, setForecast] = useState<ForecastBrief | null>(null);
+  const [forecastLoading, setForecastLoading] = useState(true);
+  const [forecastError, setForecastError] = useState<string | null>(null);
   const timeFormat = useTimeFormat();
 
-  useEffect(() => {
+  const loadForecast = () => {
+    setForecastLoading(true);
+    setForecastError(null);
     let active = true;
     fetch("/api/thermal/indoor-forecast?hours=24")
-      .then((response) => (response.ok ? response.json() : null))
+      .then((response) => {
+        if (!response.ok) throw new Error(`Forecast returned ${response.status}`);
+        return response.json();
+      })
       .then((data) => {
         if (active) setForecast(data);
       })
       .catch(() => {
-        if (active) setForecast(null);
-      });
+        if (active) setForecastError("Forecast details could not be loaded.");
+      })
+      .finally(() => { if (active) setForecastLoading(false); });
     return () => { active = false; };
+  };
+
+  useEffect(() => {
+    const cleanup = loadForecast();
+    return cleanup;
   }, [plan?.id]);
 
   const nextAction = useMemo(
@@ -84,17 +104,18 @@ export function DecisionSummary({ plan, indoorTemp }: DecisionSummaryProps) {
       <div className="decision-summary-header">
         <div>
           <span className="decision-summary-kicker">What matters now</span>
-          <h2>{atRisk ? "Comfort needs attention" : "System is following the current plan"}</h2>
+          <h2>{controlState?.headline ?? "Control state unavailable"}</h2>
         </div>
         <span className={`forecast-trust-badge forecast-trust-badge--${forecast?.display_status ?? "unavailable"}`}>
-          {(forecast?.display_status ?? "checking").replace(/_/g, " ")}
+          {forecastDisplayStatusLabel(forecast?.display_status ?? "checking")}
         </span>
       </div>
       <div className="decision-summary-grid">
         <div>
           <span>Now</span>
           <strong>{indoorTemp != null ? `${indoorTemp.toFixed(1)}°C indoors` : "Waiting for indoor sensor"}</strong>
-          <small>{plan ? `Active plan #${plan.id}` : "No active plan"}</small>
+          <DataAge timestamp={indoorTimestamp} stale={indoorStale} />
+          <small>{controlState?.detail ?? "Control state could not be loaded."}</small>
         </div>
         <div>
           <span>Next</span>
@@ -124,6 +145,22 @@ export function DecisionSummary({ plan, indoorTemp }: DecisionSummaryProps) {
           </div>
         </div>
       </div>
+      {!controlState && (
+        <Banner tone="warning">
+          <p>Control state unavailable.</p>
+          <button className="btn btn-sm" onClick={onRetry}>Retry</button>
+        </Banner>
+      )}
+      {forecastError && (
+        <Banner tone="warning">
+          <p>{forecastError}</p>
+          <button className="btn btn-sm" onClick={loadForecast}>Retry</button>
+        </Banner>
+      )}
+      {forecastLoading && <p className="text-muted text-sm">Loading forecast details...</p>}
+      {!forecastLoading && !forecastError && !forecast && (
+        <p className="text-muted text-sm">No forecast details are available yet.</p>
+      )}
     </section>
   );
 }

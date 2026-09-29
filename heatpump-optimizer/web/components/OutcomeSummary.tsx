@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { formatCost, useCurrency } from "./useCurrency";
+import { Banner } from "./Banner";
 
 interface OutcomeSummaryData {
   days: number;
@@ -41,20 +42,29 @@ interface OutcomeSummaryData {
 export function OutcomeSummary() {
   const [data, setData] = useState<OutcomeSummaryData | null>(null);
   const [days, setDays] = useState(7);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
   const currency = useCurrency();
 
   useEffect(() => {
     const controller = new AbortController();
+    setLoading(true);
+    setError(null);
     fetch(`/api/outcomes/summary?days=${days}`, { signal: controller.signal })
-      .then((response) => (response.ok ? response.json() : null))
+      .then((response) => {
+        if (!response.ok) throw new Error(`Outcome summary returned ${response.status}`);
+        return response.json();
+      })
       .then((value) => {
         if (!controller.signal.aborted) setData(value);
       })
       .catch(() => {
-        if (!controller.signal.aborted) setData(null);
-      });
+        if (!controller.signal.aborted) setError("Outcome data could not be loaded.");
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [days]);
+  }, [days, retry]);
 
   return (
     <section className="plan-section outcome-summary" aria-label="Measured optimization outcome">
@@ -76,8 +86,12 @@ export function OutcomeSummary() {
           ))}
         </div>
       </div>
-      {!data ? (
-        <p className="text-muted text-sm">Outcome data is loading or not available yet.</p>
+      {loading ? (
+        <p className="text-muted text-sm">Loading outcome data...</p>
+      ) : error ? (
+        <Banner tone="warning"><p>{error}</p><button className="btn btn-sm" onClick={() => setRetry((value) => value + 1)}>Retry</button></Banner>
+      ) : !data || (!data.cost?.measured_kwh && !data.comfort?.samples) ? (
+        <p className="text-muted text-sm">No measured outcome data is available for this period yet.</p>
       ) : (
         <>
           <dl className="outcome-summary-metrics">
@@ -131,17 +145,17 @@ export function OutcomeSummary() {
         )}
         {data?.experiment && (
           <p className="chart-caption">
-          {data.experiment.enabled ? (
-            data.experiment.status === "waiting_for_heating_conditions" ? (
-              <>Manual trial suggestions are on, but paused until safe heating conditions return{data.experiment.conditions?.outdoor_temp_c != null && data.experiment.conditions?.heating_off_outdoor_c != null ? ` (outside ${data.experiment.conditions.outdoor_temp_c.toFixed(1)}°C; heating-off threshold ${data.experiment.conditions.heating_off_outdoor_c.toFixed(1)}°C)` : ""}. Nothing is sent to the heat pump automatically.</>
+            {data.experiment.enabled ? (
+              data.experiment.status === "waiting_for_heating_conditions" ? (
+                <>Manual trial suggestions are on, but paused until safe heating conditions return{data.experiment.conditions?.outdoor_temp_c != null && data.experiment.conditions?.heating_off_outdoor_c != null ? ` (outside ${data.experiment.conditions.outdoor_temp_c.toFixed(1)}°C; heating-off threshold ${data.experiment.conditions.heating_off_outdoor_c.toFixed(1)}°C)` : ""}. Nothing is sent to the heat pump automatically.</>
+              ) : (
+                <>Manual trial suggestions: on — review-only, with a maximum {data.experiment.maximum_curve_step_c?.toFixed(1) ?? "—"}°C heat-curve step. Nothing is sent to the heat pump automatically.</>
+              )
             ) : (
-              <>Manual trial suggestions: on — review-only, with a maximum {data.experiment.maximum_curve_step_c?.toFixed(1) ?? "—"}°C heat-curve step. Nothing is sent to the heat pump automatically.</>
-            )
-          ) : (
-            <>
-              Manual trial suggestions: off. <a className="chart-caption-link" href="/settings?tab=system#manual-trial-suggestions">Open the setting</a> to see optional, limited heat-curve trials.
-            </>
-          )}
+              <>
+                Manual trial suggestions: off. <a className="chart-caption-link" href="/settings?tab=system#manual-trial-suggestions">Open the setting</a> to see optional, limited heat-curve trials.
+              </>
+            )}
           </p>
         )}
       </div>

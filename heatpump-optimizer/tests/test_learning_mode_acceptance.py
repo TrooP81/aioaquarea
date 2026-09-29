@@ -9,7 +9,9 @@ import pytest
 from fastapi import HTTPException
 
 from packages.api.routers import optimizer as optimizer_router
+from packages.core.learning_state import LearningStateSnapshot, get_learning_state_details
 from packages.ml import seasonal_learning
+from packages.optimizer.executor_core import LearningModeState, resolve_learning_mode_state
 
 
 class _AsyncContext:
@@ -21,6 +23,187 @@ class _AsyncContext:
 
     async def __aexit__(self, *_args):
         return False
+
+
+@pytest.mark.asyncio
+async def test_manual_learning_survives_seasonal_lookup_failure():
+    with (
+        patch("packages.core.settings_service.get_bool_setting", new=AsyncMock(return_value=True)),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            new=AsyncMock(side_effect=RuntimeError("seasonal unavailable")),
+        ) as seasonal,
+    ):
+        snapshot, details = await get_learning_state_details()
+        executor_state = await resolve_learning_mode_state()
+
+    assert snapshot == LearningStateSnapshot(True, False, True)
+    assert details == {}
+    assert executor_state is LearningModeState.ACTIVE
+    seasonal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_learning_mode_endpoint_keeps_manual_toggle_when_seasonal_lookup_fails():
+    with (
+        patch("packages.core.settings_service.get_bool_setting", new=AsyncMock(return_value=True)),
+        patch("packages.core.settings_service.get_setting", new=AsyncMock(return_value="")),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            new=AsyncMock(side_effect=RuntimeError("seasonal unavailable")),
+        ) as seasonal,
+        patch.object(optimizer_router, "unresolved_revert_summary", new=AsyncMock(return_value={})),
+        patch.object(optimizer_router, "get_session", return_value=_AsyncContext(MagicMock())),
+    ):
+        result = await optimizer_router._learning_mode_status()
+
+    assert result["enabled"] is True
+    assert result["effective_active"] is True
+    assert result["state_reliable"] is True
+    seasonal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_learning_read_failure_remains_unknown():
+    with patch(
+        "packages.core.settings_service.get_bool_setting",
+        new=AsyncMock(side_effect=RuntimeError("settings unavailable")),
+    ):
+        snapshot, _ = await get_learning_state_details()
+        executor_state = await resolve_learning_mode_state()
+
+    assert snapshot == LearningStateSnapshot(False, False, False)
+    assert executor_state is LearningModeState.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manual_enabled, manual_raises, seasonal_active, seasonal_raises, expected_snapshot, expected_executor, seasonal_called",
+    [
+        (
+            True,
+            False,
+            True,
+            False,
+            LearningStateSnapshot(True, False, True),
+            LearningModeState.ACTIVE,
+            False,
+        ),
+        (
+            True,
+            False,
+            False,
+            False,
+            LearningStateSnapshot(True, False, True),
+            LearningModeState.ACTIVE,
+            False,
+        ),
+        (
+            True,
+            False,
+            False,
+            True,
+            LearningStateSnapshot(True, False, True),
+            LearningModeState.ACTIVE,
+            False,
+        ),
+        (
+            False,
+            False,
+            True,
+            False,
+            LearningStateSnapshot(False, True, True),
+            LearningModeState.ACTIVE,
+            True,
+        ),
+        (
+            False,
+            False,
+            False,
+            False,
+            LearningStateSnapshot(False, False, True),
+            LearningModeState.INACTIVE,
+            True,
+        ),
+        (
+            False,
+            False,
+            False,
+            True,
+            LearningStateSnapshot(False, False, False),
+            LearningModeState.UNKNOWN,
+            True,
+        ),
+        (
+            False,
+            True,
+            True,
+            False,
+            LearningStateSnapshot(False, False, False),
+            LearningModeState.UNKNOWN,
+            False,
+        ),
+        (
+            False,
+            True,
+            False,
+            False,
+            LearningStateSnapshot(False, False, False),
+            LearningModeState.UNKNOWN,
+            False,
+        ),
+        (
+            False,
+            True,
+            False,
+            True,
+            LearningStateSnapshot(False, False, False),
+            LearningModeState.UNKNOWN,
+            False,
+        ),
+    ],
+    ids=[
+        "manual-seasonal-active",
+        "manual-seasonal-inactive",
+        "manual-seasonal-error",
+        "seasonal-active",
+        "inactive",
+        "seasonal-error",
+        "manual-error-seasonal-active",
+        "manual-error-seasonal-inactive",
+        "manual-error-seasonal-error",
+    ],
+)
+async def test_real_learning_state_matrix_preserves_executor_semantics(
+    manual_enabled,
+    manual_raises,
+    seasonal_active,
+    seasonal_raises,
+    expected_snapshot,
+    expected_executor,
+    seasonal_called,
+):
+    manual = AsyncMock(
+        side_effect=RuntimeError("settings unavailable") if manual_raises else None,
+        return_value=manual_enabled,
+    )
+    seasonal = AsyncMock(
+        side_effect=RuntimeError("seasonal unavailable") if seasonal_raises else None,
+        return_value={"observe_only_active": seasonal_active},
+    )
+    with (
+        patch("packages.core.settings_service.get_bool_setting", new=manual),
+        patch("packages.ml.seasonal_learning.get_seasonal_calibration_status", new=seasonal),
+    ):
+        snapshot, _ = await get_learning_state_details()
+        executor_state = await resolve_learning_mode_state()
+
+    assert snapshot == expected_snapshot
+    assert executor_state is expected_executor
+    if seasonal_called:
+        assert seasonal.await_count == 2
+    else:
+        seasonal.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -126,14 +309,13 @@ async def test_learning_mode_rejection_serializes_obligation_snapshot():
 )
 async def test_learning_mode_status_preserves_obligation_contract(obligations):
     with (
-        patch("packages.core.settings_service.get_bool_setting", new=AsyncMock(return_value=False)),
         patch("packages.core.settings_service.get_setting", new=AsyncMock(return_value="")),
+        patch(
+            "packages.core.learning_state.get_learning_state_details",
+            new=AsyncMock(return_value=(LearningStateSnapshot(False, False, True), {})),
+        ),
         patch.object(
             optimizer_router, "unresolved_revert_summary", new=AsyncMock(return_value=obligations)
-        ),
-        patch(
-            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
-            new=AsyncMock(return_value={}),
         ),
         patch.object(optimizer_router, "get_session", return_value=_AsyncContext(MagicMock())),
     ):
@@ -144,6 +326,45 @@ async def test_learning_mode_status_preserves_obligation_contract(obligations):
     assert result["sources"] == []
     assert result["open_revert_obligations"] == obligations
     assert result["state_reliable"] is True
+
+
+@pytest.mark.asyncio
+async def test_learning_mode_status_preserves_wire_semantics_for_manual_and_seasonal_sources():
+    seasonal = {
+        "seasonal_blocked_by_unresolved_safety_revert": False,
+        "seasonal_first_deferred_at": None,
+        "seasonal_deferred_seconds": None,
+    }
+    with (
+        patch(
+            "packages.core.settings_service.get_setting",
+            new=AsyncMock(return_value="2026-09-27T12:00:00+00:00"),
+        ),
+        patch(
+            "packages.core.learning_state.get_learning_state_details",
+            new=AsyncMock(return_value=(LearningStateSnapshot(True, True, True), seasonal)),
+        ),
+        patch.object(optimizer_router, "unresolved_revert_summary", new=AsyncMock(return_value={})),
+        patch.object(optimizer_router, "get_session", return_value=_AsyncContext(MagicMock())),
+    ):
+        result = await optimizer_router._learning_mode_status()
+
+    assert result["enabled"] is True
+    assert result["effective_active"] is True
+    assert result["sources"] == ["manual", "seasonal"]
+    assert result["state_reliable"] is True
+    assert set(result) == {
+        "enabled",
+        "since",
+        "days_elapsed",
+        "effective_active",
+        "sources",
+        "state_reliable",
+        "open_revert_obligations",
+        "seasonal_blocked_by_unresolved_safety_revert",
+        "seasonal_first_deferred_at",
+        "seasonal_deferred_seconds",
+    }
 
 
 @pytest.mark.asyncio

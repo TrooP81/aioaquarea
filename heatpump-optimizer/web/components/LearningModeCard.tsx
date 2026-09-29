@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Banner } from "./Banner";
 
 interface LearningModeState {
   enabled: boolean;
@@ -137,7 +138,7 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
         for the ML models. Toggle off to let the optimizer act.
       </p>
 
-      {error && <p className="text-danger">{error}</p>}
+      {error && <Banner tone="danger"><p>{error}</p></Banner>}
 
       {!state && !error && (
         <div className="plan-loading">
@@ -196,14 +197,7 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
             </div>
           )}
 
-          {message && (
-            <p
-              className={`train-msg ${message.ok ? "train-msg--ok" : "train-msg--err"}`}
-              style={{ marginTop: "0.75rem" }}
-            >
-              {message.text}
-            </p>
-          )}
+          {message && <Banner tone={message.ok ? "info" : "warning"}><p>{message.text}</p></Banner>}
         </>
       )}
     </div>
