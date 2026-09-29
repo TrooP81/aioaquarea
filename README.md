@@ -5,11 +5,15 @@ Asynchronous library to control Panasonic Aquarea devices
 
 ## Requirements
 
-This library requires:
+- Python >= 3.10
+- `aiohttp`, `beautifulsoup4`, `soupsieve` (and `StrEnum` on Python 3.10), installed automatically
 
-- Python >= 3.9
-- asyncio
-- aiohttp
+## Documentation
+
+- [Library reference](docs/library-reference.md) – client, device, tank, enums, errors
+- [Panasonic Aquarea API map](docs/panasonic-aquarea-api.md) – endpoints and command payload fields
+- [Dependency management](docs/dependency-management.md) – lock files, audits, and regeneration
+- [Heat Pump Optimizer](heatpump-optimizer/README.md) – cost-optimizing controller built on this library
 
 ## Usage
 The library supports the production environment of the Panasonic Aquarea Smart Cloud API and also the Demo environment. One of the main usages of this library is to integrate the Panasonic Aquarea Smart Cloud API with Home Assistant via [home-assistant-aquarea](https://github.com/cjaliaga/home-assistant-aquarea)
@@ -40,7 +44,7 @@ async def main():
         )
 
         # The library is designed to retrieve a device object and interact with it:
-        devices = await client.get_devices(include_long_id=True)
+        devices = await client.get_devices()
 
         # Picking the first device associated with the account:
         device_info = devices[0]
@@ -60,6 +64,24 @@ async def main():
         # The device can automatically refresh its data:
         await device.refresh_data()
 ```
+
+Commands that would not change device state (for example setting the current
+tank target again) are skipped. See the [library reference](docs/library-reference.md)
+for which methods skip unchanged values and which always send.
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+
+python -m pytest tests -q
+python -m black --check aioaquarea tests
+python -m isort --check-only aioaquarea tests
+python -m pylint --errors-only aioaquarea
+```
+
+CI (`.github/workflows/library-checks.yml`) runs the tests on Python 3.10–3.13,
+plus lint, a package build with `twine check`, and `pip-audit`.
 
 ## Acknowledgements
 

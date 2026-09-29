@@ -22,8 +22,23 @@ Status uses the same transfer endpoint with an inner `GET`:
 - live adaptor: `/remote/v1/api/devices?gwid=<id>&deviceDirect=1`
 - cloud cache: `/remote/v1/api/devices?gwid=<id>&deviceDirect=0`
 
-Device discovery reads `/remote/v1/api/device/group`. Consumption uses the
-transfer endpoint with inner API `/remote/v1/api/consumption`.
+Device discovery reads `GET https://accsmart.panasonic.com/device/group`.
+Consumption uses the transfer endpoint with inner API `/remote/v1/api/consumption`.
+
+## Read endpoints
+
+| Function | Outer request | Inner API / method | Library method |
+| --- | --- | --- | --- |
+| Device discovery | `GET https://accsmart.panasonic.com/device/group` | — | `Client.get_devices()` |
+| Live status | transfer | `/remote/v1/api/devices?gwid=<id>&deviceDirect=1`, `GET` | `Client.get_device_status()` |
+| Cached status | transfer | `/remote/v1/api/devices?gwid=<id>&deviceDirect=0`, `GET` | `Client.get_device_status()` fallback |
+| Consumption | transfer | `/remote/v1/api/consumption`, `POST` with `gwid`, `dataMode` (0 day, 1 month, 2 year), `date`, `osTimezone` | `Client.get_device_consumption()` |
+| Weekly timer | transfer | `/remote/v1/api/weeklytimer`, `GET` with `gwid` | `Client.get_device_weekly_timer()` |
+
+The weekly timer response is parsed from `schedule[]` entries with
+`dayOfWeek` (1 Monday … 7 Sunday), `zoneId`, `startTime`, `endTime`,
+`heatSet`, `coolSet`, and `enabled`. Weekly timer writes are intentionally not
+implemented.
 
 ## Mapped command fields
 
@@ -38,10 +53,14 @@ transfer endpoint with inner API `/remote/v1/api/consumption`.
 | Auxiliary heater | `forceHeater` | 0 off, 1 on | Wrapper only; never enable automatically |
 | Holiday timer | `holidayTimer` | 0 off, 1 on | Wrapper only; requires occupancy intent |
 | Forced defrost | `forcedefrost` | 1 request | Wrapper only; suppress if already defrosting |
+| Special status | `specialStatus`, `zoneStatus[]` | 0 normal, 1 eco, 2 comfort; zone `heatSet`/`coolSet` | Not automated |
 
-`specialStatus` (normal/eco/comfort) still uses the older direct device status
-endpoint in the library. Its state is now parsed when Panasonic returns it, but
-some devices or cached responses may omit it.
+`specialStatus` (normal/eco/comfort) still uses the older direct device
+endpoint: `POST remote/v1/api/devices/<long id>` with body
+`{"status": [{"deviceGuid", "specialStatus", "zoneStatus": [...]}]}`.
+Zones with an external sensor are omitted, and unset `heatSet`/`coolSet` values
+are not sent. Its state is parsed when Panasonic returns it, but some devices or
+cached responses may omit it.
 
 ## Safety classification
 

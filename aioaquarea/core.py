@@ -11,6 +11,7 @@ import aiohttp
 
 from .api_client import AquareaAPIClient
 from .auth import Authenticator, CCAppVersion, PanasonicSettings
+from .command_result import PanasonicCommandResult
 from .const import AQUAREA_SERVICE_BASE, AQUAREA_SERVICE_DEMO_BASE, AquareaEnvironment
 from .consumption_manager import AquareaConsumptionManager
 from .data import (
@@ -277,7 +278,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
     @auth_required
     async def post_device_operation_status(
         self, long_device_id: str, new_operation_status: OperationStatus
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device operation status."""
         return await self._device_control.post_device_operation_status(
             long_device_id, new_operation_status
@@ -286,7 +287,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
     @auth_required
     async def post_device_tank_temperature(
         self, long_device_id: str, new_temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device tank temperature."""
         return await self._device_control.post_device_tank_temperature(
             long_device_id, new_temperature
@@ -298,7 +299,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
         long_device_id: str,
         new_operation_status: OperationStatus,
         zones: list[DeviceZoneStatus],
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device tank operation status."""
         return await self._device_control.post_device_tank_operation_status(
             long_device_id, new_operation_status, zones
@@ -313,7 +314,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
         operation_status: OperationStatus,
         tank_operation_status: OperationStatus,
         zone_temperature_updates: list[ZoneTemperatureSetUpdate] | None = None,
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device operation update."""
         return await self._device_control.post_device_operation_update(
             long_id,
@@ -330,8 +331,8 @@ class AquareaClient:  # Renamed Client to AquareaClient
         long_id: str,
         special_status: SpecialStatus | None,
         zones: list[ZoneTemperatureSetUpdate],
-    ) -> None:
-        """Post device operation update."""
+    ) -> PanasonicCommandResult:
+        """Post device special status (eco/comfort/normal)."""
         return await self._device_control.post_device_set_special_status(
             long_id, special_status, zones
         )
@@ -339,7 +340,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
     @auth_required
     async def post_device_zone_heat_temperature(
         self, long_id: str, zone_id: int, temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device zone heat temperature."""
         return await self._device_control.post_device_zone_heat_temperature(
             long_id, zone_id, temperature
@@ -348,27 +349,31 @@ class AquareaClient:  # Renamed Client to AquareaClient
     @auth_required
     async def post_device_zone_cool_temperature(
         self, long_id: str, zone_id: int, temperature: int
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post device zone cool temperature."""
         return await self._device_control.post_device_zone_cool_temperature(
             long_id, zone_id, temperature
         )
 
     @auth_required
-    async def post_device_set_quiet_mode(self, long_id: str, mode: QuietMode) -> None:
+    async def post_device_set_quiet_mode(
+        self, long_id: str, mode: QuietMode
+    ) -> PanasonicCommandResult:
         """Post quiet mode."""
         return await self._device_control.post_device_set_quiet_mode(long_id, mode)
 
     @auth_required
-    async def post_device_force_dhw(self, long_id: str, force_dhw: ForceDHW) -> None:
-        """Post quiet mode."""
+    async def post_device_force_dhw(
+        self, long_id: str, force_dhw: ForceDHW
+    ) -> PanasonicCommandResult:
+        """Post force DHW."""
         return await self._device_control.post_device_force_dhw(long_id, force_dhw)
 
     @auth_required
     async def post_device_force_heater(
         self, long_id: str, force_heater: ForceHeater
-    ) -> None:
-        """Post quiet mode."""
+    ) -> PanasonicCommandResult:
+        """Post force heater."""
         return await self._device_control.post_device_force_heater(
             long_id, force_heater
         )
@@ -376,21 +381,21 @@ class AquareaClient:  # Renamed Client to AquareaClient
     @auth_required
     async def post_device_holiday_timer(
         self, long_id: str, holiday_timer: HolidayTimer
-    ) -> None:
-        """Post quiet mode."""
+    ) -> PanasonicCommandResult:
+        """Post holiday timer."""
         return await self._device_control.post_device_holiday_timer(
             long_id, holiday_timer
         )
 
     @auth_required
-    async def post_device_request_defrost(self, long_id: str) -> None:
-        """Post quiet mode."""
+    async def post_device_request_defrost(self, long_id: str) -> PanasonicCommandResult:
+        """Post forced defrost request."""
         return await self._device_control.post_device_request_defrost(long_id)
 
     @auth_required
     async def post_device_set_powerful_time(
         self, long_id: str, powerful_time: PowerfulTime
-    ) -> None:
+    ) -> PanasonicCommandResult:
         """Post powerful time."""
         return await self._device_control.post_device_set_powerful_time(
             long_id, powerful_time

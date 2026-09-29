@@ -24,8 +24,10 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
 - **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
-- **Rules-based optimizer (v3)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
-- **MILP optimizer**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
+- **Rules-based optimizer (`rules_v7`)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
+- **MILP optimizer (`milp_v1`)**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
+- **Shower mode**: Optional reactive DHW boost when the tank temperature drops sharply between polls
+- **Seasonal calibration**: Optional observe-only period during cold weather to collect natural heating data and train demand/thermal models
 - **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
 - **Direction-aware COP**: Real COP computation from compressor direction and consumption data
 - **ML models**: COP prediction, demand forecasting, and indoor comfort model (train on your own data)
@@ -35,6 +37,8 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **On-demand actions**: "Optimize now" queues a durable re-plan for the optimizer service; "Poll now" triggers a device refresh
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
+- **Operational alerts**: In-app (and optional webhook) alerts for stale data, adaptor outages, failed actions, and degraded forecasts
+- **Automated backups**: Daily PostgreSQL archives with retention, optional verification, and optional encrypted replica
 - **Audit log**: Every executed action is recorded
 
 ## Quick Start
@@ -42,7 +46,8 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 1. **Copy environment config:**
    ```bash
    cp .env.example .env
-   # Edit .env with your Panasonic credentials and ENTSO-E token.
+   # Edit .env for location, price area, and ports if needed. Panasonic credentials
+   # and API tokens (ENTSO-E, Tibber, SmartThings) can be entered on the Settings page.
    # The checked-in contract stays local-only: development mode, API_TOKEN=disabled,
    # loopback database/API/dashboard ports, and CORS at http://localhost:4444.
    ```
@@ -59,7 +64,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 
 ## Configuration
 
-Settings can be supplied via environment variables (typically through `.env`) and most are also editable at runtime from the **Settings** page in the dashboard. UI changes take precedence over the env defaults.
+Settings can be supplied via environment variables (typically through `.env`) and most are also editable at runtime from the **Settings** page in the dashboard. UI changes take precedence over the env defaults. The tables below cover the common variables; see [docs/configuration-reference.md](docs/configuration-reference.md) for every environment variable and runtime setting.
 
 ### Credentials & data sources
 
@@ -107,10 +112,13 @@ Panasonic Comfort Cloud username and password are entered in the dashboard **Set
 |---------|-------------------|-------------|
 | `web` | `WEB_PORT` (4444) | Dashboard UI |
 | `api` | `API_PORT` (8500) | REST API + Swagger docs (`/docs`) |
-| `poller` | — | Data collection (device + prices + weather + SmartThings) |
+| `poller` | — | Data collection (device + prices + weather + SmartThings), comfort-model retraining, seasonal calibration, alert delivery |
 | `optimizer` | — | Plan generation + action execution |
+| `migrate` | — | One-shot `alembic upgrade head`; `poller`, `optimizer`, and `api` start after it succeeds |
 | `db` | `DB_PORT` (5434 → container 5432) | TimescaleDB |
-| `redis` | (internal only) | Cache + token persistence |
+| `redis` | (internal only) | Panasonic auth circuit-breaker state |
+| `backup` | — | Scheduled `pg_dump` archives into `./backups` |
+| `backup-verify` | — | `maintenance` profile only; restores the newest archive into a disposable database |
 
 ## Backups And Calibration
 
@@ -167,10 +175,11 @@ Thermal calibration is explicit: use `POST /api/thermal/calibrate` after enough 
 
 ## API Endpoints
 
-The full, always-current OpenAPI spec is available at `http://localhost:8500/docs`. Highlights:
+The full, always-current OpenAPI spec is available at `http://localhost:8500/docs`. When `API_TOKEN` is set, every route requires `Authorization: Bearer <token>` except `/health`, `/health/ready`, and `/api/smartthings/oauth/callback`. The dashboard's server-side proxy adds the token for you. Highlights:
 
 **Overview & history**
 - `GET /api/dashboard` — Overview (status, current price, today's kWh, hourly-priced today's cost, active plan, override flag)
+- `GET /api/control-state` — Persisted optimizer control state (no device I/O)
 - `GET /api/status/history?hours=24` — Device status history
 - `GET /api/device/settings` — Last-known device-reported settings
 - `GET /api/consumption/history?hours=24` — Per-interval energy deltas
@@ -180,7 +189,10 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 - `GET /api/audit` — Audit log
 - `GET /api/logs?minutes=30&level=&service=` — Application log entries (last up to 24h)
 - `GET /api/currency` / `GET /api/time-format` — UI display preferences
+- `GET /api/version` — Running API version
 - `GET /health` — Liveness probe
+- `GET /health/ready` — Readiness probe, including poller/optimizer heartbeat and backup freshness
+- `GET /metrics` — Prometheus-format operational metrics
 
 **Optimizer & overrides**
 - `GET /api/plans` / `GET /api/plans/{id}` — Plans and plan details with actions
@@ -188,14 +200,19 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 - `GET /api/learning-mode` / `POST /api/learning-mode` — Read or toggle observe-only learning mode (`{"enabled": true|false}`)
 - `POST /api/optimize-now` — Queue a durable re-plan; poll `GET /api/optimize-now/{request_id}` for its status and resulting plan
 - `GET /api/plan-activity` / `GET /api/outcomes/summary` / `GET /api/operations/alerts` — Dashboard lifecycle, measured outcome, and operational-health data
+- `POST /api/operations/safety-reverts/{action_id}/resolve` — Resolve a deferred safety revert once fresh evidence proves it safe
 - `POST /api/poll-now` — Force an immediate device poll
 - `POST /api/overrides` / `DELETE /api/overrides/{id}` — Create or cancel a manual override
+
+**Panasonic**
+- `GET /api/panasonic/capabilities` — Mapped command surface, observed zones/tank, safety policy, and adaptor state (no cloud call; see [../docs/panasonic-aquarea-api.md](../docs/panasonic-aquarea-api.md))
 
 **Comfort schedule & indoor temp**
 - `GET /api/comfort-schedule` / `PUT /api/comfort-schedule` — Read/write the schedule
 - `GET /api/comfort-schedule/learned` — Auto-detected usage patterns
 - `POST /api/comfort-schedule/apply-learned` — Merge learned patterns into the schedule
 - `GET /api/indoor-temp?hours=24` / `GET /api/indoor-temp/latest` — Indoor sensor history/latest
+- `GET /api/sensors/diagnostics?hours=168` — Observation-only SmartThings sensor diagnostics
 
 **SmartThings integration**
 - `GET /api/smartthings/devices` — List discoverable temperature sensors (powers the Settings sensor selector)
@@ -214,6 +231,8 @@ The Settings page → **SmartThings Integration** section includes a sensor sele
 - `POST /api/ml/train` — Retrain COP and demand models
 - `GET /api/comfort-model/status` / `POST /api/comfort-model/train` / `GET /api/comfort-model/predict`
 - `GET /api/thermal/status` / `POST /api/thermal/calibrate` / `GET /api/thermal/curve` / `GET /api/thermal/indoor-forecast`
+- `GET /api/thermal/forecast-scorecard` — Scores past indoor forecasts against later sensor readings
+- `GET /api/thermal/heat-curve-advice` — Suggests a small manual Panasonic heat-curve adjustment (never sends a command)
 
 **Settings & connectivity**
 - `GET /api/settings` / `PUT /api/settings`
@@ -226,42 +245,83 @@ The Settings page → **Danger Zone — Reset Data** card exposes this: tick the
 
 ## How the Optimizer Works
 
-### Rules Engine (v3)
+The `optimizer` service re-plans every hour and checks for due actions every minute. Plans are skipped (no new plan, existing actions keep their state) while device status is not fresh enough for control.
+
+### Layer selection
+
+The `optimizer_layer` setting chooses the planner:
+
+| Value | Behaviour |
+|-------|-----------|
+| `rules_only` (default) | Always the rules engine. |
+| `milp_preferred` | Always MILP, using COP/demand models only if trained. Falls back to rules if the solver fails; pauses planning if price/weather inputs are incomplete. |
+| `auto` | MILP when COP and demand models are trained **and** the last 14 days contain at least 50 COP and 50 consumption records; otherwise rules. |
+
+### Rules Engine (`rules_v7`)
 1. **DHW Shifting**: Uses the thermal model to find the cheapest slot before each deadline, with direction-aware heating time estimation
 2. **Pre-heating**: Boosts zone temperature during cheap hours before forecast cold spells
-3. **Peak avoidance**: Activates quiet mode during the 5% most expensive hours (if outdoor temp allows)
+3. **Peak avoidance**: Quiet mode level 1 for up to 1/6 of the horizon's hours, choosing the most expensive hours that are at least 1.3× the median price; skipped when outdoor temperature is below 0 °C
 4. **Comfort schedule**: Switches between eco and comfort modes based on weekday/weekend schedule with configurable price overrides
 5. **Quiet mode**: Reduces compressor speed during configurable night hours (default 22:00–06:00)
 6. **Adaptive learning**: Automatically detects regular heating patterns and merges them into the comfort schedule
 7. **Holiday mode**: Suspends all optimization when device is in holiday mode
 8. **Action verification**: Polls device after each command to confirm it took effect
 
-### MILP Optimizer (v2)
+### MILP Optimizer (`milp_v1`)
 Solves a 24h cost-minimization problem with:
 - Decision: when to run DHW, how much space heating per hour
 - Objective: minimize Σ(price × kWh_electrical)
 - Constraints: per-hour tank floor (uses `tank_min_temp_offpeak` during sleep/away hours, normal `tank_min_temp` during comfort hours), tank max, comfort bounds, COP curve, hardware rate limits, and the comfort model's predicted indoor response when available
 
-The MILP path is selected automatically when ≥14 days of training data and trained ML models are available; otherwise the rules engine runs.
+### Shower mode
+When `shower_mode_enabled` is `true`, a tank drop of at least `shower_drop_threshold` °C between polls starts an immediate Force DHW boost, paired with a Force DHW off that runs on recovery or after `shower_max_duration_minutes`. No boost is started while Force DHW is already on or during the top 5% of the day's prices.
+
+### Poller schedule
+
+| Job | Interval |
+|-----|----------|
+| Device status (+ shower detection) | `POLL_INTERVAL_SECONDS` (300 s) |
+| Consumption | 15 min |
+| Prices | 15 min |
+| Weather | 30 min |
+| SmartThings indoor temperature | `smartthings_poll_interval` (300 s) |
+| Comfort model retrain | 6 h |
+| Seasonal calibration check | 6 h |
+| Operational alert delivery | 5 min |
+| Heartbeat | 1 min |
 
 ### ML Models
 - **COP Model**: Predicts COP directly from real thermal data using compressor direction-aware sample pairing
 - **Demand Model**: Forecasts thermal demand from weather + usage patterns
 - **Comfort Model**: Predicts indoor temperature response, used by both rules and MILP for accurate pre-heating
+- **Thermal model**: Tank and indoor heating response; calibrated via `POST /api/thermal/calibrate`
 - Models are persisted with HMAC-signed pickles (`SECRET_KEY`-bound) and shared between containers via `MODEL_DIR`
-- Auto-retrain weekly on accumulated data; manual retrain via `POST /api/ml/train` or the settings page
+- The comfort model retrains every 6 hours in the `poller`. COP and demand models retrain via `POST /api/ml/train`, the settings page, or seasonal calibration (demand only). The weekly Sunday 03:00 UTC retrain in `packages.ml.main` is not part of the default Compose stack.
 
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Install the locked development graph (see ../docs/dependency-management.md)
+python -m pip install -c constraints.txt -e ".[all,dev]"
 
-# Run tests
-pytest
+# Unit tests (no database needed)
+python -m pytest --ignore=tests/e2e -q
+
+# Lint / format
+ruff check packages/ tests/
+ruff format packages/ tests/
 
 # Run a single service locally
 python -m packages.poller.main
+```
+
+### Backend end-to-end tests
+
+`tests/e2e/` needs the disposable Postgres (port 5433) and Redis (port 6380) from `docker-compose.test.yml`. The test database URL and Redis URL must be set before any app module is imported.
+
+```bash
+run-tests.bat               # Windows: starts the test stack, runs tests/e2e, tears down (activates ..\.venv)
+scripts/run-e2e.ps1         # Backend E2E + mocked Playwright suite in an isolated Compose project
 ```
 
 ### Frontend end-to-end tests
@@ -291,6 +351,7 @@ npm run test:e2e:live
 - Manual override **always wins** over the optimizer
 - **Learning mode** suppresses all device commands while enabled (optimizer observes only) — useful for safely collecting training data. Unresolved safety restores wait until control resumes, so normal activation is blocked until they close; forcing activation is exceptional and audited.
 - Rate limiter prevents API abuse (30 reads/h, 20 writes/h)
-- Circuit breaker disables auth for 15 min after 3 failures
+- Every Panasonic write first requires live (not cloud-cached) adaptor status no older than 60 seconds
+- Circuit breaker disables auth for 15 min after 3 failures (state shared across services via Redis)
 - All actions are audit-logged
 - Emergency: set any override via the API to immediately pause everything
