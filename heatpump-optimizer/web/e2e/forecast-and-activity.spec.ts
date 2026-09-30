@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 const now = new Date();
 
@@ -130,9 +130,9 @@ test("shows rainfall and separates actual activity from plan revisions", async (
   await page.getByRole("tab", { name: "Charts" }).click();
   await expect(page.getByRole("region", { name: "Indoor comfort, weather and price forecast" })).toBeVisible();
   await page.getByText("Show raw weather, price and temperature history").click();
-    await expect(
-      page.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
-    ).toBeVisible();
+  await expect(
+    page.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
+  ).toBeVisible();
   await expect(page.getByText("Blue bars show rain in mm/h.")).toBeVisible();
   await page.getByRole("tab", { name: "Plan" }).click();
   await expect(page.getByTestId("plan-activity")).toBeVisible();

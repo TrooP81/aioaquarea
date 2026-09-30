@@ -12,6 +12,7 @@ from .executor_core import (
     VERIFY_TIMEOUT_S,
     PlanExecutor as _CorePlanExecutor,
     is_learning_mode_active,
+    resolve_learning_mode_state,
 )
 
 
@@ -27,7 +28,7 @@ class PlanExecutor(_CorePlanExecutor):
             wrapper,
             session_factory=lambda *args, **kwargs: get_session(*args, **kwargs),
             sleep=lambda delay: asyncio.sleep(delay),
-            learning_check=lambda: is_learning_mode_active(),
+            learning_check=lambda: resolve_learning_mode_state(),
         )
 
 
@@ -40,4 +41,5 @@ __all__ = [
     "asyncio",
     "get_session",
     "is_learning_mode_active",
+    "resolve_learning_mode_state",
 ]

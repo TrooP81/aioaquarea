@@ -18,7 +18,7 @@ from sqlalchemy import and_, case, func, select, update
 
 from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
-from packages.core.learning_state import get_learning_state
+from packages.core.learning_state import get_learning_state_details
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
@@ -68,11 +68,11 @@ async def resolve_learning_mode_state() -> LearningModeState:
     A lookup failure leaves ordinary control unsafe, but a pending restorative action
     remains eligible for the executor's separate safety lane.
     """
-    state = await get_learning_state()
+    state, seasonal = await get_learning_state_details()
     if not state.reliable:
         return LearningModeState.UNKNOWN
     if state.seasonal_active:
-        logger.info("executor_seasonal_calibration_active")
+        logger.info("executor_seasonal_calibration_active", **seasonal)
     return LearningModeState.ACTIVE if state.active else LearningModeState.INACTIVE
 
 

@@ -9,6 +9,7 @@ import pytest
 
 from packages.optimizer.actions import ActionType
 from packages.optimizer.executor import PlanExecutor
+from packages.optimizer.executor_core import LearningModeState
 
 
 def _make_action(action_type: str, payload: dict | None = None):
@@ -94,8 +95,8 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
     with (
         patch("packages.optimizer.executor.get_session") as mock_gs,
         patch(
-            "packages.optimizer.executor.is_learning_mode_active",
-            new=AsyncMock(return_value=False),
+            "packages.optimizer.executor.resolve_learning_mode_state",
+            new=AsyncMock(return_value=LearningModeState.INACTIVE),
         ),
         patch.object(
             executor,

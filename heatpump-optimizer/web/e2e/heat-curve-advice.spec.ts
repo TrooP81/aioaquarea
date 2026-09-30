@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 const curveSettings = {
   heat_curve_outdoor_cold_c: { value: "5", type: "float", description: "Cold outdoor point" },

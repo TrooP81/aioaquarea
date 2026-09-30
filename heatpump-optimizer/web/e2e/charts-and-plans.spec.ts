@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 const mockPrices = Array.from({ length: 48 }, (_, i) => ({
   ts: new Date(Date.now() - (12 - i) * 3600000).toISOString(),

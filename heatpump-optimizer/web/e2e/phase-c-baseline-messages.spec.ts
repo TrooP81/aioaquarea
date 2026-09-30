@@ -1,4 +1,4 @@
-import { expect, Page, test } from "@playwright/test";
+import { expect, type Page, test } from "./fixtures";
 
 const now = new Date();
 const forecastTs = new Date(now.getTime() + 60 * 60 * 1000).toISOString();

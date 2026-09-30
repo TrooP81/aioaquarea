@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "./fixtures";
 
 const settings = {
   price_provider: { value: "manual", type: "text", description: "Price provider", options: ["manual", "entsoe", "tibber"] },

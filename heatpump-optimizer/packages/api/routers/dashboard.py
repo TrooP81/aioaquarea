@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import asyncio
+import time
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import and_, desc, func, select
@@ -45,6 +46,9 @@ from packages.core.settings_service import (
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+_COMFORT_ASSESSMENT_CACHE_TTL_S = 30.0
+_comfort_assessment_cache: tuple[float, dict[str, object] | None] | None = None
+_comfort_assessment_lock = asyncio.Lock()
 
 
 @router.get("/api/dashboard", response_model=DashboardResponse)
@@ -300,23 +304,39 @@ async def get_dashboard():
     )
 
 
+async def _get_comfort_assessment() -> dict[str, object] | None:
+    global _comfort_assessment_cache
+
+    cached = _comfort_assessment_cache
+    if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
+        return cached[1]
+
+    # Coalesce concurrent cache refreshes for this read-only endpoint.
+    async with _comfort_assessment_lock:
+        cached = _comfort_assessment_cache
+        if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
+            return cached[1]
+        try:
+            from packages.api.routers.models_router import get_indoor_forecast
+
+            forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
+            assessment = forecast.get("comfort_assessment") if isinstance(forecast, dict) else None
+            comfort_assessment = assessment if isinstance(assessment, dict) else None
+            _comfort_assessment_cache = (time.monotonic(), comfort_assessment)
+            return comfort_assessment
+        except Exception as exc:
+            logger.warning(
+                "control_state_comfort_assessment_unavailable",
+                error_type=type(exc).__name__,
+            )
+            return None
+
+
 @router.get("/api/control-state", response_model=ControlStateResponse)
 async def get_control_state():
     """Return the persisted optimizer control state without device I/O."""
 
-    comfort_assessment = None
-    try:
-        from packages.api.routers.models_router import get_indoor_forecast
-
-        forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
-        if isinstance(forecast, dict):
-            assessment = forecast.get("comfort_assessment")
-            comfort_assessment = assessment if isinstance(assessment, dict) else None
-    except Exception as exc:  # noqa: BLE001 - missing forecast must not alter dispatch messaging
-        logger.warning(
-            "control_state_comfort_assessment_unavailable",
-            error_type=type(exc).__name__,
-        )
+    comfort_assessment = await _get_comfort_assessment()
     try:
         return await resolve_control_state(comfort_assessment=comfort_assessment)
     except ControlStateOverrideUnavailableError as exc:

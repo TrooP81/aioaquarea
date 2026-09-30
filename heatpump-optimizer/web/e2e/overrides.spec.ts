@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 const mockDashboard = {
   current_status: {
@@ -68,6 +68,7 @@ test.describe("Override Controls", () => {
         body: JSON.stringify({ ...mockDashboard, has_override: true }),
       })
     );
+    await page.route("**/api/control-state", (route) => route.fulfill({ status: 503 }));
 
     await page.goto("/");
     await expect(page.locator(".banner")).toContainText("Control state unavailable");

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 test("renders fallback indoor forecast warning without browser errors", async ({ page }) => {
     const browserErrors: string[] = [];

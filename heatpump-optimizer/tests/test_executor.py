@@ -81,6 +81,7 @@ def mock_wrapper():
 @pytest.fixture
 def executor(mock_wrapper):
     instance = PlanExecutor(mock_wrapper)
+    instance._learning_check = AsyncMock(return_value=LearningModeState.INACTIVE)
     instance._device_quality_check = AsyncMock(
         return_value={"ready": True, "reasons": [], "threshold_seconds": 900}
     )
@@ -666,8 +667,8 @@ class TestExecuteDueActions:
         with (
             patch("packages.optimizer.executor.get_session") as mock_gs,
             patch(
-                "packages.optimizer.executor.is_learning_mode_active",
-                new=AsyncMock(return_value=False),
+                "packages.optimizer.executor.resolve_learning_mode_state",
+                new=AsyncMock(return_value=LearningModeState.INACTIVE),
             ),
         ):
             mock_session = AsyncMock()
@@ -693,8 +694,8 @@ class TestExecuteDueActions:
         with (
             patch("packages.optimizer.executor.get_session") as mock_gs,
             patch(
-                "packages.optimizer.executor.is_learning_mode_active",
-                new=AsyncMock(return_value=False),
+                "packages.optimizer.executor.resolve_learning_mode_state",
+                new=AsyncMock(return_value=LearningModeState.INACTIVE),
             ),
         ):
             mock_session = AsyncMock()
@@ -951,6 +952,77 @@ async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_s
 
 class TestLearningMode:
     @pytest.mark.asyncio
+    async def test_real_learning_lookup_failure_blocks_ordinary_dispatch(self):
+        executor = PlanExecutor(AsyncMock())
+        executor._claim_due_safety_action = AsyncMock(return_value=None)
+        executor._execute_action = AsyncMock()
+
+        with patch(
+            "packages.core.settings_service.get_bool_setting",
+            new=AsyncMock(side_effect=RuntimeError("learning state unavailable")),
+        ):
+            await executor.execute_due_actions()
+
+        executor._execute_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_wrapper_unknown_runs_one_safety_revert_and_skips_ordinary_actions(self):
+        executor = PlanExecutor(AsyncMock())
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+        executor._execute_action = AsyncMock()
+
+        with patch(
+            "packages.optimizer.executor.resolve_learning_mode_state",
+            new=AsyncMock(return_value=LearningModeState.UNKNOWN),
+        ):
+            await executor.execute_due_actions()
+
+        executor._execute_safety_action.assert_awaited_once_with(safety_action)
+        executor._execute_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_wrapper_unknown_without_revert_skips_ordinary_actions(self):
+        executor = PlanExecutor(AsyncMock())
+        executor._claim_due_safety_action = AsyncMock(return_value=None)
+        executor._execute_action = AsyncMock()
+
+        with patch(
+            "packages.optimizer.executor.resolve_learning_mode_state",
+            new=AsyncMock(return_value=LearningModeState.UNKNOWN),
+        ):
+            await executor.execute_due_actions()
+
+        executor._execute_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("state", "claims_safety"),
+        [(LearningModeState.ACTIVE, False), (LearningModeState.INACTIVE, True)],
+    )
+    async def test_wrapper_passes_through_learning_state(self, state, claims_safety):
+        executor = PlanExecutor(AsyncMock())
+        safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        executor._claim_due_safety_action = AsyncMock(return_value=safety_action)
+        executor._execute_safety_action = AsyncMock()
+
+        with patch(
+            "packages.optimizer.executor.resolve_learning_mode_state",
+            new=AsyncMock(return_value=state),
+        ):
+            await executor.execute_due_actions()
+
+        assert executor._claim_due_safety_action.await_count == int(claims_safety)
+        assert executor._execute_safety_action.await_count == int(claims_safety)
+
+    def test_wrapper_exports_learning_helpers(self):
+        from packages.optimizer.executor import is_learning_mode_active, resolve_learning_mode_state
+
+        assert callable(is_learning_mode_active)
+        assert callable(resolve_learning_mode_state)
+
+    @pytest.mark.asyncio
     async def test_learning_mode_skips_due_safety_reverts_without_dispatch(self, executor):
         safety_action = _make_action(str(ActionType.FORCE_DHW_OFF))
         executor._learning_check = AsyncMock(return_value=True)
@@ -979,6 +1051,23 @@ class TestLearningMode:
             assert await is_learning_mode_active() is True
 
     @pytest.mark.asyncio
+    async def test_seasonal_calibration_log_preserves_detail_fields(self):
+        from packages.optimizer.executor_core import resolve_learning_mode_state
+
+        state = SimpleNamespace(reliable=True, seasonal_active=True, active=True)
+        seasonal = {"reason": "active", "average_outdoor_c": 4.5}
+        with (
+            patch(
+                "packages.optimizer.executor_core.get_learning_state_details",
+                new=AsyncMock(return_value=(state, seasonal)),
+            ),
+            patch("packages.optimizer.executor_core.logger.info") as info,
+        ):
+            assert await resolve_learning_mode_state() is LearningModeState.ACTIVE
+
+        info.assert_called_once_with("executor_seasonal_calibration_active", **seasonal)
+
+    @pytest.mark.asyncio
     async def test_learning_mode_skips_due_actions_without_touching_device(self, executor):
         executor._learning_check = AsyncMock(return_value=True)
         executor._claim_due_safety_action = AsyncMock()
@@ -995,8 +1084,8 @@ class TestLearningMode:
         with (
             patch("packages.optimizer.executor.get_session") as mock_gs,
             patch(
-                "packages.optimizer.executor.is_learning_mode_active",
-                new=AsyncMock(return_value=False),
+                "packages.optimizer.executor.resolve_learning_mode_state",
+                new=AsyncMock(return_value=LearningModeState.INACTIVE),
             ),
         ):
             mock_session = AsyncMock()

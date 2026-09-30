@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,12 +10,21 @@ import pytest
 
 from packages.core.learning_state import LearningStateSnapshot
 from packages.core.optimizer_control_state import (
+    ControlStateOverrideUnavailableError,
     _next_action_is_embargoed,
     _next_pending_action_embargoed,
     get_controlling_override,
     resolve_control_state,
 )
 from packages.api.schemas import ControlStateResponse
+
+
+@pytest.fixture(autouse=True)
+def reset_dashboard_comfort_assessment_cache(monkeypatch):
+    from packages.api.routers import dashboard
+
+    monkeypatch.setattr(dashboard, "_comfort_assessment_cache", None)
+    monkeypatch.setattr(dashboard, "_comfort_assessment_lock", asyncio.Lock())
 
 
 class _Session:
@@ -50,6 +61,21 @@ async def test_shared_override_query_selects_highest_id_not_latest_start():
     assert override is selected
     statement = session.execute.await_args.args[0]
     assert "ORDER BY overrides.id DESC" in str(statement)
+
+
+@pytest.mark.asyncio
+async def test_control_state_raises_when_controlling_override_lookup_fails(monkeypatch):
+    session = _Session([])
+    monkeypatch.setattr(
+        "packages.core.optimizer_control_state.get_session", lambda: _Context(session)
+    )
+    monkeypatch.setattr(
+        "packages.core.optimizer_control_state.get_controlling_override",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(ControlStateOverrideUnavailableError):
+        await resolve_control_state()
 
 
 @pytest.mark.asyncio
@@ -132,6 +158,76 @@ async def test_control_state_forecast_failure_falls_through_to_automatic(monkeyp
 
     assert result.state == "automatic"
     assert resolve.await_args.kwargs["comfort_assessment"] is None
+
+
+@pytest.mark.asyncio
+async def test_control_state_caches_successful_comfort_assessment(monkeypatch):
+    from packages.api.routers import dashboard
+
+    forecast = AsyncMock(return_value={"comfort_assessment": {"state": "at_risk"}})
+    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
+    monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
+
+    await dashboard.get_control_state()
+    await dashboard.get_control_state()
+
+    assert forecast.await_count == 1
+    assert resolve.await_args.kwargs["comfort_assessment"] == {"state": "at_risk"}
+
+    monkeypatch.setattr(
+        dashboard,
+        "_comfort_assessment_cache",
+        (time.monotonic() - 31, {"state": "at_risk"}),
+    )
+    await dashboard.get_control_state()
+
+    assert forecast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_control_state_coalesces_concurrent_comfort_assessment_refreshes(monkeypatch):
+    from packages.api.routers import dashboard
+
+    release_forecast = asyncio.Event()
+    forecast_started = asyncio.Event()
+
+    async def forecast_call(*, hours):
+        forecast_started.set()
+        await release_forecast.wait()
+        return {"comfort_assessment": {"state": "at_risk"}}
+
+    forecast = AsyncMock(side_effect=forecast_call)
+    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
+    monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
+
+    first = asyncio.create_task(dashboard.get_control_state())
+    await asyncio.wait_for(forecast_started.wait(), timeout=1)
+    second = asyncio.create_task(dashboard.get_control_state())
+    await asyncio.sleep(0)
+    release_forecast.set()
+
+    await asyncio.gather(first, second)
+
+    assert forecast.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_control_state_does_not_cache_comfort_assessment_failure(monkeypatch):
+    from packages.api.routers import dashboard
+
+    forecast = AsyncMock(
+        side_effect=[RuntimeError("forecast unavailable"), {"comfort_assessment": {}}]
+    )
+    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
+    monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
+
+    await dashboard.get_control_state()
+    await dashboard.get_control_state()
+
+    assert forecast.await_count == 2
 
 
 @pytest.mark.asyncio
