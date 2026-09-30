@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:4444"  # Comma-separated allowed origins
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
+    executor_safety_read_reserve: int = Field(default=2, ge=1, le=4)
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

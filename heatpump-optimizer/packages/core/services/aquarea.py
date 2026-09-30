@@ -261,22 +261,25 @@ class AquareaWrapper:
         async with self._device_lock:
             if self._device is not None:
                 return self._device
+            return await self._initialize_device_locked(charge_read=True)
 
-            await self._ensure_authenticated()
+    async def _initialize_device_locked(self, *, charge_read: bool):
+        await self._ensure_authenticated()
+        if charge_read:
             await self._read_limiter.acquire()
-            devices = await self._client.get_devices()
-            if not devices:
-                raise RuntimeError("No devices found on account")
-            self._device_info = devices[0]
-            from datetime import timedelta
+        devices = await self._client.get_devices()
+        if not devices:
+            raise RuntimeError("No devices found on account")
+        self._device_info = devices[0]
+        from datetime import timedelta
 
-            self._device = await self._client.get_device(
-                device_info=self._device_info,
-                consumption_refresh_interval=timedelta(minutes=5),
-                timezone=self._timezone,
-            )
-            self._record_live_status(self._device)
-            return self._device
+        self._device = await self._client.get_device(
+            device_info=self._device_info,
+            consumption_refresh_interval=timedelta(minutes=5),
+            timezone=self._timezone,
+        )
+        self._record_live_status(self._device)
+        return self._device
 
     async def get_selected_device_id(self) -> str:
         """Return the selected identity without status refresh or resilience mutation."""
@@ -314,12 +317,13 @@ class AquareaWrapper:
         """
         self._raise_if_adapter_backoff_active()
 
-        if self._device is None:
-            return await self.get_device()
-
         await self._read_limiter.acquire()
+        async with self._device_lock:
+            if self._device is None:
+                return await self._initialize_device_locked(charge_read=False)
+            device = self._device
         try:
-            await self._device.refresh_data(allow_cached_fallback=False)
+            await device.refresh_data(allow_cached_fallback=False)
         except DeviceUnavailableError as exc:
             self._last_live_status_at = None
             failures, retry_after = self._register_adapter_failure(
@@ -332,8 +336,8 @@ class AquareaWrapper:
                 consecutive_failures=failures,
                 retry_after_seconds=retry_after,
             ) from exc
-        self._record_live_status(self._device)
-        return self._device
+        self._record_live_status(device)
+        return device
 
     async def get_active_weekly_timer_slots(self, at: dt.datetime | None = None) -> tuple:
         """Read and cache active Panasonic timer slots; failures never block control."""

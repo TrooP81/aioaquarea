@@ -14,7 +14,10 @@ from sqlalchemy import desc, select
 
 from packages.core.database import get_session
 from packages.core.models import IndoorTempReading, PlanActionRecord, PlanRecord
-from packages.optimizer.executor_core import VERIFY_REDISPATCH_ATTEMPTS, VERIFY_TIMEOUT_S
+from packages.optimizer.executor_core import (
+    INITIAL_VERIFY_CHECKPOINTS_S,
+    REDISPATCH_VERIFY_CHECKPOINTS_S,
+)
 
 logger = structlog.get_logger()
 
@@ -38,7 +41,7 @@ MAX_BASELINE_CANDIDATE_P90_C = 2.0
 MAX_DISPATCH_ACTION_LOOKUP = 500
 CARRYOVER_LOOKBACK = dt.timedelta(hours=24)
 DISPATCH_DRIFT_MARGIN = dt.timedelta(
-    seconds=VERIFY_TIMEOUT_S * (1 + VERIFY_REDISPATCH_ATTEMPTS) + 60
+    seconds=max(INITIAL_VERIFY_CHECKPOINTS_S) + max(REDISPATCH_VERIFY_CHECKPOINTS_S) + 60
 )
 
 # A condition without evaluation data must never be treated as evidence that

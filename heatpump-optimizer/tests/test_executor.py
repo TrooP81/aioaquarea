@@ -10,8 +10,14 @@ import pytest
 from aioaquarea import QuietMode
 from aioaquarea.data import SpecialStatus
 
-from packages.core.models import PlanActionRecord
+from packages.core.models import DeviceStatusRecord, PlanActionRecord
 from packages.optimizer.actions import ACTION_REGISTRY, ActionType, VerifyResult
+from packages.optimizer.actions.registry import ActionHandler
+from packages.optimizer.executor_core import (
+    SAFETY_ACTION_STUCK_AFTER,
+    SAFETY_DISPATCH_MARGIN_S,
+    SAFETY_VERIFY_CHECKPOINTS_S,
+)
 from packages.optimizer.executor import (
     MAX_ACTIONS_PER_CYCLE,
     PlanExecutor,
@@ -44,6 +50,7 @@ def _device(
     special_status=None,
     tank_temp=None,
     zone_temp=None,
+    zone2_temp=None,
     zone_min=20,
     zone_max=65,
     special_status_supported=True,
@@ -56,9 +63,10 @@ def _device(
         tank=SimpleNamespace(target_temperature=tank_temp)
         if tank_temp is not None
         else SimpleNamespace(target_temperature=None),
-        zones={0: _zone(zone_temp, zone_min, zone_max)}
-        if zone_temp is not None
-        else {0: _zone(None, zone_min, zone_max)},
+        zones={
+            0: _zone(zone_temp, zone_min, zone_max),
+            **({2: _zone(zone2_temp, zone_min, zone_max)} if zone2_temp is not None else {}),
+        },
     )
 
 
@@ -85,6 +93,8 @@ def executor(mock_wrapper):
     instance._device_quality_check = AsyncMock(
         return_value={"ready": True, "reasons": [], "threshold_seconds": 900}
     )
+    instance._load_persisted_observation = AsyncMock(return_value=None)
+    instance._reserve_verification_read = AsyncMock(return_value=True)
     return instance
 
 
@@ -496,6 +506,407 @@ class TestExecuteAction:
 
 
 class TestVerification:
+    @pytest.mark.asyncio
+    async def test_safety_verification_uses_safety_lane_and_requeues_without_redispatch(
+        self, executor, mock_wrapper
+    ):
+        action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        action.safety_attempt_count = 0
+        handler = MagicMock()
+        handler.dispatch = AsyncMock(return_value={"force_dhw": "OFF"})
+        handler.redispatch_expected = AsyncMock()
+        executor._dispatch_precondition = AsyncMock(return_value=None)
+        executor._safety_already_safe = AsyncMock(return_value=False)
+        executor._poll_until_verified = AsyncMock(
+            return_value=(VerifyResult(ok=False, reason="mismatch"), 2)
+        )
+        executor._requeue_safety_action = AsyncMock()
+        mock_wrapper.safety_write = MagicMock()
+        mock_wrapper.safety_write.return_value.__enter__ = MagicMock()
+        mock_wrapper.safety_write.return_value.__exit__ = MagicMock(return_value=False)
+        session = AsyncMock()
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor._session_factory = MagicMock(return_value=context)
+
+        with patch("packages.optimizer.executor_core.get_action_handler", return_value=handler):
+            await executor._execute_safety_action(action)
+
+        verification_call = executor._poll_until_verified.await_args.kwargs
+        assert verification_call["lane"] == "safety"
+        assert verification_call["phase"] == "safety"
+        assert verification_call["checkpoints"] == SAFETY_VERIFY_CHECKPOINTS_S
+        assert verification_call["live_checkpoints"] == frozenset({15, 60})
+        handler.redispatch_expected.assert_not_awaited()
+        executor._requeue_safety_action.assert_awaited_once_with(action, "mismatch")
+
+    @pytest.mark.asyncio
+    async def test_live_read_exception_marks_unverified_without_redispatch(
+        self, executor, mock_wrapper
+    ):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = MagicMock()
+        handler.verification_supported = True
+        handler.verify.return_value = VerifyResult(ok=False, reason="mismatch")
+        handler.redispatch_expected = AsyncMock()
+        mock_wrapper.refresh_device.side_effect = RuntimeError("Panasonic unavailable")
+        executor._sleep = AsyncMock()
+        executor._mark_executed_unverified = AsyncMock()
+
+        with patch("packages.optimizer.executor_core.get_action_handler", return_value=handler):
+            await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
+
+        handler.redispatch_expected.assert_not_awaited()
+        executor._mark_executed_unverified.assert_awaited_once_with(
+            action, "verification_evidence_unavailable"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method_name",
+        ["_load_persisted_observation", "_reserve_verification_read"],
+    )
+    async def test_ledger_failure_marks_unverified_without_live_read_or_redispatch(
+        self, executor, mock_wrapper, method_name
+    ):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = MagicMock()
+        handler.verification_supported = True
+        handler.redispatch_expected = AsyncMock()
+        setattr(executor, method_name, AsyncMock(side_effect=RuntimeError("ledger unavailable")))
+        executor._mark_executed_unverified = AsyncMock()
+
+        with patch("packages.optimizer.executor_core.get_action_handler", return_value=handler):
+            await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
+
+        mock_wrapper.refresh_device.assert_not_awaited()
+        handler.redispatch_expected.assert_not_awaited()
+        executor._mark_executed_unverified.assert_awaited_once_with(
+            action, "verification_ledger_unavailable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_verification_is_reraised_without_terminal_outcome(self, executor):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = MagicMock()
+        handler.verification_supported = True
+        handler.redispatch_expected = AsyncMock()
+        executor._mark_executed_unverified = AsyncMock()
+
+        with (
+            patch("packages.optimizer.executor_core.get_action_handler", return_value=handler),
+            patch.object(
+                executor, "_poll_until_verified", new=AsyncMock(side_effect=asyncio.CancelledError)
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
+
+        executor._mark_executed_unverified.assert_not_awaited()
+        handler.redispatch_expected.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_exception_is_failed(self, executor):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = MagicMock()
+        handler.dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed"))
+        executor._dispatch_precondition = AsyncMock(return_value=None)
+
+        with (
+            patch("packages.optimizer.executor_core.get_action_handler", return_value=handler),
+            patch("packages.optimizer.executor.get_session") as mock_get_session,
+        ):
+            mock_session = AsyncMock()
+            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            await executor._execute_action(action)
+
+        statuses = [
+            _extract_stmt_values(call.args[0]).get("status")
+            for call in mock_session.execute.await_args_list
+        ]
+        assert "failed" in statuses
+
+    @pytest.mark.asyncio
+    async def test_redispatch_exception_is_failed(self, executor):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = MagicMock()
+        handler.dispatch = AsyncMock(return_value={"force_dhw": "ON"})
+        handler.redispatch_expected = AsyncMock(side_effect=RuntimeError("retry failed"))
+        executor._dispatch_precondition = AsyncMock(return_value=None)
+        mismatch = VerifyResult(ok=False, reason="mismatch")
+
+        with (
+            patch("packages.optimizer.executor_core.get_action_handler", return_value=handler),
+            patch.object(
+                executor, "_poll_until_verified", new=AsyncMock(return_value=(mismatch, 2))
+            ),
+            patch("packages.optimizer.executor.get_session") as mock_get_session,
+        ):
+            mock_session = AsyncMock()
+            mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            await executor._execute_action(action)
+
+        handler.redispatch_expected.assert_awaited_once()
+        statuses = [
+            _extract_stmt_values(call.args[0]).get("status")
+            for call in mock_session.execute.await_args_list
+        ]
+        assert "failed" in statuses
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("matches", [True, False], ids=["match", "mismatch"])
+    @pytest.mark.parametrize("action_type", list(ActionType), ids=lambda value: value.value)
+    async def test_live_and_persisted_verification_have_parity_for_every_action(
+        self, executor, action_type, matches
+    ):
+        special_status_values = {
+            "eco": ("ECO", 1),
+            "comfort": ("COMFORT", 2),
+            "none": (None, None),
+        }
+        cases = {
+            ActionType.FORCE_DHW_ON: (
+                {},
+                {"force_dhw": "ON"},
+                _device(force_dhw=1),
+                {"force_dhw": 1},
+            ),
+            ActionType.FORCE_DHW_OFF: (
+                {},
+                {"force_dhw": "OFF"},
+                _device(force_dhw=0),
+                {"force_dhw": 0},
+            ),
+            ActionType.QUIET_MODE_ON: (
+                {},
+                {"quiet_mode": "LEVEL2"},
+                _device(quiet_mode=2),
+                {"quiet_mode": 2},
+            ),
+            ActionType.QUIET_MODE_OFF: (
+                {},
+                {"quiet_mode": "OFF"},
+                _device(quiet_mode=0),
+                {"quiet_mode": 0},
+            ),
+            ActionType.ZONE_TEMP_BOOST: (
+                {"zone_id": 0},
+                {"zone_id": 0, "temperature": 37},
+                _device(zone_temp=37),
+                {"zone1_target_temp": 37},
+            ),
+            ActionType.ZONE_TEMP_RESTORE: (
+                {"zone_id": 0},
+                {"zone_id": 0, "temperature": 21},
+                _device(zone_temp=21),
+                {"zone1_target_temp": 21},
+            ),
+            ActionType.SET_TANK_TEMP: (
+                {},
+                {"temperature": 52},
+                _device(tank_temp=52),
+                {"tank_target_temp": 52},
+            ),
+            ActionType.SET_ZONE_HEAT_TEMPERATURE: (
+                {"zone_id": 0},
+                {"zone_id": 0, "temperature": 34},
+                _device(zone_temp=34),
+                {"zone1_target_temp": 34},
+            ),
+            ActionType.ECO_MODE_ON: (
+                {},
+                {"special_status": "ECO"},
+                _device(special_status="ECO"),
+                {"special_status": special_status_values["eco"][1]},
+            ),
+            ActionType.ECO_MODE_OFF: (
+                {},
+                {"special_status": None},
+                _device(special_status=None),
+                {"special_status": special_status_values["none"][1]},
+            ),
+            ActionType.NORMAL_MODE_ON: (
+                {},
+                {"special_status": None},
+                _device(special_status=None),
+                {"special_status": special_status_values["none"][1]},
+            ),
+            ActionType.COMFORT_MODE_ON: (
+                {},
+                {"special_status": "COMFORT"},
+                _device(special_status="COMFORT"),
+                {"special_status": special_status_values["comfort"][1]},
+            ),
+        }
+        payload, expected, live_device, persisted_fields = cases[action_type]
+        if not matches:
+            if action_type in {ActionType.FORCE_DHW_ON, ActionType.FORCE_DHW_OFF}:
+                live_device = _device(force_dhw=0 if action_type is ActionType.FORCE_DHW_ON else 1)
+                persisted_fields = {"force_dhw": 0 if action_type is ActionType.FORCE_DHW_ON else 1}
+            elif (
+                action_type is ActionType.QUIET_MODE_ON or action_type is ActionType.QUIET_MODE_OFF
+            ):
+                live_device = _device(
+                    quiet_mode=1 if action_type is ActionType.QUIET_MODE_ON else 1
+                )
+                persisted_fields = {"quiet_mode": 1}
+            elif action_type is ActionType.SET_TANK_TEMP:
+                live_device = _device(tank_temp=51)
+                persisted_fields = {"tank_target_temp": 51}
+            elif action_type in {
+                ActionType.ZONE_TEMP_BOOST,
+                ActionType.ZONE_TEMP_RESTORE,
+                ActionType.SET_ZONE_HEAT_TEMPERATURE,
+            }:
+                mismatch_target = 36 if action_type is ActionType.ZONE_TEMP_BOOST else 20
+                live_device = _device(zone_temp=mismatch_target)
+                persisted_fields = {"zone1_target_temp": mismatch_target}
+            else:
+                mismatch_status = "COMFORT" if expected["special_status"] == "ECO" else "ECO"
+                live_device = _device(special_status=mismatch_status)
+                persisted_fields = {
+                    "special_status": special_status_values[mismatch_status.lower()][1]
+                }
+
+        record = DeviceStatusRecord(
+            ts=dt.datetime.now(dt.timezone.utc),
+            device_id="device-a",
+            **persisted_fields,
+        )
+        session = AsyncMock()
+        query_result = MagicMock()
+        query_result.scalar_one_or_none.return_value = record
+        session.execute = AsyncMock(return_value=query_result)
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor._session_factory = MagicMock(return_value=context)
+        executor._load_persisted_observation = CorePlanExecutor._load_persisted_observation.__get__(
+            executor, type(executor)
+        )
+
+        persisted = await executor._load_persisted_observation(
+            "device-a", dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        )
+        live_result = ACTION_REGISTRY[action_type].verify(
+            executor._normalize_live_observation(live_device), payload, expected
+        )
+        persisted_result = ACTION_REGISTRY[action_type].verify(persisted, payload, expected)
+
+        assert live_result.as_dict() == persisted_result.as_dict()
+        assert live_result.ok is matches
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("matches", [True, False], ids=["match", "mismatch"])
+    @pytest.mark.parametrize(
+        ("action_type", "expected_temperature", "mismatch_temperature"),
+        [
+            (ActionType.ZONE_TEMP_BOOST, 37, 36),
+            (ActionType.ZONE_TEMP_RESTORE, 21, 20),
+            (ActionType.SET_ZONE_HEAT_TEMPERATURE, 34, 20),
+        ],
+    )
+    async def test_live_and_persisted_verification_have_zone_2_parity(
+        self, executor, action_type, expected_temperature, mismatch_temperature, matches
+    ):
+        observed_temperature = expected_temperature if matches else mismatch_temperature
+        record = DeviceStatusRecord(
+            ts=dt.datetime.now(dt.timezone.utc),
+            device_id="device-a",
+            zone2_target_temp=observed_temperature,
+        )
+        session = AsyncMock()
+        query_result = MagicMock()
+        query_result.scalar_one_or_none.return_value = record
+        session.execute = AsyncMock(return_value=query_result)
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor._session_factory = MagicMock(return_value=context)
+        executor._load_persisted_observation = CorePlanExecutor._load_persisted_observation.__get__(
+            executor, type(executor)
+        )
+        payload = {"zone_id": 2}
+        expected = {"zone_id": 2, "temperature": expected_temperature}
+
+        persisted = await executor._load_persisted_observation(
+            "device-a", dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        )
+        live_result = ACTION_REGISTRY[action_type].verify(
+            executor._normalize_live_observation(_device(zone2_temp=observed_temperature)),
+            payload,
+            expected,
+        )
+        persisted_result = ACTION_REGISTRY[action_type].verify(persisted, payload, expected)
+
+        assert live_result.as_dict() == persisted_result.as_dict()
+        assert live_result.ok is matches
+
+    @pytest.mark.asyncio
+    async def test_initial_verification_uses_approved_checkpoints_and_live_reads(
+        self, executor, mock_wrapper
+    ):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        executor._sleep = AsyncMock()
+        executor._store_verification_progress = AsyncMock()
+        mock_wrapper.refresh_device.return_value = _device(force_dhw=0)
+
+        result, attempts = await executor._poll_until_verified(
+            action=action,
+            handler=ACTION_REGISTRY[ActionType.FORCE_DHW_ON],
+            payload={},
+            expected_state={"force_dhw": "ON"},
+            attempts=0,
+            lane="ordinary",
+            phase="initial",
+            checkpoints=(15, 30, 60),
+            live_checkpoints=frozenset({15, 60}),
+            evidence_after=dt.datetime.now(dt.timezone.utc),
+        )
+
+        assert not result.ok
+        assert attempts == 2
+        assert [call.args[0] for call in executor._sleep.await_args_list] == [15, 15, 30]
+        assert mock_wrapper.refresh_device.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_quota_denial_does_not_refresh_or_redispatch(self, executor, mock_wrapper):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        executor._reserve_verification_read = AsyncMock(return_value=False)
+        executor._mark_executed_unverified = AsyncMock()
+
+        await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
+
+        mock_wrapper.refresh_device.assert_not_awaited()
+        mock_wrapper.force_dhw.assert_not_awaited()
+        executor._mark_executed_unverified.assert_awaited_once_with(
+            action, "verification_quota_exhausted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unsupported_verification_consumes_no_read(self, executor):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        handler = ActionHandler(
+            AsyncMock(), lambda *_args: VerifyResult(ok=False), verification_supported=False
+        )
+        executor._mark_executed_unverified = AsyncMock()
+
+        with patch("packages.optimizer.executor_core.get_action_handler", return_value=handler):
+            await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
+
+        executor._reserve_verification_read.assert_not_awaited()
+        executor._mark_executed_unverified.assert_awaited_once_with(
+            action, "verification_not_supported"
+        )
+
+    def test_safety_stuck_threshold_exceeds_last_checkpoint_and_margin(self):
+        assert SAFETY_ACTION_STUCK_AFTER > dt.timedelta(
+            seconds=max(SAFETY_VERIFY_CHECKPOINTS_S) + SAFETY_DISPATCH_MARGIN_S
+        )
+
     @pytest.mark.asyncio
     async def test_timeout_then_retry_success(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.FORCE_DHW_ON))

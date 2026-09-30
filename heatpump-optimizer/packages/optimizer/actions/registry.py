@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from packages.core.panasonic_special_status import optimizer_special_status_supported
 
-from .types import ActionType, VerifyResult
+from .types import ActionType, VerificationObservation, VerifyResult
 
 DispatchFn = Callable[[Any, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 RedispatchFn = Callable[[Any, dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -21,6 +21,7 @@ class ActionHandler:
     dispatch: DispatchFn
     verify: VerifyFn
     redispatch: RedispatchFn | None = None
+    verification_supported: bool = True
 
     async def redispatch_expected(
         self,
@@ -35,6 +36,11 @@ class ActionHandler:
 
 
 def _zone_from_device(device: Any, zone_id: int = 0):
+    if isinstance(device, VerificationObservation):
+        target = device.zone_targets.get(zone_id)
+        if target is None and not zone_id:
+            target = device.zone_targets.get(0) or device.zone_targets.get(1)
+        return None if target is None else type("Zone", (), {"heat_target_temperature": target})()
     zones = getattr(device, "zones", None)
     if not zones:
         return None
@@ -67,11 +73,23 @@ def _is_valid_zone_target(value: Any, zone: Any) -> bool:
 
 
 def _special_status_name(device: Any) -> str | None:
+    if isinstance(device, VerificationObservation):
+        return device.special_status
     status = getattr(device, "special_status", None)
     return getattr(status, "name", None)
 
 
 def _tank_target_reached(device: Any) -> tuple[bool, Any, Any]:
+    if isinstance(device, VerificationObservation):
+        current_temp = device.tank_temperature
+        target_temp = device.tank_target_temperature
+        return (
+            isinstance(current_temp, (int, float))
+            and isinstance(target_temp, (int, float))
+            and current_temp >= target_temp - 0.5,
+            current_temp,
+            target_temp,
+        )
     tank = getattr(device, "tank", None)
     current_temp = getattr(tank, "temperature", None)
     target_temp = getattr(tank, "target_temperature", None)
@@ -367,7 +385,12 @@ async def _dispatch_comfort_mode_on(wrapper: Any, payload: dict[str, Any]) -> di
 def _verify_force_dhw(
     device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
 ) -> VerifyResult:
-    observed = getattr(getattr(device, "force_dhw", None), "value", None)
+    raw_value = getattr(device, "force_dhw", None)
+    observed = (
+        raw_value
+        if isinstance(device, VerificationObservation)
+        else getattr(raw_value, "value", None)
+    )
     expected_value = 1 if expected and expected.get("force_dhw") == "ON" else 0
     if expected_value == 1 and observed != expected_value:
         reached, _, _ = _tank_target_reached(device)
@@ -390,7 +413,12 @@ def _verify_force_dhw(
 def _verify_quiet_mode(
     device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
 ) -> VerifyResult:
-    observed = getattr(getattr(device, "quiet_mode", None), "value", None)
+    raw_value = getattr(device, "quiet_mode", None)
+    observed = (
+        raw_value
+        if isinstance(device, VerificationObservation)
+        else getattr(raw_value, "value", None)
+    )
     target = expected.get("quiet_mode") if expected else None
     expected_value = {"OFF": 0, "LEVEL1": 1, "LEVEL2": 2, "LEVEL3": 3}.get(target)
     ok = expected_value is not None and observed == expected_value
@@ -420,7 +448,11 @@ def _verify_special_status(
 def _verify_tank_temp(
     device: Any, payload: dict[str, Any], expected: dict[str, Any] | None
 ) -> VerifyResult:
-    observed = getattr(getattr(device, "tank", None), "target_temperature", None)
+    observed = (
+        device.tank_target_temperature
+        if isinstance(device, VerificationObservation)
+        else getattr(getattr(device, "tank", None), "target_temperature", None)
+    )
     target = expected.get("temperature") if expected else None
     ok = observed == target
     return VerifyResult(

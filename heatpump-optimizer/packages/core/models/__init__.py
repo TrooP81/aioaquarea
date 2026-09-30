@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -247,6 +249,37 @@ class PlanActionRecord(Base):
     )
     safety_next_retry_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     safety_claimed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExecutorVerificationReadRecord(Base):
+    """Durable reservation made before an executor verification read."""
+
+    __tablename__ = "executor_verification_reads"
+    __table_args__ = (
+        Index("ix_executor_verification_reads_reserved_at", "reserved_at"),
+        Index("ix_executor_verification_reads_lane_reserved_at", "lane", "reserved_at"),
+        CheckConstraint(
+            "lane IN ('ordinary', 'safety')", name="ck_executor_verification_reads_lane"
+        ),
+        CheckConstraint(
+            "phase IN ('initial', 'redispatch', 'safety')",
+            name="ck_executor_verification_reads_phase",
+        ),
+        CheckConstraint(
+            "checkpoint_seconds IN (15, 60)",
+            name="ck_executor_verification_reads_checkpoint",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    reserved_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    lane: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_id: Mapped[int] = mapped_column(
+        ForeignKey("plan_actions.id", ondelete="RESTRICT"), nullable=False
+    )
+    phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    checkpoint_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class OptimizationRequestRecord(Base):

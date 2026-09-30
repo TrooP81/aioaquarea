@@ -31,6 +31,7 @@ with an error. An empty string clears a free-form value.
 | `MODEL_DIR` | `/app/models` | ML model directory; shared by `api`, `poller`, `optimizer` via the `modeldata` volume. |
 | `LOG_LEVEL` | `INFO` | Log level. |
 | `POLL_INTERVAL_SECONDS` | `300` | Device status poll interval used by the poller scheduler. Also the env fallback for `poll_interval_seconds`. |
+| `EXECUTOR_SAFETY_READ_RESERVE` | `2` | Startup-only count of the five hourly executor verification reads reserved for safety restores. Valid range: 1–4. |
 | `PRICE_PROVIDER` | `entsoe` | Env fallback for `price_provider`. |
 | `ENTSOE_API_TOKEN` | _(empty)_ | Env fallback for `entsoe_api_token`. |
 | `ENTSOE_AREA` | `10YNL----------L` | Env fallback for `entsoe_area`. |

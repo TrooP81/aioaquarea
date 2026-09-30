@@ -9,6 +9,7 @@ import packages.optimizer.rules_engine as rules_engine
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.models import PlanRecord
 from packages.ml.forecast_quality import (
+    DISPATCH_DRIFT_MARGIN,
     MAX_DISPATCH_ACTION_LOOKUP,
     _baseline_promotion_summary,
     _collect_baseline_pairs,
@@ -28,6 +29,10 @@ from packages.ml.forecast_quality import (
     score_bucket,
 )
 from packages.core.settings_service import SETTINGS_SCHEMA
+
+
+def test_dispatch_drift_margin_covers_both_verification_windows():
+    assert DISPATCH_DRIFT_MARGIN == dt.timedelta(seconds=180)
 
 
 class _AsyncContext:

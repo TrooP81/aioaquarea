@@ -109,7 +109,7 @@ async def phase2_migration_database():
 async def migration_case(phase2_migration_database):
     migration_engine, database_url = phase2_migration_database
     version = await _migration_version(migration_engine)
-    if version == "029":
+    if version != "028":
         await _clear_migration_data(migration_engine)
         await asyncio.to_thread(_run_alembic, database_url, "downgrade", "028")
     await _clear_migration_data(migration_engine)
@@ -128,6 +128,33 @@ def _plan(now: dt.datetime, version: str, status: str = "active") -> PlanRecord:
 
 
 class TestPhase2MigrationAcceptance:
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_migration_030_up_down_up_creates_and_removes_verification_ledger(
+        self, migration_case
+    ):
+        migration_engine, database_url = migration_case
+
+        await asyncio.to_thread(_run_alembic, database_url, "upgrade", "030")
+        await _migration_version(migration_engine, "030")
+        result = await _migration_sql(
+            migration_engine, "SELECT to_regclass('public.executor_verification_reads')"
+        )
+        assert result.scalar_one() == "executor_verification_reads"
+
+        await asyncio.to_thread(_run_alembic, database_url, "downgrade", "029")
+        await _migration_version(migration_engine, "029")
+        result = await _migration_sql(
+            migration_engine, "SELECT to_regclass('public.executor_verification_reads')"
+        )
+        assert result.scalar_one() is None
+
+        await asyncio.to_thread(_run_alembic, database_url, "upgrade", "030")
+        await _migration_version(migration_engine, "030")
+        result = await _migration_sql(
+            migration_engine, "SELECT to_regclass('public.executor_verification_reads')"
+        )
+        assert result.scalar_one() == "executor_verification_reads"
+
     async def _seed_legacy_event(
         self,
         migration_engine,

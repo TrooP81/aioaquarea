@@ -301,6 +301,28 @@ async def test_cached_refresh_consumes_one_read_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_null_device_fallback_charges_one_token_before_lock() -> None:
+    wrapper = _wrapper()
+    cached_device = SimpleNamespace(refresh_data=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
+    initialized_device = SimpleNamespace(status_data_mode=StatusDataMode.LIVE)
+    wrapper._device = cached_device
+    wrapper._client.get_devices.return_value = [SimpleNamespace(device_id="device-1")]
+    wrapper._client.get_device.return_value = initialized_device
+
+    async def acquire_then_clear_device():
+        wrapper._device = None
+
+    wrapper._read_limiter.acquire.side_effect = acquire_then_clear_device
+
+    assert await wrapper.refresh_device() is initialized_device
+
+    wrapper._read_limiter.acquire.assert_awaited_once()
+    cached_device.refresh_data.assert_not_awaited()
+    wrapper._client.get_devices.assert_awaited_once()
+    wrapper._client.get_device.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_cached_initial_status_is_not_returned_as_fresh() -> None:
     wrapper = _wrapper()
     device_info = SimpleNamespace(device_id="device-1")

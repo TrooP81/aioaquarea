@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from dataclasses import replace
 from enum import StrEnum
 
 import structlog
-from sqlalchemy import and_, case, func, select, update
+from sqlalchemy import and_, case, func, select, text, update
 
+from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.learning_state import get_learning_state_details
@@ -25,6 +27,7 @@ from packages.core.models import (
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
+    ExecutorVerificationReadRecord,
     SpaceHeatingGateRecord,
 )
 from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS
@@ -41,19 +44,45 @@ from packages.core.safety_reverts import (
 from packages.core.services import AquareaWrapper
 from packages.core.settings_service import get_space_heating_gate_config
 from packages.core.space_heating_gate import SpaceHeatingGateState, resolve_effective_gate
-from packages.optimizer.actions import ActionType, VerifyResult, get_action_handler
+from packages.optimizer.actions import (
+    ActionType,
+    VerificationObservation,
+    VerifyResult,
+    get_action_handler,
+)
 from packages.optimizer.executor_gate import is_room_heating_increase
 
 logger = structlog.get_logger()
 
 MAX_ACTIONS_PER_CYCLE = 3
+EXECUTOR_VERIFY_READ_LIMIT = 5
+INITIAL_VERIFY_CHECKPOINTS_S = (15, 30, 60)
+INITIAL_LIVE_CHECKPOINTS_S = frozenset({15, 60})
+REDISPATCH_VERIFY_CHECKPOINTS_S = (15, 30, 60)
+REDISPATCH_LIVE_CHECKPOINTS_S = frozenset({60})
+SAFETY_VERIFY_CHECKPOINTS_S = (15, 30, 60)
+SAFETY_LIVE_CHECKPOINTS_S = frozenset({15, 60})
 VERIFY_POLL_INTERVAL_S = 10
 VERIFY_TIMEOUT_S = 60
 VERIFY_REDISPATCH_ATTEMPTS = 1
 SHUTDOWN_CANCEL_REASON = "shutdown_cancelled"
 SAFETY_DISPATCH_MARGIN_S = 30
 SAFETY_ACTION_STUCK_AFTER = dt.timedelta(minutes=2)
-assert SAFETY_ACTION_STUCK_AFTER > dt.timedelta(seconds=VERIFY_TIMEOUT_S + SAFETY_DISPATCH_MARGIN_S)
+assert SAFETY_ACTION_STUCK_AFTER > dt.timedelta(
+    seconds=max(SAFETY_VERIFY_CHECKPOINTS_S) + SAFETY_DISPATCH_MARGIN_S
+)
+
+
+class _VerificationEvidenceUnavailable(Exception):
+    pass
+
+
+class _VerificationLedgerUnavailable(Exception):
+    pass
+
+
+class _VerificationQuotaExhausted(Exception):
+    pass
 
 
 class LearningModeState(StrEnum):
@@ -309,11 +338,16 @@ class PlanExecutor:
                     )
                 )
             result, attempts = await self._poll_until_verified(
-                action_id=action.id,
+                action=action,
                 handler=handler,
                 payload=payload,
                 expected_state=expected_state,
                 attempts=0,
+                lane="safety",
+                phase="safety",
+                checkpoints=SAFETY_VERIFY_CHECKPOINTS_S,
+                live_checkpoints=SAFETY_LIVE_CHECKPOINTS_S,
+                evidence_after=now,
             )
             if result.ok:
                 await self._mark_verified(action, attempts, result)
@@ -321,6 +355,12 @@ class PlanExecutor:
                 await self._requeue_safety_action(action, result.reason)
         except asyncio.CancelledError:
             raise
+        except (
+            _VerificationEvidenceUnavailable,
+            _VerificationLedgerUnavailable,
+            _VerificationQuotaExhausted,
+        ) as exc:
+            await self._requeue_safety_action(action, type(exc).__name__)
         except Exception as exc:  # safety failures are retried, never terminal
             await self._requeue_safety_action(action, type(exc).__name__)
 
@@ -513,7 +553,7 @@ class PlanExecutor:
                 expected_state=expected_state,
             )
 
-            await self._verify_with_retry(action, payload, expected_state)
+            await self._verify_with_retry(action, payload, expected_state, now)
 
         except asyncio.CancelledError:
             logger.warning(
@@ -708,62 +748,275 @@ class PlanExecutor:
         action: PlanActionRecord,
         payload: dict,
         expected_state: dict[str, object],
+        dispatched_at: dt.datetime | None = None,
     ) -> None:
         action_type = ActionType(action.action_type)
         handler = get_action_handler(action_type)
-        attempts = 0
-        last_result = VerifyResult(ok=False, expected_value=expected_state, reason="not_verified")
-
-        for dispatch_attempt in range(VERIFY_REDISPATCH_ATTEMPTS + 1):
-            last_result, attempts = await self._poll_until_verified(
-                action_id=action.id,
+        dispatched_at = dispatched_at or dt.datetime.now(dt.timezone.utc)
+        if not handler.verification_supported:
+            await self._mark_executed_unverified(action, "verification_not_supported")
+            return
+        try:
+            initial, attempts = await self._poll_until_verified(
+                action=action,
+                handler=handler,
+                payload=payload,
+                expected_state=expected_state,
+                attempts=0,
+                lane="ordinary",
+                phase="initial",
+                checkpoints=INITIAL_VERIFY_CHECKPOINTS_S,
+                live_checkpoints=INITIAL_LIVE_CHECKPOINTS_S,
+                evidence_after=dispatched_at,
+            )
+        except asyncio.CancelledError:
+            raise
+        except _VerificationQuotaExhausted:
+            await self._mark_executed_unverified(action, "verification_quota_exhausted")
+            return
+        except _VerificationLedgerUnavailable:
+            await self._mark_executed_unverified(action, "verification_ledger_unavailable")
+            return
+        except _VerificationEvidenceUnavailable:
+            await self._mark_executed_unverified(action, "verification_evidence_unavailable")
+            return
+        if initial.ok:
+            await self._mark_verified(action, attempts, initial)
+            return
+        expected_state = (
+            await handler.redispatch_expected(self._wrapper, payload, expected_state)
+            or expected_state
+        )
+        redispatched_at = dt.datetime.now(dt.timezone.utc)
+        try:
+            final, attempts = await self._poll_until_verified(
+                action=action,
                 handler=handler,
                 payload=payload,
                 expected_state=expected_state,
                 attempts=attempts,
+                lane="ordinary",
+                phase="redispatch",
+                checkpoints=REDISPATCH_VERIFY_CHECKPOINTS_S,
+                live_checkpoints=REDISPATCH_LIVE_CHECKPOINTS_S,
+                evidence_after=redispatched_at,
             )
-            if last_result.ok:
-                await self._mark_verified(action, attempts, last_result)
-                return
-
-            if dispatch_attempt < VERIFY_REDISPATCH_ATTEMPTS:
-                logger.warning(
-                    "action_verification_retrying",
-                    action_id=action.id,
-                    action_type=action.action_type,
-                    observed=last_result.observed_value,
-                    expected=last_result.expected_value,
-                    reason=last_result.reason,
-                )
-                # Relative actions must retry their originally calculated
-                # target to avoid compounding adjustments.
-                expected_state = (
-                    await handler.redispatch_expected(self._wrapper, payload, expected_state)
-                    or expected_state
-                )
-
-        await self._mark_failed(action, attempts, last_result)
+        except asyncio.CancelledError:
+            raise
+        except _VerificationQuotaExhausted:
+            await self._mark_executed_unverified(action, "verification_quota_exhausted")
+            return
+        except _VerificationLedgerUnavailable:
+            await self._mark_executed_unverified(action, "verification_ledger_unavailable")
+            return
+        except _VerificationEvidenceUnavailable:
+            await self._mark_executed_unverified(action, "verification_evidence_unavailable")
+            return
+        if final.ok:
+            await self._mark_verified(action, attempts, final)
+        else:
+            await self._mark_failed(
+                action, attempts, replace(final, reason="verification_mismatch_after_redispatch")
+            )
 
     async def _poll_until_verified(
         self,
         *,
-        action_id: int,
+        action: PlanActionRecord,
         handler,
         payload: dict,
         expected_state: dict[str, object],
         attempts: int,
+        lane: str,
+        phase: str,
+        checkpoints: tuple[int, ...],
+        live_checkpoints: frozenset[int],
+        evidence_after: dt.datetime,
     ) -> tuple[VerifyResult, int]:
-        deadline = asyncio.get_running_loop().time() + VERIFY_TIMEOUT_S
-        while True:
-            device = await self._wrapper.refresh_device()
-            result = handler.verify(device, payload, expected_state)
+        result = VerifyResult(ok=False, expected_value=expected_state, reason="not_verified")
+        previous_checkpoint = 0
+        for checkpoint in checkpoints:
+            await self._sleep(checkpoint - previous_checkpoint)
+            previous_checkpoint = checkpoint
+            try:
+                persisted = await self._load_persisted_observation(action.device_id, evidence_after)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "verification_ledger_unavailable",
+                    lane=lane,
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    checkpoint=checkpoint,
+                    evidence_source="persisted",
+                    error_type=type(exc).__name__,
+                )
+                raise _VerificationLedgerUnavailable() from exc
+            if persisted is not None:
+                result = handler.verify(persisted, payload, expected_state)
+                await self._store_verification_progress(action.id, attempts, result)
+                logger.info(
+                    "verification_evidence",
+                    lane=lane,
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    checkpoint=checkpoint,
+                    evidence_source="persisted",
+                    admission_result="not_required",
+                    reason=result.reason,
+                )
+                if result.ok:
+                    return result, attempts
+            if checkpoint not in live_checkpoints:
+                continue
+            try:
+                admitted = await self._reserve_verification_read(action, lane, phase, checkpoint)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "verification_ledger_unavailable",
+                    lane=lane,
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    checkpoint=checkpoint,
+                    evidence_source="live",
+                    error_type=type(exc).__name__,
+                )
+                raise _VerificationLedgerUnavailable() from exc
+            if not admitted:
+                logger.info(
+                    "verification_reservation",
+                    lane=lane,
+                    action_id=action.id,
+                    action_type=action.action_type,
+                    checkpoint=checkpoint,
+                    evidence_source="live",
+                    admission_result="denied",
+                    reason="verification_quota_exhausted",
+                )
+                raise _VerificationQuotaExhausted()
+            try:
+                device = await self._wrapper.refresh_device()
+                result = handler.verify(
+                    self._normalize_live_observation(device), payload, expected_state
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _VerificationEvidenceUnavailable() from exc
             attempts += 1
-            await self._store_verification_progress(action_id, attempts, result)
+            await self._store_verification_progress(action.id, attempts, result)
+            logger.info(
+                "verification_evidence",
+                lane=lane,
+                action_id=action.id,
+                action_type=action.action_type,
+                checkpoint=checkpoint,
+                evidence_source="live",
+                admission_result="admitted",
+                reason=result.reason,
+            )
             if result.ok:
                 return result, attempts
-            if asyncio.get_running_loop().time() >= deadline:
-                return result, attempts
-            await self._sleep(VERIFY_POLL_INTERVAL_S)
+        return result, attempts
+
+    async def _reserve_verification_read(
+        self, action, lane: str, phase: str, checkpoint: int
+    ) -> bool:
+        async with self._session_factory() as session:
+            await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            await session.execute(text("SELECT pg_advisory_xact_lock(1163280966, 1)"))
+            db_now = (await session.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            await session.execute(
+                text("DELETE FROM executor_verification_reads WHERE reserved_at < :cutoff"),
+                {"cutoff": db_now - dt.timedelta(days=7)},
+            )
+            total = (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM executor_verification_reads WHERE reserved_at > :cutoff"
+                    ),
+                    {"cutoff": db_now - dt.timedelta(hours=1)},
+                )
+            ).scalar_one()
+            ordinary = (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM executor_verification_reads WHERE lane = 'ordinary' AND reserved_at > :cutoff"
+                    ),
+                    {"cutoff": db_now - dt.timedelta(hours=1)},
+                )
+            ).scalar_one()
+            reserve = settings.executor_safety_read_reserve
+            admitted = total < EXECUTOR_VERIFY_READ_LIMIT and (
+                lane != "ordinary" or ordinary < EXECUTOR_VERIFY_READ_LIMIT - reserve
+            )
+            if admitted:
+                session.add(
+                    ExecutorVerificationReadRecord(
+                        reserved_at=db_now,
+                        device_id=action.device_id,
+                        lane=lane,
+                        action_id=action.id,
+                        phase=phase,
+                        checkpoint_seconds=checkpoint,
+                    )
+                )
+            return admitted
+
+    async def _load_persisted_observation(self, device_id: str | None, evidence_after: dt.datetime):
+        if not device_id:
+            return None
+        async with self._session_factory() as session:
+            record = (
+                await session.execute(
+                    select(DeviceStatusRecord)
+                    .where(
+                        DeviceStatusRecord.device_id == device_id,
+                        DeviceStatusRecord.ts > evidence_after,
+                    )
+                    .order_by(DeviceStatusRecord.ts.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if record is None:
+            return None
+        try:
+            from aioaquarea.data import SpecialStatus
+
+            special_status = (
+                SpecialStatus(record.special_status).name
+                if record.special_status is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return None
+        return VerificationObservation(
+            record.force_dhw,
+            record.quiet_mode,
+            special_status,
+            record.tank_temp,
+            record.tank_target_temp,
+            {0: record.zone1_target_temp, 1: record.zone1_target_temp, 2: record.zone2_target_temp},
+        )
+
+    @staticmethod
+    def _normalize_live_observation(device) -> VerificationObservation:
+        tank = getattr(device, "tank", None)
+        zones = getattr(device, "zones", {}) or {}
+        return VerificationObservation(
+            getattr(getattr(device, "force_dhw", None), "value", None),
+            getattr(getattr(device, "quiet_mode", None), "value", None),
+            getattr(getattr(device, "special_status", None), "name", None),
+            getattr(tank, "temperature", None),
+            getattr(tank, "target_temperature", None),
+            {
+                int(zone_id): getattr(zone, "heat_target_temperature", None)
+                for zone_id, zone in zones.items()
+            },
+        )
 
     async def _store_verification_progress(
         self, action_id: int, attempts: int, result: VerifyResult
@@ -806,6 +1059,24 @@ class PlanExecutor:
             action_type=action.action_type,
             action_id=action.id,
             verify_attempts=attempts,
+        )
+
+    async def _mark_executed_unverified(self, action: PlanActionRecord, reason: str) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(PlanActionRecord)
+                .where(PlanActionRecord.id == action.id)
+                .values(
+                    status="executed_unverified",
+                    executed_at=dt.datetime.now(dt.timezone.utc),
+                    result_json=json.dumps({"success": True, "verified": False, "reason": reason}),
+                )
+            )
+        logger.warning(
+            "action_executed_unverified",
+            action_id=action.id,
+            action_type=action.action_type,
+            reason=reason,
         )
 
     async def _mark_failed(
