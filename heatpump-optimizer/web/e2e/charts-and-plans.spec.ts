@@ -262,7 +262,7 @@ test.describe("Price Chart", () => {
     const modelsTab = page.getByRole("tab", { name: "Models" });
     await modelsTab.click();
     await expect(modelsTab).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByRole("heading", { name: "How the optimizer is deciding" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Why it decides" })).toBeVisible();
   });
 });
 

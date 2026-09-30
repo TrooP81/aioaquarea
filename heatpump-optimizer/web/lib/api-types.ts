@@ -32,3 +32,16 @@ export interface ControlState {
     notices: ControlStateNotice[];
     resolved_at: string;
 }
+
+export interface SpaceHeatingGate {
+    state: "ALLOWED" | "BLOCKED" | "UNKNOWN";
+    reason: string;
+    profile_id: string;
+    on_operator: string;
+    off_operator: string;
+    base_c: number;
+    on_threshold_c: number;
+    off_threshold_c: number;
+    last_raw_outdoor_c: number | null;
+    fingerprint_matches: boolean;
+}

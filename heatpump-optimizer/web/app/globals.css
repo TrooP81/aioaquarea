@@ -1561,6 +1561,28 @@ body {
   margin-bottom: 1.25rem;
 }
 
+.optimizer-readable-text,
+.optimizer-status-label {
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.optimizer-diagnostics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.optimizer-diagnostics-panel {
+  margin-top: 1rem;
+}
+
+.optimizer-diagnostics-section {
+  margin-top: 1.25rem;
+}
+
 .opt-layer-badge {
   padding: 0.25rem 0.75rem;
   border-radius: 9999px;
@@ -2096,6 +2118,13 @@ body {
 
 .model-card-badge--trained {
   color: #fbbf24;
+}
+
+/* Keep all Diagnostics text at the Models readability floor. */
+.optimizer-diagnostics-panel,
+.optimizer-diagnostics-panel :where(p, span, div, strong, h3, h4, button, label) {
+  font-size: 0.8rem;
+  line-height: 1.5;
 }
 
 /* Safer settings editor */

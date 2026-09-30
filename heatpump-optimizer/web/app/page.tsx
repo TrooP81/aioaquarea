@@ -21,7 +21,7 @@ import { TabNavigation } from "@/components/TabNavigation";
 import { DecisionSummary } from "@/components/DecisionSummary";
 import { Banner } from "@/components/Banner";
 import { DataAge } from "@/components/DataAge";
-import type { ControlState } from "@/lib/api-types";
+import type { ControlState, SpaceHeatingGate } from "@/lib/api-types";
 import { SECTIONS, SectionId } from "@/lib/constants";
 import Link from "next/link";
 
@@ -70,6 +70,7 @@ interface DashboardData {
   } | null;
   has_override: boolean;
   override_id: number | null;
+  space_heating_gate?: SpaceHeatingGate | null;
 }
 
 interface PollResult {
@@ -425,7 +426,7 @@ export default function Home() {
         aria-labelledby="dashboard-tab-status"
         hidden={activeSection !== "status"}
       >
-        <OptimizerStatus />
+        <OptimizerStatus controlState={controlState} spaceHeatingGate={data?.space_heating_gate ?? null} />
       </section>
     </main>
   );

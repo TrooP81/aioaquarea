@@ -132,6 +132,7 @@ test.describe("Responsive Layout", () => {
 
     await page.goto("/?view=status");
 
+    await page.getByRole("button", { name: "Show diagnostics" }).click();
     await expect(page.getByText(/Quality gate: Unrecognized status \(mystery_code\)/)).toBeVisible();
   });
 

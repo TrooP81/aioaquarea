@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { DataAge } from "./DataAge";
 import { LAYER_LABELS, reasonLabel, seasonalReasonLabel } from "@/lib/constants";
+import type { ControlState, SpaceHeatingGate } from "@/lib/api-types";
+import { OptimizerDiagnostics } from "./OptimizerDiagnostics";
+import { WhyItDecides } from "./WhyItDecides";
 
 interface ModelInfo {
   trained: boolean;
@@ -222,32 +225,46 @@ function layerBadgeClass(layer: string): string {
   return "opt-layer-badge";
 }
 
-export function OptimizerStatus() {
+export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlState: ControlState | null; spaceHeatingGate: SpaceHeatingGate | null }) {
   const [status, setStatus] = useState<OptimizerStatusData | null>(null);
   const [comfort, setComfort] = useState<ComfortInfo | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempLatest | null>(null);
   const [forecastScorecard, setForecastScorecard] = useState<ForecastScorecard | null>(null);
   const [sensorDiagnostics, setSensorDiagnostics] = useState<SensorDiagnostics | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [training, setTraining] = useState<Record<string, boolean>>({});
   const [trainMsg, setTrainMsg] = useState<TrainMessage | null>(null);
 
-  const refresh = () =>
-    Promise.all([
-      fetch("/api/optimizer/status").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/comfort-model/status").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/indoor-temp/latest").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/thermal/forecast-scorecard").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/sensors/diagnostics").then((r) => (r.ok ? r.json() : null)),
-    ])
-      .then(([opt, cmf, temp, scorecard, diagnostics]) => {
-        setStatus(opt);
-        setComfort(cmf);
-        setIndoorTemp(temp);
-        setForecastScorecard(scorecard);
-        setSensorDiagnostics(diagnostics);
-      })
-      .catch(() => setError("Failed to load optimizer status"));
+  const refresh = async (focusDecisionSummary = false) => {
+    setIsRefreshing(true);
+    try {
+      const required = await fetch("/api/optimizer/status");
+      if (!required.ok) throw new Error("Failed to load optimizer status");
+      const [opt, cmf, temp, scorecard, diagnostics] = await Promise.all([
+        required.json(),
+        fetch("/api/comfort-model/status").then((response) => response.ok ? response.json() : null).catch(() => null),
+        fetch("/api/indoor-temp/latest").then((response) => response.ok ? response.json() : null).catch(() => null),
+        fetch("/api/thermal/forecast-scorecard").then((response) => response.ok ? response.json() : null).catch(() => null),
+        fetch("/api/sensors/diagnostics").then((response) => response.ok ? response.json() : null).catch(() => null),
+      ]);
+      setStatus(opt);
+      setComfort(cmf);
+      setIndoorTemp(temp);
+      setForecastScorecard(scorecard);
+      setSensorDiagnostics(diagnostics);
+      setError(null);
+      if (focusDecisionSummary) {
+        window.requestAnimationFrame(() => {
+          document.getElementById("why-it-decides-heading")?.focus();
+        });
+      }
+    } catch {
+      setError("Failed to load optimizer status");
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   useEffect(() => { refresh(); }, []);
 
@@ -332,6 +349,9 @@ export function OptimizerStatus() {
       <div className="plan-section">
         <h2 className="chart-title">How the optimizer is deciding</h2>
         <p className="text-danger">{error}</p>
+        <button type="button" className="btn btn-sm" onClick={() => refresh(true)} disabled={isRefreshing} aria-busy={isRefreshing}>
+          {isRefreshing ? "Retrying..." : "Retry"}
+        </button>
       </div>
     );
   }
@@ -479,228 +499,241 @@ export function OptimizerStatus() {
   const indoorHeatingProgress = status.seasonal_calibration?.indoor_heating?.minimum_samples
     ? Math.min(100, Math.round(100 * (status.seasonal_calibration.indoor_heating.samples ?? 0) / status.seasonal_calibration.indoor_heating.minimum_samples))
     : null;
+  const limitations = [
+    !dataFreshness.fresh ? "Live pump status is stale, so automatic commands are paused." : null,
+    status.planning_data_quality && !status.planning_data_quality.control_allowed ? "Planning data currently prevents new plans." : null,
+    status.comfort_controllability?.message,
+    status.seasonal_calibration?.observe_only_active ? "Seasonal observation is active, so device commands are paused while evidence is collected." : null,
+  ].filter((value): value is string => Boolean(value));
 
   return (
     <div className="plan-section">
-      <h2 className="chart-title">How the optimizer is deciding</h2>
-      <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        The active layer chooses your schedule. Optional machine-learning models make it smarter as
-        they collect data — until they&apos;re ready, the optimizer falls back to safe built-in rules.
-      </p>
+      <WhyItDecides controlState={controlState} activeLayer={activeLayerLabel} fallbackActive={Boolean(status.last_plan?.fell_back)} limitations={limitations} models={models} />
+      <OptimizerDiagnostics>
 
-      {/* Active layer badge */}
-      <div className="opt-layer-row">
-        <span className="text-muted text-sm">Decision engine</span>
-        <span className={layerBadgeClass(status.active_layer)}>
-          {activeLayerLabel}
-        </span>
-        <span className="text-muted text-xs">
-          {layerExplanation}
-        </span>
-      </div>
-      {status.last_plan && (
-        <div className="opt-layer-row">
-          <span className="text-muted text-sm">Last plan engine</span>
-          <span className={layerBadgeClass(status.last_plan.version)}>
-            {status.last_plan.engine.toUpperCase()}
-          </span>
-          {status.last_plan.fell_back && (
-            <span className="text-warning text-xs">
-              MILP unavailable — fell back to rules
+        {/* Active layer badge */}
+        <section>
+          <h3>Decision engine details</h3>
+          <div className="opt-layer-row">
+            <span className="optimizer-status-label text-muted">Decision engine</span>
+            <span className={layerBadgeClass(status.active_layer)}>
+              {activeLayerLabel}
             </span>
+            <span className="text-muted text-xs">
+              {layerExplanation}
+            </span>
+          </div>
+          {status.last_plan && (
+            <div className="opt-layer-row">
+              <span className="text-muted text-sm">Last plan engine</span>
+              <span className={layerBadgeClass(status.last_plan.version)}>
+                {status.last_plan.engine.toUpperCase()}
+              </span>
+              {status.last_plan.fell_back && (
+                <span className="text-warning text-xs">
+                  MILP unavailable — fell back to rules
+                </span>
+              )}
+            </div>
           )}
-        </div>
-      )}
-      <p className={dataFreshness.fresh ? "text-muted text-xs" : "text-warning text-sm"}>
-        Live pump status: <DataAge timestamp={dataFreshness.latest_device_status} stale={!dataFreshness.fresh} />
-        {!dataFreshness.fresh && " — automatic commands are paused until fresh data returns."}
-      </p>
-      {status.decision_readiness && (
-        <div className={status.decision_readiness.state === "ready" ? "indoor-temp-card" : "indoor-temp-card text-muted"} style={{ margin: "0.75rem 0" }}>
-          <strong>{status.decision_readiness.title}</strong>
-          <div className="text-sm">{status.decision_readiness.detail}</div>
-        </div>
-      )}
-      {status.planning_data_quality && !status.planning_data_quality.control_allowed && (
-        <p className="text-warning text-sm">
-          New plans are paused: {status.planning_data_quality.reasons.join(" ")}
-        </p>
-      )}
-      {status.planning_data_quality?.price_horizon_limited && (
-        <p className="text-muted text-xs">
-          Price publication: {status.planning_data_quality.price?.contiguous_hours ?? status.planning_data_quality.effective_horizon_hours ?? "limited"}h published and {status.planning_data_quality.price?.fresh ? "fresh" : "awaiting refresh"}. The plan is limited to published prices and will refresh when tomorrow&apos;s prices arrive; next check within {Math.round((status.planning_data_quality.price?.next_publication_check_seconds ?? 900) / 60)} min.
-        </p>
-      )}
-      {status.comfort_controllability && (
-        <p className={status.comfort_controllability.status === "not_heatpump_controllable" ? "text-warning text-sm" : "text-muted text-xs"}>
-          Comfort control: {status.comfort_controllability.message}
-          {status.comfort_controllability.outdoor_temp_c != null && status.comfort_controllability.cutoff_c != null
-            ? ` Outdoor ${status.comfort_controllability.outdoor_temp_c.toFixed(1)}°C · cutoff ${status.comfort_controllability.cutoff_c.toFixed(1)}°C.`
-            : ""}
-        </p>
-      )}
-      {status.seasonal_calibration && (
-        <p className={status.seasonal_calibration.observe_only_active ? "text-warning text-sm" : "text-muted text-xs"}>
-          Seasonal calibration: {seasonalReasonLabel(status.seasonal_calibration.reason)}
-          {status.seasonal_calibration.average_outdoor_c != null ? ` · recent outdoor average ${status.seasonal_calibration.average_outdoor_c.toFixed(1)}°C` : ""}
-          {status.seasonal_calibration.observe_only_active && " — device commands are paused while natural heating data is collected."}
-          {status.seasonal_calibration.next_step ? ` Next: ${reasonLabel(status.seasonal_calibration.next_step)}.` : ""}
-        </p>
-      )}
-      {status.seasonal_calibration?.enabled && (
-        <div className="indoor-temp-card text-muted text-xs" style={{ margin: "0.75rem 0" }}>
-          <strong>Season readiness</strong>
-          <div>Demand evidence: {status.seasonal_calibration.demand?.usable_samples ?? 0}/{status.seasonal_calibration.demand?.minimum_samples ?? "—"} {demandProgress != null ? `(${demandProgress}%)` : ""}</div>
-          {demandProgress != null && <progress value={demandProgress} max={100} aria-label="Demand-model seasonal evidence" style={{ width: "100%" }} />}
-          <div>Indoor-heating evidence: {status.seasonal_calibration.indoor_heating?.samples ?? 0}/{status.seasonal_calibration.indoor_heating?.minimum_samples ?? "—"} {indoorHeatingProgress != null ? `(${indoorHeatingProgress}%)` : ""}</div>
-          {indoorHeatingProgress != null && <progress value={indoorHeatingProgress} max={100} aria-label="Indoor-heating seasonal evidence" style={{ width: "100%" }} />}
-          <div>{status.seasonal_calibration.auto_train ? "Automatic training is enabled when evidence is ready." : "Manual training is selected."}</div>
-        </div>
-      )}
-      {sensorDiagnostics && (
-        <div className="indoor-temp-card text-muted text-xs" style={{ margin: "0.75rem 0" }}>
-          <strong>Sensor diagnostics · shadow mode</strong>
-          <div>{sensorDiagnostics.summary} {sensorDiagnostics.room_spread_c != null ? `Room spread ${sensorDiagnostics.room_spread_c.toFixed(1)}°C.` : ""}</div>
-          <div>{sensorDiagnostics.sensors.map((sensor) => `${sensor.label || sensor.room || sensor.device_id}: ${sensor.state}${sensor.is_reference ? " (comfort reference)" : ""}`).join(" · ")}</div>
-        </div>
-      )}
-
-      {/* Model cards */}
-      <div className="model-grid">
-        {models.map((m) => (
-          <div key={m.label} className="model-card">
-            <div className="model-card-header">
-              <StatusDot state={m.state} />
-              <span className="model-card-name">{m.label}</span>
-              <span className={`model-card-badge model-card-badge--${m.state}`}>{modelStateLabel(m.state)}</span>
+          <p className={dataFreshness.fresh ? "text-muted text-xs" : "text-warning text-sm"}>
+            Live pump status: <DataAge timestamp={dataFreshness.latest_device_status} stale={!dataFreshness.fresh} />
+            {!dataFreshness.fresh && " — automatic commands are paused until fresh data returns."}
+          </p>
+          {status.decision_readiness && (
+            <div className={status.decision_readiness.state === "ready" ? "indoor-temp-card" : "indoor-temp-card text-muted"} style={{ margin: "0.75rem 0" }}>
+              <strong>{status.decision_readiness.title}</strong>
+              <div className="text-sm">{status.decision_readiness.detail}</div>
             </div>
-            <div className="model-card-plain">{m.plain}</div>
-            <div className="model-card-details">
-              <div>Last trained: {formatDate(m.lastTrained)}</div>
-              <div>{m.detail}</div>
-              {m.capabilities && (
-                <div className="model-capabilities">
-                  {m.capabilities.map((capability) => (
-                    <span key={capability.label} className={`model-capability model-capability--${capability.state}`}>
-                      {capability.label}: {capability.state}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="model-next-step"><strong>What this means:</strong> {m.nextStep}</div>
+          )}
+          {status.planning_data_quality && !status.planning_data_quality.control_allowed && (
+            <p className="text-warning text-sm">
+              New plans are paused: {status.planning_data_quality.reasons.join(" ")}
+            </p>
+          )}
+          {status.planning_data_quality?.price_horizon_limited && (
+            <p className="text-muted text-xs">
+              Price publication: {status.planning_data_quality.price?.contiguous_hours ?? status.planning_data_quality.effective_horizon_hours ?? "limited"}h published and {status.planning_data_quality.price?.fresh ? "fresh" : "awaiting refresh"}. The plan is limited to published prices and will refresh when tomorrow&apos;s prices arrive; next check within {Math.round((status.planning_data_quality.price?.next_publication_check_seconds ?? 900) / 60)} min.
+            </p>
+          )}
+          {status.comfort_controllability && (
+            <p className={status.comfort_controllability.status === "not_heatpump_controllable" ? "text-warning text-sm" : "text-muted text-xs"}>
+              Comfort control: {status.comfort_controllability.message}
+              {status.comfort_controllability.outdoor_temp_c != null && status.comfort_controllability.cutoff_c != null
+                ? ` Outdoor ${status.comfort_controllability.outdoor_temp_c.toFixed(1)}°C · cutoff ${status.comfort_controllability.cutoff_c.toFixed(1)}°C.`
+                : ""}
+            </p>
+          )}
+        </section>
+        <section><h3>Seasonal calibration</h3>{status.seasonal_calibration ? (
+          <p className={status.seasonal_calibration.observe_only_active ? "text-warning text-sm" : "text-muted text-xs"}>
+            Seasonal calibration: {seasonalReasonLabel(status.seasonal_calibration.reason)}
+            {status.seasonal_calibration.average_outdoor_c != null ? ` · recent outdoor average ${status.seasonal_calibration.average_outdoor_c.toFixed(1)}°C` : ""}
+            {status.seasonal_calibration.observe_only_active && " — device commands are paused while natural heating data is collected."}
+            {status.seasonal_calibration.next_step ? ` Next: ${reasonLabel(status.seasonal_calibration.next_step)}.` : ""}
+          </p>
+        ) : <p className="optimizer-readable-text">Unavailable.</p>}
+          {status.seasonal_calibration?.enabled && (
+            <div className="indoor-temp-card text-muted text-xs" style={{ margin: "0.75rem 0" }}>
+              <strong>Season readiness</strong>
+              <div>Demand evidence: {status.seasonal_calibration.demand?.usable_samples ?? 0}/{status.seasonal_calibration.demand?.minimum_samples ?? "—"} {demandProgress != null ? `(${demandProgress}%)` : ""}</div>
+              {demandProgress != null && <progress value={demandProgress} max={100} aria-label="Demand-model seasonal evidence" style={{ width: "100%" }} />}
+              <div>Indoor-heating evidence: {status.seasonal_calibration.indoor_heating?.samples ?? 0}/{status.seasonal_calibration.indoor_heating?.minimum_samples ?? "—"} {indoorHeatingProgress != null ? `(${indoorHeatingProgress}%)` : ""}</div>
+              {indoorHeatingProgress != null && <progress value={indoorHeatingProgress} max={100} aria-label="Indoor-heating seasonal evidence" style={{ width: "100%" }} />}
+              <div>{status.seasonal_calibration.auto_train ? "Automatic training is enabled when evidence is ready." : "Manual training is selected."}</div>
             </div>
+          )}</section>
+        <section><h3>Sensor diagnostics</h3>{sensorDiagnostics ? (
+          <div className="indoor-temp-card text-muted text-xs" style={{ margin: "0.75rem 0" }}>
+            <strong>Sensor diagnostics · shadow mode</strong>
+            <div>{sensorDiagnostics.summary} {sensorDiagnostics.room_spread_c != null ? `Room spread ${sensorDiagnostics.room_spread_c.toFixed(1)}°C.` : ""}</div>
+            <div>{sensorDiagnostics.sensors.map((sensor) => `${sensor.label || sensor.room || sensor.device_id}: ${sensor.state}${sensor.is_reference ? " (comfort reference)" : ""}`).join(" · ")}</div>
           </div>
-        ))}
-      </div>
+        ) : <p className="optimizer-readable-text">Unavailable.</p>}</section>
 
-      {forecastScorecard && (
-        <div className="indoor-temp-card" style={{ marginTop: "1rem" }}>
-          <div className="model-card-header">
-            <span className="model-card-name">Forecast validation</span>
-          </div>
-          <div className="model-card-details">
-            {forecastFamilies.map((family) => {
-              const evidence = family.evidence;
-              const gate = evidence?.quality_gate;
-              return (
-                <div key={family.label} style={{ marginTop: "0.6rem" }}>
-                  <strong>{family.label}</strong>
-                  <div className="text-muted text-xs">{family.detail}</div>
-                  {!evidence || evidence.overall.samples === 0 ? (
-                    <div className="text-muted text-xs">Waiting for clean, sensor-matched outcomes.</div>
-                  ) : (
-                    <div>
-                      MAE {evidence.overall.mae?.toFixed(2)}°C across {evidence.overall.samples} outcomes
-                      {evidence.overall.bias != null ? ` · bias ${evidence.overall.bias >= 0 ? "+" : ""}${evidence.overall.bias.toFixed(2)}°C` : ""}
-                      {evidence.overall.p90_abs_error != null ? ` · P90 ${evidence.overall.p90_abs_error.toFixed(2)}°C` : ""}
-                      <div className={gate?.control_allowed ? "text-muted text-xs" : "text-warning text-sm"}>
-                        {gate?.status === "failed" ? "Quality gate: " : "Evidence: "}{reasonLabel(gate?.reason)}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            <div className="text-muted text-xs" style={{ marginTop: "0.6rem" }}>{forecastScorecard.note}</div>
-            {forecastScorecard.exclusions && Object.values(forecastScorecard.exclusions).some((count) => count > 0) && (
-              <div className="text-muted text-xs">Excluded outcomes: {Object.entries(forecastScorecard.exclusions).map(([reason, count]) => `${count} ${reasonLabel(reason)}`).join(" · ")}</div>
-            )}
-          </div>
-        </div>
-      )}
+        {spaceHeatingGate ? (
+          <section>
+            <h3>Space-heating gate</h3>
+            <p className="optimizer-readable-text">{spaceHeatingGate.state}: {spaceHeatingGate.reason}. Profile: {spaceHeatingGate.profile_id}. Thresholds: {spaceHeatingGate.on_threshold_c} C on, {spaceHeatingGate.off_threshold_c} C off.</p>
+          </section>
+        ) : <section><h3>Space-heating gate</h3><p className="optimizer-readable-text">Unavailable.</p></section>}
 
-      {/* Training controls */}
-      <div className="training-controls">
-        <button
-          className="btn btn-sm"
-          onClick={trainMl}
-          disabled={training.ml || demandTrainingBlocked}
-          aria-busy={training.ml}
-          title={demandTrainingBlocked ? "Demand training is waiting for usable heating-season evidence." : undefined}
-        >
-          {training.ml ? "Training..." : demandTrainingBlocked ? "Demand training waiting for evidence" : "Train COP & Demand"}
-        </button>
-        <button
-          className="btn btn-sm"
-          onClick={trainComfort}
-          disabled={training.comfort || comfortTrainingBlocked}
-          aria-busy={training.comfort}
-          title={comfortTrainingBlocked ? "Retraining cannot improve control readiness until confirmed room-heating samples exist." : undefined}
-        >
-          {training.comfort ? "Training..." : comfortTrainingBlocked ? "Comfort training waiting for heat samples" : "Train Comfort Model"}
-        </button>
-        <button
-          className="btn btn-sm"
-          onClick={calibrateThermal}
-          disabled={training.thermal}
-          aria-busy={training.thermal}
-        >
-          {training.thermal ? "Calibrating..." : "Calibrate Thermal"}
-        </button>
-      </div>
-      {trainMsg && (
-        <p className={`train-msg train-msg--${trainMsg.tone}`}>
-          {trainMsg.text}
-        </p>
-      )}
-
-      {/* SmartThings indoor temperature */}
-      {indoorTemp && indoorTemp.avg_temperature != null && (
-        <>
-          <h3 className="indoor-temp-heading">SmartThings Indoor Temperature</h3>
-          <div className="indoor-temp-card">
-            <div className="indoor-temp-value">
-              {indoorTemp.avg_temperature.toFixed(1)}°C
-            </div>
-            <div className="model-card-details">
-              <div>
-                {indoorTemp.reference_sensor_id
-                  ? `Reference room: ${indoorTemp.reference_sensor_label || indoorTemp.reference_room || indoorTemp.reference_sensor_id}`
-                  : `Trusted median from ${indoorTemp.sensor_count} sensor${indoorTemp.sensor_count !== 1 ? "s" : ""}`}
-                {indoorTemp.confidence ? ` · ${indoorTemp.confidence} confidence` : ""}
-                {indoorTemp.spread_c != null ? ` · room spread ${indoorTemp.spread_c.toFixed(1)}°C` : ""}
+        {/* Model cards */}
+        <section><h3>Models</h3><div className="model-grid">
+          {models.map((m) => (
+            <div key={m.label} className="model-card">
+              <div className="model-card-header">
+                <StatusDot state={m.state} />
+                <h4 className="model-card-name">{m.label}</h4>
+                <span className={`model-card-badge model-card-badge--${m.state}`}>{modelStateLabel(m.state)}</span>
               </div>
-              <div>Last reading: {formatDate(indoorTemp.latest_reading)}</div>
-              {indoorTemp.sensors && indoorTemp.sensors.length > 1 && (
-                <div>
-                  Rooms: {indoorTemp.sensors.map((sensor) => `${sensor.device_label || sensor.room || sensor.device_id} ${sensor.temperature.toFixed(1)}°C`).join(" · ")}
-                </div>
-              )}
-              {indoorTemp.reason && <div className="text-warning text-sm">{reasonLabel(indoorTemp.reason)}</div>}
-              {indoorTemp.last_fresh_reading && indoorTemp.last_fresh_reading !== indoorTemp.latest_reading && (
-                <div className="text-warning text-sm">
-                  Sensor data stale: last fresh reading {formatDate(indoorTemp.last_fresh_reading)}
-                </div>
-              )}
-              {!indoorTemp.last_fresh_reading && (
-                <div className="text-warning text-sm">
-                  No fresh sensor data received yet
-                </div>
+              <div className="model-card-plain">{m.plain}</div>
+              <div className="model-card-details">
+                <div>Last trained: {formatDate(m.lastTrained)}</div>
+                <div>{m.detail}</div>
+                {m.capabilities && (
+                  <div className="model-capabilities">
+                    {m.capabilities.map((capability) => (
+                      <span key={capability.label} className={`model-capability model-capability--${capability.state}`}>
+                        {capability.label}: {capability.state}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="model-next-step"><strong>What this means:</strong> {m.nextStep}</div>
+              </div>
+            </div>
+          ))}
+        </div></section>
+
+        <section><h3>Forecast validation</h3>{forecastScorecard ? (
+          <div className="indoor-temp-card" style={{ marginTop: "1rem" }}>
+            <div className="model-card-header">
+              <span className="model-card-name">Forecast validation</span>
+            </div>
+            <div className="model-card-details">
+              {forecastFamilies.map((family) => {
+                const evidence = family.evidence;
+                const gate = evidence?.quality_gate;
+                return (
+                  <div key={family.label} style={{ marginTop: "0.6rem" }}>
+                    <h4>{family.label}</h4>
+                    <div className="text-muted text-xs">{family.detail}</div>
+                    {!evidence || evidence.overall.samples === 0 ? (
+                      <div className="text-muted text-xs">Waiting for clean, sensor-matched outcomes.</div>
+                    ) : (
+                      <div>
+                        MAE {evidence.overall.mae?.toFixed(2)}°C across {evidence.overall.samples} outcomes
+                        {evidence.overall.bias != null ? ` · bias ${evidence.overall.bias >= 0 ? "+" : ""}${evidence.overall.bias.toFixed(2)}°C` : ""}
+                        {evidence.overall.p90_abs_error != null ? ` · P90 ${evidence.overall.p90_abs_error.toFixed(2)}°C` : ""}
+                        <div className={gate?.control_allowed ? "text-muted text-xs" : "text-warning text-sm"}>
+                          {gate?.status === "failed" ? "Quality gate: " : "Evidence: "}{reasonLabel(gate?.reason)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div className="text-muted text-xs" style={{ marginTop: "0.6rem" }}>{forecastScorecard.note}</div>
+              {forecastScorecard.exclusions && Object.values(forecastScorecard.exclusions).some((count) => count > 0) && (
+                <div className="text-muted text-xs">Excluded outcomes: {Object.entries(forecastScorecard.exclusions).map(([reason, count]) => `${count} ${reasonLabel(reason)}`).join(" · ")}</div>
               )}
             </div>
           </div>
-        </>
-      )}
+        ) : <p className="optimizer-readable-text">Unavailable.</p>}</section>
+
+        {/* Training controls */}
+        <section><h3>Training</h3><div className="training-controls">
+          <button
+            className="btn btn-sm"
+            onClick={trainMl}
+            disabled={training.ml || demandTrainingBlocked}
+            aria-busy={training.ml}
+            title={demandTrainingBlocked ? "Demand training is waiting for usable heating-season evidence." : undefined}
+          >
+            {training.ml ? "Training..." : demandTrainingBlocked ? "Demand training waiting for evidence" : "Train COP & Demand"}
+          </button>
+          <button
+            className="btn btn-sm"
+            onClick={trainComfort}
+            disabled={training.comfort || comfortTrainingBlocked}
+            aria-busy={training.comfort}
+            title={comfortTrainingBlocked ? "Retraining cannot improve control readiness until confirmed room-heating samples exist." : undefined}
+          >
+            {training.comfort ? "Training..." : comfortTrainingBlocked ? "Comfort training waiting for heat samples" : "Train Comfort Model"}
+          </button>
+          <button
+            className="btn btn-sm"
+            onClick={calibrateThermal}
+            disabled={training.thermal}
+            aria-busy={training.thermal}
+          >
+            {training.thermal ? "Calibrating..." : "Calibrate Thermal"}
+          </button>
+        </div>
+          {trainMsg && (
+            <p className={`train-msg train-msg--${trainMsg.tone}`}>
+              {trainMsg.text}
+            </p>
+          )}</section>
+
+        {/* SmartThings indoor temperature */}
+        <section><h3>SmartThings indoor temperature</h3>{indoorTemp && indoorTemp.avg_temperature != null ? (
+          <>
+            <div className="indoor-temp-card">
+              <div className="indoor-temp-value">
+                {indoorTemp.avg_temperature.toFixed(1)}°C
+              </div>
+              <div className="model-card-details">
+                <div>
+                  {indoorTemp.reference_sensor_id
+                    ? `Reference room: ${indoorTemp.reference_sensor_label || indoorTemp.reference_room || indoorTemp.reference_sensor_id}`
+                    : `Trusted median from ${indoorTemp.sensor_count} sensor${indoorTemp.sensor_count !== 1 ? "s" : ""}`}
+                  {indoorTemp.confidence ? ` · ${indoorTemp.confidence} confidence` : ""}
+                  {indoorTemp.spread_c != null ? ` · room spread ${indoorTemp.spread_c.toFixed(1)}°C` : ""}
+                </div>
+                <div>Last reading: {formatDate(indoorTemp.latest_reading)}</div>
+                {indoorTemp.sensors && indoorTemp.sensors.length > 1 && (
+                  <div>
+                    Rooms: {indoorTemp.sensors.map((sensor) => `${sensor.device_label || sensor.room || sensor.device_id} ${sensor.temperature.toFixed(1)}°C`).join(" · ")}
+                  </div>
+                )}
+                {indoorTemp.reason && <div className="text-warning text-sm">{reasonLabel(indoorTemp.reason)}</div>}
+                {indoorTemp.last_fresh_reading && indoorTemp.last_fresh_reading !== indoorTemp.latest_reading && (
+                  <div className="text-warning text-sm">
+                    Sensor data stale: last fresh reading {formatDate(indoorTemp.last_fresh_reading)}
+                  </div>
+                )}
+                {!indoorTemp.last_fresh_reading && (
+                  <div className="text-warning text-sm">
+                    No fresh sensor data received yet
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        ) : <p className="optimizer-readable-text">Unavailable.</p>}</section>
+      </OptimizerDiagnostics>
     </div>
   );
 }

@@ -42,7 +42,7 @@ interface DashboardProps {
       state?: string;
       reason?: string;
       profile_id?: string;
-    };
+    } | null;
   } | null;
 }
 

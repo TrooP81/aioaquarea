@@ -65,6 +65,7 @@ test.describe("Comfort training messages", () => {
 
         await page.goto("/");
         await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 
         await expect(page.locator(".train-msg")).toHaveText("Training already in progress");
@@ -76,6 +77,7 @@ test.describe("Comfort training messages", () => {
 
         await page.goto("/");
         await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 
         await expect(page.locator(".train-msg")).toHaveText("Training skipped: insufficient_samples");
@@ -88,6 +90,7 @@ test.describe("Comfort training messages", () => {
 
         await page.goto("/");
         await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 
         await expect(page.locator(".train-msg")).toHaveText("Training completed: lock finalization recovered");

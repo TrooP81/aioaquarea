@@ -46,7 +46,7 @@ const dashboard = {
     active_plan: null,
     has_override: false,
     override_id: null,
-    space_heating_gate: { state: "blocked", reason: "no_device_status", profile_id: null },
+    space_heating_gate: { state: "BLOCKED", reason: "no_device_status", profile_id: "default", on_operator: "<", off_operator: ">=", base_c: 15, on_threshold_c: 13, off_threshold_c: 15, last_raw_outdoor_c: null, fingerprint_matches: true },
 };
 
 const indoorForecast = {
