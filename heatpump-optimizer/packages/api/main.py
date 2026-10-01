@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
+import logging
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,9 +21,11 @@ from packages.api.routers.settings import router as settings_router
 from packages.api.routers.smartthings import router as smartthings_router
 from packages.core.config import settings
 from packages.core.logging import configure_logging
+from packages.core.services import AquareaWrapper
 from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 
 configure_logging("api")
+logger = logging.getLogger(__name__)
 
 if not is_auth_enabled():
     import structlog
@@ -35,11 +39,37 @@ if not is_auth_enabled():
         ),
     )
 
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    wrapper: AquareaWrapper | None = None
+    if settings.panasonic_distributed_read_quota_enabled:
+        wrapper = AquareaWrapper(read_only=True)
+        try:
+            await wrapper.start()
+        except Exception:
+            logger.exception("Panasonic quota wrapper startup failed")
+            try:
+                await wrapper.stop()
+            except Exception:
+                logger.exception("Panasonic quota wrapper partial shutdown failed")
+        else:
+            application.state.aquarea_wrapper = wrapper
+    try:
+        yield
+    finally:
+        active_wrapper = getattr(application.state, "aquarea_wrapper", None)
+        if active_wrapper is not None:
+            await active_wrapper.stop()
+            del application.state.aquarea_wrapper
+
+
 app = FastAPI(
     title="Heat Pump Optimizer API",
     version=APP_VERSION,
     description="API for monitoring and optimizing Panasonic Aquarea heat pump costs",
     dependencies=[Depends(require_auth)],
+    lifespan=lifespan,
 )
 
 app.add_middleware(

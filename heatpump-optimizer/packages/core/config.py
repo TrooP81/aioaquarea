@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
     executor_safety_read_reserve: int = Field(default=2, ge=1, le=4)
+    panasonic_distributed_read_quota_enabled: bool = False
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

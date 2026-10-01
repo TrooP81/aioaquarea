@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sqlalchemy import select
 
 from packages.core.database import get_session
@@ -12,8 +12,33 @@ from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import DeviceStatusRecord, ServiceHeartbeatRecord
 from packages.core.panasonic_capabilities import build_panasonic_capabilities
 from packages.core.service_health import service_heartbeat_details
+from packages.core.resilience import ReadQuotaCategory
+from packages.core.services import AquareaWrapper
 
 router = APIRouter()
+
+
+@router.get("/api/panasonic/read-quota")
+async def panasonic_read_quota(request: Request):
+    """Return quota capacity without exposing Panasonic account identity."""
+
+    wrapper = getattr(request.app.state, "aquarea_wrapper", None)
+    if wrapper is None:
+        status = await AquareaWrapper(read_only=True).get_rate_limit_status()
+    else:
+        status = await wrapper.get_rate_limit_status()
+    return {
+        "enabled": status.enabled,
+        "reliable": status.reliable,
+        "remaining": int(status.remaining) if status.remaining is not None else None,
+        "capacity": status.capacity,
+        "manual_required": status.manual_required,
+        "retry_after_seconds": status.retry_after_seconds,
+        "counters": {
+            category.value: status.counters.get(category, 0) for category in ReadQuotaCategory
+        },
+        "observed_at": status.observed_at,
+    }
 
 
 @router.get("/api/panasonic/capabilities")

@@ -6,7 +6,9 @@ import pytest
 
 from packages.core.resilience import (
     CircuitBreaker,
+    DistributedReadQuota,
     RateLimiter,
+    ReadQuotaCategory,
     RedisCircuitBreaker,
     SafetyWriteCapacityError,
     safety_write_context,
@@ -121,3 +123,10 @@ class TestRateLimiter:
     def test_p2_ac10_long_run_ordinary_throughput_is_bounded_by_safety_retries(self):
         # Four 15-minute safety retries consume four of the 20 hourly write tokens.
         assert 20 - 4 == 16
+
+
+def test_distributed_read_quota_status_preserves_lua_retry_delay_seconds() -> None:
+    status = DistributedReadQuota._status([0, 0, 120, 0, 0, 0, 0, 1_800_000_000_000])
+
+    assert status.retry_after_seconds == 120
+    assert status.counters[ReadQuotaCategory.STATUS] == 0

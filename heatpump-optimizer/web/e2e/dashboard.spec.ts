@@ -50,6 +50,131 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("space-heating-gate")).toContainText("Blocked");
   });
 
+  test("shows enabled quota capacity and keeps refresh available above the manual threshold", async ({ page }) => {
+    await page.route("**/api/panasonic/read-quota", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true,
+          reliable: true,
+          remaining: 24,
+          capacity: 30,
+          manual_required: 10,
+          retry_after_seconds: 0,
+          counters: { status: 1, consumption: 2, weekly_timer: 0, manual: 0 },
+          observed_at: new Date().toISOString(),
+        }),
+      })
+    );
+
+    await page.goto("/");
+
+    await expect(page.getByText("24 / 30 Panasonic reads available.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Refresh from heat pump" })).toBeEnabled();
+  });
+
+  test("disables refresh below the manual threshold and when quota is unreliable", async ({ page }) => {
+    let quota = {
+      enabled: true,
+      reliable: true,
+      remaining: 9 as number | null,
+      capacity: 30,
+      manual_required: 10,
+      retry_after_seconds: 1,
+      counters: { status: 1, consumption: 2, weekly_timer: 0, manual: 0 },
+      observed_at: new Date().toISOString(),
+    };
+    await page.route("**/api/panasonic/read-quota", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(quota) })
+    );
+
+    await page.goto("/");
+    const refresh = page.getByRole("button", { name: "Refresh from heat pump" });
+    await expect(refresh).toBeDisabled();
+
+    quota = { ...quota, reliable: false, remaining: null };
+    await page.reload();
+    await expect(refresh).toBeDisabled();
+    await expect(page.getByText("Panasonic read quota is temporarily unavailable.", { exact: true })).toBeVisible();
+  });
+
+  test("shows a quota exhaustion message for a 429 poll-now response", async ({ page }) => {
+    let quotaRequests = 0;
+    await page.route("**/api/panasonic/read-quota", (route) => {
+      quotaRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true,
+          reliable: true,
+          remaining: 20,
+          capacity: 30,
+          manual_required: 10,
+          retry_after_seconds: 123,
+          counters: { status: 1, consumption: 2, weekly_timer: 0, manual: 0 },
+          observed_at: new Date().toISOString(),
+        }),
+      });
+    });
+    await page.route("**/api/poll-now", (route) =>
+      route.fulfill({
+        status: 429,
+        contentType: "application/json",
+        headers: { "Retry-After": "123" },
+        body: JSON.stringify({ detail: { code: "panasonic_read_quota_exhausted", retry_after_seconds: 123 } }),
+      })
+    );
+
+    await page.goto("/");
+    await expect.poll(() => quotaRequests).toBeGreaterThan(0);
+    const quotaRequestsAfterLoad = quotaRequests;
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+
+    await expect(page.locator(".banner--warning")).toContainText(/allowance used up.*~3 min/i);
+    await expect.poll(() => quotaRequests).toBeGreaterThan(quotaRequestsAfterLoad);
+    await expect(page.locator("body")).not.toContainText("Partial success");
+  });
+
+  test("shows a temporary-unavailable message for a 503 poll-now response", async ({ page }) => {
+    let quotaRequests = 0;
+    await page.route("**/api/panasonic/read-quota", (route) => {
+      quotaRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true,
+          reliable: true,
+          remaining: 20,
+          capacity: 30,
+          manual_required: 10,
+          retry_after_seconds: 0,
+          counters: { status: 1, consumption: 2, weekly_timer: 0, manual: 0 },
+          observed_at: new Date().toISOString(),
+        }),
+      });
+    });
+    await page.route("**/api/poll-now", (route) =>
+      route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        headers: { "Retry-After": "30" },
+        body: JSON.stringify({ detail: { code: "panasonic_read_quota_unavailable", retry_after_seconds: 30 } }),
+      })
+    );
+
+    await page.goto("/");
+    await expect.poll(() => quotaRequests).toBeGreaterThan(0);
+    const quotaRequestsAfterLoad = quotaRequests;
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+
+    await expect(page.locator(".banner--danger")).toContainText(/quota service unavailable.*background polling continues/i);
+    await expect.poll(() => quotaRequests).toBeGreaterThan(quotaRequestsAfterLoad);
+    await expect(page.locator("body")).not.toContainText("Partial success");
+  });
+
   test("shows disconnected when no device status", async ({ page }) => {
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({
@@ -178,6 +303,25 @@ test.describe("Dashboard", () => {
       })
     );
 
+    let quotaRequests = 0;
+    await page.route("**/api/panasonic/read-quota", (route) => {
+      quotaRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true,
+          reliable: true,
+          remaining: 24,
+          capacity: 30,
+          manual_required: 10,
+          retry_after_seconds: 0,
+          counters: { status: 1, consumption: 2, weekly_timer: 0, manual: 0 },
+          observed_at: new Date().toISOString(),
+        }),
+      });
+    });
+
     let pollNowCalls = 0;
     await page.route("**/api/poll-now", (route) => {
       pollNowCalls += 1;
@@ -202,14 +346,21 @@ test.describe("Dashboard", () => {
     });
 
     await page.goto("/");
+    await expect.poll(() => quotaRequests).toBeGreaterThan(0);
+    const quotaRequestsAfterLoad = quotaRequests;
     await page.getByRole("button", { name: "Refresh from heat pump" }).click();
     const successBanner = page.locator(".banner", { hasText: "All data fetched successfully" });
     await expect(successBanner).toBeVisible();
+    await expect.poll(() => quotaRequests).toBeGreaterThan(quotaRequestsAfterLoad);
+    await expect(page.locator("body")).not.toContainText("Partial success");
     await expect(successBanner).toHaveCount(0, { timeout: 9000 });
 
+    const quotaRequestsAfterSuccess = quotaRequests;
     await page.getByRole("button", { name: "Refresh from heat pump" }).click();
     const failureBanner = page.locator(".banner", { hasText: "weather: timeout" });
     await expect(failureBanner).toBeVisible();
+    await expect.poll(() => quotaRequests).toBeGreaterThan(quotaRequestsAfterSuccess);
+    await expect(page.locator("body")).not.toContainText("Partial success");
     await page.getByRole("button", { name: "Dismiss" }).click();
     await expect(failureBanner).toHaveCount(0);
   });

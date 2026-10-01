@@ -898,7 +898,11 @@ class PlanExecutor:
                 )
                 raise _VerificationQuotaExhausted()
             try:
-                device = await self._wrapper.refresh_device()
+                from packages.core.services import ReadQuotaContext
+
+                device = await self._wrapper.refresh_device(
+                    quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION
+                )
                 result = handler.verify(
                     self._normalize_live_observation(device), payload, expected_state
                 )

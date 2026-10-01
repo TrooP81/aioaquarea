@@ -45,3 +45,14 @@ export interface SpaceHeatingGate {
     last_raw_outdoor_c: number | null;
     fingerprint_matches: boolean;
 }
+
+export interface ReadQuotaResponse {
+    enabled: boolean;
+    reliable: boolean;
+    remaining: number | null;
+    capacity: number;
+    manual_required: number;
+    retry_after_seconds: number;
+    counters: Record<"status" | "consumption" | "weekly_timer" | "manual", number>;
+    observed_at: string;
+}

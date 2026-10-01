@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import datetime as dt
+import hashlib
 import logging
 import math
 import time
+import unicodedata
+from dataclasses import dataclass
+from enum import StrEnum
 from functools import lru_cache
 from importlib import import_module
 from zoneinfo import ZoneInfo
@@ -18,6 +22,7 @@ import redis.asyncio as redis
 from aioaquarea import (
     AquareaEnvironment,
     Client,
+    DataNotAvailableError,
     DeviceUnavailableError,
     DeviceInfo,
     ForceHeater,
@@ -28,7 +33,19 @@ from aioaquarea.data import StatusDataMode
 
 from ..config import settings
 from ..panasonic_special_status import optimizer_special_status_supported
-from ..resilience import CircuitBreaker, RateLimiter, RedisCircuitBreaker, safety_write_context
+from ..resilience import (
+    CircuitBreaker,
+    DistributedReadQuota,
+    DistributedReadQuotaExhausted,
+    RateLimiter,
+    ReadQuotaCategory,
+    ReadQuotaReservation,
+    ReadQuotaStatus,
+    READ_QUOTA_CAPACITY,
+    READ_QUOTA_MANUAL_REQUIRED,
+    RedisCircuitBreaker,
+    safety_write_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +53,37 @@ _COMMAND_STATUS_MAX_AGE_SECONDS = 60.0
 _ADAPTER_RETRY_BASE_SECONDS = 300
 _ADAPTER_RETRY_MAX_SECONDS = 1800
 _WEEKLY_TIMER_CACHE_SECONDS = 3600.0
+EXECUTOR_VERIFICATION_QUOTA_STARVED_AFTER_SECONDS = 60
+
+
+class ReadQuotaContext(StrEnum):
+    EXECUTOR_VERIFICATION = "executor_verification"
+
+
+@dataclass(frozen=True)
+class ConsumptionSnapshot:
+    date: dt.date
+    heat_kwh: float | None
+    cool_kwh: float | None
+    tank_kwh: float | None
+    fetched_at: dt.datetime
+
+    @property
+    def total_kwh(self) -> float | None:
+        components = (self.heat_kwh, self.cool_kwh, self.tank_kwh)
+        if all(component is None for component in components):
+            return None
+        return sum(component for component in components if component is not None)
+
+
+@dataclass
+class _QuotaStarvationState:
+    active: bool = False
+    consecutive_starved_verifications: int = 0
+    ledger_slots_committed_since_recovery: int = 0
+    accumulated_wait_seconds_since_recovery: float = 0.0
+    verification_wait_started_at: float | None = None
+    verification_wait_attempts: int = 0
 
 
 @lru_cache(maxsize=1)
@@ -120,6 +168,10 @@ class PanasonicCredentialsMissingError(RuntimeError):
     """Raised when Panasonic credentials have not been entered in Settings."""
 
 
+class PanasonicQuotaAccountMismatchError(RuntimeError):
+    """A reservation belongs to a different authenticated Panasonic account."""
+
+
 class AquareaWrapper:
     """Wrapper around aioaquarea.Client for application use."""
 
@@ -128,6 +180,7 @@ class AquareaWrapper:
         self._client: Client | None = None
         self._session: aiohttp.ClientSession | None = None
         self._redis: redis.Redis | None = None
+        self._read_quota: DistributedReadQuota | None = None
         self._device = None
         self._device_info: DeviceInfo | None = None
         self._timezone = ZoneInfo("UTC")
@@ -145,8 +198,11 @@ class AquareaWrapper:
         self._redis_circuit_breaker: RedisCircuitBreaker | None = None
         self._authenticated = False
         self._credentials: tuple[str, str] | None = None
+        self._account_key: str | None = None
         self._weekly_timer = None
         self._weekly_timer_fetched_at: float | None = None
+        self._quota_reliable = True
+        self._quota_starvation = {ReadQuotaContext.EXECUTOR_VERIFICATION: _QuotaStarvationState()}
 
     async def start(self) -> None:
         """Initialize session and redis; login failures are retried on device access."""
@@ -155,6 +211,8 @@ class AquareaWrapper:
         self._session = aiohttp.ClientSession()
         self._redis = redis.from_url(settings.redis_url)
         self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
+        if settings.panasonic_distributed_read_quota_enabled:
+            self._read_quota = DistributedReadQuota(self._redis)
         self._timezone = ZoneInfo(await get_user_tz())
 
         try:
@@ -197,6 +255,7 @@ class AquareaWrapper:
                 timezone=self._timezone,
             )
             self._credentials = (username, password)
+            self._account_key = self._account_key_for_username(username)
             self._device = None
             self._device_info = None
         await self._authenticate()
@@ -248,6 +307,102 @@ class AquareaWrapper:
             logger.error("Authentication failed: %s", exc)
             raise
 
+    @staticmethod
+    def _account_key_for_username(username: str) -> str:
+        normalized = unicodedata.normalize("NFKC", username).strip().casefold()
+        if not normalized:
+            raise PanasonicCredentialsMissingError(
+                "Panasonic credentials are not configured; add them in the Settings tab"
+            )
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    async def _resolve_account_key(self) -> str:
+        if self._account_key is not None:
+            return self._account_key
+        from ..settings_service import get_setting
+
+        return self._account_key_for_username(await get_setting("aquarea_username"))
+
+    def _distributed_quota_enabled(self) -> bool:
+        return settings.panasonic_distributed_read_quota_enabled
+
+    async def _reserve_background_read(
+        self,
+        category: ReadQuotaCategory,
+        *,
+        quota_context: ReadQuotaContext | None = None,
+    ) -> ReadQuotaReservation:
+        account_key = await self._resolve_account_key()
+        if self._read_quota is None:
+            raise RuntimeError("Distributed Panasonic read quota is unavailable")
+        starvation = self._quota_starvation.get(quota_context) if quota_context else None
+        while True:
+            try:
+                await self._read_quota.reserve(account_key, 1, category)
+            except DistributedReadQuotaExhausted as exc:
+                if starvation is not None:
+                    if starvation.verification_wait_started_at is None:
+                        starvation.verification_wait_started_at = time.monotonic()
+                    starvation.verification_wait_attempts += 1
+                await asyncio.sleep(max(1, exc.status.retry_after_seconds))
+                continue
+            except Exception:
+                self._quota_reliable = False
+                await self._read_limiter.acquire()
+                return ReadQuotaReservation(account_key, category, 1, "local")
+            self._quota_reliable = True
+            return ReadQuotaReservation(account_key, category, 1, "distributed")
+
+    def _record_quota_starvation_recovery(self, starvation: _QuotaStarvationState) -> None:
+        started_at = starvation.verification_wait_started_at
+        starvation.verification_wait_started_at = None
+        wait_attempts = starvation.verification_wait_attempts
+        starvation.verification_wait_attempts = 0
+        if started_at is None:
+            if starvation.active:
+                logger.info("executor_verification_quota_recovered")
+                starvation.active = False
+                starvation.consecutive_starved_verifications = 0
+                starvation.ledger_slots_committed_since_recovery = 0
+                starvation.accumulated_wait_seconds_since_recovery = 0.0
+            return
+        waited_seconds = time.monotonic() - started_at
+        starvation.accumulated_wait_seconds_since_recovery += waited_seconds
+        if waited_seconds >= EXECUTOR_VERIFICATION_QUOTA_STARVED_AFTER_SECONDS:
+            starvation.consecutive_starved_verifications += 1
+            if not starvation.active:
+                starvation.active = True
+                logger.warning(
+                    "executor_verification_quota_starved",
+                    extra={
+                        "threshold_seconds": EXECUTOR_VERIFICATION_QUOTA_STARVED_AFTER_SECONDS,
+                        "waited_seconds": waited_seconds,
+                        "wait_attempts": wait_attempts,
+                        "consecutive_starved_verifications": (
+                            starvation.consecutive_starved_verifications
+                        ),
+                        "ledger_slots_committed_since_recovery": (
+                            starvation.ledger_slots_committed_since_recovery
+                        ),
+                    },
+                )
+        if starvation.active and waited_seconds < EXECUTOR_VERIFICATION_QUOTA_STARVED_AFTER_SECONDS:
+            logger.info("executor_verification_quota_recovered")
+            starvation.active = False
+            starvation.consecutive_starved_verifications = 0
+            starvation.ledger_slots_committed_since_recovery = 0
+            starvation.accumulated_wait_seconds_since_recovery = 0.0
+
+    def _assert_reservation_account(self, reservation: ReadQuotaReservation) -> None:
+        if (
+            reservation.source == "distributed"
+            and self._account_key is not None
+            and reservation.account_key != self._account_key
+        ):
+            raise PanasonicQuotaAccountMismatchError(
+                "Panasonic account changed after quota admission"
+            )
+
     async def get_device(self):
         """Return the cached device, loading it once when necessary.
 
@@ -258,24 +413,37 @@ class AquareaWrapper:
         if self._device is not None:
             return self._device
 
+        if self._distributed_quota_enabled():
+            reservation = await self._reserve_background_read(ReadQuotaCategory.STATUS)
+            async with self._device_lock:
+                self._assert_reservation_account(reservation)
+                if self._device is not None:
+                    return self._device
+                return await self._initialize_device_locked(reservation=reservation)
+
         async with self._device_lock:
             if self._device is not None:
                 return self._device
-            return await self._initialize_device_locked(charge_read=True)
+            return await self._initialize_device_locked(reservation=None)
 
-    async def _initialize_device_locked(self, *, charge_read: bool):
+    async def _initialize_device_locked(self, *, reservation: ReadQuotaReservation | None):
         await self._ensure_authenticated()
-        if charge_read:
+        if reservation is not None:
+            self._assert_reservation_account(reservation)
+        else:
             await self._read_limiter.acquire()
         devices = await self._client.get_devices()
         if not devices:
             raise RuntimeError("No devices found on account")
         self._device_info = devices[0]
-        from datetime import timedelta
-
+        consumption_refresh_interval = (
+            None
+            if reservation is not None and reservation.source == "distributed"
+            else dt.timedelta(minutes=5)
+        )
         self._device = await self._client.get_device(
             device_info=self._device_info,
-            consumption_refresh_interval=timedelta(minutes=5),
+            consumption_refresh_interval=consumption_refresh_interval,
             timezone=self._timezone,
         )
         self._record_live_status(self._device)
@@ -286,6 +454,29 @@ class AquareaWrapper:
         if self._device is not None:
             device_id = getattr(self._device, "long_id", None)
             if device_id:
+                return str(device_id)
+
+        if self._distributed_quota_enabled():
+            reservation = await self._reserve_background_read(ReadQuotaCategory.STATUS)
+            async with self._device_lock:
+                self._assert_reservation_account(reservation)
+                if self._device is not None:
+                    device_id = getattr(self._device, "long_id", None)
+                    if device_id:
+                        return str(device_id)
+                if self._device_info is not None:
+                    device_id = getattr(self._device_info, "device_id", None)
+                    if device_id:
+                        return str(device_id)
+                await self._ensure_authenticated()
+                self._assert_reservation_account(reservation)
+                devices = await self._client.get_devices()
+                if not devices:
+                    raise RuntimeError("No devices found on account")
+                self._device_info = devices[0]
+                device_id = getattr(self._device_info, "device_id", None)
+                if not device_id:
+                    raise RuntimeError("Selected Panasonic device has no identity")
                 return str(device_id)
 
         async with self._device_lock:
@@ -308,7 +499,7 @@ class AquareaWrapper:
                 raise RuntimeError("Selected Panasonic device has no identity")
             return str(device_id)
 
-    async def refresh_device(self):
+    async def refresh_device(self, *, quota_context: ReadQuotaContext | None = None):
         """Refresh device data using one logical Panasonic read token.
 
         Creating a device already fetches its current status. Avoid an
@@ -317,10 +508,36 @@ class AquareaWrapper:
         """
         self._raise_if_adapter_backoff_active()
 
+        if self._distributed_quota_enabled():
+            starvation = self._quota_starvation.get(quota_context) if quota_context else None
+            # Safety relies on the sequential executor loop and APScheduler max_instances=1.
+            if starvation is not None:
+                starvation.ledger_slots_committed_since_recovery += 1
+            reservation = await self._reserve_background_read(
+                ReadQuotaCategory.STATUS, quota_context=quota_context
+            )
+            return await self._refresh_device_unreserved(reservation, quota_context=quota_context)
+
         await self._read_limiter.acquire()
+        return await self._refresh_device_unreserved(
+            ReadQuotaReservation("", ReadQuotaCategory.STATUS, 1, "local")
+        )
+
+    async def _refresh_device_unreserved(
+        self,
+        reservation: ReadQuotaReservation | None,
+        *,
+        quota_context: ReadQuotaContext | None = None,
+    ):
         async with self._device_lock:
+            if reservation is not None:
+                self._assert_reservation_account(reservation)
+                if reservation.source == "distributed" and quota_context is not None:
+                    starvation = self._quota_starvation.get(quota_context)
+                    if starvation is not None:
+                        self._record_quota_starvation_recovery(starvation)
             if self._device is None:
-                return await self._initialize_device_locked(charge_read=False)
+                return await self._initialize_device_locked(reservation=reservation)
             device = self._device
         try:
             await device.refresh_data(allow_cached_fallback=False)
@@ -349,7 +566,10 @@ class AquareaWrapper:
         if stale:
             try:
                 device = await self.get_device()
-                await self._read_limiter.acquire()
+                if self._distributed_quota_enabled():
+                    await self._reserve_background_read(ReadQuotaCategory.WEEKLY_TIMER)
+                else:
+                    await self._read_limiter.acquire()
                 self._weekly_timer = await device.get_weekly_timer()
             except Exception as exc:  # noqa: BLE001 - optional read-only capability
                 logger.warning("Panasonic weekly timer read failed; continuing control: %s", exc)
@@ -360,6 +580,105 @@ class AquareaWrapper:
             return ()
         instant = at or dt.datetime.now(dt.timezone.utc)
         return self._weekly_timer.active_slots(instant, self._timezone)
+
+    async def refresh_consumption(self, at: dt.datetime) -> ConsumptionSnapshot:
+        if not self._distributed_quota_enabled():
+            raise RuntimeError("Distributed Panasonic read quota is disabled")
+        reservation = await self._reserve_background_read(ReadQuotaCategory.CONSUMPTION)
+        return await self._fetch_consumption_unreserved(at, reservation)
+
+    async def _fetch_consumption_unreserved(
+        self, at: dt.datetime, reservation: ReadQuotaReservation
+    ) -> ConsumptionSnapshot:
+        from aioaquarea.statistics import DateType
+
+        device = await self.get_device()
+        self._assert_reservation_account(reservation)
+        response = await self._client.get_device_consumption(
+            device.long_id, DateType.MONTH, at.strftime("%Y%m01")
+        )
+        if not response:
+            raise DataNotAvailableError("Panasonic consumption data is unavailable")
+        for item in response:
+            raw_date = item.data_time
+            if not raw_date:
+                continue
+            try:
+                item_date = dt.datetime.strptime(raw_date, "%Y%m%d").date()
+            except ValueError:
+                logger.warning("Panasonic consumption response contained a malformed date")
+                continue
+            if item_date == at.date():
+                return ConsumptionSnapshot(
+                    date=item_date,
+                    heat_kwh=item.heat_consumption,
+                    cool_kwh=item.cool_consumption,
+                    tank_kwh=item.tank_consumption,
+                    fetched_at=dt.datetime.now(dt.timezone.utc),
+                )
+        raise DataNotAvailableError(
+            "Panasonic consumption data is unavailable for the requested date"
+        )
+
+    async def refresh_status_and_consumption(
+        self, at: dt.datetime
+    ) -> tuple[object, ConsumptionSnapshot | None]:
+        if not self._distributed_quota_enabled():
+            raise RuntimeError("Distributed Panasonic read quota is disabled")
+        account_key = await self._resolve_account_key()
+        if self._read_quota is None:
+            raise RuntimeError("Distributed Panasonic read quota is unavailable")
+        await self._read_quota.reserve(
+            account_key,
+            2,
+            ReadQuotaCategory.MANUAL,
+            minimum_remaining=READ_QUOTA_MANUAL_REQUIRED - 2,
+        )
+        self._quota_reliable = True
+        reservation = ReadQuotaReservation(account_key, ReadQuotaCategory.MANUAL, 2, "distributed")
+        device = await self._refresh_device_unreserved(reservation)
+        try:
+            snapshot = await self._fetch_consumption_unreserved(at, reservation)
+        except DataNotAvailableError:
+            snapshot = None
+        return device, snapshot
+
+    async def get_rate_limit_status(self) -> ReadQuotaStatus:
+        now = dt.datetime.now(dt.timezone.utc)
+        counters = {category: 0 for category in ReadQuotaCategory}
+        if not self._distributed_quota_enabled():
+            return ReadQuotaStatus(
+                False,
+                True,
+                None,
+                READ_QUOTA_CAPACITY,
+                READ_QUOTA_MANUAL_REQUIRED,
+                0,
+                counters,
+                now,
+            )
+        try:
+            account_key = await self._resolve_account_key()
+            if self._read_quota is None:
+                raise RuntimeError("Distributed Panasonic read quota is unavailable")
+            status = await self._read_quota.snapshot(account_key)
+        except Exception:
+            self._quota_reliable = False
+            return ReadQuotaStatus(
+                True,
+                False,
+                None,
+                READ_QUOTA_CAPACITY,
+                READ_QUOTA_MANUAL_REQUIRED,
+                30,
+                counters,
+                now,
+            )
+        self._quota_reliable = True
+        return status
+
+    def cached_rate_limit_reliability(self) -> bool:
+        return self._quota_reliable
 
     def _record_live_status(self, device) -> None:
         try:

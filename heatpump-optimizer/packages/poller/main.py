@@ -181,6 +181,40 @@ async def _record_fault(device) -> None:
 
 async def poll_consumption(wrapper: AquareaWrapper) -> None:
     """Poll consumption data and persist."""
+    if settings.panasonic_distributed_read_quota_enabled:
+        try:
+            now = dt.datetime.now(dt.timezone.utc)
+            device = await wrapper.get_device()
+            raw_outdoor_temp = device.temperature_outdoor
+            async with get_session() as session:
+                outdoor = await resolve_outdoor_temperature(
+                    session,
+                    heat_pump_c=raw_outdoor_temp,
+                    at=now,
+                )
+            snapshot = await wrapper.refresh_consumption(now)
+            record = ConsumptionRecord(
+                ts=now,
+                device_id=device.long_id,
+                heat_kwh=snapshot.heat_kwh or 0,
+                cool_kwh=snapshot.cool_kwh or 0,
+                tank_kwh=snapshot.tank_kwh or 0,
+                outdoor_temp=outdoor.effective_c,
+                heat_pump_outdoor_temp=outdoor.heat_pump_c,
+                outdoor_temp_source=outdoor.source,
+            )
+            async with get_session() as session:
+                session.add(record)
+            logger.info(
+                "consumption_polled",
+                heat=record.heat_kwh,
+                cool=record.cool_kwh,
+                tank=record.tank_kwh,
+            )
+        except Exception as e:
+            logger.error("consumption_poll_failed", error=str(e))
+        return
+
     from aioaquarea.statistics import ConsumptionType
 
     try:

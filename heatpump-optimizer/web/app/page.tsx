@@ -21,7 +21,7 @@ import { TabNavigation } from "@/components/TabNavigation";
 import { DecisionSummary } from "@/components/DecisionSummary";
 import { Banner } from "@/components/Banner";
 import { DataAge } from "@/components/DataAge";
-import type { ControlState, SpaceHeatingGate } from "@/lib/api-types";
+import type { ControlState, ReadQuotaResponse, SpaceHeatingGate } from "@/lib/api-types";
 import { SECTIONS, SectionId } from "@/lib/constants";
 import Link from "next/link";
 
@@ -76,6 +76,7 @@ interface DashboardData {
 interface PollResult {
   success: boolean;
   message: string;
+  tone?: "warning" | "danger";
 }
 
 interface PollNowTaskResult {
@@ -86,6 +87,13 @@ interface PollNowTaskResult {
 interface PollNowResponse {
   status?: string;
   results?: Record<string, PollNowTaskResult>;
+}
+
+interface PollNowErrorResponse {
+  detail?: {
+    code?: string;
+    retry_after_seconds?: number;
+  };
 }
 
 interface IndoorTempData {
@@ -154,6 +162,7 @@ export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
   const [controlState, setControlState] = useState<ControlState | null>(null);
+  const [readQuota, setReadQuota] = useState<ReadQuotaResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
@@ -171,16 +180,18 @@ export default function Home() {
 
   const fetchData = async () => {
     try {
-      const [dashRes, tempRes, controlRes] = await Promise.all([
+      const [dashRes, tempRes, controlRes, quotaRes] = await Promise.all([
         fetch("/api/dashboard"),
         fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest"),
         fetchOptionalJson("/api/control-state", isControlState),
+        fetchOptionalJson<ReadQuotaResponse>("/api/panasonic/read-quota"),
       ]);
       if (!dashRes.ok) throw new Error(`API error: ${dashRes.status}`);
       const json = await dashRes.json();
       setData(json);
       setIndoorTemp(tempRes);
       setControlState(controlRes);
+      setReadQuota(quotaRes);
       setError(null);
       setLastUpdated(new Date());
     } catch (e) {
@@ -218,6 +229,33 @@ export default function Home() {
     setPollResult(null);
     try {
       const res = await fetch("/api/poll-now", { method: "POST" });
+      if (!res.ok) {
+        const errorBody: PollNowErrorResponse | null = await res.json().catch(() => null);
+        const retryAfterHeader = Number(res.headers.get("Retry-After"));
+        const retryAfterSeconds = Number.isFinite(retryAfterHeader) && retryAfterHeader >= 0
+          ? retryAfterHeader
+          : errorBody?.detail?.retry_after_seconds;
+
+        if (res.status === 429) {
+          const wait = typeof retryAfterSeconds === "number"
+            ? ` — try again in ~${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`
+            : " — try again later";
+          setPollResult({
+            success: false,
+            tone: "warning",
+            message: `Panasonic read allowance used up${wait}`,
+          });
+        } else if (res.status === 503 && errorBody?.detail?.code === "panasonic_read_quota_unavailable") {
+          setPollResult({
+            success: false,
+            tone: "danger",
+            message: "Read quota service unavailable — refresh is paused, background polling continues",
+          });
+        } else {
+          setPollResult({ success: false, tone: "danger", message: `Refresh failed (HTTP ${res.status})` });
+        }
+        return;
+      }
       const json: PollNowResponse = await res.json();
       if (json.status === "ok") {
         setPollResult({ success: true, message: "All data fetched successfully" });
@@ -228,10 +266,10 @@ export default function Home() {
           .join("; ");
         setPollResult({ success: false, message: msgs || "Partial success" });
       }
-      await fetchData();
     } catch {
       setPollResult({ success: false, message: "Network error — is the API running?" });
     } finally {
+      await fetchData();
       setPolling(false);
     }
   };
@@ -290,6 +328,11 @@ export default function Home() {
         : "● Disconnected";
 
   const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
+  const quotaBlocksRefresh = readQuota?.enabled === true && (
+    readQuota.reliable === false ||
+    readQuota.remaining === null ||
+    readQuota.remaining < readQuota.manual_required
+  );
 
   return (
     <main id="main-content" className="dashboard" tabIndex={-1}>
@@ -300,7 +343,7 @@ export default function Home() {
           {lastUpdated && (
             <DataAge timestamp={lastUpdated.toISOString()} />
           )}
-          <button className="btn" onClick={pollNow} disabled={polling}>
+          <button className="btn" onClick={pollNow} disabled={polling || quotaBlocksRefresh}>
             {polling ? "Refreshing..." : "Refresh from heat pump"}
           </button>
           <Link href="/settings" className="btn">Settings</Link>
@@ -309,7 +352,13 @@ export default function Home() {
           </span>
         </div>
       </div>
-      <p className="refresh-allowance">Uses the Panasonic hourly read allowance.</p>
+      <p className="refresh-allowance">
+        {readQuota?.enabled
+          ? readQuota.reliable && readQuota.remaining !== null
+            ? `${readQuota.remaining} / ${readQuota.capacity} Panasonic reads available.`
+            : "Panasonic read quota is temporarily unavailable."
+          : "Uses the Panasonic hourly read allowance."}
+      </p>
       <TabNavigation
         activeId={activeSection}
         ariaLabel="Dashboard workspace"
@@ -323,7 +372,7 @@ export default function Home() {
       </p>
 
       {pollResult && (
-        <Banner tone={pollResult.success ? "info" : "warning"}>
+        <Banner tone={pollResult.success ? "info" : pollResult.tone ?? "warning"}>
           <p>{pollResult.message}</p>
           <button className="btn btn-sm" onClick={() => setPollResult(null)}>
             Dismiss

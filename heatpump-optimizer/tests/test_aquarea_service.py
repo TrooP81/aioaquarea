@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aioaquarea import (
+    DataNotAvailableError,
     DeviceUnavailableError,
     ForceDHW,
     ForceHeater,
@@ -912,3 +913,26 @@ async def test_clear_special_status_skips_when_already_normal() -> None:
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_special_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quota_manual_refresh_keeps_status_when_consumption_is_unavailable(
+    monkeypatch,
+) -> None:
+    wrapper = _wrapper()
+    wrapper._account_key = "account-key"
+    wrapper._read_quota = SimpleNamespace(reserve=AsyncMock())
+    device = SimpleNamespace(long_id="device-1")
+    monkeypatch.setattr(wrapper, "_distributed_quota_enabled", lambda: True)
+    wrapper._refresh_device_unreserved = AsyncMock(return_value=device)
+    wrapper._fetch_consumption_unreserved = AsyncMock(
+        side_effect=DataNotAvailableError("Panasonic consumption data is unavailable")
+    )
+
+    refreshed, snapshot = await wrapper.refresh_status_and_consumption(
+        dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+    )
+
+    assert refreshed is device
+    assert snapshot is None
+    wrapper._read_quota.reserve.assert_awaited_once()

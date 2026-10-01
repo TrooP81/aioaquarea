@@ -31,6 +31,7 @@ with an error. An empty string clears a free-form value.
 | `MODEL_DIR` | `/app/models` | ML model directory; shared by `api`, `poller`, `optimizer` via the `modeldata` volume. |
 | `LOG_LEVEL` | `INFO` | Log level. |
 | `POLL_INTERVAL_SECONDS` | `300` | Device status poll interval used by the poller scheduler. Also the env fallback for `poll_interval_seconds`. |
+| `PANASONIC_DISTRIBUTED_READ_QUOTA_ENABLED` | `false` | Enables the Redis-backed, per-account Panasonic logical-read quota. Manual refresh reserves two reads and requires ten available reads before admission; background reads wait and fall back to the local limiter when Redis is unavailable. |
 | `EXECUTOR_SAFETY_READ_RESERVE` | `2` | Startup-only count of the five hourly executor verification reads reserved for safety restores. Valid range: 1–4. |
 | `PRICE_PROVIDER` | `entsoe` | Env fallback for `price_provider`. |
 | `ENTSOE_API_TOKEN` | _(empty)_ | Env fallback for `entsoe_api_token`. |
@@ -49,6 +50,16 @@ with an error. An empty string clears a free-form value.
 
 Panasonic credentials are **not** read from the environment. Set
 `aquarea_username` and `aquarea_password` on the Settings page.
+
+### Panasonic distributed read-quota canary and rollback
+
+Keep `PANASONIC_DISTRIBUTED_READ_QUOTA_ENABLED=false` for the legacy local
+limiter. During a canary, enable it on one isolated deployment with Redis
+available, verify `/api/panasonic/read-quota` reports `enabled: true` and
+`reliable: true`, and confirm manual refresh succeeds above the displayed
+ten-read threshold. The dashboard disables manual refresh when the quota is
+unreliable or below that threshold. To roll back, set the flag to `false` and
+restart the API and poller; no migration or Redis cleanup is required.
 
 ### Docker Compose
 
