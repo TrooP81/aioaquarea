@@ -75,11 +75,13 @@ for (const { name, path, expectedPath, hash } of [
     });
 }
 
-for (const { name, path, status, statuses } of [
-    { name: "failed legacy alias", path: "/?view=plan&activity=failed#plan-action-42", status: "failed", statuses: ["failed", "expired"] },
-    { name: "failed canonical URL", path: "/?view=timeline&activity=failed#plan-action-42", status: "failed", statuses: ["failed", "expired"] },
-    { name: "safety legacy alias", path: "/?view=plan&activity=safety#plan-action-43", status: "pending", statuses: ["pending", "executing", "dispatched"] },
-    { name: "safety canonical URL", path: "/?view=timeline&activity=safety#plan-action-43", status: "pending", statuses: ["pending", "executing", "dispatched"] },
+const TIMELINE_ACTIVITY_STATUSES = ["executed", "executed_unverified", "failed", "expired", "skipped", "skipped_peak", "cancelled", "pending", "executing", "dispatched"];
+
+for (const { name, path, status } of [
+    { name: "failed legacy alias", path: "/?view=plan&activity=failed#plan-action-42", status: "failed" },
+    { name: "failed canonical URL", path: "/?view=timeline&activity=failed#plan-action-42", status: "failed" },
+    { name: "safety legacy alias", path: "/?view=plan&activity=safety#plan-action-43", status: "pending" },
+    { name: "safety canonical URL", path: "/?view=timeline&activity=safety#plan-action-43", status: "pending" },
 ]) {
     test(`${name} waits for activity, scrolls, focuses, and clears the highlight`, async ({ page }) => {
         const id = status === "failed" ? 42 : 43;
@@ -105,7 +107,7 @@ for (const { name, path, status, statuses } of [
         await expect(target).toHaveAttribute("aria-current", "true");
         await expect(target).toBeFocused();
         await expect(target).toHaveClass(/deep-link-target/);
-        expect(requestedStatuses).toEqual(statuses);
+        expect(requestedStatuses).toEqual(TIMELINE_ACTIVITY_STATUSES);
         expect(await page.evaluate(() => (window as unknown as { __phase3ScrolledIds: string[] }).__phase3ScrolledIds)).toContain(`plan-action-${id}`);
         await page.waitForTimeout(8_100);
         await expect(target).not.toHaveClass(/deep-link-target/);
@@ -121,7 +123,7 @@ test("Outcome requests and renders skipped peak-price actions", async ({ page })
 
     await page.goto("/?view=timeline");
 
-    await expect(page.getByText("Skipped (peak price)")).toBeVisible();
+    await expect(page.getByTestId("plan-activity").getByText("Skipped (peak price)")).toBeVisible();
     expect(requestedStatuses).toContain("skipped_peak");
 });
 

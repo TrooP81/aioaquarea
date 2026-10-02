@@ -89,11 +89,14 @@ const EMPTY_STATE: PlanActionsState = {
  * the selected plan changes. This keeps late responses from replacing data for
  * the plan currently displayed in the UI.
  */
-export function usePlanActions(planId: number | null | undefined): PlanActionsState {
+export function usePlanActions(
+  planId: number | null | undefined,
+  enabled = true,
+): PlanActionsState {
   const [state, setState] = useState<PlanActionsState>(EMPTY_STATE);
 
   useEffect(() => {
-    if (planId == null) {
+    if (!enabled || planId == null) {
       setState(EMPTY_STATE);
       return;
     }
@@ -131,7 +134,7 @@ export function usePlanActions(planId: number | null | undefined): PlanActionsSt
       });
 
     return () => controller.abort();
-  }, [planId]);
+  }, [enabled, planId]);
 
   return state;
 }

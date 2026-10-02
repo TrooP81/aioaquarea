@@ -5,7 +5,7 @@ import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/c
 import { useRefresh } from "./RefreshContext";
 import { useTimeFormat } from "./useTimeFormat";
 
-interface PlanActivity {
+export interface PlanActivity {
   id: number;
   plan_id: number;
   plan_created_at: string;
@@ -49,11 +49,11 @@ function statusesForFilter(filter: ActivityFilter): string[] {
   return OUTCOME_STATUSES;
 }
 
-type TimelineEntry =
+export type TimelineEntry =
   | { kind: "action"; action: PlanActivity }
   | { kind: "replacement"; planId: number; cancelled: PlanActivity[] };
 
-function summariseActivity(activity: PlanActivity[]): TimelineEntry[] {
+export function summariseActivity(activity: PlanActivity[]): TimelineEntry[] {
   const entries: TimelineEntry[] = [];
   const replacements = new Map<number, Extract<TimelineEntry, { kind: "replacement" }>>();
 
@@ -113,7 +113,7 @@ function formatActivityDate(iso: string, hour12: boolean): string {
   });
 }
 
-export function PlanActivityTimeline() {
+export function PlanActivityTimeline({ activityData, activityError, activityLoading }: { activityData?: PlanActivity[]; activityError?: string | null; activityLoading?: boolean } = {}) {
   const { refreshEpoch } = useRefresh();
   const [activity, setActivity] = useState<PlanActivity[]>([]);
   const [filter, setFilter] = useState<ActivityFilter>(locationFilter);
@@ -126,6 +126,7 @@ export function PlanActivityTimeline() {
   const timeFormat = useTimeFormat();
 
   useEffect(() => {
+    if (activityData) return;
     const controller = new AbortController();
 
     const loadActivity = async () => {
@@ -153,7 +154,11 @@ export function PlanActivityTimeline() {
     return () => {
       controller.abort();
     };
-  }, [filter, refreshEpoch]);
+  }, [activityData, filter, refreshEpoch]);
+
+  const displayedActivity = activityData ?? activity;
+  const displayedError = activityError ?? error;
+  const displayedLoading = activityLoading ?? loading;
 
   useEffect(() => {
     const applyFilter = () => setFilter(locationFilter());
@@ -175,7 +180,7 @@ export function PlanActivityTimeline() {
   useEffect(() => {
     const hash = deepLinkHash;
     const match = /^#plan-action-(\d+)$/.exec(hash);
-    if (!match || loading || error || highlightedHash.current === hash) return;
+    if (!match || displayedLoading || displayedError || highlightedHash.current === hash) return;
 
     const frame = window.requestAnimationFrame(() => {
       const target = document.getElementById(`plan-action-${match[1]}`);
@@ -193,7 +198,7 @@ export function PlanActivityTimeline() {
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timeout);
     };
-  }, [activity, deepLinkHash, error, loading]);
+  }, [deepLinkHash, displayedError, displayedLoading, displayedActivity]);
 
   useEffect(() => {
     if (!deepLinkTarget) return;
@@ -203,7 +208,7 @@ export function PlanActivityTimeline() {
     return () => window.cancelAnimationFrame(frame);
   }, [deepLinkTarget]);
 
-  if (loading) {
+  if (displayedLoading) {
     return (
       <section className="plan-section">
         <h2 className="chart-title">Recent Activity</h2>
@@ -215,16 +220,16 @@ export function PlanActivityTimeline() {
     );
   }
 
-  if (error) {
+  if (displayedError) {
     return (
       <section className="plan-section">
         <h2 className="chart-title">Recent Activity</h2>
-        <p className="plan-error">Could not load recent activity: {error}</p>
+        <p className="plan-error">Could not load recent activity: {displayedError}</p>
       </section>
     );
   }
 
-  if (activity.length === 0) {
+  if (displayedActivity.length === 0) {
     return (
       <section className="plan-section">
         <h2 className="chart-title">Recent Activity</h2>
@@ -259,7 +264,7 @@ export function PlanActivityTimeline() {
       {deepLinkNotice && <p className="plan-error" role="status">{deepLinkNotice}</p>}
       <ol className="plan-activity-list">
         {summariseActivity(
-          activity.filter((item) => item.status !== "cancelled" || item.result?.reason !== "superseded"),
+          displayedActivity.filter((item) => statusesForFilter(filter).includes(item.status)),
         ).map((entry) => {
           if (entry.kind === "replacement") {
             const occurredAt = entry.cancelled[0].executed_at || entry.cancelled[0].scheduled_ts;

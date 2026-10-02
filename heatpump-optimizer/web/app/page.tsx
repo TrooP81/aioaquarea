@@ -6,9 +6,7 @@ import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
 import { ConsumptionChart } from "@/components/ConsumptionChart";
 import { ForecastChart } from "@/components/ForecastChart";
-import { ComfortImpactChart } from "@/components/ComfortImpactChart";
 import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
-import { PlanView } from "@/components/PlanView";
 import { PlanActivityTimeline } from "@/components/PlanActivityTimeline";
 import { PlanHistory } from "@/components/PlanHistory";
 import { Controls } from "@/components/Controls";
@@ -22,6 +20,10 @@ import { DecisionSummary } from "@/components/DecisionSummary";
 import { Banner } from "@/components/Banner";
 import { DataAge } from "@/components/DataAge";
 import { RefreshProvider, useRefresh } from "@/components/RefreshContext";
+import { TimelineWorkspace } from "@/components/TimelineWorkspace";
+import { PlanView } from "@/components/PlanView";
+import type { PlanActivity } from "@/components/PlanActivityTimeline";
+import type { PlanAction } from "@/components/usePlanActions";
 import type { ControlState, ReadQuotaResponse, SpaceHeatingGate } from "@/lib/api-types";
 import { LEGACY_SECTION_ALIASES, SECTIONS, SectionId } from "@/lib/constants";
 import Link from "next/link";
@@ -186,6 +188,12 @@ function DashboardPage() {
   const [activeSection, setActiveSection] = useState<SectionId>("home");
   const [showRawChartDetails, setShowRawChartDetails] = useState(false);
   const [locationHash, setLocationHash] = useState("");
+  const [timelineActivity, setTimelineActivity] = useState<PlanActivity[]>([]);
+  const [timelineActivityError, setTimelineActivityError] = useState<string | null>(null);
+  const [timelineActivityLoading, setTimelineActivityLoading] = useState(true);
+  const [timelineActions, setTimelineActions] = useState<PlanAction[]>([]);
+  const [timelineActionsError, setTimelineActionsError] = useState<string | null>(null);
+  const [timelineActionsLoading, setTimelineActionsLoading] = useState(true);
   const fetchGeneration = useRef(0);
 
   const selectSection = (section: SectionId) => {
@@ -470,8 +478,19 @@ function DashboardPage() {
       >
         {activeSection === "timeline" && (
           <>
-            <PlanView plan={data?.active_plan ?? null} />
-            <PlanActivityTimeline />
+            <PlanView
+              plan={data?.active_plan ?? null}
+              controlledActions={timelineActions}
+              controlledError={timelineActionsError}
+              controlledLoading={timelineActionsLoading}
+            />
+            <TimelineWorkspace
+              planId={data?.active_plan?.id}
+              controlState={controlState}
+              onActivity={(actions, activityError, activityLoading) => { setTimelineActivity(actions); setTimelineActivityError(activityError); setTimelineActivityLoading(activityLoading); }}
+              onActions={(actions, actionsError, actionsLoading) => { setTimelineActions(actions); setTimelineActionsError(actionsError); setTimelineActionsLoading(actionsLoading); }}
+            />
+            <PlanActivityTimeline activityData={timelineActivity} activityError={timelineActivityError} activityLoading={timelineActivityLoading} />
             <PlanHistory />
           </>
         )}
@@ -484,7 +503,6 @@ function DashboardPage() {
         aria-labelledby="dashboard-tab-under-the-hood"
         hidden={activeSection !== "under-the-hood"}
       >
-        <ComfortImpactChart />
         <ConsumptionChart />
         <div id="raw-charts">
           <div style={{ marginBottom: "1rem" }}>

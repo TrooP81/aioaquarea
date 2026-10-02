@@ -103,14 +103,15 @@ test("chart_message_uses_v5_source_metadata_and_legacy_overlap_fallback", async 
 
     for (const scenario of ["shadow", "history", "default", "none", "explicit", "legacy"] as const) {
         await mockDashboard(page, scenario);
-        await page.goto("/");
-        await page.getByRole("tab", { name: "Under the hood" }).click();
-        const chart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
-        await expect(chart).toBeVisible();
+        await page.goto("/?view=timeline");
+        const timeline = page.getByTestId("explanation-timeline");
+        await expect(timeline).toBeVisible();
+        await expect(timeline.locator(".timeline-forecast")).toHaveCount(1);
+        await expect(timeline.locator(".timeline-target")).toHaveText("Hourly target");
         if (scenario === "explicit") {
-            await expect(chart.getByText(/Automatic room heat|Expected automatic room heat|No room heating is expected/)).toHaveCount(0);
+            await expect(page.locator(".timeline-forecast-note")).toHaveCount(0);
         } else {
-            await expect(chart.getByText(expected[scenario], { exact: true })).toBeVisible();
+            await expect(page.locator(".timeline-forecast-note")).toHaveText(expected[scenario]);
         }
     }
 });

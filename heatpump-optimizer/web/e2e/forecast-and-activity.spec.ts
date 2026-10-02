@@ -73,10 +73,16 @@ test("shows rainfall and separates actual activity from plan revisions", async (
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify([{
-        ts: now.toISOString(), temperature: 6, wind_speed: 4, humidity: 82,
-        cloud_cover: 0.8, irradiance: 25, precipitation: 1.6,
-      }]),
+      body: JSON.stringify([
+        {
+          ts: now.toISOString(), temperature: 6, wind_speed: 4, humidity: 82,
+          cloud_cover: 0.8, irradiance: 25, precipitation: 1.6,
+        },
+        {
+          ts: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), temperature: 6.2, wind_speed: 4.1,
+          humidity: 80, cloud_cover: 0.7, irradiance: 30, precipitation: 0,
+        },
+      ]),
     })
   );
   await page.route(/\/api\/thermal\/indoor-forecast(?:\?|$)/, (route) =>
@@ -124,21 +130,30 @@ test("shows rainfall and separates actual activity from plan revisions", async (
   await page.route(/\/api\/plans(?:\?|$)/, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([activePlan]) })
   );
+  await page.route("**/api/settings", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ comfort_temp_min: { value: "20" }, comfort_temp_max: { value: "22" } }) })
+  );
 
   await page.goto("/");
 
   await page.getByRole("tab", { name: "Under the hood" }).click();
-  await expect(page.getByRole("region", { name: "Indoor comfort, weather and price forecast" })).toBeVisible();
   await page.getByText("Show raw weather, price and temperature history").click();
+  const weatherChart = page.getByRole("region", { name: "Weather forecast chart" });
+  await expect(weatherChart).toBeVisible();
   await expect(
-    page.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
+    weatherChart.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
   ).toBeVisible();
-  await expect(page.getByText("Blue bars show rain in mm/h.")).toBeVisible();
+  await expect(weatherChart.getByText("Blue bars show rain in mm/h.")).toBeVisible();
   await page.getByRole("tab", { name: "Timeline" }).click();
-  await expect(page.getByTestId("plan-activity")).toBeVisible();
-  await expect(page.getByText("Heat hot water")).toBeVisible();
-  await expect(page.getByText("Command completed and verified")).toBeVisible();
-  await expect(page.getByText("Executor shutdown interrupted action verification")).toBeVisible();
-  await expect(page.getByText("Cancelled because a newer plan replaced this one")).toHaveCount(0);
+  await expect(page.getByTestId("explanation-timeline")).toBeVisible();
+  await expect(page.locator(".timeline-forecast")).toHaveCount(1);
+  await expect(page.locator(".timeline-comfort-band")).toHaveText("Comfort band");
+  await expect(page.locator(".timeline-target")).toHaveText("Hourly target");
+  const activity = page.getByTestId("plan-activity");
+  await expect(activity).toBeVisible();
+  await expect(activity.getByText("Heat hot water")).toBeVisible();
+  await expect(activity.getByText("Command completed and verified")).toBeVisible();
+  await expect(activity.getByText("Executor shutdown interrupted action verification")).toBeVisible();
+  await expect(activity.getByText("Cancelled because a newer plan replaced this one")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Plan change history" })).toBeVisible();
 });

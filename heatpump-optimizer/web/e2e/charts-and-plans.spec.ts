@@ -189,24 +189,14 @@ test.describe("Price Chart", () => {
   });
 
   test("renders price chart section", async ({ page }) => {
-    await page.goto("/");
-    const chartsTab = page.getByRole("tab", { name: "Under the hood" });
-    const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
-    await chartsTab.click();
-    try {
-      await expect(comfortChart).toBeVisible({ timeout: 5000 });
-    } catch {
-      // Next dev can reload once while compiling the initial client bundle.
-      // Re-select the tab after that reload so this test checks the chart, not
-      // the development-server startup race.
-      await chartsTab.click();
-      await expect(comfortChart).toBeVisible({ timeout: 5000 });
-    }
-    await expect(comfortChart.getByText("Indoor Comfort, Weather & Price — 2h", { exact: true })).toBeVisible();
-    await expect(comfortChart.locator(".recharts-area-area")).toHaveCount(1);
-    // Additional weather/price overlays are allowed; the core comfort view
-    // must retain at least its four explanatory forecast curves.
-    expect(await comfortChart.locator(".recharts-line-curve").count()).toBeGreaterThanOrEqual(4);
+    await page.route("**/api/settings", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ comfort_temp_min: { value: "20" }, comfort_temp_max: { value: "22" } }) }));
+    await page.goto("/?view=timeline");
+    const timeline = page.getByTestId("explanation-timeline");
+    await expect(timeline).toBeVisible();
+    await expect(timeline.locator(".timeline-forecast")).toHaveCount(2);
+    await expect(timeline.locator(".timeline-comfort-band")).toHaveText("Comfort band");
+    await expect(timeline.locator(".timeline-target")).toHaveText("Hourly target");
+    await page.getByRole("tab", { name: "Under the hood" }).click();
     await expect(page.getByRole("button", { name: "Show hot water" })).toBeVisible();
   });
 

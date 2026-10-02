@@ -26,6 +26,9 @@ interface PlanProps {
     horizon_end?: string;
     created_at?: string;
   } | null;
+  controlledActions?: PlanAction[];
+  controlledLoading?: boolean;
+  controlledError?: string | null;
 }
 
 /* ── Time-of-day groups ── */
@@ -62,13 +65,13 @@ function LayerBadge({ version }: { version: string }) {
         background: isMl
           ? "rgba(34,197,94,0.15)"
           : isMilp
-          ? "rgba(59,130,246,0.15)"
-          : "rgba(148,163,184,0.15)",
+            ? "rgba(59,130,246,0.15)"
+            : "rgba(148,163,184,0.15)",
         color: isMl
           ? "var(--success)"
           : isMilp
-          ? "var(--accent)"
-          : "var(--text-muted)",
+            ? "var(--accent)"
+            : "var(--text-muted)",
       }}
     >
       {LAYER_LABELS[version] || version}
@@ -189,9 +192,17 @@ function TimeGroupDivider({ group }: { group: TimeGroup }) {
 
 /* ── Main Component ── */
 
-export function PlanView({ plan }: PlanProps) {
+export function PlanView({
+  plan,
+  controlledActions,
+  controlledLoading,
+  controlledError,
+}: PlanProps) {
   const [showAll, setShowAll] = useState(false);
-  const { actions, loading, error: fetchError } = usePlanActions(plan?.id);
+  const fetchedActions = usePlanActions(plan?.id, controlledActions === undefined);
+  const actions = controlledActions ?? fetchedActions.actions;
+  const loading = controlledLoading ?? fetchedActions.loading;
+  const fetchError = controlledError ?? fetchedActions.error;
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
