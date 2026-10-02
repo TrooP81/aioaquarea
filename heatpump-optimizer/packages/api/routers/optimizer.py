@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import asyncio
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
@@ -13,6 +14,7 @@ from packages.core.database import get_session
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
+    ConsumptionRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
@@ -503,7 +505,8 @@ async def set_learning_mode(body: LearningModeUpdate, force: bool = Query(False)
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
     from packages.core.settings_service import get_setting
-    from packages.ml.models import MODEL_DIR, DemandModel
+    from packages.ml.models import DemandModel, MODEL_DIR
+    from packages.ml.model_status import _inspect_model_artifact
     from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
 
@@ -511,48 +514,27 @@ async def get_optimizer_status():
     optimizer_status = await get_optimizer_status_snapshot(layer)
     learning_mode = await _learning_mode_status()
 
-    cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
-    demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
-
     async with get_session() as session:
         consumption_count = await session.execute(
-            select(func.count()).select_from(PlanActionRecord)
+            select(func.count()).select_from(ConsumptionRecord)
         )
         total_consumption = consumption_count.scalar() or 0
 
-    estimated_days = max(1, total_consumption // 96) if total_consumption > 0 else 0
-    cop_samples = max(0, total_consumption - estimated_days)
-    demand_quality = await DemandModel().training_data_quality()
-
-    def _version_to_iso(prefix: str, models: list) -> str | None:
-        if not models:
-            return None
-        version = models[-1].stem.replace(prefix, "")
-        try:
-            return (
-                dt.datetime.strptime(version, "%Y%m%d_%H%M")
-                .replace(tzinfo=dt.timezone.utc)
-                .isoformat()
-            )
-        except ValueError:
-            return version
+    cop_model, demand_model, demand_quality = await asyncio.gather(
+        asyncio.to_thread(_inspect_model_artifact, "cop", MODEL_DIR),
+        asyncio.to_thread(_inspect_model_artifact, "demand", MODEL_DIR),
+        DemandModel().training_data_quality(),
+    )
+    cop_model["source_records"] = total_consumption
+    demand_model["source_records"] = total_consumption
 
     return {
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
         "fallback_layer": "rules_v3",
         "learning_mode": learning_mode,
-        "cop_model": {
-            "trained": optimizer_status["cop_trained"],
-            "last_trained": _version_to_iso("cop_model_", cop_models),
-            "samples": cop_samples,
-        },
-        "demand_model": {
-            "trained": optimizer_status["demand_trained"],
-            "last_trained": _version_to_iso("demand_model_", demand_models),
-            "samples": demand_quality["usable_samples"],
-            "data_quality": demand_quality,
-        },
+        "cop_model": cop_model,
+        "demand_model": {**demand_model, "data_quality": demand_quality},
         "thermal_model": {
             "calibrated": thermal_model.params.last_calibrated is not None,
             "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),

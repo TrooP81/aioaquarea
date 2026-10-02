@@ -48,6 +48,7 @@ class DemandModel:
         self._model_lower = None  # p10
         self._model_upper = None  # p90
         self._version: str = "untrained"
+        self._metrics: dict[str, float | int | str | None] = {}
         self._last_data_quality: dict[str, object] = self._empty_data_quality()
 
     @staticmethod
@@ -75,12 +76,23 @@ class DemandModel:
         """Diagnostics from the most recent data preparation pass."""
         return dict(self._last_data_quality)
 
+    @property
+    def metrics(self) -> dict[str, float | int | str | None]:
+        """Persisted forward-chaining validation evidence for the live model."""
+        return dict(self._metrics)
+
+    @property
+    def version(self) -> str:
+        """Version parsed from the currently loaded artifact filename."""
+        return self._version
+
     def reset(self) -> None:
         """Discard the trained model and return to the untrained fallback state."""
         self._model = None
         self._model_lower = None
         self._model_upper = None
         self._version = "untrained"
+        self._metrics = {}
 
     @property
     def is_trained(self) -> bool:
@@ -172,18 +184,27 @@ class DemandModel:
         self._model_lower = lower
         self._model_upper = upper
         self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
+        self._metrics = {
+            "mae": round(float(mae), 3),
+            "cv_std": round(float(cv_std), 3),
+            "baseline_mae": decision["baseline_mae"],
+            "samples": int(len(X)),
+            "validation_method": "forward_chaining_time_series_cv",
+        }
         model_path = MODEL_DIR / f"{DEMAND_MODEL_ARTIFACT_PREFIX}{self._version}.pkl"
         from packages.ml.safe_persistence import safe_dump
 
-        safe_dump({"median": median, "lower": lower, "upper": upper}, model_path)
+        safe_dump(
+            {"median": median, "lower": lower, "upper": upper, "metrics": self._metrics}, model_path
+        )
         prune_old_models(DEMAND_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
         write_mae_baseline("demand", mae)
         return {
             "version": self._version,
-            "mae": mae,
-            "cv_std": cv_std,
-            "baseline_mae": decision["baseline_mae"],
-            "samples": len(X),
+            "mae": self._metrics["mae"],
+            "cv_std": self._metrics["cv_std"],
+            "baseline_mae": self._metrics["baseline_mae"],
+            "samples": self._metrics["samples"],
         }
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:
@@ -453,6 +474,8 @@ class DemandModel:
             self._model_lower = payload.get("lower") if isinstance(payload, dict) else None
             self._model_upper = payload.get("upper") if isinstance(payload, dict) else None
             self._version = path.stem.replace(DEMAND_MODEL_ARTIFACT_PREFIX, "")
+            raw_metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
+            self._metrics = dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
             _logger.info(
                 "demand_model_loaded",
                 version=self._version,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +22,8 @@ from packages.api.routers.optimizer import (
     get_optimization_request,
     optimize_now,
 )
+from packages.ml.model_status import clear_artifact_status_cache
+from packages.ml.safe_persistence import safe_dump
 
 
 def _session_context(session):
@@ -275,7 +278,356 @@ async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) 
 
     training_data_quality.assert_awaited_once_with()
     assert response["demand_model"]["data_quality"] == quality
-    assert response["demand_model"]["samples"] == 19
+    assert response["demand_model"]["samples"] == 0
+    assert response["demand_model"]["source_records"] == 188
+
+
+def _write_signed_artifact(path, payload) -> None:
+    with patch(
+        "packages.ml.safe_persistence._validate_path", side_effect=lambda candidate: candidate
+    ):
+        safe_dump(payload, path)
+
+
+@pytest.mark.asyncio
+async def test_optimizer_status_returns_consumption_evidence_and_artifact_metrics(tmp_path) -> None:
+    count_result = MagicMock()
+    count_result.scalar.return_value = 42
+    session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
+    thermal_model = SimpleNamespace(
+        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
+    )
+    artifact_status = {
+        "trained": True,
+        "last_trained": "2026-10-01T12:00:00+00:00",
+        "samples": 36,
+        "metrics": {"mae": 0.123, "samples": 36},
+        "unavailable_reason": None,
+    }
+
+    with (
+        patch(
+            "packages.core.settings_service.get_setting", new=AsyncMock(return_value="rules_only")
+        ),
+        patch(
+            "packages.optimizer.main.get_optimizer_status_snapshot",
+            new=AsyncMock(return_value={"active_layer": "rules_v3"}),
+        ),
+        patch(
+            "packages.api.routers.optimizer._learning_mode_status",
+            new=AsyncMock(return_value={"enabled": False}),
+        ),
+        patch(
+            "packages.ml.model_status._inspect_model_artifact",
+            return_value=artifact_status,
+        ),
+        patch(
+            "packages.ml.models.DemandModel.training_data_quality",
+            new=AsyncMock(return_value={"usable_samples": 2}),
+        ),
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+        patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
+    ):
+        response = await get_optimizer_status()
+
+    assert response["cop_model"]["source_records"] == 42
+    assert response["demand_model"]["source_records"] == 42
+    assert response["cop_model"]["trained"] is True
+    assert response["cop_model"]["last_trained"] == "2026-10-01T12:00:00+00:00"
+    assert response["cop_model"]["metrics"] == {"mae": 0.123, "samples": 36}
+    count_statement = session.execute.await_args.args[0]
+    assert "consumption" in str(count_statement)
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "filename", "payload"),
+    [
+        (
+            "cop",
+            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            {"model": SimpleNamespace(n_features_in_=7), "metrics": {"mae": 0.2, "samples": 17}},
+        ),
+        (
+            "demand",
+            "demand_model_weather_v3_20261001_1200.pkl",
+            {"median": SimpleNamespace(n_features_in_=10), "metrics": {"mae": 0.3, "samples": 23}},
+        ),
+    ],
+)
+def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload, tmp_path) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    _write_signed_artifact(tmp_path / filename, payload)
+    clear_artifact_status_cache()
+    with (
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.safe_persistence._validate_path", side_effect=lambda candidate: candidate
+        ),
+    ):
+        status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status == {
+        "trained": True,
+        "last_trained": "2026-10-01T12:00:00+00:00",
+        "samples": payload["metrics"]["samples"],
+        "metrics": payload["metrics"],
+        "unavailable_reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "filename"),
+    [
+        ("cop", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+        ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
+    ],
+)
+def test_model_status_reports_signature_failure_without_details(
+    model_kind, filename, tmp_path
+) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    (tmp_path / filename).write_bytes(b"not a signed artifact")
+    clear_artifact_status_cache()
+    with patch("packages.ml.models.MODEL_DIR", tmp_path):
+        status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status["trained"] is False
+    assert status["unavailable_reason"] == "integrity_check_failed"
+    assert str(tmp_path) not in str(status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_kind", "filename"),
+    [
+        ("cop", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+        ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
+    ],
+)
+async def test_optimizer_status_contains_safe_failure_for_bad_artifact(
+    model_kind, filename, tmp_path
+) -> None:
+    (tmp_path / filename).write_bytes(b"not a signed artifact")
+    clear_artifact_status_cache()
+    count_result = MagicMock()
+    count_result.scalar.return_value = 42
+    session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
+    thermal_model = SimpleNamespace(
+        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
+    )
+
+    with (
+        patch(
+            "packages.core.settings_service.get_setting", new=AsyncMock(return_value="rules_only")
+        ),
+        patch(
+            "packages.optimizer.main.get_optimizer_status_snapshot",
+            new=AsyncMock(return_value={"active_layer": "rules_v3"}),
+        ),
+        patch(
+            "packages.api.routers.optimizer._learning_mode_status",
+            new=AsyncMock(return_value={"enabled": False}),
+        ),
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.models.DemandModel.training_data_quality",
+            new=AsyncMock(return_value={"usable_samples": 0}),
+        ),
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+        patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
+    ):
+        response = await get_optimizer_status()
+
+    model_status = response[f"{model_kind}_model"]
+    assert model_status["trained"] is False
+    assert model_status["unavailable_reason"] == "integrity_check_failed"
+    assert str(tmp_path) not in json.dumps(response)
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "filename"),
+    [
+        ("cop", "cop_model_weather_dhw_v3_20261001_1200.pkl"),
+        ("demand", "demand_model_weather_v2_20261001_1200.pkl"),
+    ],
+)
+def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename, tmp_path) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    _write_signed_artifact(tmp_path / filename, {"model": SimpleNamespace(n_features_in_=7)})
+    clear_artifact_status_cache()
+    status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status["trained"] is False
+    assert status["unavailable_reason"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "older_filename", "newer_filename", "older_payload", "newer_payload"),
+    [
+        (
+            "cop",
+            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            "cop_model_weather_dhw_v4_20261002_1200.pkl",
+            {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
+            {"model": SimpleNamespace(n_features_in_=1)},
+        ),
+        (
+            "demand",
+            "demand_model_weather_v3_20261001_1200.pkl",
+            "demand_model_weather_v3_20261002_1200.pkl",
+            {"median": SimpleNamespace(n_features_in_=10), "metrics": {"samples": 23}},
+            {"median": SimpleNamespace(n_features_in_=1)},
+        ),
+    ],
+)
+def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
+    model_kind, older_filename, newer_filename, older_payload, newer_payload, tmp_path
+) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    _write_signed_artifact(tmp_path / older_filename, older_payload)
+    _write_signed_artifact(tmp_path / newer_filename, newer_payload)
+    clear_artifact_status_cache()
+    with (
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.safe_persistence._validate_path", side_effect=lambda candidate: candidate
+        ),
+    ):
+        status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status == {
+        "trained": True,
+        "last_trained": "2026-10-01T12:00:00+00:00",
+        "samples": older_payload["metrics"]["samples"],
+        "metrics": older_payload["metrics"],
+        "unavailable_reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "older_filename", "newer_filename", "older_payload"),
+    [
+        (
+            "cop",
+            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            "cop_model_weather_dhw_v4_20261002_1200.pkl",
+            {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
+        ),
+        (
+            "demand",
+            "demand_model_weather_v3_20261001_1200.pkl",
+            "demand_model_weather_v3_20261002_1200.pkl",
+            {"median": SimpleNamespace(n_features_in_=10), "metrics": {"samples": 23}},
+        ),
+    ],
+)
+def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
+    model_kind, older_filename, newer_filename, older_payload, tmp_path
+) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    _write_signed_artifact(tmp_path / older_filename, older_payload)
+    (tmp_path / newer_filename).write_bytes(b"not a signed artifact")
+    clear_artifact_status_cache()
+    with (
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.safe_persistence._validate_path", side_effect=lambda candidate: candidate
+        ),
+    ):
+        status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status["trained"] is True
+    assert status["last_trained"] == "2026-10-01T12:00:00+00:00"
+    assert status["metrics"] == older_payload["metrics"]
+    assert status["unavailable_reason"] is None
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "filename", "payload"),
+    [
+        (
+            "cop",
+            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            {"model": SimpleNamespace(n_features_in_=1)},
+        ),
+        (
+            "demand",
+            "demand_model_weather_v3_20261001_1200.pkl",
+            {"median": SimpleNamespace(n_features_in_=1)},
+        ),
+    ],
+)
+def test_model_status_reports_only_incompatible_artifact(
+    model_kind, filename, payload, tmp_path
+) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    _write_signed_artifact(tmp_path / filename, payload)
+    clear_artifact_status_cache()
+    with (
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.safe_persistence._validate_path", side_effect=lambda candidate: candidate
+        ),
+    ):
+        status = _inspect_model_artifact(model_kind, tmp_path)
+
+    assert status["trained"] is False
+    assert status["unavailable_reason"] == "incompatible_artifact"
+
+
+def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    path = tmp_path / "cop_model_weather_dhw_v4_20261001_1200.pkl"
+    path.write_bytes(b"first")
+    clear_artifact_status_cache()
+    loaded_metrics = iter(({"samples": 4}, {"samples": 9}))
+    load_latest = MagicMock(return_value=True)
+    fake_model = SimpleNamespace(
+        load_latest=load_latest, version="20261001_1200", metrics={"samples": 0}
+    )
+
+    def load_changed_metrics():
+        fake_model.metrics = next(loaded_metrics)
+        return True
+
+    load_latest.side_effect = load_changed_metrics
+    with patch("packages.ml.models.COPModel", return_value=fake_model):
+        first = _inspect_model_artifact("cop", tmp_path)
+        second = _inspect_model_artifact("cop", tmp_path)
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
+        third = _inspect_model_artifact("cop", tmp_path)
+
+    assert first["metrics"] == {"samples": 4}
+    assert second == first
+    assert third["metrics"] == {"samples": 9}
+    assert load_latest.call_count == 2
+
+
+def test_model_status_cache_invalidates_when_an_artifact_is_added(tmp_path) -> None:
+    from packages.ml.model_status import _inspect_model_artifact
+
+    first_path = tmp_path / "cop_model_weather_dhw_v4_20261001_1200.pkl"
+    first_path.write_bytes(b"first")
+    clear_artifact_status_cache()
+    fake_model = SimpleNamespace(version="20261001_1200", metrics={"samples": 4})
+    fake_model.load_latest = MagicMock(return_value=True)
+
+    with patch("packages.ml.models.COPModel", return_value=fake_model):
+        first = _inspect_model_artifact("cop", tmp_path)
+        (tmp_path / "cop_model_weather_dhw_v4_20261002_1200.pkl").write_bytes(b"second")
+        fake_model.metrics = {"samples": 9}
+        second = _inspect_model_artifact("cop", tmp_path)
+
+    assert first["metrics"] == {"samples": 4}
+    assert second["metrics"] == {"samples": 9}
+    assert fake_model.load_latest.call_count == 2
 
 
 @pytest.mark.asyncio

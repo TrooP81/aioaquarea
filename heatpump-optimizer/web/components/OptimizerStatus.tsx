@@ -13,6 +13,7 @@ interface ModelInfo {
   samples?: number;
   source_records?: number;
   metrics?: { mae?: number; cv_std?: number; samples?: number; baseline_mae?: number; validation_method?: string };
+  unavailable_reason?: "not_found" | "integrity_check_failed" | "incompatible_artifact" | "load_failed" | null;
   data_quality?: DemandDataQuality;
 }
 
@@ -190,6 +191,7 @@ interface ModelCard {
   state: ModelState;
   lastTrained: string | null;
   detail: string;
+  unavailableReason?: string;
   nextStep: string;
   capabilities?: Array<{ label: string; state: "ready" | "learning" | "waiting" }>;
 }
@@ -223,6 +225,12 @@ function layerBadgeClass(layer: string): string {
   if (layer.includes("ml")) return "opt-layer-badge opt-layer-badge--ml";
   if (layer.includes("milp")) return "opt-layer-badge opt-layer-badge--milp";
   return "opt-layer-badge";
+}
+
+function modelUnavailableReason(reason: ModelInfo["unavailable_reason"]): string | undefined {
+  if (reason === "integrity_check_failed") return "Saved model failed its integrity check.";
+  if (reason === "incompatible_artifact") return "Saved model is from an older format - retrain to update.";
+  return undefined;
 }
 
 export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlState: ControlState | null; spaceHeatingGate: SpaceHeatingGate | null }) {
@@ -376,8 +384,8 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
     fresh: false,
   };
   const demandDetail = demandQuality
-    ? `${demandQuality.usable_samples}/${demandQuality.minimum_samples} usable intervals${demandQuality.remaining_samples ? ` · ${demandQuality.remaining_samples} still needed` : ""}${demandQuality.training_blocker === "waiting_for_space_heating_season" ? " · waiting for heating season" : ""}${demandQuality.rejected_rate_bounds > 0 ? ` · ${demandQuality.rejected_rate_bounds} rejected as implausible rate` : ""}${demandQuality.weather_matches > 0 ? ` · weather matched ${demandQuality.weather_matches}` : ""}`
-    : `${status.demand_model.samples ?? 0} usable intervals`;
+    ? `${status.demand_model.source_records ?? 0} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""} · ${demandQuality.usable_samples}/${demandQuality.minimum_samples} usable intervals${demandQuality.remaining_samples ? ` · ${demandQuality.remaining_samples} still needed` : ""}${demandQuality.training_blocker === "waiting_for_space_heating_season" ? " · waiting for heating season" : ""}${demandQuality.rejected_rate_bounds > 0 ? ` · ${demandQuality.rejected_rate_bounds} rejected as implausible rate` : ""}${demandQuality.weather_matches > 0 ? ` · weather matched ${demandQuality.weather_matches}` : ""}`
+    : `${status.demand_model.source_records ?? 0} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""}`;
 
   const models: ModelCard[] = [
     {
@@ -394,6 +402,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
         : "collecting",
       lastTrained: status.cop_model.last_trained,
       detail: `${status.cop_model.source_records ?? 0} energy readings${status.cop_model.metrics?.mae != null ? ` · forward CV MAE ${status.cop_model.metrics.mae.toFixed(3)} COP${status.cop_model.metrics.cv_std != null ? ` · ±${status.cop_model.metrics.cv_std.toFixed(3)}` : ""}` : " · validation score will appear after the next training run"}`,
+      unavailableReason: modelUnavailableReason(status.cop_model.unavailable_reason),
       nextStep: status.cop_model.trained
         ? status.cop_model.metrics?.baseline_mae != null && status.cop_model.metrics?.mae != null && status.cop_model.metrics.mae >= status.cop_model.metrics.baseline_mae
           ? "The learned model does not yet beat the simple baseline, so it is not promoted as validated."
@@ -408,6 +417,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
         : "collecting",
       lastTrained: status.demand_model.last_trained,
       detail: demandDetail,
+      unavailableReason: modelUnavailableReason(status.demand_model.unavailable_reason),
       nextStep: status.demand_model.trained
         ? "Used only when the selected decision layer and input-quality gates allow it."
         : demandQuality?.training_blocker === "waiting_for_space_heating_season"
@@ -611,6 +621,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
               <div className="model-card-details">
                 <div>Last trained: {formatDate(m.lastTrained)}</div>
                 <div>{m.detail}</div>
+                {m.unavailableReason && <div>{m.unavailableReason}</div>}
                 {m.capabilities && (
                   <div className="model-capabilities">
                     {m.capabilities.map((capability) => (

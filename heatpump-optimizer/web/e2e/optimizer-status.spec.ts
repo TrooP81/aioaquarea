@@ -12,8 +12,8 @@ const statusWithFreshData = {
         fresh: true,
     },
     planning_data_quality: { control_allowed: true, reasons: [] },
-    cop_model: { trained: false, last_trained: null, samples: 12 },
-    demand_model: { trained: false, last_trained: null, samples: 8 },
+    cop_model: { trained: false, last_trained: null as string | null, samples: 12, source_records: 42, metrics: { mae: 0.123, samples: 12 }, unavailable_reason: null as string | null },
+    demand_model: { trained: false, last_trained: null as string | null, samples: 8, source_records: 42, metrics: { mae: 0.456, samples: 8 }, unavailable_reason: null as string | null },
     thermal_model: {
         calibrated: false,
         tank_heating_rate: 0,
@@ -204,6 +204,38 @@ test.describe("Models status split", () => {
             await diagnostics.elementHandle(),
         );
         expect(diagnosticsSectionsAreSiblings).toBe(true);
+    });
+
+    test("shows artifact-backed reading counts and validation MAE on COP and Demand cards", async ({ page }) => {
+        await mockOptimizerStatus(page, {
+            ...statusWithFreshData,
+            cop_model: { ...statusWithFreshData.cop_model, trained: true, last_trained: "2026-10-01T12:00:00+00:00" },
+            demand_model: { ...statusWithFreshData.demand_model, trained: true, last_trained: "2026-10-01T12:00:00+00:00" },
+        });
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+
+        const copCard = page.locator(".model-card").filter({ has: page.getByRole("heading", { name: "COP Model" }) });
+        await expect(copCard).toContainText(/Last trained: .*2026/);
+        await expect(copCard).toContainText("42 energy readings");
+        await expect(copCard).toContainText("forward CV MAE 0.123 COP");
+
+        const demandCard = page.locator(".model-card").filter({ has: page.getByRole("heading", { name: "Demand Model" }) });
+        await expect(demandCard).toContainText(/Last trained: .*2026/);
+        await expect(demandCard).toContainText("42 energy readings");
+        await expect(demandCard).toContainText("validation MAE 0.456 kW");
+    });
+
+    test("shows saved-model integrity failures on the affected model card", async ({ page }) => {
+        await mockOptimizerStatus(page, {
+            ...statusWithFreshData,
+            cop_model: { ...statusWithFreshData.cop_model, unavailable_reason: "integrity_check_failed" },
+        });
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+
+        const copCard = page.locator(".model-card").filter({ has: page.getByRole("heading", { name: "COP Model" }) });
+        await expect(copCard).toContainText("Saved model failed its integrity check.");
     });
 
     test("has a no-skip heading hierarchy in the accessibility snapshot", async ({ page }) => {
