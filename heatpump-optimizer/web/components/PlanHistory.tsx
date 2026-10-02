@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useCurrency, formatCostInCurrency } from "./useCurrency";
 import { useTimeFormat } from "./useTimeFormat";
 import { PlanAction, usePlanActions } from "./usePlanActions";
+import { useRefresh } from "./RefreshContext";
 import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
 
 interface PlanSummary {
@@ -179,10 +180,11 @@ function formatLateness(seconds: number | null | undefined): string | null {
 }
 
 export function PlanHistory() {
+  const { refreshEpoch } = useRefresh();
   const [plans, setPlans] = useState<PlanSummary[]>([]);
   const [showAllRevisions, setShowAllRevisions] = useState(false);
   const [visibleCount, setVisibleCount] = useState(12);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const {
@@ -196,22 +198,25 @@ export function PlanHistory() {
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
-  const loadPlans = useCallback(() => {
-    fetch("/api/plans?limit=50")
-      .then((r) => {
-        if (!r.ok) throw new Error(`API error (${r.status})`);
-        return r.json();
-      })
-      .then((data) => setPlans(data))
-      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load plan history"))
-      .finally(() => setLoading(false));
+  const loadPlans = useCallback(async (signal: AbortSignal) => {
+    setError(null);
+    try {
+      const response = await fetch("/api/plans?limit=50", { signal });
+      if (!response.ok) throw new Error(`API error (${response.status})`);
+      const data = await response.json();
+      if (!signal.aborted) setPlans(data);
+    } catch (e) {
+      if (!signal.aborted) setError(e instanceof Error ? e.message : "Failed to load plan history");
+    } finally {
+      if (!signal.aborted) setInitialLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    loadPlans();
-    const interval = window.setInterval(loadPlans, 30_000);
-    return () => window.clearInterval(interval);
-  }, [loadPlans]);
+    const controller = new AbortController();
+    void loadPlans(controller.signal);
+    return () => controller.abort();
+  }, [loadPlans, refreshEpoch]);
 
   const toggleExpand = (planId: number) => {
     if (expandedId === planId) {
@@ -251,7 +256,7 @@ export function PlanHistory() {
     : groupedPlans
   ).slice(0, visibleCount);
 
-  if (loading) {
+  if (initialLoading) {
     return (
       <div className="plan-section">
         <h2 className="chart-title">Plan Revisions</h2>
@@ -263,7 +268,7 @@ export function PlanHistory() {
     );
   }
 
-  if (error) {
+  if (error && plans.length === 0) {
     return (
       <div className="plan-section">
         <h2 className="chart-title">Plan Revisions</h2>
@@ -296,6 +301,7 @@ export function PlanHistory() {
           Show every technical revision
         </label>
       </div>
+      {error && <div className="plan-error"><span>{error}</span></div>}
       <div className="plan-history-list">
         {historyRows.map(({ plan, grouped }, rowIndex) => {
           const isExpanded = expandedId === plan.id;

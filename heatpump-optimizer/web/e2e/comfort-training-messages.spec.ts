@@ -64,7 +64,7 @@ test.describe("Comfort training messages", () => {
         await mockPage(page, { status: "training_in_progress" });
 
         await page.goto("/");
-        await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("tab", { name: "Under the hood" }).click();
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 
@@ -76,7 +76,7 @@ test.describe("Comfort training messages", () => {
         await mockPage(page, { status: "training_skipped", reason: "insufficient_samples" });
 
         await page.goto("/");
-        await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("tab", { name: "Under the hood" }).click();
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 
@@ -89,7 +89,7 @@ test.describe("Comfort training messages", () => {
         await mockPage(page, { training_notice: "training_lock_finalize_recovered" });
 
         await page.goto("/");
-        await page.getByRole("tab", { name: "Models" }).click();
+        await page.getByRole("tab", { name: "Under the hood" }).click();
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train Comfort Model" }).click();
 

@@ -858,7 +858,7 @@ class TestPhase2AlertAcceptance:
             alert["details"]["latest_blocked_trigger_at"]
             == (now - dt.timedelta(minutes=4)).isoformat()
         )
-        assert alert["href"] == "/?view=plan&activity=safety#plan-action-17"
+        assert alert["href"] == "/?view=timeline&activity=safety#plan-action-17"
 
     @pytest.mark.asyncio
     async def test_P2_AC8_watchdog_threshold_and_reset_are_durable(self):

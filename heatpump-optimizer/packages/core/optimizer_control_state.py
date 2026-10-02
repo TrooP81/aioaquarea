@@ -238,7 +238,7 @@ async def resolve_control_state(
                     detail="No actions are dispatched, including safety reverts.",
                     reason_code="learning_mode_active",
                     primary_action=ControlStateAction(
-                        kind="link", label="View plan", href="/?view=plan"
+                        kind="link", label="View plan", href="/?view=timeline"
                     ),
                     resolved_at=now,
                 )
@@ -258,7 +258,7 @@ async def resolve_control_state(
                     detail="Automatic dispatch remains active; the forecast indicates comfort risk.",
                     reason_code="comfort_at_risk",
                     primary_action=ControlStateAction(
-                        kind="link", label="View plan", href="/?view=plan"
+                        kind="link", label="View plan", href="/?view=timeline"
                     ),
                     resolved_at=now,
                 )
@@ -295,7 +295,7 @@ async def resolve_control_state(
                 detail="Automatic dispatch remains active.",
                 reason_code="new_plans_paused" if notices else "automatic",
                 primary_action=ControlStateAction(
-                    kind="link", label="View plan", href="/?view=plan"
+                    kind="link", label="View plan", href="/?view=timeline"
                 ),
                 notices=notices,
                 resolved_at=now,
@@ -317,6 +317,6 @@ def _holding(reason_code: str, now: dt.datetime) -> ControlStateSnapshot:
         headline="Automatic control is holding",
         detail="Ordinary affected actions are held or deferred; safety reverts may still run.",
         reason_code=reason_code,
-        primary_action=ControlStateAction(kind="link", label="View plan", href="/?view=plan"),
+        primary_action=ControlStateAction(kind="link", label="View plan", href="/?view=timeline"),
         resolved_at=now,
     )

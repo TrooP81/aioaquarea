@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Banner } from "./Banner";
+import { useRefresh } from "./RefreshContext";
 
 interface OperationalAlert {
   id: string;
@@ -21,36 +22,32 @@ interface OperationalAlertData {
 
 /** Compact, auto-refreshing operational health summary for the Overview tab. */
 export function OperationalAlerts() {
+  const { refreshEpoch } = useRefresh();
   const [data, setData] = useState<OperationalAlertData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
 
   useEffect(() => {
-    let alive = true;
-    const load = () => {
+    const controller = new AbortController();
+    const load = async () => {
       setLoading(true);
       setError(null);
-      fetch("/api/operations/alerts")
-        .then((response) => {
-          if (!response.ok) throw new Error(`Operational alerts returned ${response.status}`);
-          return response.json();
-        })
-        .then((value) => {
-          if (alive) setData(value);
-        })
-        .catch(() => {
-          if (alive) setError("Operational alerts could not be loaded.");
-        })
-        .finally(() => { if (alive) setLoading(false); });
+      try {
+        const response = await fetch("/api/operations/alerts", { signal: controller.signal });
+        if (!response.ok) throw new Error(`Operational alerts returned ${response.status}`);
+        setData(await response.json());
+      } catch {
+        if (!controller.signal.aborted) setError("Operational alerts could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
     };
-    load();
-    const interval = window.setInterval(load, 30_000);
+    void load();
     return () => {
-      alive = false;
-      window.clearInterval(interval);
+      controller.abort();
     };
-  }, [retry]);
+  }, [refreshEpoch, retry]);
 
   if (loading) return <section className="plan-section"><h2 className="chart-title">Operational health</h2><p className="text-muted text-sm">Loading operational alerts...</p></section>;
   if (error) return <section className="plan-section"><h2 className="chart-title">Operational health</h2><Banner tone="warning"><p>{error}</p><button className="btn btn-sm" onClick={() => setRetry((value) => value + 1)}>Retry</button></Banner></section>;

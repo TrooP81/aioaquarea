@@ -140,7 +140,7 @@ export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale
               : "Forecast stays within the active target"}
           </strong>
           <div className="decision-summary-actions">
-            <Link className="btn btn-sm" href="/?view=plan">View plan</Link>
+            <Link className="btn btn-sm" href="/?view=timeline">View plan</Link>
             {settingsLink && <Link className="btn btn-sm btn-primary" href={settingsLink}>Review blocker</Link>}
           </div>
         </div>

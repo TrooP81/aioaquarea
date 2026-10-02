@@ -67,7 +67,7 @@ test("plan history ignores a late response from a previously expanded plan", asy
   );
 
   await page.goto("/");
-  await page.getByRole("tab", { name: "Plan" }).click();
+  await page.getByRole("tab", { name: "Timeline" }).click();
   const rows = page.locator(".plan-history-row");
   await expect(rows).toHaveCount(2);
 
@@ -77,4 +77,55 @@ test("plan history ignores a late response from a previously expanded plan", asy
   await expect(page.getByText("second plan only")).toBeVisible();
   await page.waitForTimeout(350);
   await expect(page.getByText("first plan only")).not.toBeVisible();
+});
+
+test("plan history stays visible while a shared-clock refresh is pending", async ({ page }) => {
+  await page.addInitScript(() => {
+    const intervals = new Map<number, () => void>();
+    const original = window.setInterval;
+    window.setInterval = ((callback: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      const id = original(callback, timeout, ...args);
+      if (timeout === 30_000 && typeof callback === "function") intervals.set(id, callback as () => void);
+      return id;
+    }) as typeof window.setInterval;
+    Object.defineProperty(window, "__phase3RefreshIntervals", { value: intervals });
+  });
+  let releaseRefresh!: () => void;
+  const delayedRefresh = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+  let planRequests = 0;
+  let delayRefresh = false;
+  await page.route(/\/api\/plans\?limit=\d+$/, async (route) => {
+    planRequests += 1;
+    if (delayRefresh) await delayedRefresh;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(plans) }).catch(() => undefined);
+  });
+  await page.route("**/api/plans/101", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ ...plans[0], actions: [action("expanded_detail")] }),
+    })
+  );
+
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Timeline" }).click();
+  const firstRow = page.locator(".plan-history-row").first();
+  await expect(firstRow).toBeVisible();
+  await firstRow.click();
+  await expect(page.getByText("expanded detail")).toBeVisible();
+
+  const requestsBeforeRefresh = planRequests;
+  delayRefresh = true;
+  await page.evaluate(() => Array.from(
+    (window as unknown as { __phase3RefreshIntervals: Map<number, () => void> }).__phase3RefreshIntervals.values(),
+  ).forEach((callback) => callback()));
+  await expect.poll(() => planRequests).toBe(requestsBeforeRefresh + 1);
+  await expect(firstRow).toBeVisible();
+  await expect(page.getByText("expanded detail")).toBeVisible();
+  const historySection = page.locator(".plan-section", {
+    has: page.getByRole("heading", { name: "Plan change history" }),
+  });
+  await expect(historySection.locator("> .plan-loading")).toHaveCount(0);
+
+  releaseRefresh();
+  await expect(firstRow).toBeVisible();
 });

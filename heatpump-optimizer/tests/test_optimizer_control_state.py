@@ -624,7 +624,7 @@ def test_control_state_schema_preserves_utc_actions_and_notices():
             "until": None,
             "override_id": None,
             "active_override_count": 0,
-            "primary_action": {"kind": "link", "label": "View plan", "href": "/?view=plan"},
+            "primary_action": {"kind": "link", "label": "View plan", "href": "/?view=timeline"},
             "notices": [
                 {
                     "code": "new_plans_paused",

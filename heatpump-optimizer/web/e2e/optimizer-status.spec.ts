@@ -69,7 +69,7 @@ async function mockOptimizerStatus(page: import("@playwright/test").Page, status
 
 test.describe("Models status split", () => {
     test("keeps diagnostics collapsed with an accessible keyboard disclosure", async ({ page }) => {
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         const toggle = page.getByRole("button", { name: "Show diagnostics" });
         await expect(page.getByRole("heading", { name: "Why it decides" })).toBeVisible();
         await expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -94,10 +94,10 @@ test.describe("Models status split", () => {
     });
 
     test("keeps Models text at the scoped 0.8rem readability floor", async ({ page }) => {
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await page.getByRole("button", { name: "Show diagnostics" }).click();
 
-        const undersizedText = await page.locator("#dashboard-panel-status").locator("*").evaluateAll((elements) =>
+        const undersizedText = await page.locator("#dashboard-panel-under-the-hood").locator("*").evaluateAll((elements) =>
             elements
                 .filter((element) => Array.from(element.childNodes).some(
                     (node) => node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim()),
@@ -111,7 +111,7 @@ test.describe("Models status split", () => {
 
     test("keeps the summary when an optional diagnostics request aborts", async ({ page }) => {
         await page.route("**/api/thermal/forecast-scorecard", (route) => route.abort());
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await expect(page.getByText(/The active engine is/)).toBeVisible();
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         await expect(page.getByRole("heading", { name: "Forecast validation" })).toBeVisible();
@@ -128,7 +128,7 @@ test.describe("Models status split", () => {
             await page.route(`**${path}`, (route) => route.abort());
         }
 
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await expect(page.getByRole("heading", { name: "Why it decides" })).toBeVisible();
         await expect(page.getByText(/The active engine is Rules\./)).toBeVisible();
         await page.getByRole("button", { name: "Show diagnostics" }).click();
@@ -151,8 +151,8 @@ test.describe("Models status split", () => {
         });
 
         for (const state of Object.keys(controlStates) as Array<keyof typeof controlStates>) {
-            await page.goto(`/?view=status&state=${state}`);
-            const summary = page.locator("#dashboard-panel-status");
+            await page.goto(`/?view=under-the-hood&state=${state}`);
+            const summary = page.locator("#dashboard-panel-under-the-hood");
             await expect(summary.getByRole("heading", { name: "Why it decides" })).toBeVisible();
             const controlSummary = summary.locator("p").filter({ hasText: controlStates[state].headline });
             await expect(controlSummary).toBeVisible();
@@ -171,7 +171,7 @@ test.describe("Models status split", () => {
 
     test("retains the pre-split Models fields and sections when diagnostics are expanded", async ({ page }) => {
         await mockOptimizerStatus(page);
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         const diagnostics = page.locator("#optimizer-diagnostics-panel");
 
@@ -207,9 +207,9 @@ test.describe("Models status split", () => {
     });
 
     test("has a no-skip heading hierarchy in the accessibility snapshot", async ({ page }) => {
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await page.getByRole("button", { name: "Show diagnostics" }).click();
-        const snapshot = await page.locator("#dashboard-panel-status").ariaSnapshot();
+        const snapshot = await page.locator("#dashboard-panel-under-the-hood").ariaSnapshot();
         const levels = [...snapshot.matchAll(/\[level=(\d)\]/g)].map((match) => Number(match[1]));
         expect(levels[0]).toBe(2);
         expect(levels.every((level, index) => index === 0 || level <= levels[index - 1] + 1)).toBe(true);
@@ -224,7 +224,7 @@ test.describe("Models status split", () => {
             }
         });
 
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await page.getByRole("button", { name: "Show diagnostics" }).click();
         await page.getByRole("button", { name: "Train COP & Demand" }).click();
         await expect.poll(() => postPaths).toContain("/api/ml/train");
@@ -242,9 +242,9 @@ test.describe("Models status split", () => {
     test("uses ordered Models headings and no horizontal overflow", async ({ page }) => {
         for (const width of [375, 640, 1280]) {
             await page.setViewportSize({ width, height: 800 });
-            await page.goto("/?view=status");
+            await page.goto("/?view=under-the-hood");
             await page.getByRole("button", { name: "Show diagnostics" }).click();
-            const levels = await page.locator("#dashboard-panel-status h1, #dashboard-panel-status h2, #dashboard-panel-status h3, #dashboard-panel-status h4").evaluateAll((headings) => headings.map((heading) => Number(heading.tagName.slice(1))));
+            const levels = await page.locator("#dashboard-panel-under-the-hood h1, #dashboard-panel-under-the-hood h2, #dashboard-panel-under-the-hood h3, #dashboard-panel-under-the-hood h4").evaluateAll((headings) => headings.map((heading) => Number(heading.tagName.slice(1))));
             expect(levels.every((level, index) => index === 0 || level <= levels[index - 1] + 1)).toBe(true);
             expect(await page.evaluate(() => document.body.scrollWidth)).toBeLessThanOrEqual(width + 1);
         }
@@ -252,7 +252,7 @@ test.describe("Models status split", () => {
 
     test("shows the required status error when optimizer status fails", async ({ page }) => {
         await page.route("**/api/optimizer/status", (route) => route.fulfill({ status: 503, body: "{}" }));
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await expect(page.getByText("Failed to load optimizer status")).toBeVisible();
     });
 
@@ -268,10 +268,10 @@ test.describe("Models status split", () => {
             });
             return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(statusWithFreshData) });
         });
-        await page.goto("/?view=status");
+        await page.goto("/?view=under-the-hood");
         await expect(page.getByText("Failed to load optimizer status")).toBeVisible();
         allowSuccess = true;
-        await page.getByRole("button", { name: "Retry" }).click();
+        await page.getByRole("button", { name: "Retry", exact: true }).click();
         await expect(page.getByRole("button", { name: "Retrying..." })).toHaveAttribute("aria-busy", "true");
         expect(releaseRetry).toBeDefined();
         const retryResponse = page.waitForResponse((response) =>

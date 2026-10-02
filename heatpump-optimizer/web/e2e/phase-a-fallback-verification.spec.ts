@@ -120,11 +120,11 @@ test("renders fallback indoor forecast warning without browser errors", async ({
     await page.route(/\/api\/(plans|plan-activity|operations\/alerts)(\?|$)/, (route) => route.fulfill(json([])));
 
     await page.goto("/");
-    const chartsTab = page.locator('button[aria-controls="dashboard-panel-charts"]:visible');
+    const chartsTab = page.locator('button[aria-controls="dashboard-panel-under-the-hood"]:visible');
     await expect(chartsTab).toBeVisible();
     await chartsTab.evaluate((element) => (element as HTMLButtonElement).click());
-    await expect(page.locator("#dashboard-panel-charts")).toBeVisible();
-    await expect(page.locator("#dashboard-panel-charts").getByText("Comfort warning")).toBeVisible();
-    await expect(page.locator("#dashboard-panel-charts .recharts-wrapper").first()).toBeVisible();
+    await expect(page.locator("#dashboard-panel-under-the-hood")).toBeVisible();
+    await expect(page.locator("#dashboard-panel-under-the-hood").getByText("Comfort warning")).toBeVisible();
+    await expect(page.locator("#dashboard-panel-under-the-hood .recharts-wrapper").first()).toBeVisible();
     expect(browserErrors).toEqual([]);
 });

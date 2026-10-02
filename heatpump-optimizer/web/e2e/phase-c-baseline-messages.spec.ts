@@ -104,7 +104,7 @@ test("chart_message_uses_v5_source_metadata_and_legacy_overlap_fallback", async 
     for (const scenario of ["shadow", "history", "default", "none", "explicit", "legacy"] as const) {
         await mockDashboard(page, scenario);
         await page.goto("/");
-        await page.getByRole("tab", { name: "Charts" }).click();
+        await page.getByRole("tab", { name: "Under the hood" }).click();
         const chart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
         await expect(chart).toBeVisible();
         if (scenario === "explicit") {

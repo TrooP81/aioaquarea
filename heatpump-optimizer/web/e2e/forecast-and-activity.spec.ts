@@ -127,14 +127,14 @@ test("shows rainfall and separates actual activity from plan revisions", async (
 
   await page.goto("/");
 
-  await page.getByRole("tab", { name: "Charts" }).click();
+  await page.getByRole("tab", { name: "Under the hood" }).click();
   await expect(page.getByRole("region", { name: "Indoor comfort, weather and price forecast" })).toBeVisible();
   await page.getByText("Show raw weather, price and temperature history").click();
   await expect(
     page.locator(".recharts-bar-rectangle .recharts-rectangle").first(),
   ).toBeVisible();
   await expect(page.getByText("Blue bars show rain in mm/h.")).toBeVisible();
-  await page.getByRole("tab", { name: "Plan" }).click();
+  await page.getByRole("tab", { name: "Timeline" }).click();
   await expect(page.getByTestId("plan-activity")).toBeVisible();
   await expect(page.getByText("Heat hot water")).toBeVisible();
   await expect(page.getByText("Command completed and verified")).toBeVisible();

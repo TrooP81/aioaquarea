@@ -118,7 +118,7 @@ test.describe("Responsive Layout", () => {
     await page.goto("/");
 
     const decisionBeforeCost = await page.locator(".decision-summary").evaluate((decision) => {
-      const cost = document.querySelector("#dashboard-panel-overview h3.card-group-label");
+      const cost = document.querySelector("#dashboard-panel-home h3.card-group-label");
       return cost !== null && Boolean(decision.compareDocumentPosition(cost) & Node.DOCUMENT_POSITION_FOLLOWING);
     });
     expect(decisionBeforeCost).toBe(true);
@@ -130,7 +130,7 @@ test.describe("Responsive Layout", () => {
       route.fulfill(jsonResponse({ plans_scored: 1, overall: { samples: 1, mae: 0.1, bias: 0, p90_abs_error: 0.2 }, horizons: [], regimes: {}, quality_gate: { status: "failed", control_allowed: false, reason: "mystery_code" }, note: "No forecast evidence" }))
     );
 
-    await page.goto("/?view=status");
+    await page.goto("/?view=under-the-hood");
 
     await page.getByRole("button", { name: "Show diagnostics" }).click();
     await expect(page.getByText(/Quality gate: Unrecognized status \(mystery_code\)/)).toBeVisible();
@@ -163,7 +163,7 @@ test.describe("Responsive Layout", () => {
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/");
       const tabs = page.getByRole("tab");
-      await expect(tabs).toHaveCount(5);
+      await expect(tabs).toHaveCount(3);
       await expect(page.locator('[role="tab"][tabindex="0"]')).toHaveCount(1);
       const active = page.getByRole("tab", { selected: true });
       const rectangles = await active.evaluate((tab) => {
@@ -177,30 +177,30 @@ test.describe("Responsive Layout", () => {
   });
 
   test("workspace tabs support roving keyboard focus and URL history", async ({ page }) => {
-    await page.goto("/?view=charts");
+    await page.goto("/?view=under-the-hood");
     const tabs = page.getByRole("tab");
-    const charts = page.getByRole("tab", { name: "Charts" });
+    const charts = page.getByRole("tab", { name: "Under the hood" });
     await expect(charts).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator("#dashboard-panel-charts")).toBeVisible();
+    await expect(page.locator("#dashboard-panel-under-the-hood")).toBeVisible();
 
     await charts.focus();
     await page.keyboard.press("ArrowRight");
-    await expect(page.getByRole("tab", { name: "Models" })).toBeFocused();
-    await expect(page.getByRole("tab", { name: "Models" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("tab", { name: "Home" })).toBeFocused();
+    await expect(page.getByRole("tab", { name: "Home" })).toHaveAttribute("aria-selected", "true");
     await page.keyboard.press("Home");
     await expect(tabs.first()).toBeFocused();
     await page.keyboard.press("End");
     await expect(tabs.last()).toBeFocused();
 
     await page.evaluate(() => {
-      window.history.pushState({}, "", "/?view=plan");
+      window.history.pushState({}, "", "/?view=timeline");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    await expect(page.getByRole("tab", { name: "Plan" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator("#dashboard-panel-plan")).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Timeline" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#dashboard-panel-timeline")).toBeVisible();
 
     await page.goto("/?view=not-a-section");
-    await expect(page.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("tab", { name: "Home" })).toHaveAttribute("aria-selected", "true");
   });
 
   test("loading and normal dashboard states each expose exactly one main", async ({ page }) => {
@@ -262,7 +262,7 @@ test.describe("Responsive Layout", () => {
       window.scrollTo = ((...args: unknown[]) => calls.push(args)) as typeof window.scrollTo;
     });
     await page.goto("/");
-    await page.getByRole("tab", { name: "Charts" }).click();
+    await page.getByRole("tab", { name: "Under the hood" }).click();
 
     const scrollCalls = await page.evaluate(() => (window as unknown as Window & { __scrollCalls: unknown[] }).__scrollCalls);
     expect(scrollCalls.some((args) => JSON.stringify(args).includes('"behavior":"auto"'))).toBe(true);
@@ -273,7 +273,7 @@ test.describe("Responsive Layout", () => {
     for (const [width, expectedColumns] of [[375, 2], [640, 1], [768, 2], [1280, 4]] as const) {
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/");
-      const grid = page.locator("#dashboard-panel-overview > .grid").first();
+      const grid = page.locator("#dashboard-panel-home > .grid").first();
       const metrics = await grid.evaluate((element) => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();

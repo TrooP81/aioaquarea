@@ -83,7 +83,7 @@ test.describe("Override Controls", () => {
 
   test("controls section is visible", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     // Controls component should render
     await expect(page.locator("text=Controls")).toBeVisible({ timeout: 5000 }).catch(() => {
       // Controls might use different heading text — just verify the page loaded
@@ -272,7 +272,7 @@ test("pause flow previews the end time and resumes with DELETE then refetch", as
   });
 
   await page.goto("/");
-  await page.getByRole("tab", { name: "Controls" }).click();
+  await page.getByRole("tab", { name: "Home" }).click();
   await page.getByRole("button", { name: "Pause Optimizer" }).click();
   await expect(page.locator(".banner").filter({ hasText: /Pause for 2 hours, ending at/ })).toBeVisible();
   await page.getByRole("button", { name: "Confirm pause" }).click();

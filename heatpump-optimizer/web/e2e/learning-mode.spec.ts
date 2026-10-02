@@ -63,7 +63,7 @@ test.describe("Learning Mode", () => {
     );
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     await expect(page.getByRole("status").filter({ hasText: "Learning" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();
   });
@@ -79,7 +79,7 @@ test.describe("Learning Mode", () => {
     );
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     await expect(page.locator(".banner").filter({ hasText: "Learning mode enabled" })).toHaveCount(0);
   });
 
@@ -106,7 +106,7 @@ test.describe("Learning Mode", () => {
     page.on("dialog", (dialog) => dialog.accept());
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     const toggle = page.getByRole("button", { name: "Turn On Learning Mode" });
     await expect(toggle).toBeVisible({ timeout: 5000 });
     await toggle.click();
@@ -139,7 +139,7 @@ test.describe("Learning Mode", () => {
       return dialogs === 1 ? dialog.accept() : dialog.dismiss();
     });
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     await page.getByRole("button", { name: "Turn On Learning Mode" }).click();
 
     await expect(page.getByText("Safety restores wait until control resumes.")).toBeVisible();
@@ -161,7 +161,7 @@ test.describe("Learning Mode", () => {
     });
     page.on("dialog", (dialog) => dialog.accept());
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     await page.getByRole("button", { name: "Turn On Learning Mode" }).click();
 
     await expect(page.getByRole("button", { name: "Turn Off Learning Mode" })).toBeVisible();

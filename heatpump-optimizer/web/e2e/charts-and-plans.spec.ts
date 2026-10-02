@@ -190,7 +190,7 @@ test.describe("Price Chart", () => {
 
   test("renders price chart section", async ({ page }) => {
     await page.goto("/");
-    const chartsTab = page.getByRole("tab", { name: "Charts" });
+    const chartsTab = page.getByRole("tab", { name: "Under the hood" });
     const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
     await chartsTab.click();
     try {
@@ -215,7 +215,7 @@ test.describe("Price Chart", () => {
     page.on("pageerror", (error) => pageErrors.push(error));
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Charts" }).click();
+    await page.getByRole("tab", { name: "Under the hood" }).click();
     await page.getByText("Show raw weather, price and temperature history").click();
 
     const priceChart = page.getByRole("region", { name: "Electricity price chart" });
@@ -251,15 +251,15 @@ test.describe("Price Chart", () => {
   test("switches between dashboard workspaces without scrolling through all sections", async ({ page }) => {
     await page.goto("/");
 
-    const planTab = page.getByRole("tab", { name: "Plan" });
+    const planTab = page.getByRole("tab", { name: "Timeline" });
     await expect(planTab).toHaveAttribute("aria-selected", "false");
     await planTab.click();
 
     await expect(planTab).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("heading", { name: "What actually happened" })).toBeVisible();
-    await expect(page.locator("#dashboard-panel-overview")).toBeHidden();
+    await expect(page.locator("#dashboard-panel-home")).toBeHidden();
 
-    const modelsTab = page.getByRole("tab", { name: "Models" });
+    const modelsTab = page.getByRole("tab", { name: "Under the hood" });
     await modelsTab.click();
     await expect(modelsTab).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("heading", { name: "Why it decides" })).toBeVisible();
@@ -356,7 +356,7 @@ test.describe("Plan View", () => {
     await expect(decisionSummary).toBeVisible({ timeout: 10000 });
     await expect(decisionSummary).toContainText("Heat hot water");
 
-    await page.getByRole("tab", { name: "Plan" }).click();
+    await page.getByRole("tab", { name: "Timeline" }).click();
 
     // Active Plan section should show the plan header
     await expect(page.getByRole("heading", { name: "Active Plan" })).toBeVisible();
@@ -364,11 +364,11 @@ test.describe("Plan View", () => {
     await expect(page.locator(".plan-cost-value")).not.toContainText("kr");
 
     // Should show human-readable status "Scheduled" instead of raw "pending"
-    await expect(page.locator("#dashboard-panel-plan .plan-action-status", { hasText: "Scheduled" }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator("#dashboard-panel-timeline .plan-action-status", { hasText: "Scheduled" }).first()).toBeVisible({ timeout: 5000 });
 
     // Should show human-readable action label
     await expect(
-      page.locator("#dashboard-panel-plan .plan-action-type").getByText("Heat hot water"),
+      page.locator("#dashboard-panel-timeline .plan-action-type").getByText("Heat hot water"),
     ).toBeVisible();
   });
 
@@ -423,7 +423,7 @@ test.describe("Plan View", () => {
     );
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Plan" }).click();
+    await page.getByRole("tab", { name: "Timeline" }).click();
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     // Should display error message instead of empty list
     await expect(page.locator(".plan-error")).toBeVisible({ timeout: 5000 });

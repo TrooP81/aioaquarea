@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ACTION_LABELS, LAYER_LABELS, STATUS_DISPLAY, formatTime } from "@/lib/constants";
+import { useRefresh } from "./RefreshContext";
 import { useTimeFormat } from "./useTimeFormat";
 
 interface PlanActivity {
@@ -19,6 +20,34 @@ interface PlanActivity {
 }
 
 const SUCCESS_STATUSES = new Set(["executed", "executed_unverified"]);
+const OUTCOME_STATUSES = [
+  "executed",
+  "executed_unverified",
+  "failed",
+  "expired",
+  "skipped",
+  "skipped_peak",
+  "cancelled",
+];
+const SAFETY_STATUSES = ["pending", "executing", "dispatched"];
+const ACTIVITY_FILTERS = ["meaningful", "failed", "executed", "safety", "all"] as const;
+
+type ActivityFilter = (typeof ACTIVITY_FILTERS)[number];
+
+function locationFilter(): ActivityFilter {
+  const requested = new URLSearchParams(window.location.search).get("activity");
+  return ACTIVITY_FILTERS.includes(requested as ActivityFilter)
+    ? requested as ActivityFilter
+    : "meaningful";
+}
+
+function statusesForFilter(filter: ActivityFilter): string[] {
+  if (filter === "failed") return ["failed", "expired"];
+  if (filter === "executed") return ["executed", "executed_unverified"];
+  if (filter === "safety") return SAFETY_STATUSES;
+  if (filter === "all") return [...OUTCOME_STATUSES, ...SAFETY_STATUSES];
+  return OUTCOME_STATUSES;
+}
 
 type TimelineEntry =
   | { kind: "action"; action: PlanActivity }
@@ -85,55 +114,94 @@ function formatActivityDate(iso: string, hour12: boolean): string {
 }
 
 export function PlanActivityTimeline() {
+  const { refreshEpoch } = useRefresh();
   const [activity, setActivity] = useState<PlanActivity[]>([]);
-  const [filter, setFilter] = useState<"meaningful" | "failed" | "executed" | "all">("meaningful");
+  const [filter, setFilter] = useState<ActivityFilter>(locationFilter);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deepLinkTarget, setDeepLinkTarget] = useState<string | null>(null);
+  const [deepLinkNotice, setDeepLinkNotice] = useState<string | null>(null);
+  const [deepLinkHash, setDeepLinkHash] = useState(() => window.location.hash);
+  const highlightedHash = useRef<string | null>(null);
   const timeFormat = useTimeFormat();
 
   useEffect(() => {
-    let active = true;
+    const controller = new AbortController();
 
     const loadActivity = async () => {
       try {
-        const statuses = filter === "failed"
-          ? "&status=failed&status=expired"
-          : filter === "executed"
-            ? "&status=executed&status=executed_unverified"
-            : "";
-        const response = await fetch(`/api/plan-activity?limit=100${statuses}`);
+        await Promise.resolve();
+        if (controller.signal.aborted) return;
+        const params = new URLSearchParams({ limit: "200" });
+        statusesForFilter(filter).forEach((status) => params.append("status", status));
+        const response = await fetch(`/api/plan-activity?${params}`, { signal: controller.signal });
         if (!response.ok) throw new Error(`API error (${response.status})`);
         const data: PlanActivity[] = await response.json();
-        if (active) {
-          setActivity(data);
-          setError(null);
-          window.setTimeout(() => {
-            if (window.location.hash.startsWith("#plan-action-")) {
-              document.querySelector(window.location.hash)?.scrollIntoView({ block: "center" });
-            }
-          }, 0);
-        }
+        if (controller.signal.aborted) return;
+        setActivity(data);
+        setError(null);
       } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : "Failed to load recent activity");
+        if (!controller.signal.aborted) {
+          setError(err instanceof Error ? err.message : "Failed to load recent activity");
+        }
       } finally {
-        if (active) setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
 
-    loadActivity();
-    const interval = window.setInterval(loadActivity, 30_000);
+    void loadActivity();
     return () => {
-      active = false;
-      window.clearInterval(interval);
+      controller.abort();
     };
-  }, [filter]);
+  }, [filter, refreshEpoch]);
 
   useEffect(() => {
-    const requested = new URLSearchParams(window.location.search).get("activity");
-    if (requested === "failed" || requested === "executed" || requested === "all") {
-      setFilter(requested);
-    }
+    const applyFilter = () => setFilter(locationFilter());
+    window.addEventListener("popstate", applyFilter);
+    return () => window.removeEventListener("popstate", applyFilter);
   }, []);
+
+  useEffect(() => {
+    const applyHash = () => {
+      highlightedHash.current = null;
+      setDeepLinkTarget(null);
+      setDeepLinkNotice(null);
+      setDeepLinkHash(window.location.hash);
+    };
+    window.addEventListener("hashchange", applyHash);
+    return () => window.removeEventListener("hashchange", applyHash);
+  }, []);
+
+  useEffect(() => {
+    const hash = deepLinkHash;
+    const match = /^#plan-action-(\d+)$/.exec(hash);
+    if (!match || loading || error || highlightedHash.current === hash) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(`plan-action-${match[1]}`);
+      if (!target) {
+        setDeepLinkNotice("Linked action is no longer in recent activity.");
+        return;
+      }
+      highlightedHash.current = hash;
+      setDeepLinkNotice(null);
+      setDeepLinkTarget(target.id);
+      target.scrollIntoView({ block: "center" });
+    });
+    const timeout = window.setTimeout(() => setDeepLinkTarget(null), 8_000);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [activity, deepLinkHash, error, loading]);
+
+  useEffect(() => {
+    if (!deepLinkTarget) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(deepLinkTarget)?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [deepLinkTarget]);
 
   if (loading) {
     return (
@@ -160,6 +228,7 @@ export function PlanActivityTimeline() {
     return (
       <section className="plan-section">
         <h2 className="chart-title">Recent Activity</h2>
+        {deepLinkNotice && <p className="plan-error" role="status">{deepLinkNotice}</p>}
         <p className="chart-caption">No completed, failed, skipped, or replaced optimizer actions yet.</p>
       </section>
     );
@@ -175,7 +244,7 @@ export function PlanActivityTimeline() {
           </p>
         </div>
         <div className="activity-filters" aria-label="Filter plan activity">
-          {(["meaningful", "failed", "executed", "all"] as const).map((value) => (
+          {ACTIVITY_FILTERS.map((value) => (
             <button
               key={value}
               className={`btn btn-sm ${filter === value ? "btn-primary" : ""}`}
@@ -187,11 +256,10 @@ export function PlanActivityTimeline() {
           ))}
         </div>
       </div>
+      {deepLinkNotice && <p className="plan-error" role="status">{deepLinkNotice}</p>}
       <ol className="plan-activity-list">
         {summariseActivity(
-          filter === "meaningful"
-            ? activity.filter((item) => item.status !== "cancelled" || item.result?.reason !== "superseded")
-            : activity,
+          activity.filter((item) => item.status !== "cancelled" || item.result?.reason !== "superseded"),
         ).map((entry) => {
           if (entry.kind === "replacement") {
             const occurredAt = entry.cancelled[0].executed_at || entry.cancelled[0].scheduled_ts;
@@ -219,7 +287,13 @@ export function PlanActivityTimeline() {
           const occurredAt = item.executed_at || item.scheduled_ts;
           const layer = LAYER_LABELS[item.optimizer_version] || item.optimizer_version;
           return (
-            <li key={item.id} id={`plan-action-${item.id}`} className="plan-activity-item">
+            <li
+              key={item.id}
+              id={`plan-action-${item.id}`}
+              className={`plan-activity-item ${deepLinkTarget === `plan-action-${item.id}` ? "deep-link-target" : ""}`}
+              tabIndex={deepLinkTarget === `plan-action-${item.id}` ? -1 : undefined}
+              aria-current={deepLinkTarget === `plan-action-${item.id}` ? "true" : undefined}
+            >
               <span className={`plan-activity-marker ${status.className}`} aria-hidden="true" />
               <time className="plan-activity-time" dateTime={occurredAt}>
                 {formatActivityDate(occurredAt, timeFormat.hour12)}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Dashboard } from "@/components/Dashboard";
 import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
@@ -21,8 +21,9 @@ import { TabNavigation } from "@/components/TabNavigation";
 import { DecisionSummary } from "@/components/DecisionSummary";
 import { Banner } from "@/components/Banner";
 import { DataAge } from "@/components/DataAge";
+import { RefreshProvider, useRefresh } from "@/components/RefreshContext";
 import type { ControlState, ReadQuotaResponse, SpaceHeatingGate } from "@/lib/api-types";
-import { SECTIONS, SectionId } from "@/lib/constants";
+import { LEGACY_SECTION_ALIASES, SECTIONS, SectionId } from "@/lib/constants";
 import Link from "next/link";
 
 interface DashboardData {
@@ -143,9 +144,13 @@ function isControlState(value: unknown): value is ControlState {
 async function fetchOptionalJson<T>(
   path: string,
   validate?: (value: unknown) => value is T,
+  signal?: AbortSignal,
 ): Promise<T | null> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 1_000);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
   try {
     const response = await fetch(path, { signal: controller.signal });
     if (!response.ok) return null;
@@ -155,10 +160,20 @@ async function fetchOptionalJson<T>(
     return null;
   } finally {
     window.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
 export default function Home() {
+  return (
+    <RefreshProvider>
+      <DashboardPage />
+    </RefreshProvider>
+  );
+}
+
+function DashboardPage() {
+  const { refreshEpoch, refreshNow } = useRefresh();
   const [data, setData] = useState<DashboardData | null>(null);
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
   const [controlState, setControlState] = useState<ControlState | null>(null);
@@ -168,8 +183,10 @@ export default function Home() {
   const [polling, setPolling] = useState(false);
   const [pollResult, setPollResult] = useState<PollResult | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [activeSection, setActiveSection] = useState<SectionId>("overview");
+  const [activeSection, setActiveSection] = useState<SectionId>("home");
   const [showRawChartDetails, setShowRawChartDetails] = useState(false);
+  const [locationHash, setLocationHash] = useState("");
+  const fetchGeneration = useRef(0);
 
   const selectSection = (section: SectionId) => {
     setActiveSection(section);
@@ -178,16 +195,18 @@ export default function Home() {
     window.history.pushState({ view: section }, "", url);
   };
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async (signal?: AbortSignal) => {
+    const generation = ++fetchGeneration.current;
     try {
       const [dashRes, tempRes, controlRes, quotaRes] = await Promise.all([
-        fetch("/api/dashboard"),
-        fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest"),
-        fetchOptionalJson("/api/control-state", isControlState),
-        fetchOptionalJson<ReadQuotaResponse>("/api/panasonic/read-quota"),
+        fetch("/api/dashboard", { signal }),
+        fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest", undefined, signal),
+        fetchOptionalJson("/api/control-state", isControlState, signal),
+        fetchOptionalJson<ReadQuotaResponse>("/api/panasonic/read-quota", undefined, signal),
       ]);
       if (!dashRes.ok) throw new Error(`API error: ${dashRes.status}`);
       const json = await dashRes.json();
+      if (signal?.aborted || generation !== fetchGeneration.current) return;
       setData(json);
       setIndoorTemp(tempRes);
       setControlState(controlRes);
@@ -195,34 +214,57 @@ export default function Home() {
       setError(null);
       setLastUpdated(new Date());
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch data");
+      if (!signal?.aborted && generation === fetchGeneration.current) {
+        setError(e instanceof Error ? e.message : "Failed to fetch data");
+      }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted && generation === fetchGeneration.current) setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(() => {
-      fetchData();
-    }, 30000);
-    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    void fetchData(controller.signal);
+    return () => controller.abort();
+  }, [fetchData, refreshEpoch]);
+
+  useEffect(() => {
     const applyLocation = () => {
-      const requested = new URLSearchParams(window.location.search).get("view");
-      if (SECTIONS.some((section) => section.id === requested)) {
-        setActiveSection(requested as SectionId);
-      } else {
-        setActiveSection("overview");
+      const url = new URL(window.location.href);
+      const requested = url.searchParams.get("view");
+      const canonical = SECTIONS.find((section) => section.id === requested);
+      const alias = requested ? LEGACY_SECTION_ALIASES[requested] : undefined;
+      const section = canonical?.id ?? alias?.section ?? "home";
+
+      if (alias) {
+        url.searchParams.set("view", alias.section);
+        if (!url.hash && alias.hash) url.hash = alias.hash;
+      } else if (requested && !canonical) {
+        url.searchParams.delete("view");
       }
+      if (url.href !== window.location.href) window.history.replaceState({}, "", url);
+      setLocationHash(url.hash);
+      if (requested === "charts") setShowRawChartDetails(true);
+      setActiveSection(section);
     };
 
     applyLocation();
     window.addEventListener("popstate", applyLocation);
-    return () => window.removeEventListener("popstate", applyLocation);
+    window.addEventListener("hashchange", applyLocation);
+    return () => {
+      window.removeEventListener("popstate", applyLocation);
+      window.removeEventListener("hashchange", applyLocation);
+    };
   }, []);
+
+  useEffect(() => {
+    const hash = locationHash;
+    if (!hash || /^#plan-action-\d+$/.test(hash)) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(hash.slice(1))?.scrollIntoView({ block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeSection, loading, locationHash, showRawChartDetails]);
 
   const pollNow = async () => {
     setPolling(true);
@@ -269,7 +311,7 @@ export default function Home() {
     } catch {
       setPollResult({ success: false, message: "Network error — is the API running?" });
     } finally {
-      await fetchData();
+      refreshNow();
       setPolling(false);
     }
   };
@@ -295,7 +337,7 @@ export default function Home() {
     try {
       const res = await fetch(action.endpoint, { method: action.method });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
-      await fetchData();
+      refreshNow();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to cancel override");
     }
@@ -396,11 +438,11 @@ export default function Home() {
 
       {/* ── Overview section ── */}
       <section
-        id="dashboard-panel-overview"
+        id="dashboard-panel-home"
         className="workspace-panel"
         role="tabpanel"
-        aria-labelledby="dashboard-tab-overview"
-        hidden={activeSection !== "overview"}
+        aria-labelledby="dashboard-tab-home"
+        hidden={activeSection !== "home"}
       >
         <DecisionSummary
           plan={data?.active_plan ?? null}
@@ -413,69 +455,57 @@ export default function Home() {
         <Dashboard data={data} />
         <OperationalAlerts />
         <OutcomeSummary />
+        <div id="controls">
+          <Controls controlState={controlState} onChanged={async () => refreshNow()} />
+          <LearningModeCard onChange={refreshNow} />
+        </div>
       </section>
 
-      {/* ── Controls (moved up — emergency actions should be accessible) ── */}
       <section
-        id="dashboard-panel-controls"
+        id="dashboard-panel-timeline"
         className="workspace-panel"
         role="tabpanel"
-        aria-labelledby="dashboard-tab-controls"
-        hidden={activeSection !== "controls"}
+        aria-labelledby="dashboard-tab-timeline"
+        hidden={activeSection !== "timeline"}
       >
-        <Controls controlState={controlState} onChanged={fetchData} />
-        <LearningModeCard onChange={fetchData} />
+        {activeSection === "timeline" && (
+          <>
+            <PlanView plan={data?.active_plan ?? null} />
+            <PlanActivityTimeline />
+            <PlanHistory />
+          </>
+        )}
       </section>
 
-      {/* ── Plan section ── */}
       <section
-        id="dashboard-panel-plan"
+        id="dashboard-panel-under-the-hood"
         className="workspace-panel"
         role="tabpanel"
-        aria-labelledby="dashboard-tab-plan"
-        hidden={activeSection !== "plan"}
-      >
-        <PlanView plan={data?.active_plan ?? null} />
-        <PlanActivityTimeline />
-        <PlanHistory />
-      </section>
-
-      {/* ── Charts section ── */}
-      <section
-        id="dashboard-panel-charts"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-charts"
-        hidden={activeSection !== "charts"}
+        aria-labelledby="dashboard-tab-under-the-hood"
+        hidden={activeSection !== "under-the-hood"}
       >
         <ComfortImpactChart />
         <ConsumptionChart />
-        <div style={{ marginBottom: "1rem" }}>
-          <button className="btn btn-sm" onClick={() => setShowRawChartDetails((value) => !value)}>
-            {showRawChartDetails
-              ? "Hide raw weather, price and temperature history"
-              : "Show raw weather, price and temperature history"}
-          </button>
+        <div id="raw-charts">
+          <div style={{ marginBottom: "1rem" }}>
+            <button className="btn btn-sm" onClick={() => setShowRawChartDetails((value) => !value)}>
+              {showRawChartDetails
+                ? "Hide raw weather, price and temperature history"
+                : "Show raw weather, price and temperature history"}
+            </button>
+          </div>
+          {showRawChartDetails && (
+            <>
+              <PriceChart />
+              <TemperatureChart />
+              <ForecastChart />
+            </>
+          )}
         </div>
-        {showRawChartDetails && (
-          <>
-            <PriceChart />
-            <TemperatureChart />
-            <ForecastChart />
-          </>
-        )}
         <ThermalPredictionChart />
-      </section>
-
-      {/* ── Status section ── */}
-      <section
-        id="dashboard-panel-status"
-        className="workspace-panel"
-        role="tabpanel"
-        aria-labelledby="dashboard-tab-status"
-        hidden={activeSection !== "status"}
-      >
-        <OptimizerStatus controlState={controlState} spaceHeatingGate={data?.space_heating_gate ?? null} />
+        <div id="models">
+          <OptimizerStatus controlState={controlState} spaceHeatingGate={data?.space_heating_gate ?? null} />
+        </div>
       </section>
     </main>
   );

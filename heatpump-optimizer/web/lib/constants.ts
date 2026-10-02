@@ -24,14 +24,20 @@ export interface Section {
 }
 
 export const SECTIONS = [
-  { id: "overview", label: "Overview", description: "Live readings and the next planned action" },
-  { id: "controls", label: "Controls", description: "Pause, override, or collect learning data" },
-  { id: "plan", label: "Plan", description: "Current schedule, completed actions, and plan revisions" },
-  { id: "charts", label: "Charts", description: "Prices, temperatures, energy use, weather, and predictions" },
-  { id: "status", label: "Models", description: "Optimizer decisions and learning-model health" },
+  { id: "home", label: "Home", description: "Live readings, controls, and operational health" },
+  { id: "timeline", label: "Timeline", description: "Current schedule, outcomes, and plan revisions" },
+  { id: "under-the-hood", label: "Under the hood", description: "Raw charts and optimizer diagnostics" },
 ] as const;
 
 export type SectionId = (typeof SECTIONS)[number]["id"];
+
+export const LEGACY_SECTION_ALIASES: Record<string, { section: SectionId; hash?: string }> = {
+  overview: { section: "home" },
+  controls: { section: "home", hash: "#controls" },
+  plan: { section: "timeline" },
+  charts: { section: "under-the-hood", hash: "#raw-charts" },
+  status: { section: "under-the-hood", hash: "#models" },
+};
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Optimizer layers

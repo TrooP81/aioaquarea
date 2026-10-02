@@ -274,7 +274,7 @@ async def get_operational_alerts(
                 action="Open Plan history to review the affected actions.",
                 plan_id=affected.plan_id,
                 action_id=affected.id,
-                href=f"/?view=plan&activity=failed#plan-action-{affected.id}",
+                href=f"/?view=timeline&activity=failed#plan-action-{affected.id}",
             )
         )
     if safety_action is not None:
@@ -315,7 +315,7 @@ async def get_operational_alerts(
                 action="Investigate the safety revert immediately.",
                 plan_id=safety_action.plan_id,
                 action_id=safety_action.id,
-                href=f"/?view=plan&activity=safety#plan-action-{safety_action.id}",
+                href=f"/?view=timeline&activity=safety#plan-action-{safety_action.id}",
                 details=details,
             )
         )
@@ -336,7 +336,7 @@ async def get_operational_alerts(
                 action="Investigate the safety worker and restore the device state.",
                 plan_id=pending_unclaimed_safety_action.plan_id,
                 action_id=pending_unclaimed_safety_action.id,
-                href=f"/?view=plan&activity=safety#plan-action-{pending_unclaimed_safety_action.id}",
+                href=f"/?view=timeline&activity=safety#plan-action-{pending_unclaimed_safety_action.id}",
                 details={
                     "device_id": pending_unclaimed_safety_action.device_id,
                     "plan_id": pending_unclaimed_safety_action.plan_id,
