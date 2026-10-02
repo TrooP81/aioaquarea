@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from typing import Any
@@ -667,7 +668,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         is_comfort_hour,
     )
     from packages.ml.thermal import thermal_model
-    from packages.optimizer.executor_core import is_learning_mode_active
+    from packages.optimizer.executor_core import LearningModeState, resolve_learning_mode_state
 
     thermal_model.load_latest()
     async with get_session() as session:
@@ -710,7 +711,14 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     # dispatches nothing — the plan is created but not run, so the tank follows
     # the heat pump's native behaviour — so we fall back to the deadband estimate
     # and flag it instead of pretending the plan drives the tank.
-    learning_mode = await is_learning_mode_active()
+    try:
+        learning_mode_state = await resolve_learning_mode_state()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - curve projection must fail closed
+        logger.warning("thermal_curve_learning_mode_check_failed", error_type=type(exc).__name__)
+        learning_mode_state = LearningModeState.UNKNOWN
+    learning_mode = learning_mode_state is LearningModeState.ACTIVE
     dhw_minutes_per_hour = [0.0] * hours
     plan_id = None
     plan_driven = False
@@ -719,7 +727,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         active_plan = plan_result.scalar_one_or_none()
         if active_plan:
             plan_id = active_plan.id
-            if not learning_mode:
+            if learning_mode_state is LearningModeState.INACTIVE:
                 actions_result = await session.execute(
                     select(PlanActionRecord)
                     .where(PlanActionRecord.plan_id == active_plan.id)
@@ -783,6 +791,8 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
             "tank_min_temp_offpeak": tank_min_temp_offpeak,
             "plan_driven": plan_driven,
             "learning_mode": learning_mode,
+            "learning_mode_state": learning_mode_state.value,
+            "learning_mode_reliable": learning_mode_state is not LearningModeState.UNKNOWN,
             "plan_id": plan_id,
         },
         "curves": {

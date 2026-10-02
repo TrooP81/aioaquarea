@@ -77,6 +77,10 @@ def _v7_artifact(model):
 
 
 class TestAC8ArtifactLifecycle:
+    @pytest.fixture(autouse=True)
+    def _learning_gate(self, optimization_learning_gate):
+        return optimization_learning_gate
+
     @pytest.mark.asyncio
     async def test_AC8_1_status_predict_and_train_refresh_before_use(self):
         model = MagicMock()
@@ -610,6 +614,10 @@ class TestAC9ComfortEvidence:
 
 
 class TestAC10FreshnessSafety:
+    @pytest.fixture(autouse=True)
+    def _learning_gate(self, optimization_learning_gate):
+        return optimization_learning_gate
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("configured", "poll", "expected"),

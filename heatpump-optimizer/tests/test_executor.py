@@ -1597,3 +1597,67 @@ class TestExpireStaleActions:
         assert "expired" in status_updates
         assert expired_stmt_sql is not None
         assert "plan_actions.status IN" in expired_stmt_sql
+
+    @pytest.mark.asyncio
+    async def test_expiry_query_uses_the_two_minute_cutoff_before_dispatch(self, executor):
+        with patch("packages.optimizer.executor.get_session") as mock_gs:
+            session = AsyncMock()
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            stale_result = MagicMock()
+            stale_result.scalars.return_value.all.return_value = []
+            session.execute = AsyncMock(return_value=stale_result)
+
+            before = dt.datetime.now(dt.timezone.utc)
+            await executor.expire_stale_actions()
+
+        statement = session.execute.await_args.args[0]
+        cutoff = next(
+            value for value in statement.compile().params.values() if isinstance(value, dt.datetime)
+        )
+        assert dt.timedelta(seconds=119) < before - cutoff < dt.timedelta(seconds=121)
+
+    @pytest.mark.asyncio
+    async def test_degraded_expiry_bounds_exposure_without_expiring_linked_restore(self, executor):
+        linked_restore = SimpleNamespace(
+            id=1,
+            plan_id=1,
+            action_type=str(ActionType.FORCE_DHW_OFF),
+            reverts_action_id=9,
+            scheduled_ts=dt.datetime(2026, 9, 24, 10, tzinfo=dt.timezone.utc),
+            status="pending",
+        )
+        ordinary_action = SimpleNamespace(
+            id=2,
+            plan_id=1,
+            action_type=str(ActionType.SET_TANK_TEMP),
+            reverts_action_id=None,
+            scheduled_ts=dt.datetime(2026, 9, 24, 10, tzinfo=dt.timezone.utc),
+            status="pending",
+        )
+        stale_result = MagicMock()
+        stale_result.scalars.return_value.all.return_value = [linked_restore, ordinary_action]
+        latest_plan_result = MagicMock()
+        latest_plan_result.scalar_one_or_none.return_value = 1
+        session = AsyncMock()
+        session.execute = AsyncMock(side_effect=[stale_result, latest_plan_result, MagicMock()])
+        executor._device_quality_check = AsyncMock(
+            return_value={"ready": False, "reasons": ["device_status_stale"]}
+        )
+
+        with (
+            patch("packages.optimizer.executor.get_session") as mock_gs,
+            patch.object(
+                executor,
+                "_diagnose_missed",
+                new=AsyncMock(return_value={"reason": "executor_gap"}),
+            ),
+        ):
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await executor.expire_stale_actions()
+
+        update_statement = session.execute.await_args_list[-1].args[0]
+        assert _extract_stmt_values(update_statement)["status"] == "expired"
+        assert ordinary_action.id in update_statement.compile().params.values()
+        assert linked_restore.id not in update_statement.compile().params.values()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from typing import Any
@@ -76,15 +77,17 @@ def minimum_floor_protection_duties(
     return duties
 
 
-async def _resolve_learning_mode() -> bool:
+async def _resolve_learning_mode():
     """Read observe-only mode once for a plan; errors must not admit scoring."""
-    from packages.optimizer.executor_core import is_learning_mode_active
+    from packages.optimizer.executor_core import LearningModeState, resolve_learning_mode_state
 
     try:
-        return bool(await is_learning_mode_active())
+        return await resolve_learning_mode_state()
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001 - scoring admission must fail closed
         logger.warning("rules_learning_mode_check_failed", error_type=type(exc).__name__)
-        return False
+        return LearningModeState.UNKNOWN
 
 
 class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, ModeRulesMixin):
@@ -279,10 +282,16 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         return normalised
 
     async def generate_plan(self) -> dict[str, Any] | None:
+        from packages.optimizer.executor_core import LearningModeState
+
         now = dt.datetime.now(dt.timezone.utc)
         horizon_start = next_hour_boundary(now)
         horizon_end = horizon_start + dt.timedelta(hours=24)
-        learning_mode_active = await _resolve_learning_mode()
+        learning_mode_state = await _resolve_learning_mode()
+        if learning_mode_state is LearningModeState.UNKNOWN:
+            logger.info("rules_planning_skipped_learning_state_unknown")
+            return None
+        learning_mode_active = learning_mode_state is LearningModeState.ACTIVE
 
         thermal_model.load_latest()
 

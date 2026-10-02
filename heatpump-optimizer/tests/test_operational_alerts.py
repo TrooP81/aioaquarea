@@ -124,6 +124,10 @@ async def test_gate_failure_and_unknown_alerts_are_actionable() -> None:
             "packages.core.operational_alerts.project_panasonic_adapter_state",
             return_value={"state_fresh": True, "status": "available"},
         ),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            AsyncMock(return_value={}),
+        ),
         patch("packages.core.operational_alerts.get_session") as mock_get_session,
     ):
         mock_get_session.return_value = _AsyncContextManager(session)

@@ -66,6 +66,8 @@ interface CurveData {
     zone1_temp: number;
     plan_driven?: boolean;
     learning_mode?: boolean;
+    learning_mode_state?: "active" | "inactive" | "unknown";
+    learning_mode_reliable?: boolean;
     plan_id?: number | null;
   };
   curves: {
@@ -278,6 +280,10 @@ export function ThermalPredictionChart() {
     : null;
   const manualAdvice = comfortAssessment?.recommendations?.[0];
   const comfortWarning = comfortAssessment && ["at_risk", "degraded", "conflict", "room_overheat_suppression"].includes(comfortAssessment.state);
+  const learningModeState = curves?.current.learning_mode_state
+    ?? (curves?.current.learning_mode ? "active" : "inactive");
+  const learningModeUnavailable = learningModeState === "unknown"
+    || curves?.current.learning_mode_reliable === false;
 
   return (
     <div className="plan-section">
@@ -287,12 +293,14 @@ export function ThermalPredictionChart() {
         {status?.model_params.last_calibrated
           ? ` Model calibrated from ${status.model_params.sample_count} samples.`
           : " Model using defaults (calibrate to learn from your data)."}
-        {curves?.current.learning_mode
-          ? " 🎓 Learning mode is on — the optimizer plans but dispatches nothing, so the tank curve shows expected coasting, not the plan."
-          : curves?.current.plan_driven
-            ? ` Tank (with heating) follows the active plan${curves.current.plan_id ? ` #${curves.current.plan_id}` : ""
-            }'s hot-water schedule.`
-            : ""}
+        {learningModeUnavailable
+          ? " Learning-state data is unavailable, so this curve is held from active-plan control."
+          : curves?.current.learning_mode
+            ? " 🎓 Learning mode is on — the optimizer plans but dispatches nothing, so the tank curve shows expected coasting, not the plan."
+            : curves?.current.plan_driven
+              ? ` Tank (with heating) follows the active plan${curves.current.plan_id ? ` #${curves.current.plan_id}` : ""
+              }'s hot-water schedule.`
+              : ""}
       </p>
 
       {/* Summary cards */}

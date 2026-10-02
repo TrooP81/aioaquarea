@@ -1,5 +1,6 @@
 """Tests for ML models (COP, Demand) and ThermalModel."""
 
+import asyncio
 import datetime as dt
 import json
 from pathlib import Path
@@ -603,6 +604,10 @@ class TestPhysicalCurveOrdering:
 class TestOrchestratorFallback:
     """Tests for the orchestrator layer selection and fallback logic."""
 
+    @pytest.fixture(autouse=True)
+    def _learning_gate(self, optimization_learning_gate):
+        return optimization_learning_gate
+
     @pytest.mark.asyncio
     async def test_select_optimizer_can_reload_models(self):
         """reload_models=True should refresh checkpoints before selecting a layer."""
@@ -882,6 +887,93 @@ class TestOrchestratorFallback:
 
         milp.generate_plan.assert_not_awaited()
         rules.return_value.generate_plan.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_learning_state_skips_before_optimizer_selection(
+        self, optimization_learning_gate
+    ):
+        from packages.optimizer.executor_core import LearningModeState
+        from packages.optimizer.main import run_optimization
+
+        optimization_learning_gate.return_value = LearningModeState.UNKNOWN
+        with patch(
+            "packages.optimizer.main._select_optimizer", new=AsyncMock()
+        ) as select_optimizer:
+            assert await run_optimization() is None
+        select_optimizer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_learning_state_lookup_failure_skips_before_optimizer_selection(
+        self, optimization_learning_gate
+    ):
+        from packages.optimizer.main import run_optimization
+
+        optimization_learning_gate.side_effect = RuntimeError("settings unavailable")
+        with patch(
+            "packages.optimizer.main._select_optimizer", new=AsyncMock()
+        ) as select_optimizer:
+            assert await run_optimization() is None
+        select_optimizer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_learning_state_does_not_touch_active_plan_or_safety_links(
+        self, optimization_learning_gate
+    ):
+        from packages.optimizer.executor_core import LearningModeState
+        from packages.optimizer.main import run_optimization
+
+        optimization_learning_gate.return_value = LearningModeState.UNKNOWN
+        with (
+            patch("packages.optimizer.main.get_session") as get_session,
+            patch("packages.optimizer.main._select_optimizer", new=AsyncMock()) as select_optimizer,
+            patch(
+                "packages.optimizer.main.comfort_model",
+                SimpleNamespace(arefresh_if_changed=AsyncMock()),
+            ) as comfort_model,
+        ):
+            assert await run_optimization(force_replace=True) is None
+
+        # The active plan and any pending linked safety restore remain untouched
+        # because UNKNOWN returns before opening the lifecycle transaction.
+        get_session.assert_not_called()
+        select_optimizer.assert_not_awaited()
+        comfort_model.arefresh_if_changed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_learning_state_cancellation_propagates(self, optimization_learning_gate):
+        from packages.optimizer.main import run_optimization
+
+        optimization_learning_gate.side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await run_optimization()
+
+    @pytest.mark.asyncio
+    async def test_active_learning_state_reaches_normal_admission_checks(
+        self, optimization_learning_gate
+    ):
+        from packages.optimizer.executor_core import LearningModeState
+        from packages.optimizer.main import run_optimization
+
+        optimization_learning_gate.return_value = LearningModeState.ACTIVE
+        optimizer = AsyncMock()
+        with (
+            patch(
+                "packages.optimizer.main._select_optimizer",
+                new=AsyncMock(return_value=("rules", optimizer)),
+            ) as select_optimizer,
+            patch("packages.optimizer.main.get_setting", new=AsyncMock(return_value="rules_only")),
+            patch(
+                "packages.optimizer.main.comfort_model",
+                SimpleNamespace(arefresh_if_changed=AsyncMock()),
+            ),
+            patch(
+                "packages.optimizer.main.get_device_data_quality",
+                new=AsyncMock(return_value={"ready": False, "reasons": ["credentials_missing"]}),
+            ),
+        ):
+            assert await run_optimization() is None
+        select_optimizer.assert_awaited_once()
+        optimizer.generate_plan.assert_not_awaited()
 
 
 def test_model_dir_is_isolated_to_pytest_tmp(isolate_model_dir: Path) -> None:

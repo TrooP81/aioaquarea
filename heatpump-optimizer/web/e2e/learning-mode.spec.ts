@@ -52,6 +52,26 @@ async function mockCommon(page: import("@playwright/test").Page) {
 }
 
 test.describe("Learning Mode", () => {
+  test("shows unavailable thermal learning state without treating the plan as active", async ({ page }) => {
+    await mockCommon(page);
+    await page.route("**/api/thermal/status", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ model_params: { last_calibrated: null, sample_count: 0 }, predictions: { tank_heating: { minutes_to_target: 0, heating_rate_per_hour: 0, confidence: "low" }, tank_cooling: { minutes_until_min: null, loss_rate_per_hour: 0, confidence: "low" }, zone_boost: { minutes_for_2deg: 0, heating_rate_per_hour: 0, confidence: "low" } } }) }));
+    await page.route("**/api/thermal/curve?hours=24", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ current: { tank_temp: 48, tank_target: 52, outdoor_temp: 7, zone1_temp: 20, plan_driven: false, learning_mode: false, learning_mode_state: "unknown", learning_mode_reliable: false }, curves: { tank_standby: [], tank_heating: [], zone_standby: [] } }) }));
+
+    await page.goto("/");
+    await page.getByRole("tab", { name: "Under the Hood" }).click();
+    await expect(page.getByText("Learning-state data is unavailable")).toBeVisible();
+  });
+
+  test("uses the legacy learning boolean when tri-state fields are absent", async ({ page }) => {
+    await mockCommon(page);
+    await page.route("**/api/thermal/status", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ model_params: { last_calibrated: null, sample_count: 0 }, predictions: { tank_heating: { minutes_to_target: 0, heating_rate_per_hour: 0, confidence: "low" }, tank_cooling: { minutes_until_min: null, loss_rate_per_hour: 0, confidence: "low" }, zone_boost: { minutes_for_2deg: 0, heating_rate_per_hour: 0, confidence: "low" } } }) }));
+    await page.route("**/api/thermal/curve?hours=24", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ current: { tank_temp: 48, tank_target: 52, outdoor_temp: 7, zone1_temp: 20, plan_driven: false, learning_mode: true }, curves: { tank_standby: [], tank_heating: [], zone_standby: [] } }) }));
+
+    await page.goto("/");
+    await page.getByRole("tab", { name: "Under the Hood" }).click();
+    await expect(page.getByText("Learning mode is on")).toBeVisible();
+  });
+
   test("shows learning-mode banner when enabled", async ({ page }) => {
     await mockCommon(page);
     await page.route("**/api/learning-mode", (route) =>

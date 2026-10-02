@@ -11,7 +11,7 @@ import pytest
 
 from packages.api.schemas import DashboardResponse
 from packages.api.routers.dashboard import get_dashboard
-from packages.api.routers.models_router import get_heat_curve_advice
+from packages.api.routers.models_router import get_heat_curve_advice, get_thermal_curve
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig
 from packages.api.routers.optimizer import (
@@ -35,6 +35,109 @@ def _session_context(session):
             return False
 
     return _AsyncContextManager(session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("learning_state", "expected_learning_mode", "expected_reliable", "expected_plan_driven"),
+    [
+        ("active", True, True, False),
+        ("inactive", False, True, True),
+        ("unknown", False, False, False),
+    ],
+)
+async def test_thermal_curve_projects_tri_state_learning_contract(
+    learning_state, expected_learning_mode, expected_reliable, expected_plan_driven
+):
+    from packages.optimizer.executor_core import LearningModeState
+
+    status = SimpleNamespace(tank_temp=48.0, tank_target_temp=52, outdoor_temp=7.0, zone1_temp=20.0)
+    active_plan = SimpleNamespace(id=42)
+    action = SimpleNamespace(
+        action_type="force_dhw_on",
+        scheduled_ts=dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0),
+        payload_json=json.dumps({"dhw_minutes": 30}),
+    )
+    status_result = SimpleNamespace(scalar_one_or_none=lambda: status)
+    plan_result = SimpleNamespace(scalar_one_or_none=lambda: active_plan)
+    actions_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [action]))
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[status_result, plan_result, actions_result])
+    )
+    thermal_model = SimpleNamespace(
+        load_latest=MagicMock(),
+        predict_temperature_curve=MagicMock(return_value=[]),
+        predict_planned_tank_curve=MagicMock(return_value=[]),
+        predict_managed_tank_curve=MagicMock(return_value=[]),
+    )
+    with (
+        patch(
+            "packages.api.routers.models_router.get_session", return_value=_session_context(session)
+        ),
+        patch(
+            "packages.core.settings_service.get_comfort_schedule", new=AsyncMock(return_value={})
+        ),
+        patch("packages.core.settings_service.get_user_tz", new=AsyncMock(return_value="UTC")),
+        patch("packages.core.settings_service.get_setting", new=AsyncMock(return_value=None)),
+        patch(
+            "packages.optimizer.executor_core.resolve_learning_mode_state",
+            new=AsyncMock(return_value=LearningModeState(learning_state)),
+        ),
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+    ):
+        response = await get_thermal_curve(hours=1)
+
+    assert response["current"] == {
+        "tank_temp": 48.0,
+        "tank_target": 52,
+        "outdoor_temp": 7.0,
+        "zone1_temp": 20.0,
+        "tank_min_temp": response["current"]["tank_min_temp"],
+        "tank_min_temp_offpeak": response["current"]["tank_min_temp_offpeak"],
+        "plan_driven": expected_plan_driven,
+        "learning_mode": expected_learning_mode,
+        "learning_mode_state": learning_state,
+        "learning_mode_reliable": expected_reliable,
+        "plan_id": 42,
+    }
+
+
+@pytest.mark.asyncio
+async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
+    status = SimpleNamespace(
+        id=1,
+        tank_temp=48.0,
+        tank_target_temp=52,
+        outdoor_temp=7.0,
+        zone1_temp=20.0,
+    )
+    status_result = SimpleNamespace(scalar_one_or_none=lambda: status)
+    session = SimpleNamespace(execute=AsyncMock(return_value=status_result))
+    thermal_model = SimpleNamespace(
+        load_latest=MagicMock(),
+        predict_temperature_curve=MagicMock(return_value=[]),
+        predict_managed_tank_curve=MagicMock(return_value=[]),
+    )
+    with (
+        patch(
+            "packages.api.routers.models_router.get_session", return_value=_session_context(session)
+        ),
+        patch(
+            "packages.core.settings_service.get_comfort_schedule", new=AsyncMock(return_value={})
+        ),
+        patch("packages.core.settings_service.get_user_tz", new=AsyncMock(return_value="UTC")),
+        patch("packages.core.settings_service.get_setting", new=AsyncMock(return_value=None)),
+        patch(
+            "packages.optimizer.executor_core.resolve_learning_mode_state",
+            new=AsyncMock(side_effect=RuntimeError("unavailable")),
+        ),
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+    ):
+        response = await get_thermal_curve(hours=1)
+
+    assert response["current"]["learning_mode_state"] == "unknown"
+    assert response["current"]["learning_mode"] is False
+    assert response["current"]["learning_mode_reliable"] is False
 
 
 def test_dashboard_response_serializes_space_heating_gate_evidence() -> None:

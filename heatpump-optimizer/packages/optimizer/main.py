@@ -35,7 +35,8 @@ from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeo
 from packages.optimizer.actions import ActionType
 from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
-from packages.optimizer.executor import PlanExecutor
+from packages.optimizer.executor import PlanExecutor, resolve_learning_mode_state
+from packages.optimizer.executor_core import LearningModeState
 from packages.ml.models import COPModel, DemandModel
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
@@ -289,6 +290,20 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
     # the complete solve avoids two plans being calculated from the same state;
     # activate_plan then provides the database-level guard across processes.
     async with _optimization_lock:
+        try:
+            learning_mode_state = await resolve_learning_mode_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - planner admission must fail closed
+            logger.error(
+                "optimization_learning_mode_check_failed",
+                error_type=type(exc).__name__,
+            )
+            learning_mode_state = LearningModeState.UNKNOWN
+        if learning_mode_state is LearningModeState.UNKNOWN:
+            logger.info("optimization_skipped_learning_state_unknown")
+            # Comfort-model refresh is deferred along with planning during UNKNOWN.
+            return None
         try:
             layer = await get_setting("optimizer_layer") or "rules_only"
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)

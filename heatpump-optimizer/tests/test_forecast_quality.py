@@ -679,12 +679,17 @@ def test_baseline_comparison_requires_learning_mode_and_eligibility(
 
 @pytest.mark.asyncio
 async def test_learning_mode_lookup_error_does_not_admit_baseline_comparison():
-    async def unavailable() -> bool:
+    async def unavailable():
         raise RuntimeError("settings unavailable")
 
+    from packages.optimizer.executor_core import LearningModeState
+
     target = dt.datetime(2026, 1, 1, 1, tzinfo=dt.timezone.utc)
-    with patch("packages.optimizer.executor_core.is_learning_mode_active", unavailable):
-        learning_mode_active = await rules_engine._resolve_learning_mode()
+    with patch("packages.optimizer.executor_core.resolve_learning_mode_state", unavailable):
+        learning_mode_state = await rules_engine._resolve_learning_mode()
+    assert learning_mode_state is LearningModeState.UNKNOWN
+    learning_mode_active = learning_mode_state is LearningModeState.ACTIVE
+    assert learning_mode_active is False
     snapshot = rules_engine.RulesOptimizer._build_forecast_snapshot(
         prices=[(target - dt.timedelta(hours=1), 0.1)],
         weather=[(target - dt.timedelta(hours=1), 5.0)],

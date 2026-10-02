@@ -13,12 +13,23 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from unittest.mock import AsyncMock
 
 TEST_API_TOKEN = "test-token"
 
 os.environ.setdefault("API_TOKEN", TEST_API_TOKEN)
 
 import aioaquarea  # noqa: E402
+
+
+@pytest.fixture
+def optimization_learning_gate(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Keep orchestration tests independent from runtime learning-state storage."""
+    from packages.optimizer.executor_core import LearningModeState
+
+    resolver = AsyncMock(return_value=LearningModeState.INACTIVE)
+    monkeypatch.setattr("packages.optimizer.main.resolve_learning_mode_state", resolver)
+    return resolver
 
 
 @pytest.fixture(autouse=True)

@@ -571,21 +571,42 @@ async def test_learning_mode_resolution_fails_closed(monkeypatch):
         raise RuntimeError("settings unavailable")
 
     from packages.optimizer import executor_core
+    from packages.optimizer.executor_core import LearningModeState
 
-    monkeypatch.setattr(executor_core, "is_learning_mode_active", unavailable)
+    monkeypatch.setattr(executor_core, "resolve_learning_mode_state", unavailable)
 
-    assert await rules_engine._resolve_learning_mode() is False
+    assert await rules_engine._resolve_learning_mode() is LearningModeState.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_unknown_learning_state_skips_rules_plan_before_database_reads(monkeypatch):
+    from packages.optimizer.executor_core import LearningModeState
+
+    monkeypatch.setattr(
+        rules_engine,
+        "_resolve_learning_mode",
+        AsyncMock(return_value=LearningModeState.UNKNOWN),
+    )
+    get_session = MagicMock()
+    monkeypatch.setattr(rules_engine, "get_session", get_session)
+
+    assert await RulesOptimizer().generate_plan() is None
+    get_session.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    ("learning_mode_active", "expected"),
+    ("learning_mode_state", "expected"),
     [
-        (False, {"learning_mode": False, "eligible": False}),
-        (True, {"learning_mode": True, "eligible": True}),
+        ("inactive", {"learning_mode": False, "eligible": False}),
+        ("active", {"learning_mode": True, "eligible": True}),
+        ("unknown", {"learning_mode": False, "eligible": False}),
     ],
 )
-def test_snapshot_baseline_evaluation_uses_resolved_learning_mode(learning_mode_active, expected):
+def test_snapshot_baseline_evaluation_uses_resolved_learning_mode(learning_mode_state, expected):
+    from packages.optimizer.executor_core import LearningModeState
+
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    state = LearningModeState(learning_mode_state)
     snapshot = RulesOptimizer._build_forecast_snapshot(
         prices=[(start, 0.1)],
         weather=[(start, 5.0)],
@@ -600,7 +621,7 @@ def test_snapshot_baseline_evaluation_uses_resolved_learning_mode(learning_mode_
         comfort_temp_min=18.0,
         tz_name="UTC",
         effective_baseline_mode="shadow",
-        learning_mode_active=learning_mode_active,
+        learning_mode_active=state is LearningModeState.ACTIVE,
     )
 
     assert snapshot["baseline_evaluation"] == expected
@@ -967,6 +988,8 @@ async def test_rules_gate_error_falls_back():
 async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private_logs(
     failure_target,
 ):
+    from packages.optimizer.executor_core import LearningModeState
+
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     status = SimpleNamespace(
         device_id="device-1",
@@ -1025,6 +1048,13 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         return {"quiet_mode_start": 22, "quiet_mode_end": 7}.get(name, 10)
 
     with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                rules_engine,
+                "_resolve_learning_mode",
+                new=AsyncMock(return_value=LearningModeState.INACTIVE),
+            )
+        )
         stack.enter_context(
             patch.object(rules_engine, "get_session", return_value=SessionContext())
         )
@@ -1212,6 +1242,15 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(rules_engine, "get_session", return_value=SessionContext())
+        )
+        from packages.optimizer.executor_core import LearningModeState
+
+        stack.enter_context(
+            patch.object(
+                rules_engine,
+                "_resolve_learning_mode",
+                new=AsyncMock(return_value=LearningModeState.INACTIVE),
+            )
         )
         stack.enter_context(
             patch.object(optimizer, "_get_prices", new=AsyncMock(return_value=[(start, 0.1)]))
