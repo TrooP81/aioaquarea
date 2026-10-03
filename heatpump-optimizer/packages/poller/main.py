@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -24,7 +25,12 @@ from packages.core.services import (
 from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.poller.feeds import fetch_price_feed, fetch_weather
 from packages.poller.smartthings import poll_smartthings_temps
-from packages.core.settings_service import get_bool_setting, get_int_setting, get_string_setting
+from packages.core.settings_service import (
+    get_bool_setting,
+    get_int_setting,
+    get_string_setting,
+    get_user_tz,
+)
 from packages.core.device_status_snapshot import build_device_status_record
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
 from packages.core.device_status_ingestion import ingest_device_status
@@ -181,9 +187,11 @@ async def _record_fault(device) -> None:
 
 async def poll_consumption(wrapper: AquareaWrapper) -> None:
     """Poll consumption data and persist."""
+    now = dt.datetime.now(dt.timezone.utc)
+    timezone_name = await get_user_tz()
+    local_now = now.astimezone(ZoneInfo(timezone_name))
     if settings.panasonic_distributed_read_quota_enabled:
         try:
-            now = dt.datetime.now(dt.timezone.utc)
             device = await wrapper.get_device()
             raw_outdoor_temp = device.temperature_outdoor
             async with get_session() as session:
@@ -192,13 +200,14 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
                     heat_pump_c=raw_outdoor_temp,
                     at=now,
                 )
-            snapshot = await wrapper.refresh_consumption(now)
+            snapshot = await wrapper.refresh_consumption(local_now)
             record = ConsumptionRecord(
                 ts=now,
                 device_id=device.long_id,
-                heat_kwh=snapshot.heat_kwh or 0,
-                cool_kwh=snapshot.cool_kwh or 0,
-                tank_kwh=snapshot.tank_kwh or 0,
+                source_date=snapshot.date,
+                heat_kwh=snapshot.heat_kwh,
+                cool_kwh=snapshot.cool_kwh,
+                tank_kwh=snapshot.tank_kwh,
                 outdoor_temp=outdoor.effective_c,
                 heat_pump_outdoor_temp=outdoor.heat_pump_c,
                 outdoor_temp_source=outdoor.source,
@@ -210,6 +219,9 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
                 heat=record.heat_kwh,
                 cool=record.cool_kwh,
                 tank=record.tank_kwh,
+                poll_instant=now.isoformat(),
+                timezone=timezone_name,
+                source_date=snapshot.date.isoformat(),
             )
         except Exception as e:
             logger.error("consumption_poll_failed", error=str(e))
@@ -219,7 +231,6 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
 
     try:
         device = await wrapper.get_device()
-        now = dt.datetime.now(dt.timezone.utc)
         raw_outdoor_temp = device.temperature_outdoor
         async with get_session() as session:
             outdoor = await resolve_outdoor_temperature(
@@ -228,13 +239,14 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
                 at=now,
             )
 
-        heat = await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
-        cool = await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
-        tank = await device.get_and_refresh_consumption(now, ConsumptionType.WATER_TANK) or 0
+        heat = await device.get_and_refresh_consumption(local_now, ConsumptionType.HEAT)
+        cool = await device.get_and_refresh_consumption(local_now, ConsumptionType.COOL)
+        tank = await device.get_and_refresh_consumption(local_now, ConsumptionType.WATER_TANK)
 
         record = ConsumptionRecord(
             ts=now,
             device_id=device.long_id,
+            source_date=local_now.date(),
             heat_kwh=heat,
             cool_kwh=cool,
             tank_kwh=tank,
@@ -245,7 +257,15 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
         async with get_session() as session:
             session.add(record)
 
-        logger.info("consumption_polled", heat=heat, cool=cool, tank=tank)
+        logger.info(
+            "consumption_polled",
+            heat=heat,
+            cool=cool,
+            tank=tank,
+            poll_instant=now.isoformat(),
+            timezone=timezone_name,
+            source_date=local_now.date().isoformat(),
+        )
     except Exception as e:
         logger.error("consumption_poll_failed", error=str(e))
 

@@ -354,9 +354,6 @@ class TestDemandModel:
         assert target.tolist() == pytest.approx([3.6, 0.4])
         assert model.last_data_quality["counter_source_day_reset"] == 1
 
-    @pytest.mark.xfail(
-        strict=True, reason="source_date SELECT lands with migration 031 ingestion change"
-    )
     @pytest.mark.asyncio
     async def test_prepare_data_selects_source_date_for_historical_local_cutover(self):
         from packages.ml.models import DemandModel
@@ -605,9 +602,6 @@ class TestCOPCounterWindows:
         assert len(y) == 49
         assert np.all((y >= model.COP_MIN) & (y <= model.COP_MAX))
 
-    @pytest.mark.xfail(
-        strict=True, reason="source_date SELECT lands with migration 031 ingestion change"
-    )
     @pytest.mark.asyncio
     async def test_hourly_tank_steps_select_source_date(self):
         from packages.ml.models import COPModel

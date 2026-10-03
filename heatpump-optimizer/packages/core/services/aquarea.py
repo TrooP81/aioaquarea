@@ -208,12 +208,16 @@ class AquareaWrapper:
         """Initialize session and redis; login failures are retried on device access."""
         from ..settings_service import get_user_tz
 
-        self._session = aiohttp.ClientSession()
-        self._redis = redis.from_url(settings.redis_url)
-        self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
-        if settings.panasonic_distributed_read_quota_enabled:
-            self._read_quota = DistributedReadQuota(self._redis)
         self._timezone = ZoneInfo(await get_user_tz())
+        try:
+            self._session = aiohttp.ClientSession()
+            self._redis = redis.from_url(settings.redis_url)
+            self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
+            if settings.panasonic_distributed_read_quota_enabled:
+                self._read_quota = DistributedReadQuota(self._redis)
+        except Exception:
+            await self.stop()
+            raise
 
         try:
             await self._ensure_authenticated()
@@ -592,12 +596,24 @@ class AquareaWrapper:
     ) -> ConsumptionSnapshot:
         from aioaquarea.statistics import DateType
 
+        if at.tzinfo is None or at.utcoffset() is None:
+            raise ValueError("Consumption refresh instant must be timezone-aware")
+        local_at = at.astimezone(self._timezone)
         device = await self.get_device()
         self._assert_reservation_account(reservation)
         response = await self._client.get_device_consumption(
-            device.long_id, DateType.MONTH, at.strftime("%Y%m01")
+            device.long_id, DateType.MONTH, local_at.strftime("%Y%m01")
         )
         if not response:
+            logger.warning(
+                "consumption_source_day_unavailable",
+                extra={
+                    "poll_instant": at.isoformat(),
+                    "timezone": str(self._timezone),
+                    "source_date": local_at.date().isoformat(),
+                    "category": "empty_response",
+                },
+            )
             raise DataNotAvailableError("Panasonic consumption data is unavailable")
         for item in response:
             raw_date = item.data_time
@@ -608,7 +624,7 @@ class AquareaWrapper:
             except ValueError:
                 logger.warning("Panasonic consumption response contained a malformed date")
                 continue
-            if item_date == at.date():
+            if item_date == local_at.date():
                 return ConsumptionSnapshot(
                     date=item_date,
                     heat_kwh=item.heat_consumption,
@@ -616,6 +632,15 @@ class AquareaWrapper:
                     tank_kwh=item.tank_consumption,
                     fetched_at=dt.datetime.now(dt.timezone.utc),
                 )
+        logger.warning(
+            "consumption_source_day_unavailable",
+            extra={
+                "poll_instant": at.isoformat(),
+                "timezone": str(self._timezone),
+                "source_date": local_at.date().isoformat(),
+                "category": "exact_day_missing",
+            },
+        )
         raise DataNotAvailableError(
             "Panasonic consumption data is unavailable for the requested date"
         )

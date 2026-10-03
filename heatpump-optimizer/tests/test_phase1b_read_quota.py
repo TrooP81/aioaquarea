@@ -7,6 +7,7 @@ import logging
 import unicodedata
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from aioaquarea import DataNotAvailableError
@@ -542,6 +543,123 @@ async def test_enabled_poll_now_returns_stable_success_envelope_and_fetches_feed
     feeds.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("now", "expected_date"),
+    [
+        (dt.datetime(2026, 7, 15, 22, 30, tzinfo=dt.timezone.utc), dt.date(2026, 7, 16)),
+        (dt.datetime(2026, 1, 15, 23, 30, tzinfo=dt.timezone.utc), dt.date(2026, 1, 16)),
+        (dt.datetime(2026, 3, 29, 1, 30, tzinfo=dt.timezone.utc), dt.date(2026, 3, 29)),
+        (dt.datetime(2026, 10, 25, 0, 30, tzinfo=dt.timezone.utc), dt.date(2026, 10, 25)),
+    ],
+)
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_poll_now_persists_stockholm_local_source_date_across_midnight_and_dst(
+    monkeypatch, now, expected_date, enabled
+) -> None:
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(
+        polling_router,
+        "dt",
+        SimpleNamespace(datetime=FrozenDateTime, timezone=dt.timezone, timedelta=dt.timedelta),
+    )
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", enabled)
+    monkeypatch.setattr(polling_router, "get_session", lambda: _SessionContext())
+    monkeypatch.setattr(
+        polling_router,
+        "build_device_status_record",
+        lambda _device: SimpleNamespace(
+            device_id="device-1",
+            outdoor_temp=None,
+            heat_pump_outdoor_temp=None,
+            outdoor_temp_source=None,
+            tank_temp=48.0,
+        ),
+    )
+    monkeypatch.setattr(
+        polling_router,
+        "resolve_outdoor_temperature",
+        AsyncMock(
+            return_value=SimpleNamespace(effective_c=4.0, heat_pump_c=4.0, source="heat-pump")
+        ),
+    )
+    monkeypatch.setattr(polling_router, "ingest_device_status", AsyncMock())
+    monkeypatch.setattr(polling_router, "_poll_prices_and_weather_legacy", AsyncMock())
+
+    device = _PollDevice()
+    if enabled:
+        status_session = _SessionContext()
+        consumption_session = _SessionContext()
+        session_contexts = iter([status_session, consumption_session])
+        monkeypatch.setattr(polling_router, "get_session", lambda: next(session_contexts))
+        wrapper = _wrapper()
+        wrapper._timezone = ZoneInfo("Europe/Stockholm")
+        wrapper.refresh_status_and_consumption = AsyncMock(
+            return_value=(
+                device,
+                ConsumptionSnapshot(
+                    date=expected_date,
+                    heat_kwh=1.0,
+                    cool_kwh=2.0,
+                    tank_kwh=3.0,
+                    fetched_at=now,
+                ),
+            )
+        )
+
+        await _poll_now_with_wrapper(wrapper)
+
+        wrapper.refresh_status_and_consumption.assert_awaited_once_with(
+            now.astimezone(ZoneInfo("Europe/Stockholm"))
+        )
+        record = consumption_session.added[0]
+    else:
+        status_session = _SessionContext()
+        consumption_session = _SessionContext()
+        price_session = _SessionContext()
+        weather_session = _SessionContext()
+        session_contexts = iter(
+            [status_session, consumption_session, price_session, weather_session]
+        )
+        monkeypatch.setattr(polling_router, "get_session", lambda: next(session_contexts))
+        monkeypatch.setattr(
+            polling_router,
+            "get_user_tz",
+            AsyncMock(return_value="Europe/Stockholm"),
+        )
+        monkeypatch.setattr(
+            "packages.core.settings_service.get_setting",
+            AsyncMock(side_effect=["user@example.com", "password"]),
+        )
+        client = SimpleNamespace(
+            login=AsyncMock(),
+            get_devices=AsyncMock(return_value=[SimpleNamespace(device_id="device-1")]),
+            get_device=AsyncMock(return_value=device),
+        )
+        monkeypatch.setattr("aiohttp.ClientSession", lambda: _SessionContext())
+        monkeypatch.setattr("aioaquarea.Client", MagicMock(return_value=client))
+        monkeypatch.setattr(
+            "packages.poller.feeds.fetch_price_feed",
+            AsyncMock(return_value=SimpleNamespace(prices=[], currency="EUR", source="test")),
+        )
+        monkeypatch.setattr("packages.poller.feeds.fetch_weather", AsyncMock(return_value=[]))
+
+        device.get_and_refresh_consumption = AsyncMock(wraps=device.get_and_refresh_consumption)
+
+        await poll_now(None)
+
+        assert device.get_and_refresh_consumption.await_args_list[0].args[0] == (
+            now.astimezone(ZoneInfo("Europe/Stockholm"))
+        )
+        record = consumption_session.added[0]
+
+    assert record.source_date == expected_date
+
+
 async def _run_poll_now_parity_branch(monkeypatch, *, enabled: bool, scenario: str):
     device = _PollDevice(
         consumption_error=(
@@ -576,6 +694,7 @@ async def _run_poll_now_parity_branch(monkeypatch, *, enabled: bool, scenario: s
     with monkeypatch.context() as patches:
         patches.setattr(settings, "panasonic_distributed_read_quota_enabled", enabled)
         patches.setattr(polling_router, "get_session", lambda: _SessionContext())
+        patches.setattr(polling_router, "get_user_tz", AsyncMock(return_value="UTC"))
         patches.setattr(
             polling_router,
             "build_device_status_record",
@@ -901,6 +1020,7 @@ async def test_disabled_poller_keeps_legacy_consumption_calls(monkeypatch) -> No
 
     monkeypatch.setattr(poller_main.settings, "panasonic_distributed_read_quota_enabled", False)
     monkeypatch.setattr(poller_main, "get_session", lambda: _SessionContext())
+    monkeypatch.setattr(poller_main, "get_user_tz", AsyncMock(return_value="UTC"))
     monkeypatch.setattr(
         poller_main,
         "resolve_outdoor_temperature",
@@ -964,6 +1084,7 @@ async def test_disabled_poll_now_uses_legacy_client_and_three_consumption_reads(
         "packages.core.settings_service.get_setting",
         AsyncMock(side_effect=["user@example.com", "password"]),
     )
+    monkeypatch.setattr(polling_router, "get_user_tz", AsyncMock(return_value="UTC"))
     monkeypatch.setattr("aiohttp.ClientSession", lambda: Session())
     monkeypatch.setattr("aioaquarea.Client", MagicMock(return_value=client))
     monkeypatch.setattr(polling_router, "build_device_status_record", MagicMock(tank_temp=48.0))

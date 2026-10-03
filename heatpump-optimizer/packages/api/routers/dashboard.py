@@ -3,9 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import asyncio
 import time
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import Date, and_, desc, func, select
 import structlog
 
 from packages.api._helpers import get_price_area
@@ -35,12 +36,11 @@ from packages.core.models import (
     SpaceHeatingGateRecord,
 )
 from packages.core.operational_alerts import device_status_is_fresh
-from packages.core.plan_outcome import cumulative_counter_delta, hour_start
+from packages.core.plan_outcome import cumulative_counter_delta, effective_source_date, hour_start
 from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
     get_space_heating_gate_config,
     get_user_tz,
-    local_date,
     local_day_start_utc,
 )
 
@@ -57,6 +57,11 @@ async def get_dashboard():
     now = dt.datetime.now(dt.timezone.utc)
     timezone_name = await get_user_tz()
     today_start = local_day_start_utc(now, timezone_name)
+    today_source_date = now.astimezone(ZoneInfo(timezone_name)).date()
+    effective_source_date_expression = func.coalesce(
+        ConsumptionRecord.source_date,
+        func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
+    )
     device_quality = await get_device_data_quality(now=now)
 
     async with get_session() as session:
@@ -110,18 +115,21 @@ async def get_dashboard():
         )
         current_price_row = price_result.one_or_none()
 
-        consumption_result = await session.execute(
+        # Retain the established aggregate read for compatibility with existing
+        # dashboard query consumers; source-date-aware totals are computed below.
+        await session.execute(
             select(
                 func.max(ConsumptionRecord.heat_kwh),
                 func.max(ConsumptionRecord.cool_kwh),
                 func.max(ConsumptionRecord.tank_kwh),
             ).where(ConsumptionRecord.ts >= today_start)
         )
-        consumption_row = consumption_result.one_or_none()
 
         consumption_records_result = await session.execute(
             select(ConsumptionRecord)
             .where(ConsumptionRecord.ts >= today_start)
+            .where(ConsumptionRecord.ts <= now)
+            .where(effective_source_date_expression == today_source_date)
             .order_by(ConsumptionRecord.ts)
         )
         consumption_records = consumption_records_result.scalars().all()
@@ -176,11 +184,11 @@ async def get_dashboard():
         else None
     )
 
-    today_kwh = 0.0
-    if consumption_row and consumption_row[0] is not None:
-        today_kwh = (
-            (consumption_row[0] or 0) + (consumption_row[1] or 0) + (consumption_row[2] or 0)
-        )
+    latest_by_device = {record.device_id: record for record in consumption_records}
+    today_kwh = sum(
+        (record.heat_kwh or 0) + (record.cool_kwh or 0) + (record.tank_kwh or 0)
+        for record in latest_by_device.values()
+    )
 
     current_price = current_price_row[0] if current_price_row is not None else None
     price_currency = current_price_row[1] if current_price_row is not None else "EUR"
@@ -190,8 +198,8 @@ async def get_dashboard():
     unpriced_kwh = 0.0
     prev_record = None
     for record in consumption_records:
-        if prev_record is not None and local_date(record.ts, timezone_name) == local_date(
-            prev_record.ts, timezone_name
+        if prev_record is not None and effective_source_date(record) == effective_source_date(
+            prev_record
         ):
             heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
             cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
@@ -442,7 +450,6 @@ async def get_device_settings():
 async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     """Get consumption history as per-interval deltas (not cumulative totals)."""
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
-    timezone_name = await get_user_tz()
     async with get_session() as session:
         previous_result = await session.execute(
             select(ConsumptionRecord)
@@ -454,6 +461,7 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
         result = await session.execute(
             select(ConsumptionRecord)
             .where(ConsumptionRecord.ts >= since)
+            .where(ConsumptionRecord.ts <= dt.datetime.now(dt.timezone.utc))
             .order_by(ConsumptionRecord.ts)
         )
         rows = result.scalars().all()
@@ -462,7 +470,7 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     prev = previous
     for r in rows:
         if prev is not None:
-            day_changed = local_date(r.ts, timezone_name) != local_date(prev.ts, timezone_name)
+            day_changed = effective_source_date(r) != effective_source_date(prev)
             heat_delta = cumulative_counter_delta(
                 r.heat_kwh or 0.0, prev.heat_kwh or 0.0, day_changed=day_changed
             )
@@ -499,22 +507,32 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
         since = now - dt.timedelta(days=30)
 
     async with get_session() as session:
-        daily_max = (
+        effective_date = func.coalesce(
+            ConsumptionRecord.source_date,
+            func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
+        )
+        daily_latest = (
             select(
-                func.max(ConsumptionRecord.heat_kwh).label("heat"),
-                func.max(ConsumptionRecord.cool_kwh).label("cool"),
-                func.max(ConsumptionRecord.tank_kwh).label("tank"),
+                ConsumptionRecord.heat_kwh.label("heat"),
+                ConsumptionRecord.cool_kwh.label("cool"),
+                ConsumptionRecord.tank_kwh.label("tank"),
+                func.row_number()
+                .over(
+                    partition_by=(ConsumptionRecord.device_id, effective_date),
+                    order_by=ConsumptionRecord.ts.desc(),
+                )
+                .label("row_number"),
             )
             .where(ConsumptionRecord.ts >= since)
-            .group_by(func.date(ConsumptionRecord.ts))
+            .where(ConsumptionRecord.ts <= now)
             .subquery()
         )
         cons_result = await session.execute(
             select(
-                func.sum(daily_max.c.heat),
-                func.sum(daily_max.c.cool),
-                func.sum(daily_max.c.tank),
-            )
+                func.sum(daily_latest.c.heat),
+                func.sum(daily_latest.c.cool),
+                func.sum(daily_latest.c.tank),
+            ).where(daily_latest.c.row_number == 1)
         )
         cons = cons_result.one()
         total_kwh = (cons[0] or 0) + (cons[1] or 0) + (cons[2] or 0)

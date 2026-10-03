@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -14,6 +15,7 @@ from packages.core.models import ConsumptionRecord, PriceRecord, WeatherRecord
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
 from packages.core.device_status_snapshot import build_device_status_record
 from packages.core.device_status_ingestion import ingest_device_status
+from packages.core.settings_service import get_user_tz
 
 router = APIRouter()
 
@@ -111,8 +113,10 @@ async def _poll_prices_and_weather_legacy(results: dict[str, object]) -> None:
 async def _poll_now_with_wrapper(wrapper: AquareaWrapper):
     results = {"device": None, "prices": None, "weather": None}
     now = dt.datetime.now(dt.timezone.utc)
+    timezone = getattr(wrapper, "_timezone", ZoneInfo("Europe/Amsterdam"))
+    local_now = now.astimezone(timezone)
     try:
-        device, snapshot = await wrapper.refresh_status_and_consumption(now)
+        device, snapshot = await wrapper.refresh_status_and_consumption(local_now)
     except DistributedReadQuotaExhausted as exc:
         raise HTTPException(
             status_code=429,
@@ -146,9 +150,10 @@ async def _poll_now_with_wrapper(wrapper: AquareaWrapper):
                     ConsumptionRecord(
                         ts=now,
                         device_id=device.long_id,
-                        heat_kwh=snapshot.heat_kwh or 0,
-                        cool_kwh=snapshot.cool_kwh or 0,
-                        tank_kwh=snapshot.tank_kwh or 0,
+                        source_date=snapshot.date,
+                        heat_kwh=snapshot.heat_kwh,
+                        cool_kwh=snapshot.cool_kwh,
+                        tank_kwh=snapshot.tank_kwh,
                         outdoor_temp=outdoor.effective_c,
                         heat_pump_outdoor_temp=outdoor.heat_pump_c,
                         outdoor_temp_source=outdoor.source,
@@ -190,6 +195,8 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
 
     if username and password:
         try:
+            timezone_name = await get_user_tz()
+            timezone = ZoneInfo(timezone_name)
             async with aiohttp.ClientSession() as session:
                 client = Client(
                     session=session,
@@ -198,6 +205,7 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
                     device_direct=True,
                     refresh_login=False,
                     environment=AquareaEnvironment.PRODUCTION,
+                    timezone=timezone,
                 )
                 await client.login()
                 devices = await client.get_devices()
@@ -226,23 +234,22 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
                     from aioaquarea.statistics import ConsumptionType
 
                     now = dt.datetime.now(dt.timezone.utc)
+                    local_now = now.astimezone(timezone)
                     try:
-                        heat = (
-                            await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
+                        heat = await device.get_and_refresh_consumption(
+                            local_now, ConsumptionType.HEAT
                         )
-                        cool = (
-                            await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
+                        cool = await device.get_and_refresh_consumption(
+                            local_now, ConsumptionType.COOL
                         )
-                        tank = (
-                            await device.get_and_refresh_consumption(
-                                now, ConsumptionType.WATER_TANK
-                            )
-                            or 0
+                        tank = await device.get_and_refresh_consumption(
+                            local_now, ConsumptionType.WATER_TANK
                         )
 
                         cons_record = ConsumptionRecord(
                             ts=now,
                             device_id=device.long_id,
+                            source_date=local_now.date(),
                             heat_kwh=heat,
                             cool_kwh=cool,
                             tank_kwh=tank,

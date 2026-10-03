@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -109,6 +110,7 @@ class ConsumptionRecord(Base):
         DateTime(timezone=True), primary_key=True, server_default=func.now()
     )
     device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_date: Mapped[dt.date | None] = mapped_column(Date)
     heat_kwh: Mapped[float | None] = mapped_column(Float)
     cool_kwh: Mapped[float | None] = mapped_column(Float)
     tank_kwh: Mapped[float | None] = mapped_column(Float)

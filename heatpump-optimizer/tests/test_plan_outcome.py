@@ -1,10 +1,14 @@
 import datetime as dt
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from packages.core.plan_outcome import (
     comfort_outcome,
     cost_outcome,
     cumulative_intervals,
+    measured_window_outcome,
     weather_matched_energy_comparison,
 )
 
@@ -37,12 +41,14 @@ def test_cumulative_intervals_uses_local_day_reset_value():
             heat_kwh=4.0,
             cool_kwh=0.0,
             tank_kwh=1.0,
+            source_date=dt.date(2026, 7, 15),
         ),
         SimpleNamespace(
             ts=dt.datetime(2026, 7, 15, 22, 5, tzinfo=UTC),
             heat_kwh=0.2,
             cool_kwh=0.0,
             tank_kwh=0.1,
+            source_date=dt.date(2026, 7, 16),
         ),
     ]
 
@@ -110,3 +116,34 @@ def test_weather_matched_comparison_is_explicitly_observational():
     assert result["matched_average_energy_kwh"] == 24.0
     assert result["energy_delta_vs_matched_kwh"] == 12.0
     assert "not proof" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_measured_outcome_source_date_queries_keep_ts_bounds():
+    class QueryResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[QueryResult() for _ in range(5)]))
+    start = dt.datetime(2026, 7, 15, tzinfo=UTC)
+    end = start + dt.timedelta(hours=12)
+
+    await measured_window_outcome(
+        session,
+        start=start,
+        end=end,
+        price_area="SE1",
+        price_currency="EUR",
+        price_source="test",
+        comfort_min_c=19.0,
+        comfort_max_c=22.0,
+    )
+
+    sql = [str(call.args[0]) for call in session.execute.call_args_list]
+    consumption_sql = [statement for statement in sql if "consumption.ts" in statement]
+    assert len(consumption_sql) == 2
+    assert all("consumption.ts >=" in statement for statement in consumption_sql)
+    assert all("consumption.ts <=" in statement for statement in consumption_sql)

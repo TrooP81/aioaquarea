@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Iterable
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +42,18 @@ def counter_value(record: ConsumptionRecord) -> float:
     return float(record.heat_kwh or 0) + float(record.cool_kwh or 0) + float(record.tank_kwh or 0)
 
 
+def effective_source_date(record: ConsumptionRecord) -> dt.date:
+    """Return Panasonic source-day provenance with a UTC fallback for legacy rows."""
+
+    source_date = getattr(record, "source_date", None)
+    if source_date is not None:
+        return source_date
+    timestamp = record.ts
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    return timestamp.astimezone(dt.timezone.utc).date()
+
+
 def cumulative_counter_delta(current: float, previous: float, *, day_changed: bool) -> float:
     """Return a positive interval delta, accounting for a daily counter reset."""
 
@@ -60,14 +71,11 @@ def cumulative_intervals(
     The first post-reset value is the energy accumulated since local midnight.
     """
 
-    timezone = ZoneInfo(timezone_name)
     intervals: list[tuple[dt.datetime, float]] = []
     previous: ConsumptionRecord | None = None
     for record in sorted(records, key=lambda row: row.ts):
         if previous is not None:
-            day_changed = (
-                record.ts.astimezone(timezone).date() != previous.ts.astimezone(timezone).date()
-            )
+            day_changed = effective_source_date(record) != effective_source_date(previous)
             # Meter counters arrive as floats; round only the interval to
             # prevent binary representation noise from leaking into costs/UI.
             delta = round(

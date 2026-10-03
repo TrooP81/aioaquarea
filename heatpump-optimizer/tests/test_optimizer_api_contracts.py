@@ -12,6 +12,7 @@ import pytest
 
 from packages.api.schemas import DashboardResponse
 from packages.api.routers.dashboard import get_dashboard
+from packages.api.routers.dashboard import get_stats
 from packages.api.routers.models_router import get_heat_curve_advice, get_thermal_curve
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig
@@ -225,6 +226,30 @@ async def test_dashboard_uses_data_quality_threshold_for_status_freshness() -> N
 
     get_device_data_quality.assert_awaited_once()
     assert freshness_check.call_args.kwargs["threshold_seconds"] == 900
+    dashboard_sql = [
+        str(call.args[0])
+        for call in session.execute.call_args_list
+        if "source_date" in str(call.args[0])
+    ]
+    assert any("consumption.ts >=" in sql and "consumption.ts <=" in sql for sql in dashboard_sql)
+
+
+@pytest.mark.asyncio
+async def test_stats_source_date_grouping_keeps_timestamp_bounds() -> None:
+    consumption_result = SimpleNamespace(one=lambda: (1.0, 2.0, 3.0))
+    price_result = SimpleNamespace(scalar=lambda: 0.1)
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[consumption_result, price_result]))
+
+    with patch(
+        "packages.api.routers.dashboard.get_session", return_value=_session_context(session)
+    ):
+        response = await get_stats("day")
+
+    assert response.total_kwh == 6.0
+    stats_sql = str(session.execute.call_args_list[0].args[0])
+    assert "source_date" in stats_sql
+    assert "consumption.ts >=" in stats_sql
+    assert "consumption.ts <=" in stats_sql
 
 
 @pytest.mark.asyncio

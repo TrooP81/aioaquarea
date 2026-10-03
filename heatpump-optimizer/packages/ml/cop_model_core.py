@@ -211,6 +211,7 @@ class COPModel:
                         ConsumptionRecord.heat_kwh,
                         ConsumptionRecord.tank_kwh,
                         ConsumptionRecord.outdoor_temp,
+                        ConsumptionRecord.source_date,
                     ).order_by(ConsumptionRecord.ts)
                 )
             ).all()
