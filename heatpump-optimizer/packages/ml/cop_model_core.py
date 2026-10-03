@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from sqlalchemy import select
@@ -10,11 +12,14 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord
+from packages.core.settings_service import get_user_tz
 from packages.ml.models_common import (
     HAS_SKLEARN,
     MODEL_DIR,
+    COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS,
     _logger,
     evaluate_regression,
+    iter_counter_change_intervals,
     make_monotonic_regressor,
     prune_old_models,
     time_series_cv_mae,
@@ -30,9 +35,10 @@ _COP_MONOTONIC_CST = [1, -1, 0, 0, 0, 0, 0]
 # checkpoints used total heating + DHW electricity while the target was based
 # on a tank-only thermal measurement, so they must not be used after the
 # denominator correction below.
-COP_MODEL_ARTIFACT_PREFIX = "cop_model_weather_dhw_v4_"
+COP_MODEL_ARTIFACT_PREFIX = "cop_model_weather_dhw_v5_"
 COP_MODEL_ARTIFACT_GLOB = f"{COP_MODEL_ARTIFACT_PREFIX}*.pkl"
-COP_MAE_BASELINE = "cop_weather_dhw_v4"
+COP_MAE_BASELINE = "cop_weather_dhw_v5"
+COP_COUNTER_CONFIRMATION_ENABLED = True
 
 
 class COPModel:
@@ -47,6 +53,7 @@ class COPModel:
         self._model = None
         self._version: str = "untrained"
         self._metrics: dict[str, float] = {}
+        self._last_data_quality: dict[str, int] = {}
 
     def reset(self) -> None:
         """Discard the trained model and return to the untrained fallback state."""
@@ -62,6 +69,11 @@ class COPModel:
     def metrics(self) -> dict[str, float]:
         """Persisted forward-chaining validation evidence for the live model."""
         return dict(self._metrics)
+
+    @property
+    def last_data_quality(self) -> dict[str, int]:
+        """Aggregate counter diagnostics from the latest preparation pass."""
+        return dict(self._last_data_quality)
 
     @property
     def version(self) -> str:
@@ -189,10 +201,12 @@ class COPModel:
         )
 
     async def _prepare_training_data(self) -> tuple[np.ndarray, np.ndarray]:
+        timezone = ZoneInfo(await get_user_tz())
         async with get_session() as session:
             consumption_rows = (
                 await session.execute(
                     select(
+                        ConsumptionRecord.device_id,
                         ConsumptionRecord.ts,
                         ConsumptionRecord.heat_kwh,
                         ConsumptionRecord.tank_kwh,
@@ -203,11 +217,13 @@ class COPModel:
             status_rows = (
                 await session.execute(
                     select(
+                        DeviceStatusRecord.device_id,
                         DeviceStatusRecord.ts,
                         DeviceStatusRecord.tank_target_temp,
                         DeviceStatusRecord.tank_temp,
                         DeviceStatusRecord.outdoor_temp,
                         DeviceStatusRecord.direction,
+                        DeviceStatusRecord.device_action,
                         DeviceStatusRecord.zone1_temp,
                         DeviceStatusRecord.defrost_active,
                     ).order_by(DeviceStatusRecord.ts)
@@ -228,23 +244,27 @@ class COPModel:
         if not consumption_rows or not status_rows:
             return np.array([]), np.array([])
 
-        status_sorted = sorted(status_rows, key=lambda s: s.ts)
-        status_ts = [s.ts for s in status_sorted]
+        status_by_device: dict[str, list] = defaultdict(list)
+        for status in status_rows:
+            status_by_device[status.device_id].append(status)
+        for statuses in status_by_device.values():
+            statuses.sort(key=lambda status: status.ts)
         weather_sorted = sorted(weather_rows, key=lambda w: w.ts)
         weather_ts = [w.ts for w in weather_sorted]
 
-        def _find_closest_status(ts):
+        def _find_closest_status(statuses, ts):
             import bisect
 
+            status_ts = [status.ts for status in statuses]
             idx = bisect.bisect_left(status_ts, ts)
             best = None
             best_gap = float("inf")
             for candidate_idx in (idx - 1, idx):
-                if 0 <= candidate_idx < len(status_sorted):
-                    gap = abs((status_sorted[candidate_idx].ts - ts).total_seconds())
+                if 0 <= candidate_idx < len(statuses):
+                    gap = abs((statuses[candidate_idx].ts - ts).total_seconds())
                     if gap < best_gap:
                         best_gap = gap
-                        best = status_sorted[candidate_idx]
+                        best = statuses[candidate_idx]
             return best if best and best_gap <= 1200 else None
 
         def _weather_at(ts) -> tuple[float | None, float, float, float]:
@@ -286,110 +306,106 @@ class COPModel:
 
         X_list = []
         y_list = []
-        skip_no_tank_delta = 0
+        counter_diagnostics: dict[str, int] = {}
         skip_no_status = 0
         skip_defrost = 0
+        skip_mixed_mode = 0
+        skip_no_dhw_activity = 0
         skip_cop_low = 0
         skip_cop_high = 0
         used_status_path = 0
         skip_no_measured_thermal = 0
 
-        prev_row = None
-        for row in consumption_rows:
-            if prev_row is None or row.ts.date() != prev_row.ts.date():
-                prev_row = row
-                continue
-            elapsed_hours = (row.ts - prev_row.ts).total_seconds() / 3600.0
-            if not (0.2 <= elapsed_hours <= 2.0):
-                skip_no_tank_delta += 1
-                prev_row = row
-                continue
-
-            prev_status_rec = _find_closest_status(prev_row.ts)
-            curr_status_rec = _find_closest_status(row.ts)
-            # The thermal target below is measured only from the DHW tank's
-            # temperature rise.  Its denominator must therefore be the DHW
-            # counter alone: including ``heat_kwh`` folds space-heating power
-            # into the same interval and biases the learned COP downward.
-            delta_elec = (row.tank_kwh or 0) - (prev_row.tank_kwh or 0)
-            if delta_elec <= 0.01:
-                skip_no_tank_delta += 1
-                prev_row = row
-                continue
-
-            elec_kw = delta_elec / elapsed_hours
-            thermal_kwh = 0.0
-            curr_status = None
-            if prev_status_rec and curr_status_rec and prev_status_rec.ts != curr_status_rec.ts:
-                if getattr(prev_status_rec, "defrost_active", False) or getattr(
-                    curr_status_rec, "defrost_active", False
-                ):
-                    skip_defrost += 1
-                    prev_row = row
-                    continue
-                used_status_path += 1
-                # Only DHW tank heating gives a physically-grounded thermal
-                # measurement (energy = tank_mass × ΔT). The zone1 "temperature"
-                # is the *water supply* temp, not a fixed thermal mass, so its
-                # delta is not a reliable proxy for delivered heat and is
-                # excluded to avoid biasing the COP target.
-                tank_thermal = 0.0
-                if prev_status_rec.tank_temp is not None and curr_status_rec.tank_temp is not None:
-                    tank_delta = curr_status_rec.tank_temp - prev_status_rec.tank_temp
-                    if tank_delta > 0:
-                        tank_thermal = tank_delta * self._tank_kwh_per_degree()
-                if tank_thermal > 0:
-                    thermal_kwh = tank_thermal / elapsed_hours
-                curr_status = {"tank_target": curr_status_rec.tank_target_temp or 50}
-            else:
+        for interval in iter_counter_change_intervals(
+            consumption_rows,
+            "tank_kwh",
+            timezone,
+            min_interval_hours=0.5,
+            max_interval_hours=2.0,
+            diagnostics=counter_diagnostics,
+            confirm_changes=COP_COUNTER_CONFIRMATION_ENABLED,
+        ):
+            statuses = status_by_device.get(interval.device_id, [])
+            prev_status_rec = _find_closest_status(statuses, interval.start_ts)
+            curr_status_rec = _find_closest_status(statuses, interval.end_ts)
+            window_statuses = [
+                status for status in statuses if interval.start_ts <= status.ts <= interval.end_ts
+            ]
+            if not prev_status_rec or not curr_status_rec or not window_statuses:
                 skip_no_status += 1
-
-            if thermal_kwh <= 0:
-                # No measured DHW thermal for this interval. We deliberately do
-                # NOT synthesize thermal from the default COP curve: that would
-                # make the target a deterministic function of the features and
-                # the model would merely relearn the fallback formula. Skip it.
-                skip_no_measured_thermal += 1
-                prev_row = row
+                continue
+            if any(getattr(status, "defrost_active", False) for status in window_statuses):
+                skip_defrost += 1
+                continue
+            if any(
+                getattr(status, "device_action", None) in {"HEATING", "COOLING"}
+                for status in window_statuses
+            ):
+                skip_mixed_mode += 1
+                continue
+            if not any(
+                getattr(status, "device_action", None) == "HEATING_WATER"
+                or getattr(status, "direction", None) == "WATER"
+                for status in window_statuses
+            ):
+                skip_no_dhw_activity += 1
                 continue
 
-            cop = thermal_kwh / elec_kw
+            used_status_path += 1
+            tank_thermal = 0.0
+            if prev_status_rec.tank_temp is not None and curr_status_rec.tank_temp is not None:
+                tank_delta = curr_status_rec.tank_temp - prev_status_rec.tank_temp
+                if tank_delta > 0:
+                    tank_thermal = tank_delta * self._tank_kwh_per_degree()
+            if tank_thermal <= 0:
+                skip_no_measured_thermal += 1
+                continue
+
+            cop = tank_thermal / interval.energy_kwh
             if cop < self.COP_MIN:
                 skip_cop_low += 1
-                prev_row = row
                 continue
             if cop > self.COP_MAX:
                 skip_cop_high += 1
-                prev_row = row
                 continue
 
-            weather_temperature, precipitation, humidity, cloud_cover = _weather_at(row.ts)
+            weather_temperature, precipitation, humidity, cloud_cover = _weather_at(interval.end_ts)
             features = self._make_features(
                 (
                     weather_temperature
                     if weather_temperature is not None
-                    else row.outdoor_temp
-                    if row.outdoor_temp is not None
+                    else interval.row.outdoor_temp
+                    if interval.row.outdoor_temp is not None
                     else 5.0
                 ),
-                int(curr_status.get("tank_target", 50) if curr_status else 50),
-                row.ts.hour,
+                int(curr_status_rec.tank_target_temp or 50),
+                interval.end_ts.hour,
                 precipitation,
                 humidity,
                 cloud_cover,
             )
             X_list.append(features)
             y_list.append(cop)
-            prev_row = row
 
+        self._last_data_quality = {
+            f"counter_{key}": counter_diagnostics.get(key, 0)
+            for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS
+        }
         _logger.info(
             "cop_training_data_prepared",
             total_consumption_rows=len(consumption_rows),
             status_rows=len(status_rows),
             paired_samples=len(y_list),
-            skip_no_tank_delta=skip_no_tank_delta,
+            counter_zero_delta=counter_diagnostics.get("zero_delta", 0),
+            counter_midday_decrease=counter_diagnostics.get("midday_decrease", 0),
+            counter_source_day_reset=counter_diagnostics.get("source_day_reset", 0),
+            counter_correction_reanchor=counter_diagnostics.get("correction_reanchor", 0),
+            counter_outside_window=counter_diagnostics.get("outside_window", 0),
+            **{key: value for key, value in self._last_data_quality.items() if value},
             skip_no_status=skip_no_status,
             skip_defrost=skip_defrost,
+            skip_mixed_mode=skip_mixed_mode,
+            skip_no_dhw_activity=skip_no_dhw_activity,
             skip_no_measured_thermal=skip_no_measured_thermal,
             skip_cop_low=skip_cop_low,
             skip_cop_high=skip_cop_high,

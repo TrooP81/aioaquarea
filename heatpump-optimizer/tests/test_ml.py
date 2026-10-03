@@ -30,11 +30,13 @@ class _FakeResult:
 class _FakeSession:
     def __init__(self, results):
         self._results = list(results)
+        self.statements = []
 
     def add(self, *_args, **_kwargs):
         return None
 
     async def execute(self, *args, **kwargs):
+        self.statements.append(args[0] if args else None)
         if self._results:
             return self._results.pop(0)
         return _FakeResult([])
@@ -109,6 +111,26 @@ class TestCOPModel:
         model = COPModel()
         with patch("packages.ml.models.MODEL_DIR", tmp_path):
             assert not model.load_latest()
+
+    @pytest.mark.parametrize(
+        ("model_class", "filename"),
+        [
+            ("COPModel", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+            ("DemandModel", "demand_model_weather_v2_20261001_1200.pkl"),
+        ],
+    )
+    def test_load_latest_ignores_legacy_artifact_prefix(self, model_class, filename, tmp_path):
+        from packages.ml.models import COPModel, DemandModel
+
+        model = {"COPModel": COPModel, "DemandModel": DemandModel}[model_class]()
+        (tmp_path / filename).write_bytes(b"legacy artifact")
+        with (
+            patch("packages.ml.models.MODEL_DIR", tmp_path),
+            patch("packages.ml.safe_persistence.safe_load") as safe_load,
+        ):
+            assert not model.load_latest()
+
+        safe_load.assert_not_called()
 
     def test_train_and_predict_with_synthetic_data(self, tmp_path):
         """Train COP model on synthetic COP data and verify predictions."""
@@ -244,8 +266,11 @@ class TestDemandModel:
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
-            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
             SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0
+            ),
+            SimpleNamespace(
+                device_id="one",
                 ts=base + dt.timedelta(minutes=15),
                 heat_kwh=0.5,
                 cool_kwh=0.0,
@@ -253,6 +278,7 @@ class TestDemandModel:
                 outdoor_temp=2.0,
             ),
             SimpleNamespace(
+                device_id="one",
                 ts=base + dt.timedelta(minutes=30),
                 heat_kwh=1.5,
                 cool_kwh=0.0,
@@ -264,7 +290,10 @@ class TestDemandModel:
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
-        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+        with (
+            patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
             X, y = await model._prepare_data()
 
         # 0.5 kWh / 0.25h = 2.0 kW; 1.0 kWh / 0.25h = 4.0 kW
@@ -276,14 +305,153 @@ class TestDemandModel:
         assert X[0][0] == 1.0
 
     @pytest.mark.asyncio
+    async def test_prepare_data_uses_source_date_for_historical_local_cutover(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 7, 15, 23, 50, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base,
+                heat_kwh=10.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=None,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.3,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=dt.date(2026, 7, 16),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=0.4,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=dt.date(2026, 7, 16),
+            ),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        context = _FakeSessionCtx([_FakeResult(consumption), _FakeResult(weather)])
+        model = DemandModel()
+
+        with (
+            patch("packages.ml.demand_model_core.get_session", return_value=context),
+            patch(
+                "packages.ml.demand_model_core.get_user_tz",
+                new=AsyncMock(return_value="Europe/Stockholm"),
+            ),
+        ):
+            _, target = await model._prepare_data()
+
+        assert target.tolist() == pytest.approx([3.6, 0.4])
+        assert model.last_data_quality["counter_source_day_reset"] == 1
+
+    @pytest.mark.xfail(
+        strict=True, reason="source_date SELECT lands with migration 031 ingestion change"
+    )
+    @pytest.mark.asyncio
+    async def test_prepare_data_selects_source_date_for_historical_local_cutover(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 7, 15, 23, 50, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base,
+                heat_kwh=10.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=None,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15),
+                heat_kwh=0.3,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=dt.date(2026, 7, 16),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=0.4,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+                source_date=dt.date(2026, 7, 16),
+            ),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        context = _FakeSessionCtx([_FakeResult(consumption), _FakeResult(weather)])
+        model = DemandModel()
+
+        with (
+            patch("packages.ml.demand_model_core.get_session", return_value=context),
+            patch(
+                "packages.ml.demand_model_core.get_user_tz",
+                new=AsyncMock(return_value="Europe/Stockholm"),
+            ),
+        ):
+            await model._prepare_data()
+
+        assert "source_date" in str(context._session.statements[0])
+
+    @pytest.mark.asyncio
+    async def test_prepare_data_uses_elapsed_time_across_repeated_daily_totals(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=1.0 if index < 12 else 2.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            )
+            for index in range(13)
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        model = DemandModel()
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            _, target = await model._prepare_data()
+
+        assert target.tolist() == pytest.approx([1.0 / 3.0])
+
+    @pytest.mark.asyncio
     async def test_prepare_data_falls_back_to_weather_temp(self):
         """When consumption lacks outdoor_temp, use nearest weather temperature."""
         from packages.ml.models import DemandModel
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
-            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=None),
             SimpleNamespace(
+                device_id="one",
+                ts=base,
+                heat_kwh=0.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=None,
+            ),
+            SimpleNamespace(
+                device_id="one",
                 ts=base + dt.timedelta(minutes=15),
                 heat_kwh=0.25,
                 cool_kwh=0.0,
@@ -299,93 +467,990 @@ class TestDemandModel:
         results = [_FakeResult(consumption), _FakeResult(weather)]
 
         model = DemandModel()
-        with patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)):
+        with (
+            patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
             X, y = await model._prepare_data()
 
         assert len(y) == 1
         assert X[0][0] == -3.0  # weather temperature filled in
         assert X[0][1] == 5.0  # weather wind
 
+    @pytest.mark.asyncio
+    async def test_hourly_counter_steps_yield_hourly_rates(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=index // 4,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            )
+            for index in range(9)
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        model = DemandModel()
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            _, target = await model._prepare_data()
+
+        assert target.tolist() == pytest.approx([1.0, 1.0])
+        assert model.last_data_quality["counter_zero_delta"] == 6
+
+    @pytest.mark.asyncio
+    async def test_prepare_data_rejects_nonpositive_and_implausible_rates(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base,
+                heat_kwh=0.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(hours=1),
+                heat_kwh=0.5,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(hours=2),
+                heat_kwh=100.5,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
+        ]
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+
+        model = DemandModel()
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch("packages.ml.demand_model_core._logger.info") as log_info,
+        ):
+            _, target = await model._prepare_data()
+
+        assert target.tolist() == pytest.approx([0.5])
+        assert model.last_data_quality["intervals"] == 2
+        assert model.last_data_quality["rejected_rate_bounds"] == 1
+        assert "one" not in repr(log_info.call_args)
+
+
+class TestCOPCounterWindows:
+    @pytest.mark.asyncio
+    async def test_hourly_tank_steps_yield_one_bounded_sample_per_change(self):
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        model = COPModel()
+        degrees_per_hour = 1.0 / model._tank_kwh_per_degree()
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=0.0,
+                tank_kwh=0.5 * (index // 4),
+                outdoor_temp=2.0,
+            )
+            for index in range(201)
+        ]
+        statuses = [
+            SimpleNamespace(
+                device_id="one",
+                ts=row.ts,
+                tank_target_temp=50,
+                tank_temp=20.0 + degrees_per_hour * (index // 4),
+                direction="WATER",
+                device_action="HEATING_WATER",
+                zone1_temp=None,
+                defrost_active=False,
+            )
+            for index, row in enumerate(consumption)
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
+            )
+        ]
+        context = _FakeSessionCtx(
+            [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
+        )
+        with (
+            patch("packages.ml.cop_model_core.get_session", return_value=context),
+            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            _, y = await model._prepare_training_data()
+
+        assert len(y) == 49
+        assert np.all((y >= model.COP_MIN) & (y <= model.COP_MAX))
+
+    @pytest.mark.xfail(
+        strict=True, reason="source_date SELECT lands with migration 031 ingestion change"
+    )
+    @pytest.mark.asyncio
+    async def test_hourly_tank_steps_select_source_date(self):
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        model = COPModel()
+        degrees_per_hour = 1.0 / model._tank_kwh_per_degree()
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=0.0,
+                tank_kwh=0.5 * (index // 4),
+                outdoor_temp=2.0,
+            )
+            for index in range(201)
+        ]
+        statuses = [
+            SimpleNamespace(
+                device_id="one",
+                ts=row.ts,
+                tank_target_temp=50,
+                tank_temp=20.0 + degrees_per_hour * (index // 4),
+                direction="WATER",
+                device_action="HEATING_WATER",
+                zone1_temp=None,
+                defrost_active=False,
+            )
+            for index, row in enumerate(consumption)
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
+            )
+        ]
+        context = _FakeSessionCtx(
+            [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
+        )
+        with (
+            patch("packages.ml.cop_model_core.get_session", return_value=context),
+            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            await model._prepare_training_data()
+
+        assert "source_date" in str(context._session.statements[0])
+
+    @pytest.mark.asyncio
+    async def test_realistic_irregular_multi_device_cop_yield_has_safe_diagnostics(self):
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 6, 0, tzinfo=dt.timezone.utc)
+        model = COPModel()
+        kwh_per_degree = model._tank_kwh_per_degree()
+        consumption = []
+        statuses = []
+        step_times = {
+            "device-a": {
+                dt.datetime(2026, 1, 5, 7, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 8, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 9, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 12, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 13, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc),
+            },
+            "device-b": {
+                dt.datetime(2026, 1, 5, 6, 45, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 7, 45, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 9, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 10, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 11, 30, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 5, 13, 0, tzinfo=dt.timezone.utc),
+            },
+        }
+        counters = {device_id: 0.0 for device_id in step_times}
+        for device_id in step_times:
+            for poll_index in range(0, 41):
+                ts = base + dt.timedelta(minutes=15 * poll_index)
+                if device_id == "device-a" and dt.datetime(
+                    2026, 1, 5, 10, 0, tzinfo=dt.timezone.utc
+                ) <= ts < dt.datetime(2026, 1, 5, 12, 0, tzinfo=dt.timezone.utc):
+                    continue
+                if ts in step_times[device_id]:
+                    counters[device_id] += 0.5
+                consumption.append(
+                    SimpleNamespace(
+                        device_id=device_id,
+                        ts=ts,
+                        heat_kwh=0.0,
+                        tank_kwh=counters[device_id],
+                        outdoor_temp=2.0,
+                    )
+                )
+                statuses.append(
+                    SimpleNamespace(
+                        device_id=device_id,
+                        ts=ts,
+                        tank_target_temp=50,
+                        tank_temp=40.0 + counters[device_id] * 2.0 / kwh_per_degree,
+                        direction="WATER" if ts.hour < 11 else "SPACE",
+                        device_action="HEATING_WATER" if ts.hour < 11 else "IDLE",
+                        zone1_temp=None,
+                        defrost_active=False,
+                    )
+                )
+        consumption.sort(key=lambda row: row.ts)
+        statuses.sort(key=lambda row: row.ts)
+        weather = [
+            SimpleNamespace(
+                ts=base,
+                temperature=2.0,
+                precipitation=0.0,
+                humidity=60.0,
+                cloud_cover=0.5,
+            )
+        ]
+        with (
+            patch(
+                "packages.ml.cop_model_core.get_session",
+                _mock_get_session(
+                    [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
+                ),
+            ),
+            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch("packages.ml.cop_model_core._logger.info") as log_info,
+        ):
+            _, target = await model._prepare_training_data()
+
+        assert 4 <= len(target) < len(step_times["device-a"]) + len(step_times["device-b"])
+        assert np.all(target == pytest.approx(2.0))
+        assert np.all((target >= model.COP_MIN) & (target <= model.COP_MAX))
+        log_text = repr(log_info.call_args)
+        assert "device-a" not in log_text
+        assert "device-b" not in log_text
+        diagnostics = log_info.call_args.kwargs
+        assert diagnostics["counter_outside_window"] >= 1
+        assert diagnostics["skip_no_dhw_activity"] >= 1
+
+    @pytest.mark.parametrize(
+        ("timezone", "start", "end"),
+        [
+            (
+                "Europe/Amsterdam",
+                dt.datetime(2026, 3, 29, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 29, 3, tzinfo=dt.timezone.utc),
+            ),
+            (
+                "Europe/Amsterdam",
+                dt.datetime(2026, 10, 25, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 10, 25, 3, tzinfo=dt.timezone.utc),
+            ),
+            (
+                "Europe/Stockholm",
+                dt.datetime(2026, 3, 29, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 29, 3, tzinfo=dt.timezone.utc),
+            ),
+            (
+                "Europe/Stockholm",
+                dt.datetime(2026, 10, 25, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 10, 25, 3, tzinfo=dt.timezone.utc),
+            ),
+        ],
+    )
+    def test_dst_spring_and_fall_use_elapsed_instants(self, timezone, start, end):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        rows = [
+            SimpleNamespace(device_id="one", ts=start, heat_kwh=1.0),
+            SimpleNamespace(device_id="one", ts=end, heat_kwh=2.0),
+        ]
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo(timezone), max_interval_hours=4.0
+            )
+        )
+        assert intervals[0].elapsed_hours == 3.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blocked_status", ["defrost", "mixed_mode"])
+    async def test_cop_rejects_defrost_and_mixed_mode_windows(self, blocked_status):
+        from packages.ml.models import COPModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=0.0,
+                tank_kwh=0.5,
+                outdoor_temp=2.0,
+            ),
+        ]
+        statuses = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                tank_target_temp=50,
+                tank_temp=20.0 + 2.5 * index,
+                direction="WATER",
+                device_action="HEATING_WATER"
+                if blocked_status != "mixed_mode" or index != 1
+                else "HEATING",
+                zone1_temp=None,
+                defrost_active=blocked_status == "defrost" and index == 1,
+            )
+            for index in range(3)
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
+            )
+        ]
+        model = COPModel()
+        with (
+            patch(
+                "packages.ml.cop_model_core.get_session",
+                _mock_get_session(
+                    [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
+                ),
+            ),
+            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            X, y = await model._prepare_training_data()
+
+        assert len(X) == len(y) == 0
+
 
 class TestConsumptionIntervals:
-    def test_basic_delta_within_day(self):
-        from packages.ml.models_common import iter_consumption_intervals
+    def test_counter_changes_ignore_zero_polls_and_keep_devices_independent(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         rows = [
-            SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.5, outdoor_temp=3.0),
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=1.0),
             SimpleNamespace(
+                device_id="two",
                 ts=base + dt.timedelta(minutes=15),
-                heat_kwh=1.4,
-                cool_kwh=0.0,
-                tank_kwh=0.6,
-                outdoor_temp=3.0,
+                heat_kwh=4.0,
             ),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=1.0),
+            SimpleNamespace(device_id="two", ts=base + dt.timedelta(minutes=30), heat_kwh=4.5),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=1.4),
         ]
-        intervals = list(iter_consumption_intervals(rows))
-        assert len(intervals) == 1
-        iv = intervals[0]
-        assert iv.elapsed_hours == pytest.approx(0.25)
-        assert iv.heat_kwh == pytest.approx(0.4)
-        assert iv.tank_kwh == pytest.approx(0.1)
-        assert iv.total_kwh == pytest.approx(0.5)
-        assert iv.total_rate_kw == pytest.approx(2.0)
+        diagnostics: dict[str, int] = {}
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("UTC"), diagnostics=diagnostics
+            )
+        )
+        assert [item.device_id for item in intervals] == ["two", "one"]
+        assert [item.energy_kwh for item in intervals] == pytest.approx([0.5, 0.4])
+        assert [item.elapsed_hours for item in intervals] == pytest.approx([0.25, 1.0])
+        assert diagnostics["zero_delta"] == 1
 
-    def test_day_boundary_reset_skipped(self):
-        from packages.ml.models_common import iter_consumption_intervals
+    def test_transient_midday_decrease_retains_anchor_for_recovery(self):
+        from zoneinfo import ZoneInfo
 
-        rows = [
-            SimpleNamespace(
-                ts=dt.datetime(2026, 1, 5, 23, 55, tzinfo=dt.timezone.utc),
-                heat_kwh=10.0,
-                cool_kwh=0.0,
-                tank_kwh=0.0,
-                outdoor_temp=3.0,
-            ),
-            SimpleNamespace(
-                ts=dt.datetime(2026, 1, 6, 0, 10, tzinfo=dt.timezone.utc),
-                heat_kwh=0.3,
-                cool_kwh=0.0,
-                tank_kwh=0.0,
-                outdoor_temp=3.0,
-            ),
-        ]
-        assert list(iter_consumption_intervals(rows)) == []
-
-    def test_out_of_window_elapsed_skipped(self):
-        from packages.ml.models_common import iter_consumption_intervals
+        from packages.ml.models_common import iter_counter_change_intervals
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         rows = [
-            SimpleNamespace(ts=base, heat_kwh=1.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=2.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=1.5),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=2.5),
+        ]
+        diagnostics: dict[str, int] = {}
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("UTC"), diagnostics=diagnostics
+            )
+        )
+        assert intervals[0].energy_kwh == pytest.approx(0.5)
+        assert intervals[0].elapsed_hours == pytest.approx(1.0)
+        assert diagnostics["midday_decrease"] == 1
+
+    def test_persisted_midday_decrease_reanchors_after_confirmation(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=2.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=1.5),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=30), heat_kwh=1.5),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=2.0),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("Europe/Stockholm"), diagnostics=diagnostics
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == pytest.approx([0.5])
+        assert [interval.elapsed_hours for interval in intervals] == pytest.approx([0.5])
+        assert diagnostics["midday_decrease"] == 1
+        assert diagnostics["correction_reanchor"] == 1
+
+    def test_cop_confirmation_rejects_transient_refresh_spike(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=10.8),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=30), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=10.4),
             SimpleNamespace(
-                ts=base + dt.timedelta(hours=3),
+                device_id="one", ts=base + dt.timedelta(hours=1, minutes=15), heat_kwh=10.4
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("Europe/Stockholm"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert [(interval.energy_kwh, interval.elapsed_hours) for interval in intervals] == [
+            (pytest.approx(0.4), pytest.approx(1.0))
+        ]
+        assert diagnostics == {
+            "positive_pending": 2,
+            "positive_reverted": 1,
+            "positive_confirmed": 1,
+        }
+
+    def test_cop_confirmation_requires_a_later_reading_after_revert(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=10.8),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=30), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=10.3),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("Europe/Stockholm"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert intervals == []
+        assert diagnostics == {
+            "positive_pending": 2,
+            "positive_reverted": 1,
+            "positive_unresolved": 1,
+        }
+
+    def test_cop_confirmation_does_not_reuse_revert_history_after_zero_reads(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=10.8),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=30), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=4), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=8), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=11), heat_kwh=10.3),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("Europe/Stockholm"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert intervals == []
+        assert diagnostics == {
+            "positive_pending": 2,
+            "positive_reverted": 1,
+            "zero_delta": 2,
+            "positive_unresolved": 1,
+        }
+
+    def test_demand_default_emits_transient_refresh_spike_immediately(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=15), heat_kwh=10.8),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=30), heat_kwh=10.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=1), heat_kwh=10.4),
+        ]
+
+        intervals = list(iter_counter_change_intervals(rows, "heat_kwh", ZoneInfo("UTC")))
+
+        assert [(interval.energy_kwh, interval.elapsed_hours) for interval in intervals] == [
+            (pytest.approx(0.8), pytest.approx(0.25))
+        ]
+
+    @pytest.mark.parametrize(
+        ("values", "expected_energy", "diagnostic"),
+        [
+            ([10.0, 10.8, 10.8], 0.8, "positive_confirmed"),
+            ([10.0, 10.8, 10.4, 10.4], 0.4, "positive_replaced"),
+        ],
+    )
+    def test_confirmation_positive_candidates(self, values, expected_energy, diagnostic):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=value,
+            )
+            for index, value in enumerate(values)
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("UTC"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == pytest.approx([expected_energy])
+        assert diagnostics[diagnostic] == 1
+
+    @pytest.mark.parametrize(
+        ("values", "expected_energy", "diagnostic"),
+        [
+            ([10.0, 0.3, 0.4], 0.3, "reset_confirmed"),
+            ([10.0, 0.3, 0.2, 0.2], 0.2, "reset_replaced"),
+            ([10.0, 0.3, 10.1], None, "reset_abandoned"),
+            ([10.0, 0.3], None, "reset_unresolved"),
+        ],
+    )
+    def test_confirmation_reset_candidates(self, values, expected_energy, diagnostic):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 23, 50, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=15 * index),
+                heat_kwh=value,
+            )
+            for index, value in enumerate(values)
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("Europe/Stockholm"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == (
+            [] if expected_energy is None else pytest.approx([expected_energy])
+        )
+        assert diagnostics[diagnostic] == 1
+
+    def test_explicit_equal_source_date_suppresses_timestamp_reset(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 5, 23, 50, tzinfo=dt.timezone.utc),
+                heat_kwh=10.0,
+                source_date=dt.date(2026, 1, 5),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 6, 0, 15, tzinfo=dt.timezone.utc),
+                heat_kwh=0.3,
+                source_date=dt.date(2026, 1, 5),
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        assert (
+            list(
+                iter_counter_change_intervals(
+                    rows, "heat_kwh", ZoneInfo("UTC"), diagnostics=diagnostics
+                )
+            )
+            == []
+        )
+        assert diagnostics["midday_decrease"] == 1
+        assert "source_day_reset" not in diagnostics
+
+    def test_missing_or_mixed_source_date_uses_timestamp_compatibility(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 23, 50, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=10.0, source_date=dt.date(2026, 1, 5)
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=25),
+                heat_kwh=0.3,
+                source_date=None,
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("Europe/Stockholm"), diagnostics=diagnostics
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == pytest.approx([0.3])
+        assert diagnostics["source_day_reset"] == 1
+
+    def test_explicit_source_date_change_starts_and_confirms_reset(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 6, 0, 5, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=10.0, source_date=dt.date(2026, 1, 5)
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=10),
+                heat_kwh=0.3,
+                source_date=dt.date(2026, 1, 6),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=20),
+                heat_kwh=0.3,
+                source_date=dt.date(2026, 1, 6),
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("UTC"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == pytest.approx([0.3])
+        assert diagnostics["source_day_reset"] == 1
+        assert diagnostics["reset_confirmed"] == 1
+
+    def test_newer_source_day_replaces_pending_positive_with_reset(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 6, 0, 5, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=10.0, source_date=dt.date(2026, 1, 5)
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=10),
+                heat_kwh=10.8,
+                source_date=dt.date(2026, 1, 5),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=20),
+                heat_kwh=0.3,
+                source_date=dt.date(2026, 1, 6),
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=30),
+                heat_kwh=0.3,
+                source_date=dt.date(2026, 1, 6),
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("UTC"),
+                diagnostics=diagnostics,
+                confirm_changes=True,
+            )
+        )
+
+        assert [interval.energy_kwh for interval in intervals] == pytest.approx([0.3])
+        assert diagnostics["positive_abandoned"] == 1
+        assert diagnostics["reset_confirmed"] == 1
+
+    def test_irregular_steps_and_long_gaps_are_bounded_per_device(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="one", ts=base, heat_kwh=1.0),
+            SimpleNamespace(device_id="two", ts=base + dt.timedelta(minutes=15), heat_kwh=4.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(minutes=70), heat_kwh=1.5),
+            SimpleNamespace(device_id="two", ts=base + dt.timedelta(minutes=95), heat_kwh=4.5),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=4), heat_kwh=2.0),
+            SimpleNamespace(device_id="one", ts=base + dt.timedelta(hours=5), heat_kwh=2.5),
+        ]
+        diagnostics: dict[str, int] = {}
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("UTC"), diagnostics=diagnostics
+            )
+        )
+
+        assert [item.device_id for item in intervals] == ["one", "two", "one"]
+        assert [item.elapsed_hours for item in intervals] == pytest.approx([7 / 6, 4 / 3, 1.0])
+        assert [item.energy_kwh for item in intervals] == pytest.approx([0.5, 0.5, 0.5])
+        assert diagnostics["outside_window"] == 1
+
+    @pytest.mark.parametrize(
+        ("timezone", "start", "end", "expected_hours"),
+        [
+            (
+                "Europe/Stockholm",
+                dt.datetime(2026, 3, 29, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 29, 3, tzinfo=dt.timezone.utc),
+                3.0,
+            ),
+            (
+                "Europe/Amsterdam",
+                dt.datetime(2026, 10, 25, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 10, 25, 3, tzinfo=dt.timezone.utc),
+                3.0,
+            ),
+        ],
+    )
+    def test_dst_uses_elapsed_instants(self, timezone, start, end, expected_hours):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        rows = [
+            SimpleNamespace(device_id="one", ts=start, heat_kwh=1.0),
+            SimpleNamespace(device_id="one", ts=end, heat_kwh=2.0),
+        ]
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo(timezone), max_interval_hours=4.0
+            )
+        )
+        assert intervals[0].elapsed_hours == expected_hours
+
+    def test_local_midnight_reset_uses_local_day_start(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 5, 22, 50, tzinfo=dt.timezone.utc),
+                heat_kwh=10.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 5, 23, 15, tzinfo=dt.timezone.utc),
+                heat_kwh=0.3,
+            ),
+        ]
+        intervals = list(
+            iter_counter_change_intervals(rows, "heat_kwh", ZoneInfo("Europe/Amsterdam"))
+        )
+        assert intervals[0].energy_kwh == pytest.approx(0.3)
+        assert intervals[0].elapsed_hours == pytest.approx(0.25)
+
+    def test_utc_source_day_reset_uses_utc_boundary(self):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 5, 23, 50, tzinfo=dt.timezone.utc),
+                heat_kwh=10.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime(2026, 1, 6, 0, 15, tzinfo=dt.timezone.utc),
+                heat_kwh=0.3,
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows, "heat_kwh", ZoneInfo("Europe/Stockholm"), diagnostics=diagnostics
+            )
+        )
+
+        assert intervals[0].energy_kwh == pytest.approx(0.3)
+        assert intervals[0].elapsed_hours == pytest.approx(0.25)
+        assert diagnostics["source_day_reset"] == 1
+
+    @pytest.mark.parametrize(
+        "reset_day",
+        [dt.date(2026, 3, 29), dt.date(2026, 10, 25)],
+    )
+    def test_dst_day_uses_utc_reset_even_when_local_date_is_unchanged(self, reset_day):
+        from zoneinfo import ZoneInfo
+
+        from packages.ml.models_common import iter_counter_change_intervals
+
+        previous_day = reset_day - dt.timedelta(days=1)
+        rows = [
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime.combine(previous_day, dt.time(23, 50), tzinfo=dt.timezone.utc),
+                heat_kwh=10.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=dt.datetime.combine(reset_day, dt.time(0, 15), tzinfo=dt.timezone.utc),
+                heat_kwh=0.3,
+            ),
+        ]
+        diagnostics: dict[str, int] = {}
+
+        intervals = list(
+            iter_counter_change_intervals(
+                rows,
+                "heat_kwh",
+                ZoneInfo("Europe/Stockholm"),
+                diagnostics=diagnostics,
+                max_interval_hours=4.0,
+            )
+        )
+
+        assert len(intervals) == 1
+        assert intervals[0].energy_kwh == pytest.approx(0.3)
+        assert intervals[0].elapsed_hours == pytest.approx(0.25)
+        assert diagnostics["source_day_reset"] == 1
+        assert diagnostics.get("local_day_reset", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_demand_accepts_four_hour_counter_interval_but_caps_longer_gaps(self):
+        from packages.ml.models import DemandModel
+
+        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(hours=4),
                 heat_kwh=2.0,
                 cool_kwh=0.0,
                 tank_kwh=0.0,
-                outdoor_temp=3.0,
+                outdoor_temp=2.0,
             ),
-        ]
-        assert list(iter_consumption_intervals(rows)) == []
-
-    def test_negative_field_delta_clamped(self):
-        from packages.ml.models_common import iter_consumption_intervals
-
-        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
-        rows = [
-            SimpleNamespace(ts=base, heat_kwh=2.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=3.0),
             SimpleNamespace(
-                ts=base + dt.timedelta(minutes=30),
-                heat_kwh=1.5,
+                device_id="one",
+                ts=base + dt.timedelta(hours=8, minutes=1),
+                heat_kwh=2.5,
                 cool_kwh=0.0,
-                tank_kwh=1.0,
-                outdoor_temp=3.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
+            ),
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(hours=8, minutes=16),
+                heat_kwh=3.0,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=2.0,
             ),
         ]
-        intervals = list(iter_consumption_intervals(rows))
-        assert len(intervals) == 1
-        assert intervals[0].heat_kwh == 0.0  # negative delta clamped to zero
-        assert intervals[0].tank_kwh == pytest.approx(1.0)
+        weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
+        model = DemandModel()
+
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            _, target = await model._prepare_data()
+
+        assert target.tolist() == pytest.approx([0.5, 2.0])
+        assert model.last_data_quality["counter_outside_window"] == 1
 
 
 class TestThermalModel:
@@ -1086,8 +2151,11 @@ class TestDemandHeatingOnlyTarget:
 
         base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
         consumption = [
-            SimpleNamespace(ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
             SimpleNamespace(
+                device_id="one", ts=base, heat_kwh=0.0, cool_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0
+            ),
+            SimpleNamespace(
+                device_id="one",
                 ts=base + dt.timedelta(minutes=15),
                 heat_kwh=0.0,
                 cool_kwh=0.0,
@@ -1098,9 +2166,12 @@ class TestDemandHeatingOnlyTarget:
         weather = [SimpleNamespace(ts=base, temperature=1.0, wind_speed=4.0, irradiance=0.0)]
 
         model = DemandModel()
-        with patch(
-            "packages.ml.demand_model_core.get_session",
-            _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(consumption), _FakeResult(weather)]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
         ):
             _, target = await model._prepare_data()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from sqlalchemy import select
@@ -10,12 +11,14 @@ from sqlalchemy import select
 from packages.core.config import settings as app_settings
 from packages.core.database import get_session
 from packages.core.models import ConsumptionRecord, WeatherRecord
+from packages.core.settings_service import get_user_tz
 from packages.ml.models_common import (
     HAS_SKLEARN,
     MODEL_DIR,
+    COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS,
     _logger,
     evaluate_regression,
-    iter_consumption_intervals,
+    iter_counter_change_intervals,
     make_monotonic_regressor,
     prune_old_models,
     time_series_cv_mae,
@@ -36,6 +39,7 @@ _DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0, 0, 0, 0]
 DEMAND_MODEL_ARTIFACT_PREFIX = "demand_model_weather_v3_"
 DEMAND_MODEL_ARTIFACT_GLOB = f"{DEMAND_MODEL_ARTIFACT_PREFIX}*.pkl"
 DEMAND_MAE_BASELINE = "demand_weather_v3"
+DEMAND_COUNTER_CONFIRMATION_ENABLED = False
 
 
 class DemandModel:
@@ -299,10 +303,12 @@ class DemandModel:
         return self.last_data_quality
 
     async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
+        timezone = ZoneInfo(await get_user_tz())
         async with get_session() as session:
             consumption_rows = (
                 await session.execute(
                     select(
+                        ConsumptionRecord.device_id,
                         ConsumptionRecord.ts,
                         ConsumptionRecord.heat_kwh,
                         ConsumptionRecord.cool_kwh,
@@ -350,14 +356,22 @@ class DemandModel:
         rejected_nonpositive = 0
         weather_matches = 0
         weather_temperature_fallbacks = 0
-        for interval in iter_consumption_intervals(consumption_rows):
+        counter_diagnostics: dict[str, int] = {}
+        for interval in iter_counter_change_intervals(
+            consumption_rows,
+            "heat_kwh",
+            timezone,
+            max_interval_hours=4.0,
+            diagnostics=counter_diagnostics,
+            confirm_changes=DEMAND_COUNTER_CONFIRMATION_ENABLED,
+        ):
             intervals += 1
             # Target is *space-heating* electrical demand only. DHW and cooling
             # are excluded because they violate the model's monotonic physics
             # (DHW is outdoor-independent; cooling demand rises — not falls —
             # with outdoor temperature). Intervals with no space-heating draw
             # are naturally dropped by the rate<=0 guard below.
-            rate = interval.heat_rate_kw
+            rate = interval.energy_kwh / interval.elapsed_hours
             if rate <= 0:
                 rejected_nonpositive += 1
                 continue
@@ -365,8 +379,8 @@ class DemandModel:
                 skip_rate_bounds += 1
                 continue
 
-            weather = _nearest_weather(interval.ts)
-            outdoor = interval.outdoor_temp
+            weather = _nearest_weather(interval.end_ts)
+            outdoor = interval.row.outdoor_temp
             wind = 3.0
             irradiance = 0.0
             precipitation = 0.0
@@ -403,8 +417,8 @@ class DemandModel:
                     outdoor,
                     wind,
                     irradiance,
-                    interval.ts.hour,
-                    interval.ts.weekday(),
+                    interval.end_ts.hour,
+                    interval.end_ts.weekday(),
                     precipitation,
                     humidity,
                     cloud_cover,
@@ -445,8 +459,21 @@ class DemandModel:
             "training_blocker": training_blocker,
             "seasonal_guidance": seasonal_guidance,
             "ready_to_train": ready_to_train,
+            "counter_zero_delta": counter_diagnostics.get("zero_delta", 0),
+            "counter_midday_decrease": counter_diagnostics.get("midday_decrease", 0),
+            "counter_source_day_reset": counter_diagnostics.get("source_day_reset", 0),
+            "counter_correction_reanchor": counter_diagnostics.get("correction_reanchor", 0),
+            "counter_outside_window": counter_diagnostics.get("outside_window", 0),
+            **{
+                f"counter_{key}": counter_diagnostics.get(key, 0)
+                for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS
+            },
         }
-        _logger.info("demand_training_data_prepared", **self._last_data_quality)
+        log_data_quality = dict(self._last_data_quality)
+        for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS:
+            if not log_data_quality[f"counter_{key}"]:
+                log_data_quality.pop(f"counter_{key}")
+        _logger.info("demand_training_data_prepared", **log_data_quality)
         return np.array(X_list), np.array(y_list)
 
     def load_latest(self) -> bool:

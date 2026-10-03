@@ -10,6 +10,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -22,9 +23,24 @@ _logger = structlog.get_logger()
 # missed samples and the average rate over the gap would be unreliable.
 MIN_INTERVAL_HOURS = 0.05  # 3 minutes
 MAX_INTERVAL_HOURS = 2.0
+COUNTER_CONFIRMATION_EPSILON = 0.001
+COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS = (
+    "positive_pending",
+    "positive_confirmed",
+    "positive_replaced",
+    "positive_abandoned",
+    "positive_reverted",
+    "positive_unresolved",
+    "reset_pending",
+    "reset_confirmed",
+    "reset_replaced",
+    "reset_abandoned",
+    "reset_unresolved",
+)
 
 
 class _ConsumptionRowLike(Protocol):
+    device_id: str
     ts: dt.datetime
     heat_kwh: float | None
     cool_kwh: float | None
@@ -74,31 +90,264 @@ class ConsumptionInterval:
         return self.cool_kwh / self.elapsed_hours if self.elapsed_hours > 0 else 0.0
 
 
-def iter_consumption_intervals(
-    rows: Iterable[_ConsumptionRowLike],
-) -> Iterator[ConsumptionInterval]:
-    """Convert cumulative day-to-date consumption counters into per-interval deltas.
+@dataclass(frozen=True)
+class CounterInterval:
+    """A positive change in one per-device day-to-date cumulative counter."""
 
-    ``rows`` must be ordered by ``ts``. Consecutive readings within the same
-    calendar day are subtracted to recover the energy used during the interval.
-    Pairs that straddle a day boundary (counter reset) or whose elapsed time falls
-    outside ``[MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS]`` are skipped. Negative
-    per-field deltas (mid-day resets / corrections) are clamped to zero.
+    device_id: str
+    start_ts: dt.datetime
+    end_ts: dt.datetime
+    elapsed_hours: float
+    energy_kwh: float
+    row: _ConsumptionRowLike
+
+
+def _aware_utc(ts: dt.datetime) -> dt.datetime:
+    """Normalize database instants so elapsed time is never wall-clock based."""
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=dt.timezone.utc)
+    return ts.astimezone(dt.timezone.utc)
+
+
+def iter_counter_change_intervals(
+    rows: Iterable[_ConsumptionRowLike],
+    counter: str,
+    timezone: ZoneInfo,
+    *,
+    min_interval_hours: float = MIN_INTERVAL_HOURS,
+    max_interval_hours: float = MAX_INTERVAL_HOURS,
+    diagnostics: dict[str, int] | None = None,
+    confirm_changes: bool = False,
+) -> Iterator[CounterInterval]:
+    """Yield valid windows between positive changes in a cumulative counter.
+
+    Anchors are independent for every device and counter. Historical records
+    use the UTC request date to select a daily API entry, so a UTC date change
+    is a source-day reset even when it is not local midnight. Locally selected
+    records reset at local midnight. A same-counter-day decrease is first
+    treated as a transient correction. A second lower reading confirms a
+    revised baseline and safely re-anchors subsequent intervals.
     """
-    prev = None
+
+    def increment(name: str) -> None:
+        if diagnostics is not None:
+            diagnostics[name] = diagnostics.get(name, 0) + 1
+
+    def reset_type(anchor: _ConsumptionRowLike, row: _ConsumptionRowLike) -> str | None:
+        anchor_source_date = getattr(anchor, "source_date", None)
+        row_source_date = getattr(row, "source_date", None)
+        if anchor_source_date is not None and row_source_date is not None:
+            return "source_day_reset" if anchor_source_date != row_source_date else None
+        if anchor.ts.date() != row.ts.date():
+            return "source_day_reset"
+        if anchor.ts.astimezone(timezone).date() != row.ts.astimezone(timezone).date():
+            return "local_day_reset"
+        return None
+
+    def reset_boundary(row: _ConsumptionRowLike, kind: str) -> dt.datetime:
+        end_ts = _aware_utc(row.ts)
+        if kind == "source_day_reset":
+            return end_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = row.ts.astimezone(timezone)
+        return local_end.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+            dt.timezone.utc
+        )
+
+    def interval(
+        anchor: _ConsumptionRowLike,
+        row: _ConsumptionRowLike,
+        start_ts: dt.datetime,
+        energy_kwh: float,
+    ) -> CounterInterval | None:
+        end_ts = _aware_utc(row.ts)
+        elapsed_hours = (end_ts - start_ts).total_seconds() / 3600.0
+        if not min_interval_hours <= elapsed_hours <= max_interval_hours:
+            increment("outside_window")
+            return None
+        return CounterInterval(anchor.device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
+
+    if confirm_changes:
+        anchors: dict[str, _ConsumptionRowLike] = {}
+        pending_positive: dict[str, _ConsumptionRowLike] = {}
+        pending_reset: dict[str, tuple[_ConsumptionRowLike, dt.datetime, str]] = {}
+        pending_corrections: dict[str, _ConsumptionRowLike] = {}
+
+        def begin_positive(
+            device_id: str, row: _ConsumptionRowLike, *, replacement: bool = False
+        ) -> None:
+            pending_positive[device_id] = row
+            increment("positive_replaced" if replacement else "positive_pending")
+
+        def begin_reset(device_id: str, row: _ConsumptionRowLike, kind: str) -> None:
+            pending_reset[device_id] = (row, reset_boundary(row, kind), kind)
+            increment("reset_pending")
+            increment(kind)
+
+        for row in rows:
+            device_id = row.device_id
+            anchor = anchors.get(device_id)
+            if anchor is None:
+                anchors[device_id] = row
+                continue
+
+            old_value = getattr(anchor, counter) or 0.0
+            new_value = getattr(row, counter) or 0.0
+            pending = pending_positive.get(device_id)
+            reset = pending_reset.get(device_id)
+
+            if reset is not None:
+                reset_row, boundary, reset_kind = reset
+                newer_reset_kind = reset_type(reset_row, row)
+                if newer_reset_kind is not None:
+                    increment("reset_abandoned")
+                    pending_reset.pop(device_id, None)
+                    begin_reset(device_id, row, newer_reset_kind)
+                    continue
+                reset_value = getattr(reset_row, counter) or 0.0
+                if (
+                    reset_value - COUNTER_CONFIRMATION_EPSILON
+                    <= new_value
+                    < old_value - COUNTER_CONFIRMATION_EPSILON
+                ):
+                    pending_reset.pop(device_id, None)
+                    increment("reset_confirmed")
+                    emitted = interval(anchor, reset_row, boundary, reset_value)
+                    if emitted is not None:
+                        yield emitted
+                    anchors[device_id] = reset_row
+                    pending_corrections.pop(device_id, None)
+                    if new_value > reset_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                if new_value < reset_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_reset[device_id] = (row, boundary, reset_kind)
+                    increment("reset_replaced")
+                    continue
+                if new_value >= old_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_reset.pop(device_id, None)
+                    increment("reset_abandoned")
+                    if new_value > old_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                continue
+
+            kind = reset_type(anchor, row)
+            pending_reset_kind = reset_type(pending, row) if pending is not None else None
+            if pending_reset_kind is not None:
+                pending_positive.pop(device_id, None)
+                increment("positive_abandoned")
+                begin_reset(device_id, row, pending_reset_kind)
+                continue
+
+            if pending is not None:
+                candidate_value = getattr(pending, counter) or 0.0
+                if abs(new_value - old_value) <= COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_reverted")
+                    continue
+                if (
+                    old_value + COUNTER_CONFIRMATION_EPSILON
+                    < new_value
+                    < candidate_value - COUNTER_CONFIRMATION_EPSILON
+                ):
+                    begin_positive(device_id, row, replacement=True)
+                    continue
+                if new_value >= candidate_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_confirmed")
+                    emitted = interval(
+                        anchor,
+                        pending,
+                        _aware_utc(anchor.ts),
+                        candidate_value - old_value,
+                    )
+                    if emitted is not None:
+                        yield emitted
+                    anchors[device_id] = pending
+                    pending_corrections.pop(device_id, None)
+                    if new_value > candidate_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                if new_value < old_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_abandoned")
+                else:
+                    continue
+
+            if abs(new_value - old_value) <= COUNTER_CONFIRMATION_EPSILON:
+                increment("zero_delta")
+                continue
+            if new_value > old_value:
+                pending_corrections.pop(device_id, None)
+                begin_positive(device_id, row)
+                continue
+            if kind is not None:
+                begin_reset(device_id, row, kind)
+                continue
+            if device_id in pending_corrections:
+                anchors[device_id] = row
+                pending_corrections.pop(device_id, None)
+                increment("correction_reanchor")
+                continue
+            pending_corrections[device_id] = row
+            increment("midday_decrease")
+
+        for device_id in pending_positive:
+            increment("positive_unresolved")
+        for device_id in pending_reset:
+            increment("reset_unresolved")
+        return
+
+    anchors: dict[str, _ConsumptionRowLike] = {}
+    pending_corrections: dict[str, _ConsumptionRowLike] = {}
     for row in rows:
-        if prev is not None and row.ts.date() == prev.ts.date():
-            elapsed = (row.ts - prev.ts).total_seconds() / 3600.0
-            if MIN_INTERVAL_HOURS <= elapsed <= MAX_INTERVAL_HOURS:
-                yield ConsumptionInterval(
-                    ts=row.ts,
-                    elapsed_hours=elapsed,
-                    heat_kwh=max(0.0, (row.heat_kwh or 0.0) - (prev.heat_kwh or 0.0)),
-                    cool_kwh=max(0.0, (row.cool_kwh or 0.0) - (prev.cool_kwh or 0.0)),
-                    tank_kwh=max(0.0, (row.tank_kwh or 0.0) - (prev.tank_kwh or 0.0)),
-                    outdoor_temp=row.outdoor_temp,
-                )
-        prev = row
+        device_id = row.device_id
+        anchor = anchors.get(device_id)
+        if anchor is None:
+            anchors[device_id] = row
+            continue
+
+        old_value = getattr(anchor, counter) or 0.0
+        new_value = getattr(row, counter) or 0.0
+        end_ts = _aware_utc(row.ts)
+        start_ts = _aware_utc(anchor.ts)
+        if new_value == old_value:
+            pending_corrections.pop(device_id, None)
+            if diagnostics is not None:
+                diagnostics["zero_delta"] = diagnostics.get("zero_delta", 0) + 1
+            continue
+
+        if new_value < old_value:
+            kind = reset_type(anchor, row)
+            if kind is None:
+                if device_id in pending_corrections:
+                    anchors[device_id] = row
+                    pending_corrections.pop(device_id, None)
+                    if diagnostics is not None:
+                        diagnostics["correction_reanchor"] = (
+                            diagnostics.get("correction_reanchor", 0) + 1
+                        )
+                    continue
+                pending_corrections[device_id] = row
+                if diagnostics is not None:
+                    diagnostics["midday_decrease"] = diagnostics.get("midday_decrease", 0) + 1
+                continue
+            start_ts = reset_boundary(row, kind)
+            energy_kwh = new_value
+            pending_corrections.pop(device_id, None)
+            if diagnostics is not None:
+                diagnostics[kind] = diagnostics.get(kind, 0) + 1
+        else:
+            energy_kwh = new_value - old_value
+            pending_corrections.pop(device_id, None)
+
+        elapsed_hours = (end_ts - start_ts).total_seconds() / 3600.0
+        anchors[device_id] = row
+        if not min_interval_hours <= elapsed_hours <= max_interval_hours:
+            if diagnostics is not None:
+                diagnostics["outside_window"] = diagnostics.get("outside_window", 0) + 1
+            continue
+        yield CounterInterval(device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
 
 
 try:

@@ -344,7 +344,7 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
     [
         (
             "cop",
-            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            "cop_model_weather_dhw_v5_20261001_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"mae": 0.2, "samples": 17}},
         ),
         (
@@ -379,7 +379,7 @@ def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload
 @pytest.mark.parametrize(
     ("model_kind", "filename"),
     [
-        ("cop", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+        ("cop", "cop_model_weather_dhw_v5_20261001_1200.pkl"),
         ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
     ],
 )
@@ -402,7 +402,7 @@ def test_model_status_reports_signature_failure_without_details(
 @pytest.mark.parametrize(
     ("model_kind", "filename"),
     [
-        ("cop", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+        ("cop", "cop_model_weather_dhw_v5_20261001_1200.pkl"),
         ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
     ],
 )
@@ -450,6 +450,7 @@ async def test_optimizer_status_contains_safe_failure_for_bad_artifact(
     ("model_kind", "filename"),
     [
         ("cop", "cop_model_weather_dhw_v3_20261001_1200.pkl"),
+        ("cop", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
         ("demand", "demand_model_weather_v2_20261001_1200.pkl"),
     ],
 )
@@ -469,8 +470,8 @@ def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename
     [
         (
             "cop",
-            "cop_model_weather_dhw_v4_20261001_1200.pkl",
-            "cop_model_weather_dhw_v4_20261002_1200.pkl",
+            "cop_model_weather_dhw_v5_20261001_1200.pkl",
+            "cop_model_weather_dhw_v5_20261002_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
             {"model": SimpleNamespace(n_features_in_=1)},
         ),
@@ -513,8 +514,8 @@ def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
     [
         (
             "cop",
-            "cop_model_weather_dhw_v4_20261001_1200.pkl",
-            "cop_model_weather_dhw_v4_20261002_1200.pkl",
+            "cop_model_weather_dhw_v5_20261001_1200.pkl",
+            "cop_model_weather_dhw_v5_20261002_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
         ),
         (
@@ -552,7 +553,7 @@ def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
     [
         (
             "cop",
-            "cop_model_weather_dhw_v4_20261001_1200.pkl",
+            "cop_model_weather_dhw_v5_20261001_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=1)},
         ),
         (
@@ -584,7 +585,7 @@ def test_model_status_reports_only_incompatible_artifact(
 def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
-    path = tmp_path / "cop_model_weather_dhw_v4_20261001_1200.pkl"
+    path = tmp_path / "cop_model_weather_dhw_v5_20261001_1200.pkl"
     path.write_bytes(b"first")
     clear_artifact_status_cache()
     loaded_metrics = iter(({"samples": 4}, {"samples": 9}))
@@ -613,7 +614,7 @@ def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> 
 def test_model_status_cache_invalidates_when_an_artifact_is_added(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
-    first_path = tmp_path / "cop_model_weather_dhw_v4_20261001_1200.pkl"
+    first_path = tmp_path / "cop_model_weather_dhw_v5_20261001_1200.pkl"
     first_path.write_bytes(b"first")
     clear_artifact_status_cache()
     fake_model = SimpleNamespace(version="20261001_1200", metrics={"samples": 4})
@@ -621,7 +622,7 @@ def test_model_status_cache_invalidates_when_an_artifact_is_added(tmp_path) -> N
 
     with patch("packages.ml.models.COPModel", return_value=fake_model):
         first = _inspect_model_artifact("cop", tmp_path)
-        (tmp_path / "cop_model_weather_dhw_v4_20261002_1200.pkl").write_bytes(b"second")
+        (tmp_path / "cop_model_weather_dhw_v5_20261002_1200.pkl").write_bytes(b"second")
         fake_model.metrics = {"samples": 9}
         second = _inspect_model_artifact("cop", tmp_path)
 
@@ -840,3 +841,23 @@ async def test_heat_curve_advice_uses_current_device_gate_and_fails_closed(
     else:
         assert response["suggested"] is None
         assert response["status"] == "not_controllable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cop_count", "consumption_count", "expected"),
+    [(49, 50, False), (50, 49, False), (50, 50, True)],
+)
+async def test_ml_data_gate_requires_both_current_thresholds(
+    cop_count, consumption_count, expected
+):
+    from packages.optimizer.main import _has_sufficient_ml_data
+
+    cop_result = MagicMock()
+    cop_result.scalar.return_value = cop_count
+    consumption_result = MagicMock()
+    consumption_result.scalar.return_value = consumption_count
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[cop_result, consumption_result]))
+
+    with patch("packages.optimizer.main.get_session", return_value=_session_context(session)):
+        assert await _has_sufficient_ml_data() is expected
