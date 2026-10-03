@@ -16,6 +16,18 @@ export interface ReleaseNote {
  */
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
+    version: "0.14.0",
+    released: "2026-10-03",
+    title: "Explainable timelines and safer learning",
+    changes: [
+      "Home, Timeline, and Under the hood replace the old tabs with deep links, a shared refresh, and a timeline that explains prices, comfort, actions, and outcomes.",
+      "Models separates plain-language decision guidance from diagnostics, and the COP and Demand cards now report real readings, validation scores, and training dates.",
+      "When learning mode can't be determined, the active plan is kept and the executor only runs safety restores; executor verification reads use a durable hourly budget.",
+      "COP training ignores brief counter glitches, and daily consumption now follows your local calendar day across midnight and daylight-saving changes.",
+      "Security updates for Next.js (GHSA-vcvr-r3jv-pc5j) and a development dependency; an optional account-wide Panasonic read quota is available but off by default.",
+    ],
+  },
+  {
     version: "0.13.7",
     released: "2026-09-23",
     title: "Dependency maintenance and release provenance",

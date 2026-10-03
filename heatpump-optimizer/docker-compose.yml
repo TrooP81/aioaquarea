@@ -36,7 +36,7 @@ services:
       dockerfile: heatpump-optimizer/Dockerfile
       target: base
       args:
-        APP_VERSION: ${APP_VERSION:-0.13.7}
+        APP_VERSION: ${APP_VERSION:-0.14.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     command: [ "alembic", "upgrade", "head" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
@@ -55,7 +55,7 @@ services:
       dockerfile: heatpump-optimizer/Dockerfile
       target: base
       args:
-        APP_VERSION: ${APP_VERSION:-0.13.7}
+        APP_VERSION: ${APP_VERSION:-0.14.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     command: [ "python", "-m", "packages.poller.main" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
@@ -81,7 +81,7 @@ services:
       dockerfile: heatpump-optimizer/Dockerfile
       target: base
       args:
-        APP_VERSION: ${APP_VERSION:-0.13.7}
+        APP_VERSION: ${APP_VERSION:-0.14.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     command: [ "python", "-m", "packages.optimizer.main" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
@@ -107,7 +107,7 @@ services:
       dockerfile: heatpump-optimizer/Dockerfile
       target: base
       args:
-        APP_VERSION: ${APP_VERSION:-0.13.7}
+        APP_VERSION: ${APP_VERSION:-0.14.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     command: [ "uvicorn", "packages.api.main:app", "--host", "0.0.0.0", "--port", "8500" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
@@ -139,7 +139,7 @@ services:
       context: ./web
       dockerfile: Dockerfile
       args:
-        APP_VERSION: ${APP_VERSION:-0.13.7}
+        APP_VERSION: ${APP_VERSION:-0.14.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     ports:
       - "127.0.0.1:${WEB_PORT:-4444}:3000"

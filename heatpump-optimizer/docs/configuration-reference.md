@@ -70,7 +70,7 @@ restart the API and poller; no migration or Redis cleanup is required.
 | `API_PORT` | `8500` | `api` | Loopback host port for the API. |
 | `WEB_PORT` | `4444` | `web` | Loopback host port for the dashboard. |
 | `COMPOSE_ENV_FILE` | `.env` | all | Alternative env file for services. |
-| `APP_VERSION` / `BUILD_REVISION` | `0.13.7` / `unknown` | image builds | Build metadata. |
+| `APP_VERSION` / `BUILD_REVISION` | `0.14.0` / `unknown` | image builds | Build metadata. |
 | `TIMESCALE_IMAGE` / `REDIS_IMAGE` | pinned digests | `db`, backups / `redis` | Image overrides. |
 
 ### Backups

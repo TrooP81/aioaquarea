@@ -32,6 +32,14 @@ def test_release_version_is_embedded_in_container_builds():
         assert f"ARG APP_VERSION={APP_VERSION}" in contents
         assert 'org.opencontainers.image.version="${APP_VERSION}"' in contents
 
+    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert compose.count(f"APP_VERSION: ${{APP_VERSION:-{APP_VERSION}}}") == 5
+
+    configuration_reference = (PROJECT_ROOT / "docs" / "configuration-reference.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"| `APP_VERSION` / `BUILD_REVISION` | `{APP_VERSION}` / `unknown` |" in configuration_reference
+
 
 @pytest.mark.asyncio
 async def test_version_endpoint_reports_running_api_version():
