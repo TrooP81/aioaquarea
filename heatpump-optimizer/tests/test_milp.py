@@ -759,15 +759,15 @@ class TestMILPSolver:
                 "quiet_mode_off",
             ), f"Unknown action type: {action['type']}"
 
-    def test_milp_with_ml_cop_model(self):
-        """MILP should use ML COP model when provided."""
+    def test_milp_ignores_retired_cop_model(self):
+        """A supplied legacy COP object never enables inference or the ML tag."""
         from packages.optimizer.milp import MILPOptimizer
 
-        mock_cop = MagicMock()
-        mock_cop.is_trained = True
-        mock_cop.predict_cop = MagicMock(return_value=4.0)
+        class RetiredCOP:
+            def __getattr__(self, name):
+                raise AssertionError(f"COP access: {name}")
 
-        milp = MILPOptimizer(cop_model=mock_cop)
+        milp = MILPOptimizer(cop_model=RetiredCOP())
         prices = _make_prices()
         weather = _make_weather()
 
@@ -780,21 +780,73 @@ class TestMILPSolver:
         )
 
         assert plan is not None
-        assert "+ml" in plan["version"]
+        assert plan["version"] == "milp_v1"
+        assert plan["cop_source"] == "assumed"
+        assert plan["cop_measured"] is False
+        assert plan["heating_efficiency"] == {"source": "assumed", "measured": False}
+        for action in plan["actions"]:
+            if action["type"] == "force_dhw_on":
+                assert action["payload"]["cop_source"] == "assumed"
+                assert action["payload"]["cop_measured"] is False
 
-    def test_ml_cop_receives_forecast_precipitation(self):
-        """The MILP must pass the matching forecast rain amount to the COP model."""
+    def test_assumed_efficiency_does_not_infer_cop_from_forecast(self):
+        """Weather/tank arguments remain compatible but never enter COP inference."""
         from packages.optimizer.milp import MILPOptimizer
 
         mock_cop = MagicMock()
         mock_cop.is_trained = True
-        mock_cop.predict_cop = MagicMock(return_value=4.0)
+        mock_cop.predict_cop = MagicMock(side_effect=AssertionError("COP inference"))
         milp = MILPOptimizer(cop_model=mock_cop)
         ts = _make_prices()[0][0]
 
         cop_fn = milp._build_cop_function(None, [{"ts": ts, "precipitation": 2.5}])
         assert cop_fn(5.0, ts.hour) == 4.0
-        mock_cop.predict_cop.assert_called_once_with(5.0, 50, ts.hour, 2.5, 60.0, 0.5)
+        mock_cop.predict_cop.assert_not_called()
+
+    @pytest.mark.parametrize("trained", [False, True])
+    def test_ml_suffix_only_reflects_retained_demand(self, trained):
+        demand = MagicMock(is_trained=trained)
+        milp = MILPOptimizer(demand_model=demand)
+        plan = milp._solve(
+            _make_prices(hours=1),
+            _make_weather(hours=1),
+            cop_fn=milp._build_cop_function(None),
+            demand_per_hour=[0.0],
+            current_tank_temp=48.0,
+        )
+        assert plan["version"] == ("milp_v1+ml" if trained else "milp_v1")
+
+    def test_dhw_thermal_divides_once_and_sh_stays_electrical(self):
+        from packages.core.config import settings
+        from packages.ml.thermal import thermal_model
+
+        base = _make_prices(hours=1)[0][0]
+        milp = MILPOptimizer()
+        with (
+            patch.object(thermal_model.params, "last_calibrated", base),
+            patch.object(
+                thermal_model, "_tank_heating_rate", return_value=3.5 / settings.tank_kwh_per_degree
+            ),
+            patch.object(
+                thermal_model, "_tank_loss_rate", return_value=-3.5 / settings.tank_kwh_per_degree
+            ),
+        ):
+            plan = milp._solve(
+                [(base, 0.25)],
+                [(base, 0.0)],
+                cop_fn=milp._build_cop_function(None),
+                demand_per_hour=[1.0],
+                current_tank_temp=45.0,
+                indoor_rates=[(0.0, 0.0)],
+            )
+
+        assert plan["cost_estimate"] == pytest.approx(0.50)
+        assert plan["space_heating_demand_kwh"] == pytest.approx(1.0)
+        dhw = next(action for action in plan["actions"] if action["type"] == "force_dhw_on")
+        assert dhw["payload"]["cop"] == pytest.approx(3.5)
+        assert dhw["payload"]["dhw_fraction"] == pytest.approx(1.0)
+        assert dhw["payload"]["cop_source"] == "assumed"
+        assert dhw["payload"]["cop_measured"] is False
 
     def test_milp_version_without_ml(self):
         """Version should be plain milp_v1 without ML models."""

@@ -244,13 +244,9 @@ class TestRulesOptimizer:
 
         assert slot == [prices[0]]
 
-    def test_dhw_slot_uses_trained_cop_model_when_tank_target_known(self):
-        """When the ML COP model is trained, DHW slot picks reflect the tank
-        target instead of the outdoor-only default curve. That opens the door
-        to real savings on hours where the ML model predicts a materially
-        different COP than the linear default.
-        """
-        optimizer = RulesOptimizer()
+    @pytest.mark.parametrize("tank_target", [None, 52])
+    def test_dhw_slot_ignores_retired_cop_for_all_targets(self, tank_target):
+        """Even a legacy trained COP object cannot influence DHW slot selection."""
         base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         prices = [
             (base, 0.10),
@@ -261,47 +257,42 @@ class TestRulesOptimizer:
             (base + dt.timedelta(hours=1), 5.0),
         ]
 
-        # ML model reports a much higher COP at hour 1 (e.g. warmer supply
-        # side, better setpoint alignment) than at hour 0. Same raw price, but
-        # hour 1 wins on cost per delivered kWh.
-        def _predict_cop(outdoor, target, hour):
-            return 5.0 if hour == 1 else 2.5
+        class RetiredCOP:
+            def __getattr__(self, name):
+                raise AssertionError(f"COP access: {name}")
 
-        mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
-        optimizer = RulesOptimizer(cop_model=mock_cop)
+        optimizer = RulesOptimizer(cop_model=RetiredCOP())
         slot = optimizer._find_lowest_dhw_energy_cost_slot(
             prices,
             weather,
             hours_needed=1,
             fallback_outdoor_temp=5.0,
-            tank_target=52,
+            tank_target=tank_target,
         )
 
-        assert slot == [prices[1]]
+        assert slot == [prices[0]]
 
-    def test_dhw_slot_falls_back_to_default_cop_without_tank_target(self):
-        """The trained COP model must not be used when the tank target is
-        unknown, since predict_cop needs it. The default curve stays in play
-        for shared preheat callers that don't have a tank target.
-        """
+    def test_compatibility_slot_arguments_never_inspect_retired_cop(self):
+        """Passing COP directly to the shared helper cannot reactivate inference."""
         optimizer = RulesOptimizer()
         base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         prices = [(base, 0.10), (base + dt.timedelta(hours=1), 0.10)]
         weather = [(base, 5.0), (base + dt.timedelta(hours=1), 5.0)]
 
-        called = []
+        class RetiredCOP:
+            def __getattr__(self, name):
+                raise AssertionError(f"COP access: {name}")
 
-        def _predict_cop(outdoor, target, hour):
-            called.append((outdoor, target, hour))
-            return 5.0
-
-        mock_cop = SimpleNamespace(is_trained=True, predict_cop=_predict_cop)
-        optimizer = RulesOptimizer(cop_model=mock_cop)
-        optimizer._find_lowest_dhw_energy_cost_slot(
-            prices, weather, hours_needed=1, fallback_outdoor_temp=5.0
+        slot = optimizer._find_lowest_heat_energy_cost_slot(
+            prices,
+            weather,
+            hours_needed=1,
+            fallback_outdoor_temp=5.0,
+            dhw_cop_model=RetiredCOP(),
+            dhw_target=52,
         )
 
-        assert called == []
+        assert slot == [prices[0]]
 
     def test_heat_slot_rejects_fragmented_price_hours(self):
         optimizer = RulesOptimizer()
@@ -833,7 +824,7 @@ class TestRulesOptimizer:
                 return_value=[{"predicted_indoor_temp": 21.0}] * len(weather),
             ),
             patch(
-                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                "packages.optimizer.rule_mixins.assumed_heating_efficiency",
                 side_effect=lambda outdoor: 2.0 if outdoor == 5.0 else 4.0,
             ),
         ):
@@ -1014,7 +1005,7 @@ class TestRulesOptimizer:
                 return_value={timestamp: 19.0 for timestamp, _ in prices},
             ),
             patch(
-                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                "packages.optimizer.rule_mixins.assumed_heating_efficiency",
                 return_value=1.0,
             ),
             patch(
@@ -1061,7 +1052,7 @@ class TestRulesOptimizer:
                 return_value={timestamp: 19.0 for timestamp, _ in prices},
             ),
             patch(
-                "packages.optimizer.rule_mixins.COPModel._default_cop_curve",
+                "packages.optimizer.rule_mixins.assumed_heating_efficiency",
                 return_value=1.0,
             ),
             patch(
@@ -2612,7 +2603,7 @@ class TestRulesOptimizer:
         prices = [(base, 0.03), (base + dt.timedelta(hours=1), 0.2)]
         weather = [(timestamp, 5.0) for timestamp, _ in prices]
         with (
-            patch("packages.optimizer.rule_mixins.COPModel._default_cop_curve", return_value=1.0),
+            patch("packages.optimizer.rule_mixins.assumed_heating_efficiency", return_value=1.0),
             patch(
                 "packages.optimizer.rule_mixins.thermal_model.predict_indoor_controlled_curve",
                 return_value=[{"predicted_indoor_temp": 20.0}] * 2,

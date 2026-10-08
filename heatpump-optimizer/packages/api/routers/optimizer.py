@@ -509,6 +509,7 @@ async def get_optimizer_status():
     from packages.ml.model_status import _inspect_model_artifact
     from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
+    from packages.optimizer.rules import RulesOptimizer
 
     layer = await get_setting("optimizer_layer") or "rules_only"
     optimizer_status = await get_optimizer_status_snapshot(layer)
@@ -525,13 +526,20 @@ async def get_optimizer_status():
         asyncio.to_thread(_inspect_model_artifact, "demand", MODEL_DIR),
         DemandModel().training_data_quality(),
     )
-    cop_model["source_records"] = total_consumption
     demand_model["source_records"] = total_consumption
 
     return {
         "configured_layer": layer,
         "active_layer": optimizer_status["active_layer"],
-        "fallback_layer": "rules_v3",
+        "effective_layer": optimizer_status.get("effective_layer", "rules"),
+        "selection_reason": optimizer_status.get(
+            "selection_reason",
+            "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer",
+        ),
+        "fallback_layer": RulesOptimizer.VERSION,
+        "cop_trained": False,
+        "cop_source": "assumed",
+        "cop_measured": False,
         "learning_mode": learning_mode,
         "cop_model": cop_model,
         "demand_model": {**demand_model, "data_quality": demand_quality},

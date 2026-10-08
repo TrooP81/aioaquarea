@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DataAge } from "./DataAge";
 import { LAYER_LABELS, reasonLabel, seasonalReasonLabel } from "@/lib/constants";
 import type { ControlState, SpaceHeatingGate } from "@/lib/api-types";
 import { OptimizerDiagnostics } from "./OptimizerDiagnostics";
 import { WhyItDecides } from "./WhyItDecides";
+import { ManualCOPMonitoring } from "./ManualCOPMonitoring";
 
 interface ModelInfo {
   trained: boolean;
@@ -13,7 +14,7 @@ interface ModelInfo {
   samples?: number;
   source_records?: number;
   metrics?: { mae?: number; cv_std?: number; samples?: number; baseline_mae?: number; validation_method?: string };
-  unavailable_reason?: "not_found" | "integrity_check_failed" | "incompatible_artifact" | "load_failed" | null;
+  unavailable_reason?: "retired" | "not_found" | "integrity_check_failed" | "incompatible_artifact" | "load_failed" | null;
   data_quality?: DemandDataQuality;
 }
 
@@ -36,6 +37,7 @@ interface ModelTrainResult {
   error?: string;
   samples?: number;
   version?: string;
+  status?: string;
 }
 
 interface ThermalInfo {
@@ -243,8 +245,10 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [training, setTraining] = useState<Record<string, boolean>>({});
   const [trainMsg, setTrainMsg] = useState<TrainMessage | null>(null);
+  const decisionFocusOrigin = useRef<Element | null>(null);
 
   const refresh = async (focusDecisionSummary = false) => {
+    const focusOrigin = focusDecisionSummary ? document.activeElement : null;
     setIsRefreshing(true);
     try {
       const required = await fetch("/api/optimizer/status");
@@ -256,18 +260,15 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
         fetch("/api/thermal/forecast-scorecard").then((response) => response.ok ? response.json() : null).catch(() => null),
         fetch("/api/sensors/diagnostics").then((response) => response.ok ? response.json() : null).catch(() => null),
       ]);
+      decisionFocusOrigin.current = focusOrigin;
       setStatus(opt);
       setComfort(cmf);
       setIndoorTemp(temp);
       setForecastScorecard(scorecard);
       setSensorDiagnostics(diagnostics);
       setError(null);
-      if (focusDecisionSummary) {
-        window.requestAnimationFrame(() => {
-          document.getElementById("why-it-decides-heading")?.focus();
-        });
-      }
     } catch {
+      decisionFocusOrigin.current = null;
       setError("Failed to load optimizer status");
     } finally {
       setIsRefreshing(false);
@@ -276,6 +277,16 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
 
   useEffect(() => { refresh(); }, []);
 
+  useLayoutEffect(() => {
+    const focusOrigin = decisionFocusOrigin.current;
+    if (!focusOrigin || error || isRefreshing || !status) return;
+    decisionFocusOrigin.current = null;
+    if (document.activeElement === focusOrigin
+      || (document.activeElement === document.body && !focusOrigin.isConnected)) {
+      document.getElementById("why-it-decides-heading")?.focus();
+    }
+  }, [error, isRefreshing, status]);
+
   const trainMl = async () => {
     setTraining((p) => ({ ...p, ml: true }));
     setTrainMsg(null);
@@ -283,11 +294,14 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
       const res = await fetch("/api/ml/train", { method: "POST" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Training failed");
-      const fmtResult = (r: ModelTrainResult | null | undefined) =>
-        r?.error ? `✗ ${r.error} (${r.samples ?? 0} samples)` : r?.version ? `✓ trained` : "unknown";
-      const copStatus = fmtResult(data.cop);
-      const demandStatus = fmtResult(data.demand);
-      setTrainMsg({ text: `COP: ${copStatus} · Demand: ${demandStatus}`, tone: !data.cop?.error && !data.demand?.error ? "success" : "error" });
+      const result: ModelTrainResult | undefined = data.demand;
+      if (result?.error) {
+        setTrainMsg({ text: `Demand: ${result.error}${result.samples != null ? ` (${result.samples} samples)` : ""}`, tone: "error" });
+      } else if (result?.version) {
+        setTrainMsg({ text: "Demand model trained.", tone: "success" });
+      } else {
+        setTrainMsg({ text: `Demand training did not publish a model${result?.status ? ` (${result.status})` : ""}.`, tone: "error" });
+      }
       await refresh();
     } catch (e) {
       setTrainMsg({ text: e instanceof Error ? e.message : "Training failed", tone: "error" });
@@ -389,29 +403,8 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
 
   const models: ModelCard[] = [
     {
-      label: "COP Model",
-      plain: "Predicts how efficiently the pump runs at different temperatures",
-      state: status.cop_model.trained
-        ? (
-          status.cop_model.metrics?.mae != null
-            && status.cop_model.metrics?.baseline_mae != null
-            && status.cop_model.metrics.mae < status.cop_model.metrics.baseline_mae
-            ? "validated"
-            : "trained"
-        )
-        : "collecting",
-      lastTrained: status.cop_model.last_trained,
-      detail: `${status.cop_model.source_records ?? 0} energy readings${status.cop_model.metrics?.mae != null ? ` · forward CV MAE ${status.cop_model.metrics.mae.toFixed(3)} COP${status.cop_model.metrics.cv_std != null ? ` · ±${status.cop_model.metrics.cv_std.toFixed(3)}` : ""}` : " · validation score will appear after the next training run"}`,
-      unavailableReason: modelUnavailableReason(status.cop_model.unavailable_reason),
-      nextStep: status.cop_model.trained
-        ? status.cop_model.metrics?.baseline_mae != null && status.cop_model.metrics?.mae != null && status.cop_model.metrics.mae >= status.cop_model.metrics.baseline_mae
-          ? "The learned model does not yet beat the simple baseline, so it is not promoted as validated."
-          : "Keep collecting varied outdoor-temperature and load observations."
-        : "Train after enough matched consumption and weather records have accumulated.",
-    },
-    {
       label: "Demand Model",
-      plain: demandQuality?.seasonal_guidance ?? "Forecasts how much hot water and heating you'll need",
+      plain: demandQuality?.seasonal_guidance ?? "Forecasts electrical space-heating demand from weather and usage patterns",
       state: status.demand_model.trained
         ? (status.active_layer.includes("ml") ? "active" : "validated")
         : "collecting",
@@ -478,7 +471,8 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
   }
 
   const activeLayerLabel = LAYER_LABELS[status.active_layer] || status.active_layer;
-  const demandTrainingBlocked = Boolean(status.cop_model.trained && demandQuality && !demandQuality.ready_to_train);
+  const demandTrainingBlocked = !demandQuality?.ready_to_train
+    || demandQuality.usable_samples < demandQuality.minimum_samples;
   const comfortActiveHeatingRows = typeof comfort?.metrics?.active_heating_rows === "number"
     ? comfort.metrics.active_heating_rows
     : 0;
@@ -501,7 +495,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
     },
   ] : [];
   const layerExplanation = status.configured_layer === "auto"
-    ? `Automatic mode — currently using ${activeLayerLabel}, the safest available layer.`
+    ? "Automatic mode uses rules while COP is retired."
     : `Fixed setting — using ${activeLayerLabel}.`;
   const demandProgress = status.seasonal_calibration?.demand?.minimum_samples
     ? Math.min(100, Math.round(100 * (status.seasonal_calibration.demand.usable_samples ?? 0) / status.seasonal_calibration.demand.minimum_samples))
@@ -608,6 +602,14 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
           </section>
         ) : <section><h3>Space-heating gate</h3><p className="optimizer-readable-text">Unavailable.</p></section>}
 
+        <section>
+          <h3>COP retired</h3>
+          <p className="optimizer-readable-text">COP training and inference are retired because thermal-output evidence is unverified. Archived estimates are retained; planning uses assumed heating efficiency, not measured COP.</p>
+          <p className="optimizer-readable-text">Total COP is available manually at the heat pump&apos;s Panasonic controller (&quot;Totalt COP-värde&quot;, marked &quot;Ungefär&quot;). This approximate whole-system value is separate from the retired DHW model and is not an optimizer input.</p>
+        </section>
+
+        <ManualCOPMonitoring />
+
         {/* Model cards */}
         <section><h3>Models</h3><div className="model-grid">
           {models.map((m) => (
@@ -682,7 +684,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
             aria-busy={training.ml}
             title={demandTrainingBlocked ? "Demand training is waiting for usable heating-season evidence." : undefined}
           >
-            {training.ml ? "Training..." : demandTrainingBlocked ? "Demand training waiting for evidence" : "Train COP & Demand"}
+            {training.ml ? "Training..." : "Train Demand"}
           </button>
           <button
             className="btn btn-sm"

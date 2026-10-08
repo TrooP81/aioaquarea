@@ -5,7 +5,87 @@ from __future__ import annotations
 import datetime as dt
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class ManualCOPRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(strict=True, pattern=r"^(0|[1-9][0-9]*)$", max_length=19)
+
+    @field_validator("expected_revision")
+    @classmethod
+    def revision_fits_bigint(cls, value: str) -> str:
+        if int(value) > 9223372036854775807:
+            raise ValueError("Revision exceeds the positive bigint range")
+        return value
+
+
+class ManualCOPPut(ManualCOPRevision):
+    value: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    observed_at: AwareDatetime
+    completeness: Literal["partial", "closed", "unknown"]
+    timezone: str = Field(strict=True, min_length=1, max_length=128)
+
+
+class ManualCOPObservationResponse(BaseModel):
+    device_id: str
+    granularity: Literal["day", "month"]
+    period_date: dt.date
+    timezone: str
+    period_start: AwareDatetime
+    period_end: AwareDatetime
+    value: float = Field(gt=0, allow_inf_nan=False)
+    observed_at: AwareDatetime
+    completeness: Literal["partial", "closed", "unknown"]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    revision: str = Field(strict=True, pattern=r"^[1-9][0-9]*$", max_length=19)
+    source: Literal["controller_estimate"] = "controller_estimate"
+    acquisition: Literal["manual_entry"] = "manual_entry"
+    scope: Literal["total"] = "total"
+    measured: Literal[False] = False
+    accuracy: Literal["approximate"] = "approximate"
+    energy_boundary: Literal["unknown"] = "unknown"
+
+
+class ManualCOPProjection(BaseModel):
+    value: float = Field(gt=0, allow_inf_nan=False)
+    lower: float = Field(gt=0, allow_inf_nan=False)
+    upper: float = Field(gt=0, allow_inf_nan=False)
+    log_daily_trend: float = Field(allow_inf_nan=False)
+    daily_trend_pct: float = Field(allow_inf_nan=False)
+    band_label: Literal["experimental empirical log-error band, uncalibrated"]
+
+
+class ManualCOPMonitoringResponse(BaseModel):
+    status: Literal["disabled", "no_data", "insufficient_data", "stale", "ready", "unavailable"]
+    reason: str
+    issue_at: AwareDatetime
+    timezone: str | None
+    local_issue_at: AwareDatetime | None
+    target_date: dt.date | None
+    fingerprint: str
+    counts: dict[str, int | list[int]]
+    forecast: ManualCOPProjection | None
+
+    @model_validator(mode="after")
+    def forecast_matches_status(self) -> ManualCOPMonitoringResponse:
+        if (self.status == "ready") != (self.forecast is not None):
+            raise ValueError("Only ready monitoring has forecast values")
+        return self
+
+
+class ManualCOPListResponse(BaseModel):
+    devices: list[str]
+    default_timezone: str
+    device_id: str | None
+    granularity: Literal["day", "month"]
+    issue_at: AwareDatetime
+    observations: list[ManualCOPObservationResponse]
+    next_before: dt.date | None
+    forecasting_enabled: bool
+    monitoring: ManualCOPMonitoringResponse
 
 
 class DeviceStatusResponse(BaseModel):

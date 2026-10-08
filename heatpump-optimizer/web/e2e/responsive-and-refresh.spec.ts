@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "./fixtures";
+import { test, expect, manualCOPObservation, manualCOPResponse, retiredCopModel, type Page } from "./fixtures";
 
 const jsonResponse = (body: unknown) => ({
   status: 200,
@@ -39,7 +39,7 @@ const mockOptimizerStatus = {
   active_layer: "rules",
   fallback_layer: "rules",
   last_plan: null,
-  cop_model: { trained: false, last_trained: null },
+  cop_model: retiredCopModel,
   demand_model: { trained: false, last_trained: null },
   thermal_model: {
     calibrated: false,
@@ -104,6 +104,92 @@ async function mockDashboardRequests(page: Page) {
 test.describe("Responsive Layout", () => {
   test.beforeEach(async ({ page }) => {
     await mockDashboardRequests(page);
+  });
+
+  test("manual controller fields and actions fit mobile and desktop", async ({ page }) => {
+    await page.route("**/api/cop/manual**", (route) => {
+      const url = new URL(route.request().url());
+      const device = url.searchParams.get("device_id");
+      return route.fulfill(jsonResponse({
+        ...manualCOPResponse,
+        device_id: device,
+        observations: device ? [manualCOPObservation(), manualCOPObservation("2026-10-03", 3.7, "2")] : [],
+        forecasting_enabled: true,
+        monitoring: {
+          ...manualCOPResponse.monitoring,
+          status: "ready",
+          reason: "matched_clock_retrospective_folds",
+          target_date: "2026-10-05",
+          counts: { ...manualCOPResponse.monitoring.counts, available_closed_days: 28, fold_training_rows: [20, 21, 22, 23, 24, 25, 26] },
+          forecast: {
+            value: 4.2, lower: 3.4, upper: 5.2, log_daily_trend: .01, daily_trend_pct: 1.005,
+            band_label: "experimental empirical log-error band, uncalibrated",
+          },
+        },
+      }));
+    });
+    for (const width of [320, 375, 640, 1280]) {
+      await page.setViewportSize({ width, height: 800 });
+      await page.goto("/?view=under-the-hood");
+      await page.getByRole("button", { name: "Show diagnostics" }).click();
+      const panel = page.locator('section[aria-labelledby="manual-cop-heading"]');
+      await panel.getByRole("combobox", { name: "Device", exact: true }).selectOption("fixture-device");
+      await panel.getByRole("button", { name: "Edit reading 2026-10-04" }).click();
+      await expect(panel.getByTestId("manual-projection")).toHaveText("4.20");
+      await expect(panel.getByLabel("COP value")).toHaveValue("9.7");
+      await expect(panel.getByRole("textbox", { name: "Controller timezone", exact: true })).toHaveValue("Europe/Stockholm");
+      const outOfBounds = await panel.locator("input, select, button").evaluateAll((controls) => {
+        const bounds = controls[0].closest("section")!.getBoundingClientRect();
+        return controls.filter((control) => {
+          const rectangle = control.getBoundingClientRect();
+          return rectangle.left < bounds.left - 1 || rectangle.right > bounds.right + 1;
+        }).map((control) => control.outerHTML);
+      });
+      expect(outOfBounds).toEqual([]);
+      expect(await page.evaluate(() => document.body.scrollWidth)).toBeLessThanOrEqual(width + 1);
+      const overlaps = await panel.locator(".manual-field").evaluateAll((fields) => fields.filter((field) => {
+        const control = field.querySelector("input,select")!.getBoundingClientRect();
+        return Array.from(field.parentElement!.querySelectorAll(".manual-field")).some((other) => {
+          if (other === field) return false;
+          const rectangle = other.getBoundingClientRect();
+          return control.left < rectangle.right && control.right > rectangle.left && control.top < rectangle.bottom && control.bottom > rectangle.top;
+        });
+      }).map((field) => field.textContent));
+      expect(overlaps).toEqual([]);
+      const overflowingText = await panel.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        const failures: string[] = [];
+        let current = walker.nextNode();
+        while (current) {
+          const parent = current.parentElement;
+          if (parent && current.textContent?.trim() && !["STYLE", "SCRIPT", "OPTION"].includes(parent.tagName)) {
+            const style = getComputedStyle(parent);
+            if (style.display !== "none" && style.visibility !== "hidden" && parent.getClientRects().length) {
+              const container = parent.getBoundingClientRect();
+              const range = document.createRange();
+              range.selectNodeContents(current);
+              if (Array.from(range.getClientRects()).some((rectangle) =>
+                rectangle.left < Math.max(bounds.left, container.left) - 1
+                || rectangle.right > Math.min(bounds.right, container.right) + 1
+                || rectangle.top < container.top - 1
+                || rectangle.bottom > container.bottom + 1,
+              )) failures.push(current.textContent.trim());
+            }
+          }
+          current = walker.nextNode();
+        }
+        return failures;
+      });
+      expect(overflowingText).toEqual([]);
+      if (width === 375 || width === 1280) {
+        await panel.evaluate((element) => {
+          const tabs = document.querySelector('[role="tablist"][aria-label="Dashboard workspace"]');
+          window.scrollBy(0, element.getBoundingClientRect().top - (tabs?.getBoundingClientRect().height ?? 0) - 16);
+        });
+        await panel.screenshot({ path: test.info().outputPath(`manual-controller-${width}.png`) });
+      }
+    }
   });
 
   test("desktop layout loads correctly", async ({ page }) => {
@@ -239,10 +325,10 @@ test.describe("Responsive Layout", () => {
   test("status indicators expose text or accessible labels without relying on color", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator(".header-actions .status-badge")).toContainText("Connected");
-    await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(1);
-    await expect(page.locator('[aria-label^="Demand hot-water model"]')).toHaveCount(1);
+    await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(0);
+    await expect(page.locator('[aria-label^="Demand heating model"]')).toHaveCount(1);
     await expect(page.locator('[aria-label^="Thermal heat-up model"]')).toHaveCount(1);
-    await expect(page.locator(".ml-status-label")).toContainText("/3 learning models ready");
+    await expect(page.locator(".ml-status-label")).toContainText("0/2 learning models ready");
   });
 
   test("skip link moves focus to the main content target", async ({ page }) => {

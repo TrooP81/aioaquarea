@@ -48,7 +48,6 @@ interface DashboardProps {
 
 interface OptimizerBrief {
   active_layer: string;
-  cop_trained: boolean;
   demand_trained: boolean;
   thermal_calibrated: boolean;
   planningData: { control_allowed: boolean; reasons: string[] } | null;
@@ -114,7 +113,6 @@ export function Dashboard({ data }: DashboardProps) {
         if (!d) return;
         setOptBrief({
           active_layer: d.active_layer,
-          cop_trained: d.cop_model?.trained ?? false,
           demand_trained: d.demand_model?.trained ?? false,
           thermal_calibrated: d.thermal_model?.calibrated ?? false,
           planningData: d.planning_data_quality ?? null,
@@ -272,11 +270,10 @@ export function Dashboard({ data }: DashboardProps) {
                 <button className="btn btn-sm" onClick={loadOptimizerBrief}>Retry</button>
               ) : optBrief ? (
                 <span className="ml-status-dots">
-                  <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} aria-label={`COP efficiency model ${optBrief.cop_trained ? "ready" : "not ready"}`} title="COP (efficiency) model" />
-                  <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} aria-label={`Demand hot-water model ${optBrief.demand_trained ? "ready" : "not ready"}`} title="Demand (hot-water) model" />
+                  <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} aria-label={`Demand heating model ${optBrief.demand_trained ? "ready" : "not ready"}`} title="Demand (electrical heating) model" />
                   <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} aria-label={`Thermal heat-up model ${optBrief.thermal_calibrated ? "ready" : "not ready"}`} title="Thermal (heat-up rate) model" />
                   <span className="ml-status-label">
-                    {[optBrief.cop_trained, optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/3 learning models ready
+                    {[optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/2 learning models ready
                   </span>
                 </span>
               ) : "No optimizer status is available yet."}

@@ -1,46 +1,55 @@
-# Canonical, isolated target for opt-in coverage of restore_db.sh --production.
 services:
   db:
-    image: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
+    image: timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
     environment:
       POSTGRES_USER: restore_test
       POSTGRES_PASSWORD: restore_test
       POSTGRES_DB: ${POSTGRES_DB:?set a disposable restore_production_test_ database name}
+      TIMESCALEDB_TELEMETRY: "off"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=20
+      - -c
+      - timescaledb.telemetry_level=off
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U restore_test -d ${POSTGRES_DB}"]
       interval: 2s
       timeout: 2s
-      retries: 15
+      retries: 30
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql/data:rw,size=${RESTORE_VERIFY_TMPFS_BYTES:-2147483648}
+    mem_limit: ${RESTORE_VERIFY_MEMORY_BYTES:-4294967296}
+    cpus: 2
+    networks:
+      default:
+        aliases: [restore-target]
 
-  backup:
-    build:
-      context: .
-      dockerfile: Dockerfile.backup
-    environment: &postgres_environment
-      PGHOST: db
+  restore-tool:
+    image: timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
+    environment:
+      PGHOST: restore-target
       PGUSER: restore_test
       PGPASSWORD: restore_test
       PGDATABASE: ${POSTGRES_DB:?set a disposable restore_production_test_ database name}
+      RESTORE_DISPOSABLE: "true"
+      RESTORE_ISOLATED_PROJECT: ${RESTORE_PRODUCTION_TEST_PROJECT:-}
+    entrypoint: []
+    tmpfs:
+      - /var/lib/postgresql/data:rw,size=16777216
+    mem_limit: 536870912
+    cpus: 2
     volumes:
-      - ${RESTORE_PRODUCTION_TEST_BACKUP_DIR:?set a temporary backup directory}:/backups
+      - ${RESTORE_PRODUCTION_TEST_BACKUP_DIR:?set a backup directory}:/backups:ro
+      - ./scripts/restore_archive.sh:/scripts/restore_archive.sh:ro
+      - ./scripts/verify_backup.sh:/scripts/verify_backup.sh:ro
 
-  backup-verify:
-    build:
-      context: .
-      dockerfile: Dockerfile.backup
-    environment: *postgres_environment
-    volumes:
-      - ${RESTORE_PRODUCTION_TEST_BACKUP_DIR:?set a temporary backup directory}:/backups
-
-  migrate:
-    build:
-      context: ..
-      dockerfile: heatpump-optimizer/Dockerfile
-      target: base
-    environment:
-      DATABASE_URL: postgresql+asyncpg://restore_test:restore_test@db:5432/${POSTGRES_DB:?set a disposable restore_production_test_ database name}
-      APP_ENVIRONMENT: testing
-      API_TOKEN: disabled
-      CORS_ORIGINS: http://localhost:4444
+networks:
+  default:
+    internal: true

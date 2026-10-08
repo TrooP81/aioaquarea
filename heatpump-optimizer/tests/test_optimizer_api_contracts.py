@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import os
@@ -25,6 +26,19 @@ from packages.api.routers.optimizer import (
 )
 from packages.ml.model_status import clear_artifact_status_cache
 from packages.ml.safe_persistence import safe_dump
+
+
+_RETIRED_COP_STATUS = {
+    "trained": False,
+    "last_trained": None,
+    "samples": 0,
+    "source_records": 0,
+    "metrics": None,
+    "status": "retired",
+    "supported": False,
+    "unavailable_reason": "retired",
+    "reason": "unverified_thermal_output",
+}
 
 
 def _session_context(session):
@@ -305,6 +319,869 @@ async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) 
     assert response["demand_model"]["data_quality"] == quality
     assert response["demand_model"]["samples"] == 0
     assert response["demand_model"]["source_records"] == 188
+    assert response["cop_model"] == {
+        "trained": False,
+        "last_trained": None,
+        "samples": 0,
+        "source_records": 0,
+        "metrics": None,
+        "status": "retired",
+        "supported": False,
+        "unavailable_reason": "retired",
+        "reason": "unverified_thermal_output",
+    }
+    assert response["cop_trained"] is False
+    assert response["fallback_layer"] == "rules_v7"
+
+
+class TestManualCOPAPI:
+    @pytest.fixture
+    async def client(self):
+        import httpx
+
+        from packages.api.main import app
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+            headers={"Authorization": "Bearer test-token"},
+        ) as client:
+            yield client
+
+    def observation(self):
+        from packages.core.models import ManualCOPObservationRecord
+
+        now = dt.datetime.now(dt.timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return ManualCOPObservationRecord(
+            device_id="fixture-device",
+            granularity="day",
+            period_date=start.date(),
+            timezone="UTC",
+            period_start=start,
+            period_end=start + dt.timedelta(days=1),
+            value=9.7,
+            observed_at=now,
+            completeness="partial",
+            created_at=now,
+            updated_at=now,
+            revision=9007199254740993,
+        )
+
+    def body(self, row, revision="0"):
+        return {
+            "value": row.value,
+            "observed_at": row.observed_at.isoformat(),
+            "completeness": row.completeness,
+            "timezone": row.timezone,
+            "expected_revision": revision,
+        }
+
+    def result(self, row=None, rows=None, scalar=None):
+        return SimpleNamespace(
+            scalar=lambda: scalar,
+            scalar_one_or_none=lambda: row,
+            scalars=lambda: SimpleNamespace(all=lambda: rows or []),
+        )
+
+    async def test_first_fixture_create_duplicate_and_forecasting_only_flag(self, client):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        path = f"/api/cop/manual/fixture-device/day/{row.period_date}"
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    self.result(row=row),
+                    self.result(scalar=True),
+                    self.result(),
+                ]
+            )
+        )
+        with patch.object(feeds, "get_session", return_value=_session_context(session)):
+            created = await client.put(path, json=self.body(row))
+            duplicate = await client.put(path, json=self.body(row))
+        assert created.status_code == 201
+        assert duplicate.status_code == 409
+        assert created.json()["value"] == 9.7
+        assert created.json()["revision"] == "9007199254740993"
+        assert {
+            key: created.json()[key]
+            for key in ("source", "acquisition", "scope", "measured", "accuracy", "energy_boundary")
+        } == {
+            "source": "controller_estimate",
+            "acquisition": "manual_entry",
+            "scope": "total",
+            "measured": False,
+            "accuracy": "approximate",
+            "energy_boundary": "unknown",
+        }
+        for enabled, expected in ((False, "disabled"), (True, "insufficient_data")):
+            session.execute = AsyncMock(
+                side_effect=[
+                    self.result(),
+                    self.result(rows=["fixture-device"]),
+                    self.result(rows=[row]),
+                    self.result(row=row),
+                    self.result(rows=[]),
+                    self.result(),
+                ]
+            )
+            with (
+                patch.object(feeds, "get_session", return_value=_session_context(session)),
+                patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=enabled)),
+                patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+                patch(
+                    "packages.ml.models.DirectionAwareCOP.compute_cop_intervals", new=AsyncMock()
+                ) as legacy,
+            ):
+                response = await client.get("/api/cop/manual?device_id=fixture-device")
+            assert response.status_code == 200
+            assert response.json()["granularity"] == "day"
+            assert response.json()["monitoring"]["status"] == expected
+            assert response.json()["monitoring"]["forecast"] is None
+            legacy.assert_not_awaited()
+
+    async def test_choices_do_not_require_a_device_or_cloud_discovery(self, client):
+        from packages.api.routers import feeds
+
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(),
+                    self.result(rows=["fixture-device", "ledger-only"]),
+                ]
+            )
+        )
+        with (
+            patch.object(feeds, "get_session", return_value=_session_context(session)),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=False)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="Europe/Stockholm")),
+        ):
+            response = await client.get("/api/cop/manual")
+        assert response.status_code == 200
+        assert response.json()["devices"] == ["fixture-device", "ledger-only"]
+        assert response.json()["default_timezone"] == "Europe/Stockholm"
+        assert response.json()["observations"] == []
+        assert all(call.args[0].is_select for call in session.execute.call_args_list[1:])
+        assert "REPEATABLE READ READ ONLY" in str(session.execute.call_args_list[0].args[0])
+
+    async def test_atomic_tokens_and_device_keys_apply_to_update_and_delete(self, client):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        token = "9007199254740993"
+        path = f"/api/cop/manual/fixture-device/day/{row.period_date}"
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    self.result(row=row),
+                    self.result(scalar=True),
+                    self.result(row=9007199254740993),
+                    self.result(scalar=True),
+                    self.result(),
+                ]
+            )
+        )
+        with patch.object(feeds, "get_session", return_value=_session_context(session)):
+            updated = await client.put(path, json=self.body(row, token))
+            deleted = await client.request("DELETE", path, json={"expected_revision": token})
+            stale = await client.put(path, json=self.body(row, token))
+        assert updated.status_code == 200
+        assert deleted.status_code == 204
+        assert deleted.content == b""
+        assert stale.status_code == 409
+        for call in (session.execute.call_args_list[1], session.execute.call_args_list[3]):
+            statement = call.args[0]
+            assert "revision" in str(statement)
+            assert token not in str(statement)
+            assert 9007199254740993 in statement.compile().params.values()
+            assert "fixture-device" in statement.compile().params.values()
+
+    async def test_unknown_device_and_stale_delete_refusals(self, client):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        path = f"/api/cop/manual/fixture-device/day/{row.period_date}"
+        for known, status in ((False, 404), (True, 409)):
+            session = SimpleNamespace(
+                execute=AsyncMock(
+                    side_effect=[
+                        self.result(scalar=known),
+                        self.result(),
+                    ]
+                )
+            )
+            with patch.object(feeds, "get_session", return_value=_session_context(session)):
+                response = await client.request("DELETE", path, json={"expected_revision": "1"})
+            assert response.status_code == status
+
+    async def test_invalid_month_delete_identity_never_opens_storage(self, client):
+        from packages.api.routers import feeds
+
+        with patch.object(
+            feeds, "get_session", side_effect=AssertionError("Invalid month opened DB")
+        ):
+            response = await client.request(
+                "DELETE",
+                "/api/cop/manual/fixture-device/month/2026-10-04",
+                json={"expected_revision": "1"},
+            )
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        "timezone",
+        [
+            "utc",
+            "US/eastern",
+            "us/Eastern",
+            "Europe/stockholm",
+            "europe/Stockholm",
+            "Etc/utc",
+            "Invalid/Timezone",
+            "localtime",
+            "posixrules",
+            "posix/UTC",
+            "right/UTC",
+        ],
+    )
+    async def test_invalid_timezone_keys_never_open_storage_with_permissive_lookup(
+        self, client, timezone
+    ):
+        from zoneinfo import ZoneInfo
+
+        from packages.api.routers import feeds
+        from packages.core import cop_monitoring
+
+        row = self.observation()
+        with (
+            patch.object(cop_monitoring, "ZoneInfo", return_value=ZoneInfo("UTC")),
+            patch.object(
+                feeds, "get_session", side_effect=AssertionError("Invalid timezone opened DB")
+            ) as storage,
+        ):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}",
+                json=self.body(row) | {"timezone": timezone},
+            )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Invalid timezone or calendar period"
+        storage.assert_not_called()
+
+    @pytest.mark.parametrize("timezone", ["UTC", "US/Eastern", "Etc/UTC", "Asia/Calcutta"])
+    @pytest.mark.parametrize("granularity", ["day", "month"])
+    @pytest.mark.parametrize(("revision", "status"), [("0", 201), ("9007199254740993", 200)])
+    async def test_supported_exact_timezone_keys_preserve_calendar_and_write_status(
+        self, client, timezone, granularity, revision, status
+    ):
+        from packages.api.routers import feeds
+        from packages.core.cop_monitoring import period_bounds
+
+        row = self.observation()
+        row.granularity = granularity
+        row.period_date = dt.date(2026, 9, 1)
+        row.timezone = timezone
+        row.period_start, row.period_end = period_bounds(granularity, row.period_date, timezone)
+        row.observed_at = row.period_end + dt.timedelta(hours=2)
+        row.completeness = "closed"
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    self.result(row=row),
+                ]
+            )
+        )
+        with patch.object(feeds, "get_session", return_value=_session_context(session)):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/{granularity}/{row.period_date}",
+                json=self.body(row, revision),
+            )
+        assert response.status_code == status
+        assert response.json()["timezone"] == timezone
+        assert response.json()["value"] == 9.7
+        assert response.json()["completeness"] == "closed"
+        assert session.execute.await_count == 2
+        parameters = session.execute.call_args_list[1].args[0].compile().params
+        assert parameters["timezone"] == timezone
+        assert parameters["period_start"] == row.period_start
+        assert parameters["period_end"] == row.period_end
+
+    @pytest.mark.parametrize(("known", "status"), [(False, 404), (True, 409)])
+    async def test_valid_timezone_put_preserves_unknown_device_and_stale_revision(
+        self, client, known, status
+    ):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=known),
+                    self.result(),
+                ]
+            )
+        )
+        with patch.object(feeds, "get_session", return_value=_session_context(session)):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}",
+                json=self.body(row, "9007199254740993"),
+            )
+        assert response.status_code == status
+        assert session.execute.await_count == (2 if known else 1)
+
+    async def test_valid_timezone_storage_constraint_failure_remains_503(self, client):
+        from sqlalchemy.exc import IntegrityError
+
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    IntegrityError("fixture storage constraint", {}, Exception("fixture")),
+                ]
+            )
+        )
+        with patch.object(feeds, "get_session", return_value=_session_context(session)):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}", json=self.body(row)
+            )
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Manual COP storage unavailable"}
+        assert session.execute.await_count == 2
+
+    @pytest.mark.parametrize("value", [True, "9.7", 0, -1])
+    async def test_invalid_client_fields_never_open_storage(self, client, value):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        with patch.object(
+            feeds, "get_session", side_effect=AssertionError("invalid request opened DB")
+        ):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}",
+                json=self.body(row) | {"value": value},
+            )
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "1e309"])
+    async def test_nonfinite_json_numbers_return_422_without_storage(self, client, literal):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        content = json.dumps(self.body(row)).replace('"value": 9.7', f'"value": {literal}')
+        with patch.object(feeds, "get_session", side_effect=AssertionError("Nonfinite opened DB")):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}",
+                content=content,
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 422
+
+    async def test_commit_failure_does_not_return_a_revision(self, client):
+        from contextlib import asynccontextmanager
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    self.result(row=row),
+                ]
+            )
+        )
+
+        @asynccontextmanager
+        async def failed_commit():
+            yield session
+            raise SQLAlchemyError("fixture commit failure")
+
+        with patch.object(feeds, "get_session", failed_commit):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}", json=self.body(row)
+            )
+        assert response.status_code == 503
+        assert "revision" not in response.json()
+
+    async def test_fit_starts_only_after_read_snapshot_closes(self, client):
+        from contextlib import asynccontextmanager
+
+        from packages.api.routers import feeds
+        from packages.core.cop_monitoring import monitoring_result
+
+        closed = False
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(),
+                    self.result(rows=["fixture-device"]),
+                    self.result(rows=[]),
+                    self.result(),
+                    self.result(),
+                ]
+            )
+        )
+
+        @asynccontextmanager
+        async def read_snapshot():
+            nonlocal closed
+            try:
+                yield session
+            finally:
+                closed = True
+
+        async def check_closed(observations, issue_at, enabled):
+            assert closed
+            return monitoring_result(observations, issue_at) | {
+                "status": "unavailable",
+                "reason": "fixture_fit_failure",
+            }
+
+        with (
+            patch.object(feeds, "get_session", read_snapshot),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch.object(feeds, "forecast_snapshot", check_closed),
+        ):
+            response = await client.get("/api/cop/manual?device_id=fixture-device")
+        assert response.status_code == 200
+        assert response.json()["monitoring"]["forecast"] is None
+        assert response.json()["monitoring"]["status"] == "unavailable"
+
+    @pytest.mark.parametrize("fail_on", [0, 2, 4])
+    async def test_read_storage_failure_closes_snapshot_without_forecasting(self, client, fail_on):
+        from contextlib import asynccontextmanager
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        results = [
+            self.result(),
+            self.result(rows=["fixture-device"]),
+            self.result(rows=[row]),
+            self.result(row=row),
+            self.result(rows=[]),
+            self.result(),
+        ]
+        results[fail_on] = SQLAlchemyError("Disposable read failure")
+        session = SimpleNamespace(execute=AsyncMock(side_effect=results))
+        closed = []
+
+        @asynccontextmanager
+        async def read_snapshot():
+            try:
+                yield session
+            finally:
+                closed.append(True)
+
+        with (
+            patch.object(feeds, "get_session", read_snapshot),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch.object(feeds, "forecast_snapshot", new=AsyncMock()) as forecast,
+        ):
+            response = await client.get("/api/cop/manual?device_id=fixture-device")
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Manual COP storage unavailable"}
+        assert closed == [True]
+        assert session.execute.await_count == fail_on + 1
+        forecast.assert_not_awaited()
+
+    async def test_cancelled_read_closes_snapshot_without_starting_a_fit(self, client):
+        from contextlib import asynccontextmanager
+
+        from packages.api.routers import feeds
+
+        entered = asyncio.Event()
+        blocked = asyncio.Event()
+        closed = []
+
+        async def execute(statement):
+            entered.set()
+            await blocked.wait()
+            raise AssertionError("Cancelled storage request resumed")
+
+        session = SimpleNamespace(execute=execute)
+
+        @asynccontextmanager
+        async def read_snapshot():
+            try:
+                yield session
+            finally:
+                closed.append(True)
+
+        with (
+            patch.object(feeds, "get_session", read_snapshot),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch.object(feeds, "forecast_snapshot", new=AsyncMock()) as forecast,
+        ):
+            request = asyncio.create_task(client.get("/api/cop/manual?device_id=fixture-device"))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                assert closed == [True]
+                forecast.assert_not_awaited()
+            finally:
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+        assert request.done()
+        assert not blocked.is_set()
+
+    async def test_existing_daily_revision_unavailable_at_issue_is_not_no_data(self, client):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        row.updated_at += dt.timedelta(days=1)
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(),
+                    self.result(rows=["fixture-device"]),
+                    self.result(rows=[row]),
+                    self.result(),
+                    self.result(row=row),
+                    self.result(rows=[]),
+                    self.result(),
+                ]
+            )
+        )
+        with (
+            patch.object(feeds, "get_session", return_value=_session_context(session)),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            response = await client.get(
+                "/api/cop/manual?device_id=fixture-device&issue_at=2000-01-01"
+            )
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.json()["monitoring"]["status"] == "insufficient_data"
+        assert response.json()["monitoring"]["reason"] == "no_current_revision_available"
+        assert response.json()["monitoring"]["forecast"] is None
+        assert response.json()["issue_at"].startswith(str(dt.datetime.now(dt.timezone.utc).date()))
+
+    @pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+    @pytest.mark.parametrize(("token", "status"), [(None, 401), ("wrong-token", 403)])
+    async def test_global_auth_refuses_before_storage(self, method, token, status, monkeypatch):
+        import httpx
+
+        from packages.api.main import app
+        from packages.api.routers import feeds
+        from packages.core.config import settings
+
+        monkeypatch.setattr(settings, "api_token", "test-token")
+        row = self.observation()
+        path = (
+            "/api/cop/manual"
+            if method == "GET"
+            else f"/api/cop/manual/fixture-device/day/{row.period_date}"
+        )
+        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+        body = self.body(row) if method == "PUT" else {"expected_revision": "1"}
+        with (
+            patch.object(
+                feeds, "get_session", side_effect=AssertionError("Unauthorized DB access")
+            ),
+            patch.object(
+                feeds,
+                "get_bool_setting",
+                new=AsyncMock(side_effect=AssertionError("Unauthorized settings access")),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1", headers=headers
+            ) as unsigned:
+                response = await unsigned.request(method, path, json=body)
+        assert response.status_code == status
+
+    async def test_disabled_auth_retains_existing_installation_perimeter_contract(
+        self, client, monkeypatch
+    ):
+        from packages.api.routers import feeds
+        from packages.core.config import settings
+
+        monkeypatch.setattr(settings, "api_token", "disabled")
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(),
+                    self.result(rows=["fixture-device"]),
+                ]
+            )
+        )
+        with (
+            patch.object(feeds, "get_session", return_value=_session_context(session)),
+            patch.object(feeds, "get_bool_setting", new=AsyncMock(return_value=False)),
+            patch.object(feeds, "get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            response = await client.get(
+                "/api/cop/manual", headers={"Authorization": "Bearer unrelated"}
+            )
+        assert response.status_code == 200
+
+    async def test_structured_mutation_logs_keys_tokens_and_outcome_not_reading(self, client):
+        from packages.api.routers import feeds
+
+        row = self.observation()
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    self.result(scalar=True),
+                    self.result(row=row),
+                ]
+            )
+        )
+        with (
+            patch.object(feeds, "get_session", return_value=_session_context(session)),
+            patch.object(feeds.logger, "info") as log,
+        ):
+            response = await client.put(
+                f"/api/cop/manual/fixture-device/day/{row.period_date}", json=self.body(row)
+            )
+        assert response.status_code == 201
+        assert log.call_args.args == ("manual_cop_mutation",)
+        assert set(log.call_args.kwargs) == {
+            "device_id",
+            "granularity",
+            "period_date",
+            "expected_revision",
+            "revision",
+            "outcome",
+        }
+        assert log.call_args.kwargs["expected_revision"] == "0"
+        assert log.call_args.kwargs["revision"] == "9007199254740993"
+        assert log.call_args.kwargs["outcome"] == "created"
+
+
+class TestCOPRetirementAPI:
+    @pytest.mark.parametrize(
+        "demand_result",
+        [
+            {"version": "fixture", "samples": 168},
+            {"error": "Insufficient data", "samples": 167},
+            RuntimeError("fixture failure"),
+        ],
+    )
+    async def test_no_selector_training_only_calls_demand(self, demand_result, tmp_path):
+        import httpx
+
+        from packages.api.main import app
+        from packages.api.routers.models_router import trigger_ml_training
+
+        import inspect
+
+        assert not inspect.signature(trigger_ml_training).parameters
+        operation = app.openapi()["paths"]["/api/ml/train"]["post"]
+        assert "requestBody" not in operation
+        assert not operation.get("parameters")
+        artifact = tmp_path / "cop_model_weather_dhw_v6_archived.pkl"
+        artifact.write_bytes(b"archived COP bytes")
+        demand = MagicMock()
+        demand.train = AsyncMock()
+        if isinstance(demand_result, Exception):
+            demand.train.side_effect = demand_result
+        else:
+            demand.train.return_value = demand_result
+        session = MagicMock()
+        with (
+            patch("packages.ml.models.DemandModel", return_value=demand),
+            patch("packages.ml.models.COPModel", side_effect=AssertionError("COP instance")),
+            patch("packages.ml.safe_persistence.safe_load", side_effect=AssertionError("COP load")),
+            patch(
+                "packages.api.routers.models_router.get_session",
+                return_value=_session_context(session),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
+                headers={"Authorization": "Bearer test-token"},
+            ) as client:
+                response = await client.post("/api/ml/train")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["cop"] == {
+            "status": "retired",
+            "supported": False,
+            "error": "cop_model_retired",
+            "reason": "unverified_thermal_output",
+        }
+        if isinstance(demand_result, Exception):
+            assert body["demand"] == {"error": "Training failed: fixture failure"}
+        else:
+            assert body["demand"] == demand_result
+        demand.train.assert_awaited_once_with()
+        session.add.assert_called_once()
+        assert artifact.read_bytes() == b"archived COP bytes"
+
+    @pytest.mark.parametrize(("hours", "expected_status"), [(24, 410), (168, 410), (0, 422)])
+    async def test_compute_is_gone_without_sessions_or_computation(self, hours, expected_status):
+        import httpx
+
+        from packages.api.main import app
+
+        with (
+            patch(
+                "packages.api.routers.feeds.get_session", side_effect=AssertionError("COP session")
+            ),
+            patch(
+                "packages.ml.models.DirectionAwareCOP.compute_cop_intervals",
+                side_effect=AssertionError("COP compute"),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
+                headers={"Authorization": "Bearer test-token"},
+            ) as client:
+                response = await client.post(f"/api/cop/compute?hours={hours}")
+
+        assert response.status_code == expected_status
+        if expected_status == 410:
+            assert response.json()["detail"]["code"] == "cop_retired"
+
+    @pytest.mark.parametrize("populated", [False, True])
+    async def test_history_and_stats_only_read_labelled_archives(self, populated):
+        import httpx
+
+        from packages.api.main import app
+
+        row = SimpleNamespace(
+            ts=dt.datetime(2026, 1, 5, tzinfo=dt.timezone.utc),
+            cop_value=3.5,
+            mode="HEATING_WATER",
+            outdoor_temp=5.0,
+            electrical_kwh=1.0,
+            thermal_kwh=3.5,
+        )
+        records = [row] if populated else []
+        archive = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: records))
+        aggregates = SimpleNamespace(
+            one=lambda: (3.5, 1, 3.5, 3.5) if populated else (None, 0, None, None)
+        )
+        session = SimpleNamespace(execute=AsyncMock(side_effect=[archive, aggregates]))
+        with (
+            patch("packages.api.routers.feeds.get_session", return_value=_session_context(session)),
+            patch("packages.ml.models.get_session", return_value=_session_context(session)),
+            patch(
+                "packages.ml.models.DirectionAwareCOP.compute_cop_intervals",
+                side_effect=AssertionError("COP compute"),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
+                headers={"Authorization": "Bearer test-token"},
+            ) as client:
+                history = await client.get("/api/cop/history")
+                stats = await client.get("/api/cop/stats")
+
+        assert history.status_code == stats.status_code == 200
+        assert history.headers["X-COP-Status"] == stats.headers["X-COP-Status"] == "retired"
+        expected_history = (
+            []
+            if not populated
+            else [
+                {
+                    "ts": row.ts.isoformat(),
+                    "cop_value": 3.5,
+                    "mode": "HEATING_WATER",
+                    "outdoor_temp": 5.0,
+                    "electrical_kwh": 1.0,
+                    "thermal_kwh": 3.5,
+                    "provenance": "legacy_unverified_estimate",
+                    "confidence": "estimated",
+                    "measured": False,
+                }
+            ]
+        )
+        assert history.json() == expected_history
+        assert stats.json() == {
+            "avg_cop": 3.5 if populated else None,
+            "sample_count": 1 if populated else 0,
+            "min_cop": 3.5 if populated else None,
+            "max_cop": 3.5 if populated else None,
+            "period_hours": 168,
+            "mode_filter": None,
+            "status": "retired",
+            "provenance": "legacy_unverified_estimate",
+            "confidence": "estimated",
+            "measured": False,
+        }
+        assert session.execute.await_count == 2
+        assert all(call.args[0].is_select for call in session.execute.call_args_list)
+
+    @pytest.mark.parametrize("control_allowed", [False, True])
+    async def test_readiness_ignores_cop_and_preserves_planning_input_gate(self, control_allowed):
+        import httpx
+
+        from packages.api.main import app
+
+        now = dt.datetime.now(dt.timezone.utc)
+        heartbeats = [
+            SimpleNamespace(service=service, updated_at=now)
+            for service in ("poller", "optimizer", "backup")
+        ]
+        rows = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: heartbeats))
+        session = SimpleNamespace(execute=AsyncMock(return_value=rows))
+        device_quality = {
+            "ready": True,
+            "credentials_configured": True,
+            "timestamp": now,
+            "age_seconds": 0,
+            "threshold_seconds": 300,
+            "reasons": [],
+        }
+        planning_quality = {
+            "control_allowed": control_allowed,
+            "reasons": [] if control_allowed else ["fixture_stale_price"],
+        }
+        with (
+            patch(
+                "packages.api.routers.models_router.get_session",
+                return_value=_session_context(session),
+            ),
+            patch(
+                "packages.core.device_data_quality.get_device_data_quality",
+                new=AsyncMock(return_value=device_quality),
+            ),
+            patch(
+                "packages.core.planning_data_quality.get_planning_data_quality",
+                new=AsyncMock(return_value=planning_quality),
+            ),
+            patch(
+                "packages.ml.model_status._inspect_model_artifact",
+                side_effect=AssertionError("COP artifact inspection"),
+            ),
+            patch("packages.ml.models.COPModel", side_effect=AssertionError("COP constructor")),
+            patch("packages.ml.safe_persistence.safe_load", side_effect=AssertionError("COP load")),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
+            ) as client:
+                response = await client.get("/health/ready")
+
+        assert response.status_code == (200 if control_allowed else 503)
+        body = response.json() if control_allowed else response.json()["detail"]
+        assert body["status"] == ("ready" if control_allowed else "degraded")
+        assert body["planning_data_quality"] == planning_quality
+        if not control_allowed:
+            assert body["stale"] == ["planning_inputs"]
+        session.execute.assert_awaited_once()
+        assert session.execute.await_args.args[0].is_select
 
 
 def _write_signed_artifact(path, payload) -> None:
@@ -344,7 +1221,9 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
         ),
         patch(
             "packages.ml.model_status._inspect_model_artifact",
-            return_value=artifact_status,
+            side_effect=lambda kind, directory: (
+                dict(_RETIRED_COP_STATUS) if kind == "cop" else dict(artifact_status)
+            ),
         ),
         patch(
             "packages.ml.models.DemandModel.training_data_quality",
@@ -355,11 +1234,11 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
     ):
         response = await get_optimizer_status()
 
-    assert response["cop_model"]["source_records"] == 42
+    assert response["cop_model"] == _RETIRED_COP_STATUS
     assert response["demand_model"]["source_records"] == 42
-    assert response["cop_model"]["trained"] is True
-    assert response["cop_model"]["last_trained"] == "2026-10-01T12:00:00+00:00"
-    assert response["cop_model"]["metrics"] == {"mae": 0.123, "samples": 36}
+    assert response["demand_model"]["trained"] is True
+    assert response["demand_model"]["last_trained"] == "2026-10-01T12:00:00+00:00"
+    assert response["demand_model"]["metrics"] == {"mae": 0.123, "samples": 36}
     count_statement = session.execute.await_args.args[0]
     assert "consumption" in str(count_statement)
 
@@ -369,7 +1248,7 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
     [
         (
             "cop",
-            "cop_model_weather_dhw_v5_20261001_1200.pkl",
+            "cop_model_weather_dhw_v6_20261001_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"mae": 0.2, "samples": 17}},
         ),
         (
@@ -383,6 +1262,7 @@ def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload
     from packages.ml.model_status import _inspect_model_artifact
 
     _write_signed_artifact(tmp_path / filename, payload)
+    archive_bytes = (tmp_path / filename).read_bytes()
     clear_artifact_status_cache()
     with (
         patch("packages.ml.models.MODEL_DIR", tmp_path),
@@ -392,19 +1272,21 @@ def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload
     ):
         status = _inspect_model_artifact(model_kind, tmp_path)
 
-    assert status == {
+    expected = {
         "trained": True,
         "last_trained": "2026-10-01T12:00:00+00:00",
         "samples": payload["metrics"]["samples"],
         "metrics": payload["metrics"],
         "unavailable_reason": None,
     }
+    assert status == (_RETIRED_COP_STATUS if model_kind == "cop" else expected)
+    assert (tmp_path / filename).read_bytes() == archive_bytes
 
 
 @pytest.mark.parametrize(
     ("model_kind", "filename"),
     [
-        ("cop", "cop_model_weather_dhw_v5_20261001_1200.pkl"),
+        ("cop", "cop_model_weather_dhw_v6_20261001_1200.pkl"),
         ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
     ],
 )
@@ -419,7 +1301,9 @@ def test_model_status_reports_signature_failure_without_details(
         status = _inspect_model_artifact(model_kind, tmp_path)
 
     assert status["trained"] is False
-    assert status["unavailable_reason"] == "integrity_check_failed"
+    assert status["unavailable_reason"] == (
+        "retired" if model_kind == "cop" else "integrity_check_failed"
+    )
     assert str(tmp_path) not in str(status)
 
 
@@ -427,7 +1311,7 @@ def test_model_status_reports_signature_failure_without_details(
 @pytest.mark.parametrize(
     ("model_kind", "filename"),
     [
-        ("cop", "cop_model_weather_dhw_v5_20261001_1200.pkl"),
+        ("cop", "cop_model_weather_dhw_v6_20261001_1200.pkl"),
         ("demand", "demand_model_weather_v3_20261001_1200.pkl"),
     ],
 )
@@ -467,7 +1351,10 @@ async def test_optimizer_status_contains_safe_failure_for_bad_artifact(
 
     model_status = response[f"{model_kind}_model"]
     assert model_status["trained"] is False
-    assert model_status["unavailable_reason"] == "integrity_check_failed"
+    assert model_status["unavailable_reason"] == (
+        "retired" if model_kind == "cop" else "integrity_check_failed"
+    )
+    assert response["cop_model"] == _RETIRED_COP_STATUS
     assert str(tmp_path) not in json.dumps(response)
 
 
@@ -487,7 +1374,7 @@ def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename
     status = _inspect_model_artifact(model_kind, tmp_path)
 
     assert status["trained"] is False
-    assert status["unavailable_reason"] == "not_found"
+    assert status["unavailable_reason"] == ("retired" if model_kind == "cop" else "not_found")
 
 
 @pytest.mark.parametrize(
@@ -495,8 +1382,8 @@ def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename
     [
         (
             "cop",
-            "cop_model_weather_dhw_v5_20261001_1200.pkl",
-            "cop_model_weather_dhw_v5_20261002_1200.pkl",
+            "cop_model_weather_dhw_v6_20261001_1200.pkl",
+            "cop_model_weather_dhw_v6_20261002_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
             {"model": SimpleNamespace(n_features_in_=1)},
         ),
@@ -525,13 +1412,14 @@ def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
     ):
         status = _inspect_model_artifact(model_kind, tmp_path)
 
-    assert status == {
+    expected = {
         "trained": True,
         "last_trained": "2026-10-01T12:00:00+00:00",
         "samples": older_payload["metrics"]["samples"],
         "metrics": older_payload["metrics"],
         "unavailable_reason": None,
     }
+    assert status == (_RETIRED_COP_STATUS if model_kind == "cop" else expected)
 
 
 @pytest.mark.parametrize(
@@ -539,8 +1427,8 @@ def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
     [
         (
             "cop",
-            "cop_model_weather_dhw_v5_20261001_1200.pkl",
-            "cop_model_weather_dhw_v5_20261002_1200.pkl",
+            "cop_model_weather_dhw_v6_20261001_1200.pkl",
+            "cop_model_weather_dhw_v6_20261002_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=7), "metrics": {"samples": 17}},
         ),
         (
@@ -567,10 +1455,13 @@ def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
     ):
         status = _inspect_model_artifact(model_kind, tmp_path)
 
-    assert status["trained"] is True
-    assert status["last_trained"] == "2026-10-01T12:00:00+00:00"
-    assert status["metrics"] == older_payload["metrics"]
-    assert status["unavailable_reason"] is None
+    if model_kind == "cop":
+        assert status == _RETIRED_COP_STATUS
+    else:
+        assert status["trained"] is True
+        assert status["last_trained"] == "2026-10-01T12:00:00+00:00"
+        assert status["metrics"] == older_payload["metrics"]
+        assert status["unavailable_reason"] is None
 
 
 @pytest.mark.parametrize(
@@ -578,7 +1469,7 @@ def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
     [
         (
             "cop",
-            "cop_model_weather_dhw_v5_20261001_1200.pkl",
+            "cop_model_weather_dhw_v6_20261001_1200.pkl",
             {"model": SimpleNamespace(n_features_in_=1)},
         ),
         (
@@ -604,13 +1495,15 @@ def test_model_status_reports_only_incompatible_artifact(
         status = _inspect_model_artifact(model_kind, tmp_path)
 
     assert status["trained"] is False
-    assert status["unavailable_reason"] == "incompatible_artifact"
+    assert status["unavailable_reason"] == (
+        "retired" if model_kind == "cop" else "incompatible_artifact"
+    )
 
 
 def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
-    path = tmp_path / "cop_model_weather_dhw_v5_20261001_1200.pkl"
+    path = tmp_path / "demand_model_weather_v3_20261001_1200.pkl"
     path.write_bytes(b"first")
     clear_artifact_status_cache()
     loaded_metrics = iter(({"samples": 4}, {"samples": 9}))
@@ -624,11 +1517,11 @@ def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> 
         return True
 
     load_latest.side_effect = load_changed_metrics
-    with patch("packages.ml.models.COPModel", return_value=fake_model):
-        first = _inspect_model_artifact("cop", tmp_path)
-        second = _inspect_model_artifact("cop", tmp_path)
+    with patch("packages.ml.models.DemandModel", return_value=fake_model):
+        first = _inspect_model_artifact("demand", tmp_path)
+        second = _inspect_model_artifact("demand", tmp_path)
         os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
-        third = _inspect_model_artifact("cop", tmp_path)
+        third = _inspect_model_artifact("demand", tmp_path)
 
     assert first["metrics"] == {"samples": 4}
     assert second == first
@@ -639,17 +1532,17 @@ def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> 
 def test_model_status_cache_invalidates_when_an_artifact_is_added(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
-    first_path = tmp_path / "cop_model_weather_dhw_v5_20261001_1200.pkl"
+    first_path = tmp_path / "demand_model_weather_v3_20261001_1200.pkl"
     first_path.write_bytes(b"first")
     clear_artifact_status_cache()
     fake_model = SimpleNamespace(version="20261001_1200", metrics={"samples": 4})
     fake_model.load_latest = MagicMock(return_value=True)
 
-    with patch("packages.ml.models.COPModel", return_value=fake_model):
-        first = _inspect_model_artifact("cop", tmp_path)
-        (tmp_path / "cop_model_weather_dhw_v5_20261002_1200.pkl").write_bytes(b"second")
+    with patch("packages.ml.models.DemandModel", return_value=fake_model):
+        first = _inspect_model_artifact("demand", tmp_path)
+        (tmp_path / "demand_model_weather_v3_20261002_1200.pkl").write_bytes(b"second")
         fake_model.metrics = {"samples": 9}
-        second = _inspect_model_artifact("cop", tmp_path)
+        second = _inspect_model_artifact("demand", tmp_path)
 
     assert first["metrics"] == {"samples": 4}
     assert second["metrics"] == {"samples": 9}
@@ -870,13 +1763,11 @@ async def test_heat_curve_advice_uses_current_device_gate_and_fails_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("cop_count", "consumption_count", "expected"),
-    [(49, 50, False), (50, 49, False), (50, 50, True)],
+    ("cop_count", "consumption_count"),
+    [(0, 0), (49, 50), (50, 49), (50, 50), (10000, 10000)],
 )
-async def test_ml_data_gate_requires_both_current_thresholds(
-    cop_count, consumption_count, expected
-):
-    from packages.optimizer.main import _has_sufficient_ml_data
+async def test_auto_never_queries_or_qualifies_legacy_history(cop_count, consumption_count):
+    from packages.optimizer.main import _select_optimizer
 
     cop_result = MagicMock()
     cop_result.scalar.return_value = cop_count
@@ -884,5 +1775,16 @@ async def test_ml_data_gate_requires_both_current_thresholds(
     consumption_result.scalar.return_value = consumption_count
     session = SimpleNamespace(execute=AsyncMock(side_effect=[cop_result, consumption_result]))
 
-    with patch("packages.optimizer.main.get_session", return_value=_session_context(session)):
-        assert await _has_sufficient_ml_data() is expected
+    with (
+        patch(
+            "packages.optimizer.main.get_session", return_value=_session_context(session)
+        ) as get_session,
+        patch("packages.optimizer.main._demand_model", SimpleNamespace(is_trained=True)),
+        patch("packages.optimizer.main.MILPOptimizer", side_effect=AssertionError("auto MILP")),
+    ):
+        layer, optimizer = await _select_optimizer("auto")
+
+    assert layer == "rules"
+    assert type(optimizer).__name__ == "RulesOptimizer"
+    get_session.assert_not_called()
+    session.execute.assert_not_awaited()

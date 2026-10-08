@@ -479,17 +479,17 @@ async def trigger_ml_training():
     import structlog
     import traceback
 
-    from packages.ml.models import COPModel, DemandModel
+    from packages.ml.models import DemandModel
 
     _log = structlog.get_logger()
-    cop = COPModel()
     demand = DemandModel()
 
-    try:
-        cop_result = await cop.train()
-    except Exception as exc:
-        _log.error("cop_train_error", error=str(exc), traceback=traceback.format_exc())
-        cop_result = {"error": f"Training failed: {exc}"}
+    cop_result = {
+        "status": "retired",
+        "supported": False,
+        "error": "cop_model_retired",
+        "reason": "unverified_thermal_output",
+    }
 
     try:
         demand_result = await demand.train()

@@ -58,11 +58,19 @@ def _parse_bool(value: str) -> bool:
 
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
+    "manual_cop_monitoring_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": "Experimental manual controller-COP forecasting only; ledger access remains available",
+    },
     # --- Optimizer layer ---
     "optimizer_layer": {
         "type": "str",
         "default": "rules_only",
-        "description": "Which optimizer layer to use",
+        "description": (
+            "rules_only and auto use rules with assumed heating efficiency while COP is retired. "
+            "milp_preferred explicitly selects MILP with the retained demand model."
+        ),
         "options": ["rules_only", "milp_preferred", "auto"],
     },
     # --- Learning mode ---

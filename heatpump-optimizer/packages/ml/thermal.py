@@ -39,6 +39,11 @@ THERMAL_MODEL_ARTIFACT = "thermal_params_v1.pkl"
 THERMAL_MODEL_SCHEMA_VERSION = 3
 
 
+def assumed_heating_efficiency(outdoor_temp: float) -> float:
+    """Return an assumed planning ratio, not measured heat-pump performance."""
+    return max(1.5, min(6.0, 3.5 + 0.1 * outdoor_temp))
+
+
 @dataclass
 class ThermalParams:
     """Learned thermal parameters for the system."""

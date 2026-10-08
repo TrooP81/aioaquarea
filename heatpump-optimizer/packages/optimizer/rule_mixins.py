@@ -10,9 +10,8 @@ import structlog
 
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
-from packages.ml.cop_model_core import COPModel
 from packages.ml.comfort_model import comfort_model
-from packages.ml.thermal import thermal_model
+from packages.ml.thermal import assumed_heating_efficiency, thermal_model
 from packages.optimizer.actions import ActionType
 
 
@@ -139,24 +138,14 @@ class SharedRuleHelpersMixin:
         dhw_cop_model=None,
         dhw_target: int | None = None,
     ) -> list[tuple[dt.datetime, float]] | None:
-        """Choose heat-pump hours by electricity cost per delivered thermal kWh.
-
-        The trained COP artifact is DHW-specific, so callers must explicitly
-        supply both that model and a tank target. Space-heating callers use the
-        outdoor-temperature fallback until a separately measured SH COP model
-        exists.
-        """
-        use_ml = dhw_target is not None and dhw_cop_model is not None and dhw_cop_model.is_trained
+        """Rank slots by price per assumed thermal kWh; COP arguments are inert."""
 
         effective_prices = []
         original_prices = {ts: price for ts, price in prices}
         for ts, price in prices:
             outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
-            if use_ml:
-                cop = dhw_cop_model.predict_cop(outdoor_temp, int(dhw_target), ts.hour)
-            else:
-                cop = COPModel._default_cop_curve(outdoor_temp)
-            effective_prices.append((ts, price / cop))
+            efficiency = assumed_heating_efficiency(outdoor_temp)
+            effective_prices.append((ts, price / efficiency))
 
         selected = self._find_cheapest_slot(effective_prices, hours_needed)
         if not selected:
@@ -287,9 +276,8 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         A heat pump produces more heat per kWh of electricity when outdoor air
         is warmer. Comparing raw spot prices alone can therefore select a cold
         hour that costs more and consumes more electricity for the same tank
-        recharge. ``price / COP`` is the effective price per thermal kWh.
-        When available, the trained COP model provides a tank-target-aware
-        estimate rather than the default outdoor-only curve.
+        recharge. Price divided by the assumed efficiency ratio is a planning
+        estimate per thermal kWh, not a measured COP or a learned DHW model.
         """
         return self._find_lowest_heat_energy_cost_slot(
             prices,
@@ -669,7 +657,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 weather_full,
                 self._get_outdoor_at(weather, timestamp, current_outdoor_temp),
             )
-            cop = COPModel._default_cop_curve(conditions["outdoor_temp"])
+            cop = assumed_heating_efficiency(conditions["outdoor_temp"])
             if (
                 isinstance(raw_price, bool)
                 or not isinstance(raw_price, (int, float))

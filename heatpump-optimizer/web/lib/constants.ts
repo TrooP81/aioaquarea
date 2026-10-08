@@ -50,6 +50,7 @@ export const LEGACY_SECTION_ALIASES: Record<string, { section: SectionId; hash?:
 export const LAYER_LABELS: Record<string, string> = {
   // Runtime version strings
   rules_v3: "Rules",
+  rules_v7: "Rules",
   milp_v1: "Optimized",
   "milp_v1+ml": "Optimized + ML",
   // Configuration keys (shown in a few places as a fallback)
@@ -61,15 +62,17 @@ export const LAYER_LABELS: Record<string, string> = {
 export const LAYER_TOOLTIPS: Record<string, string> = {
   rules_v3:
     "Rule-based scheduler: deterministic heuristics using electricity prices, comfort windows and quiet hours.",
+  rules_v7:
+    "Rule-based scheduler using electricity prices, comfort windows, quiet hours and assumed heating efficiency.",
   milp_v1:
     "Cost optimizer (MILP): searches for the lowest-cost schedule across the whole planning horizon.",
   "milp_v1+ml":
-    "Cost optimizer enhanced with machine-learning predictions of efficiency (COP) and hot-water demand.",
+    "Cost optimizer using retained machine-learning predictions of electrical heating demand and assumed heating efficiency.",
   rules_only: "Deterministic rule-based scheduling. Most predictable; no ML required.",
   milp_preferred:
     "Use the MILP cost optimizer when possible, falling back to rules on any error.",
   auto:
-    "Use the MILP optimizer once ML models are trained on enough data; otherwise fall back to rules.",
+    "Uses rules while COP is retired; automatic MILP promotion is disabled.",
 };
 
 /** Options for the `optimizer_layer` setting dropdown. */
@@ -85,7 +88,7 @@ export const OPTIMIZER_LAYER_OPTIONS: Record<string, { label: string; descriptio
   auto: {
     label: "Automatic",
     description:
-      "Use the MILP optimizer once ML models are trained on ≥14 days of data; otherwise use rules.",
+      "Uses rules while COP is retired; automatic MILP promotion is disabled.",
   },
 };
 

@@ -8,14 +8,17 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    DDL,
     Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Sequence,
     String,
     Text,
+    event,
     func,
     text,
 )
@@ -392,6 +395,111 @@ class COPRecord(Base):
     outdoor_temp: Mapped[float | None] = mapped_column(Float)
     electrical_kwh: Mapped[float | None] = mapped_column(Float)
     thermal_kwh: Mapped[float | None] = mapped_column(Float)
+
+
+_MANUAL_COP_CALENDAR_MIDNIGHT_DDL = """
+CREATE OR REPLACE FUNCTION public.manual_cop_calendar_midnight(
+    local_midnight timestamp without time zone, timezone_name text
+) RETURNS timestamp with time zone
+LANGUAGE sql STABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog
+AS $$
+    SELECT CASE WHEN (local_midnight AT TIME ZONE timezone_name) IS NOT NULL THEN
+        CASE WHEN EXISTS (
+            SELECT 1 FROM pg_timezone_names
+            WHERE name COLLATE "C" = timezone_name COLLATE "C"
+                AND name !~ '^(posix|right)/'
+                AND name NOT IN ('localtime', 'posixrules')
+        ) THEN (
+            SELECT min(instant)
+            FROM generate_series(
+                (local_midnight AT TIME ZONE 'UTC') - INTERVAL '86399 seconds',
+                (local_midnight AT TIME ZONE 'UTC') + INTERVAL '86399 seconds',
+                INTERVAL '1 second'
+            ) AS candidates(instant)
+            WHERE (instant AT TIME ZONE timezone_name) = local_midnight
+        ) END
+    END
+$$
+"""
+
+
+manual_cop_revision_seq = Sequence(
+    "manual_cop_revision_seq",
+    start=1,
+    minvalue=1,
+    maxvalue=9223372036854775807,
+    cycle=False,
+    metadata=Base.metadata,
+)
+
+
+class ManualCOPObservationRecord(Base):
+    """Retained manual controller estimates, unrelated to derived COP archives."""
+
+    __tablename__ = "manual_cop_observations"
+    __table_args__ = (
+        CheckConstraint("granularity IN ('day', 'month')", name="ck_manual_cop_granularity"),
+        CheckConstraint(
+            "granularity <> 'month' OR EXTRACT(DAY FROM period_date) = 1",
+            name="ck_manual_cop_month_start",
+        ),
+        CheckConstraint("timezone <> ''", name="ck_manual_cop_timezone"),
+        CheckConstraint(
+            "value > 0 AND value < 'Infinity'::double precision", name="ck_manual_cop_value"
+        ),
+        CheckConstraint("revision > 0", name="ck_manual_cop_revision"),
+        CheckConstraint("period_start < period_end", name="ck_manual_cop_period_order"),
+        CheckConstraint(
+            "period_start IS NOT DISTINCT FROM public.manual_cop_calendar_midnight("
+            "period_date::timestamp, timezone) AND "
+            "period_end IS NOT DISTINCT FROM public.manual_cop_calendar_midnight("
+            "CASE WHEN granularity = 'day' "
+            "THEN period_date::timestamp + INTERVAL '1 day' "
+            "ELSE period_date::timestamp + INTERVAL '1 month' END, timezone)",
+            name="ck_manual_cop_calendar",
+        ),
+        CheckConstraint(
+            "observed_at >= period_start AND observed_at <= CURRENT_TIMESTAMP",
+            name="ck_manual_cop_observed_at",
+        ),
+        CheckConstraint(
+            "completeness IN ('partial', 'closed', 'unknown') AND "
+            "(completeness <> 'closed' OR observed_at >= period_end)",
+            name="ck_manual_cop_completeness",
+        ),
+        CheckConstraint("created_at <= updated_at", name="ck_manual_cop_server_times"),
+    )
+
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    granularity: Mapped[str] = mapped_column(String(5), primary_key=True)
+    period_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    timezone: Mapped[str] = mapped_column(String(128), nullable=False)
+    period_start: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    observed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completeness: Mapped[str] = mapped_column(String(7), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    revision: Mapped[int] = mapped_column(
+        BigInteger,
+        manual_cop_revision_seq,
+        nullable=False,
+        server_default=manual_cop_revision_seq.next_value(),
+    )
+
+
+event.listen(
+    ManualCOPObservationRecord.__table__,
+    "before_create",
+    DDL(_MANUAL_COP_CALENDAR_MIDNIGHT_DDL).execute_if(dialect="postgresql"),
+    propagate=True,
+)
 
 
 class IndoorTempReading(Base):

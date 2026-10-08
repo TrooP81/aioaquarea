@@ -63,11 +63,10 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
         setState(lm);
         if (opt) {
           const ready = [
-            opt.cop_model?.trained,
             opt.demand_model?.trained,
             opt.thermal_model?.calibrated,
           ].filter(Boolean).length;
-          setModels({ ready, total: 3 });
+          setModels({ ready, total: 2 });
         }
         setError(null);
       })

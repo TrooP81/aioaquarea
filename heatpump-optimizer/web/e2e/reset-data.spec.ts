@@ -50,7 +50,7 @@ test.describe("Reset data card", () => {
           deleted_rows: { indoor_temp_reading: 42 },
           total_rows_deleted: 42,
           models_reset: true,
-          deleted_models: ["cop_model_1.pkl"],
+          deleted_models: ["demand_model_1.pkl"],
         }),
       });
     });
@@ -68,12 +68,13 @@ test.describe("Reset data card", () => {
     await indoor.check();
 
     await expect(
-      page.getByText(/Trained ML models.*will also be reset/),
+      page.getByText(/Retained models.*will also be reset/),
     ).toBeVisible();
 
     await page.getByRole("button", { name: "Reset Selected Data" }).click();
 
     await expect(page.getByText(/Deleted 42 record\(s\)/)).toBeVisible();
+    await expect(page.getByText(/COP artifacts and all model baselines are retained/)).toBeVisible();
     expect(resetBody).toEqual({ scopes: ["indoor_temp"] });
   });
 
@@ -97,19 +98,36 @@ test.describe("Reset data card", () => {
       });
     });
 
-    page.on("dialog", (dialog) => dialog.accept());
+    let confirmation = "";
+    page.on("dialog", (dialog) => {
+      confirmation = dialog.message();
+      return dialog.accept();
+    });
 
     await page.goto("/settings");
     await page.getByRole("tab", { name: "System" }).click();
 
     await page
-      .locator("label", { hasText: "Start everything fresh (select all)" })
+      .locator("label", { hasText: "Select all resettable data" })
       .locator("input[type=checkbox]")
       .check();
 
     await page.getByRole("button", { name: "Reset Selected Data" }).click();
 
     await expect(page.getByText(/Deleted 0 record\(s\)/)).toBeVisible();
-    expect(resetBody.scopes.length).toBe(7);
+    expect(resetBody.scopes.sort()).toEqual(["device_status", "energy", "indoor_temp", "logs", "plans", "prices", "weather"]);
+    expect(confirmation).toContain("COP history, COP artifacts and all model baselines are kept");
+    expect(confirmation).not.toContain("ALL collected data");
+  });
+
+  test("energy reset describes consumption only and retained COP history", async ({ page }) => {
+    await mockSettings(page);
+    await page.goto("/settings");
+    await page.getByRole("tab", { name: "System" }).click();
+    const energy = page.locator("label", { hasText: "Energy history" });
+    await expect(energy).toContainText("Consumption records only; retired COP history is retained");
+    await energy.locator("input[type=checkbox]").check();
+    await expect(page.getByText(/Retained models \(demand, comfort, thermal\)/)).toBeVisible();
+    await expect(page.getByText("Energy & COP history", { exact: true })).toHaveCount(0);
   });
 });

@@ -12,7 +12,6 @@ from packages.core.models import (
     AppLogRecord,
     AuditLogRecord,
     ConsumptionRecord,
-    COPRecord,
     DeviceStatusRecord,
     FaultRecord,
     IndoorTempReading,
@@ -32,7 +31,7 @@ logger = structlog.get_logger()
 # touched, so credentials, sensor selection, and the OAuth connection survive.
 RESET_SCOPES: dict[str, list] = {
     "indoor_temp": [IndoorTempReading],
-    "energy": [COPRecord, ConsumptionRecord],
+    "energy": [ConsumptionRecord],
     "device_status": [ShowerEventRecord, FaultRecord, DeviceStatusRecord],
     "weather": [WeatherRecord],
     "prices": [PriceRecord],
@@ -51,24 +50,22 @@ class ResetRequest(BaseModel):
 
 
 def reset_ml_models() -> list[str]:
-    """Reset in-memory model state and delete persisted model files.
+    """Reset retained models; leave retired COP artifacts and all baselines intact.
 
     Singletons are reset in place because other modules import them by
     reference. Returns the list of deleted model file names.
     """
     from packages.ml.comfort_model import comfort_model
-    from packages.ml.models import cop_model, demand_model
+    from packages.ml.models import demand_model
     from packages.ml.models_common import MODEL_DIR
     from packages.ml.thermal import thermal_model
 
-    cop_model.reset()
     demand_model.reset()
     comfort_model.reset()
     thermal_model.reset()
 
     deleted: list[str] = []
     for pattern in (
-        "cop_model_*.pkl",
         "demand_model_*.pkl",
         "comfort_model_*.pkl",
         "thermal_params_v1.pkl",

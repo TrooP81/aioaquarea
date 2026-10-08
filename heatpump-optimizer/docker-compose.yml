@@ -170,7 +170,7 @@ services:
       BACKUP_DIR: /backups
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
-      BACKUP_VERIFY_AFTER_DUMP: ${BACKUP_VERIFY_AFTER_DUMP:-false}
+      BACKUP_VERIFY_AFTER_DUMP: "false"
       BACKUP_REPLICA_ENABLED: ${BACKUP_REPLICA_ENABLED:-false}
       BACKUP_REPLICA_DIR: /replica
       BACKUP_REPLICA_REQUIRED: ${BACKUP_REPLICA_REQUIRED:-false}
@@ -186,30 +186,21 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  backup-verify:
-    # Run manually with: docker compose --profile maintenance run --rm backup-verify
+  restore-tool:
     profiles: [ "maintenance" ]
-    build:
-      context: .
-      dockerfile: Dockerfile.backup
-      args:
-        TIMESCALE_IMAGE: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
+    image: timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
       PGHOST: db
       PGUSER: ${POSTGRES_USER:-heatpump}
       PGPASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
       PGDATABASE: ${POSTGRES_DB:-heatpump}
-      BACKUP_DIR: /backups
-      BACKUP_REPLICA_ENCRYPTION_KEY: ${BACKUP_REPLICA_ENCRYPTION_KEY:-}
-    command: [ "/bin/sh", "/scripts/verify_backup.sh" ]
+      RESTORE_DISPOSABLE: "false"
+    entrypoint: []
+    command: [ "/bin/sh", "-c", "echo 'Use scripts/restore_db.sh for guarded restores' >&2; exit 2" ]
     volumes:
-      - ./backups:/backups
-      - ./scripts/verify_backup.sh:/scripts/verify_backup.sh:ro
-      - ${BACKUP_REPLICA_HOST_DIR:-./backups-replica}:/replica
-    depends_on:
-      db:
-        condition: service_healthy
+      - ./backups:/backups:ro
+      - ./scripts/restore_archive.sh:/scripts/restore_archive.sh:ro
 
 volumes:
   pgdata:

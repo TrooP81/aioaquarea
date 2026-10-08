@@ -71,7 +71,7 @@ restart the API and poller; no migration or Redis cleanup is required.
 | `WEB_PORT` | `4444` | `web` | Loopback host port for the dashboard. |
 | `COMPOSE_ENV_FILE` | `.env` | all | Alternative env file for services. |
 | `APP_VERSION` / `BUILD_REVISION` | `0.14.0` / `unknown` | image builds | Build metadata. |
-| `TIMESCALE_IMAGE` / `REDIS_IMAGE` | pinned digests | `db`, backups / `redis` | Image overrides. |
+| `TIMESCALE_IMAGE` / `REDIS_IMAGE` | pinned digests | `db`, backups / `redis` | Deployment image choices. Restore tooling is immutable and rejects a different database image or Timescale version. |
 
 ### Backups
 
@@ -79,12 +79,53 @@ restart the API and poller; no migration or Redis cleanup is required.
 | --- | --- | --- |
 | `BACKUP_INTERVAL_SECONDS` | `86400` | Interval between archives. |
 | `BACKUP_RETENTION_DAYS` | `14` | Days completed archives are kept. |
-| `BACKUP_VERIFY_AFTER_DUMP` | `false` | Restore each archive into a disposable database before accepting it. |
+| `BACKUP_VERIFY_AFTER_DUMP` | `false` | Forced off in production Compose. Same-instance verification is forbidden; use isolated drills. |
 | `BACKUP_REPLICA_ENABLED` | `false` | Write an encrypted copy to the replica directory. |
 | `BACKUP_REPLICA_REQUIRED` | `false` | Treat a failed replica as a failed backup. |
 | `BACKUP_REPLICA_ENCRYPTION_KEY` | _(empty)_ | Required when replicas are enabled. |
 | `BACKUP_REPLICA_HOST_DIR` | `./backups-replica` | Host directory mounted as the replica target. |
 | `BACKUP_MAX_AGE_SECONDS` | `93600` (26 h) | Read by the API readiness check; an older newest backup is reported stale. |
+
+### Restore And Isolated Drills (Phase 1)
+
+These are script/CI inputs, not runtime application settings. See the
+[restore and rollback runbook](../README.md#local-evidence-and-restore-runbook).
+Metadata sidecars, backup-time verification, and backup-health state transitions
+remain Phase 2 work; no migration or API health behavior changes in Phase 1.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RESTORE_SOURCE_IMAGE` | required | Trusted source image: exact pinned `timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57`. No production override. |
+| `RESTORE_SOURCE_TIMESCALE_VERSION` | required | Exactly `2.26.4`. Archive PostgreSQL major must be `16`; pinned server is `16.13`. |
+| `RESTORE_EXPECTED_REVISION` | required | Trusted numeric pre-migration archive revision. Production upgrades only the verified candidate to repository head. |
+| `RESTORE_REQUIRED_ROLES` | inspected roles | Additional space-separated source/job-owner identifiers. Production requires existing roles; disposable targets alone create `NOLOGIN` roles. |
+| `RESTORE_PRODUCTION_TEST_COMPOSE_FILE` | unset | Must be the canonical disposable Compose file; any partial redirection fails closed. |
+| `RESTORE_PRODUCTION_TEST_PROJECT` | unset | Must start with `restore-db-production-test-`. Live authorization never overrides redirection. |
+| `RESTORE_PRODUCTION_TEST_BACKUP_DIR` | unset | Existing external disposable archive directory, read-only in containers; aliases/children of project backups are rejected. |
+| `RESTORE_TEST_PROJECT` | unique disposable project | `--test` permits only `restore-db-production-test-*`. |
+| `RESTORE_TEST_DATABASE` | unique disposable database | `--test` permits only `restore_production_test_*`; it never replaces an existing candidate. |
+| `RESTORE_TEST_KEEP_STACK` | `false` | Test harness only: retain the isolated stack for assertions. Its owner must still clean up in `finally`. |
+| `RESTORE_VERIFY_TMPFS_BYTES` | `2147483648` | Explicit legacy/manual capacity. For trusted source bytes `S`, use at least `ceil(1.5*S)+1 GiB`, rounded to 256 MiB. Compressed archive size is not `S`. |
+| `RESTORE_VERIFY_MEMORY_BYTES` | derived | Always tmpfs + `2147483648` in entry points/tests. PostgreSQL: `shared_buffers=256MB`, `maintenance_work_mem=512MB`, `work_mem=16MB`, `max_connections=20`; single-job restore. |
+| `RUN_DOCKER_RESTORE_TESTS` | off | Set to `1` to run the synthetic tmpfs Docker gate. No published ports or external networks. |
+| `RUN_REAL_BACKUP_RESTORE_TESTS` | off | Additionally set to `1` only on an authorized trusted host. Restores newest complete dump without cutover. |
+| `RESTORE_REAL_BACKUP_DIR` | project backups | Trusted-host read-only real archive directory. Never mount a live volume. |
+| `RESTORE_REAL_EXPECTED_REVISION` | `030` (recorded legacy evidence) | Explicit trusted source revision for the real drill; update when the source revision changes. |
+| `BACKUP_VERIFY_ISOLATED` | off | Must be exactly `true`. No bypass flag. |
+| `BACKUP_LIVE_DATABASE` | `heatpump` | Verifier rejects this name in both `PGDATABASE` and `BACKUP_VERIFY_DATABASE`; also always rejects `PGHOST=db`. |
+| `BACKUP_VERIFY_DATABASE` | `heatpump_restore_verify` | Fresh isolated candidate name; cannot be live or an existing database. |
+| `BACKUP_VERIFY_TIMEOUT_SECONDS` | `3600` | Single-job verification wall timeout. |
+
+Verifier errors distinguish `verification_resource_failed` (`container_oom`,
+`tmpfs_exhausted`, `postgres_memory`, `timeout`) from `verification_failed` for
+archive/content errors. The artifact is retained. Full Docker-state OOM inspection,
+metadata capacity sizing, and readiness reporting require the Phase 2 launcher.
+
+The weekly workflow requires a dedicated Linux runner labelled `restore-drill`
+and repository variables `RESTORE_DRILL_BACKUP_DIR`,
+`RESTORE_DRILL_EXPECTED_REVISION`, and `RESTORE_DRILL_TMPFS_BYTES`. Configure no
+production DB credentials, networks, or volumes on that runner. Synthetic drills
+run on every PR; real dumps stay off hosted PR runners and CI artifacts.
 
 ### Web (`web` service)
 
@@ -110,7 +151,7 @@ not meant to be edited.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `optimizer_layer` | str | `rules_only` | `rules_only`, `milp_preferred`, or `auto`. |
+| `optimizer_layer` | str | `rules_only` | Values unchanged. `rules_only` and `auto` use rules during COP retirement; `auto` never qualifies legacy history for MILP. `milp_preferred` explicitly selects MILP with optional trained Demand and unchanged solver fallback/input gates. |
 | `learning_mode_enabled` | bool | `false` | Observe-only: plans are generated, no device commands are sent. |
 | `learning_mode_since` | str | _(empty)_ | Internal: when learning mode was last enabled. |
 | `shower_mode_enabled` | str | `false` | `true`/`false`. Reactive DHW boost on a rapid tank temperature drop. |
@@ -122,6 +163,20 @@ not meant to be edited.
 | `price_eco_upgrade_pct` | int | `25` | Upgrade eco to normal below this price percentile. |
 | `comfort_schedule` | json | weekday `7–9, 17–21`; weekend `8–21` | Comfort hours by day type: `{"weekday": [...], "weekend": [...]}`. |
 | `learned_schedule_threshold` | float | `0.3` | Minimum heating activity score (0–1) to auto-add a comfort hour. |
+
+COP retirement v1.0 adds no settings, default/value changes or migration. There is no COP-reactivation toggle. Status always reports the retired COP tombstone; `POST /api/ml/train` remains parameter-free and trains Demand only. Demand still requires 168 usable intervals, and the former 50-sample COP threshold is retired rather than reduced. Planning uses the unchanged bounded assumed efficiency, not measured COP; the `+ml` label refers to Demand only.
+
+Resetting `energy` preserves `cop_history`; resetting models preserves COP artifacts and all model baselines. The physical Panasonic controller's manually accessible **Totalt COP-värde**, marked **Ungefär**, is an approximate whole-system estimate with period/completeness limits, not the retired DHW model or an optimizer input. The separate manual ledger and default-off experimental forecaster do not reactivate COP or supply planning/training inputs. See [controller interpretation and manual monitoring contracts](../README.md#controller-total-cop).
+
+### Manual COP monitoring
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `manual_cop_monitoring_enabled` | bool | `false` | Experimental daily controller-estimate forecasting only. Manual ledger GET/PUT/DELETE and retention remain available while off. Read through `get_bool_setting`; the Diagnostics toggle is labelled Experimental forecasting. |
+
+The existing `timezone` setting prefills entry only; the operator confirms the physical controller's IANA timezone. Stored periods keep their own timezone/UTC boundaries when that setting later changes. Monthly readings are informational; they never enter forecasts. Predictions require 28 consecutive closed current daily revisions and seven matched-clock retrospective folds with at least 20 available training rows each. Late entries/corrections can keep the panel insufficient even with 28 readings because old revisions are never reconstructed. The empirical log-error band is experimental and uncalibrated, not confidence or physical-efficiency evidence. Missing optional ML dependencies return unavailable without a legacy fallback; no new dependency is needed or installed.
+
+Migration `032` creates an ordinary retained table and non-cycling bigint sequence. Revision/expected-revision JSON scalars are opaque decimal strings. Generic/model resets exclude manual readings and the sequence; delete/recreate and rollback never reuse tokens. Existing backup policy is unchanged and active deletion does not purge backups. Operational rollback disables this setting, uses a retirement-safe build, and retains both objects/data. No automatic downgrade/drop or sequence rewind is supported. Production migration, deployment, release and live enablement require separate authorization. Authentication remains conditional on the existing installed bearer token/perimeter and server proxy, installation-wide rather than per-device.
 
 ### Seasonal calibration
 

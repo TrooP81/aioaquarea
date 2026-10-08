@@ -5,14 +5,12 @@ from __future__ import annotations
 import datetime as dt
 from pathlib import Path
 
-from packages.ml.cop_model_core import COP_MODEL_ARTIFACT_GLOB, COP_MODEL_ARTIFACT_PREFIX
 from packages.ml.demand_model_core import (
     DEMAND_MODEL_ARTIFACT_GLOB,
     DEMAND_MODEL_ARTIFACT_PREFIX,
 )
 
 _ARTIFACT_CONFIG = {
-    "cop": (COP_MODEL_ARTIFACT_GLOB, COP_MODEL_ARTIFACT_PREFIX),
     "demand": (DEMAND_MODEL_ARTIFACT_GLOB, DEMAND_MODEL_ARTIFACT_PREFIX),
 }
 _artifact_status_cache: dict[
@@ -53,6 +51,19 @@ def _artifacts_with_fingerprint(
 
 def _inspect_model_artifact(model_kind: str, model_dir: Path) -> dict[str, object]:
     """Inspect the newest compatible signed artifact through the model's loader."""
+    if model_kind == "cop":
+        return {
+            "trained": False,
+            "last_trained": None,
+            "samples": 0,
+            "source_records": 0,
+            "metrics": None,
+            "status": "retired",
+            "supported": False,
+            "unavailable_reason": "retired",
+            "reason": "unverified_thermal_output",
+        }
+
     glob, prefix = _ARTIFACT_CONFIG[model_kind]
     artifacts, cache_key = _artifacts_with_fingerprint(model_dir, glob)
 
@@ -63,9 +74,9 @@ def _inspect_model_artifact(model_kind: str, model_dir: Path) -> dict[str, objec
     if not artifacts:
         status = _empty_status("not_found")
     else:
-        from packages.ml.models import COPModel, DemandModel
+        from packages.ml.models import DemandModel
 
-        model = COPModel() if model_kind == "cop" else DemandModel()
+        model = DemandModel()
         try:
             loaded = model.load_latest()
         except ValueError:

@@ -38,7 +38,10 @@ def test_release_version_is_embedded_in_container_builds():
     configuration_reference = (PROJECT_ROOT / "docs" / "configuration-reference.md").read_text(
         encoding="utf-8"
     )
-    assert f"| `APP_VERSION` / `BUILD_REVISION` | `{APP_VERSION}` / `unknown` |" in configuration_reference
+    assert (
+        f"| `APP_VERSION` / `BUILD_REVISION` | `{APP_VERSION}` / `unknown` |"
+        in configuration_reference
+    )
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-import { test, expect } from "./fixtures";
+import { test, expect, retiredCopModel } from "./fixtures";
 
 const mockDashboard = {
   current_status: {
@@ -26,7 +26,7 @@ const optimizerStatus = {
   active_layer: "rules_v3",
   fallback_layer: "rules_v3",
   learning_mode: { enabled: false, since: null, days_elapsed: null },
-  cop_model: { trained: false, last_trained: null, samples: 0 },
+  cop_model: retiredCopModel,
   demand_model: { trained: false, last_trained: null, samples: 0 },
   thermal_model: { calibrated: false, tank_heating_rate: 0, confidence: "default", last_calibrated: null },
 };
@@ -52,6 +52,27 @@ async function mockCommon(page: import("@playwright/test").Page) {
 }
 
 test.describe("Learning Mode", () => {
+  for (const [demandTrained, thermalCalibrated, ready] of [[false, false, 0], [true, false, 1], [false, true, 1], [true, true, 2]] as const) {
+    test(`counts only actual retained model states: ${demandTrained}/${thermalCalibrated}`, async ({ page }) => {
+      await mockCommon(page);
+      await page.route("**/api/optimizer/status", (route) => route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...optimizerStatus,
+          cop_model: { ...retiredCopModel, trained: true },
+          demand_model: { ...optimizerStatus.demand_model, trained: demandTrained },
+          thermal_model: { ...optimizerStatus.thermal_model, calibrated: thermalCalibrated },
+        }),
+      }));
+      await page.route("**/api/learning-mode", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, since: new Date().toISOString(), days_elapsed: 3 }) }));
+      await page.goto("/");
+      await expect(page.getByText(`Models ready: ${ready}/2`, { exact: true })).toBeVisible();
+      await expect(page.locator(".ml-status-label")).toHaveText(`${ready}/2 learning models ready`);
+      await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(0);
+    });
+  }
+
   test("shows unavailable thermal learning state without treating the plan as active", async ({ page }) => {
     await mockCommon(page);
     await page.route("**/api/thermal/status", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ model_params: { last_calibrated: null, sample_count: 0 }, predictions: { tank_heating: { minutes_to_target: 0, heating_rate_per_hour: 0, confidence: "low" }, tank_cooling: { minutes_until_min: null, loss_rate_per_hour: 0, confidence: "low" }, zone_boost: { minutes_for_2deg: 0, heating_rate_per_hour: 0, confidence: "low" } } }) }));

@@ -22,15 +22,15 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Hourly-accurate cost tracking**: Today's cost is computed as Σ(per-interval Δ kWh × that hour's spot price), not a flat-rate estimate
 - **Fault detection**: Automatic detection and logging of device faults
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
-- **Weather-aware**: Open-Meteo forecast for COP estimation and pre-heating
+- **Weather-aware**: Open-Meteo forecast for assumed heating efficiency, demand forecasting and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
 - **Rules-based optimizer (`rules_v7`)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
 - **MILP optimizer (`milp_v1`)**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
 - **Shower mode**: Optional reactive DHW boost when the tank temperature drops sharply between polls
 - **Seasonal calibration**: Optional observe-only period during cold weather to collect natural heating data and train demand/thermal models
 - **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
-- **Direction-aware COP**: Real COP computation from compressor direction and consumption data
-- **ML models**: COP prediction, demand forecasting, and indoor comfort model (train on your own data)
+- **COP retirement**: Unverified legacy estimates are archived; no active COP training, loading, inference or live computation
+- **Retained models**: Electrical heating-demand forecasting, indoor comfort and calibrated thermal response
 - **Action verification**: Confirms commands took effect by polling device after execution
 - **Manual overrides**: Always-wins pause button for the optimizer; survives optimizer reruns
 - **Learning mode**: Manually toggleable observe-only mode — the optimizer keeps planning but sends no device commands, so the heat pump runs naturally while clean training data is collected over a long period
@@ -38,7 +38,7 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
 - **Operational alerts**: In-app (and optional webhook) alerts for stale data, adaptor outages, failed actions, and degraded forecasts
-- **Automated backups**: Daily PostgreSQL archives with retention, optional verification, and optional encrypted replica
+- **Automated backups**: Daily PostgreSQL archives with retention, isolated restore drills, and optional encrypted replica
 - **Audit log**: Every executed action is recorded
 
 ## Quick Start
@@ -118,17 +118,48 @@ Panasonic Comfort Cloud username and password are entered in the dashboard **Set
 | `db` | `DB_PORT` (5434 → container 5432) | TimescaleDB |
 | `redis` | (internal only) | Panasonic auth circuit-breaker state |
 | `backup` | — | Scheduled `pg_dump` archives into `./backups` |
-| `backup-verify` | — | `maintenance` profile only; restores the newest archive into a disposable database |
+| `restore-tool` | — | `maintenance` profile only; pinned tools for the guarded restore entry point, not a live verifier |
 
 ## Backups And Calibration
 
 The `backup` service creates PostgreSQL custom-format archives every 24 hours by default and retains completed archives for 14 days. Set `BACKUP_INTERVAL_SECONDS` and `BACKUP_RETENTION_DAYS` to change those bounds. Optional encrypted replicas require `BACKUP_REPLICA_ENABLED=true` and `BACKUP_REPLICA_ENCRYPTION_KEY`; set `BACKUP_REPLICA_REQUIRED=true` only when a failed replica should make backup health fail.
 
-Validate the newest archive with the disposable restore verifier:
+The legacy live-pointed verifier has been removed. `BACKUP_VERIFY_AFTER_DUMP` is
+forced to `false` in Compose. Never verify on `PGHOST=db`, against the live
+database, or on the live Compose network. `verify_backup.sh` rejects these targets
+and a missing `BACKUP_VERIFY_ISOLATED=true` marker before inspecting any archive.
+
+Run the synthetic Timescale drill with Docker and a POSIX shell:
 
 ```bash
-docker compose --profile maintenance run --rm backup-verify
+RUN_DOCKER_RESTORE_TESTS=1 python -m pytest tests/test_restore_db_integration.py --noconftest -q -s
 ```
+
+The dedicated `Backup Restorability Phase 1` workflow runs the synthetic drill on
+every PR. It proves the missing-`heatpump` role failure at `bgw_job` COPY, successful
+full restore with a disposable `heatpump NOLOGIN` role, four hypertables/chunks/
+validated parent keys, and actual scheduled job execution after database rename.
+The execution probe uses the existing disposable login role: TimescaleDB will not
+run jobs owned by a `NOLOGIN` compatibility role. Real production roles are checked,
+never created or altered automatically.
+
+Weekly real-backup drills run Sunday at 04:17 UTC on a dedicated Linux self-hosted
+runner labelled `restore-drill`. Configure repository variables
+`RESTORE_DRILL_BACKUP_DIR`, `RESTORE_DRILL_EXPECTED_REVISION`, and
+`RESTORE_DRILL_TMPFS_BYTES`. Give that runner read-only archive access, no live
+database credentials or live volumes, and enough Docker-host memory. Real dumps
+are never used on hosted PR runners or uploaded as CI artifacts.
+
+Each drill uses a unique `restore-db-production-test-*` project, an internal-only
+network with no published ports, the immutable image, read-only backups, tmpfs
+storage, explicit PostgreSQL settings, and unconditional project/volume cleanup.
+The legacy manual budget is 2 GiB tmpfs plus 2 GiB process headroom. For a known
+source size `S`, provision at least `ceil(1.5*S) + 1 GiB`, rounded up to 256 MiB,
+for tmpfs; container memory is always tmpfs plus 2 GiB. Do not infer `S` from the
+compressed archive size. Resource failures report `verification_resource_failed`,
+not archive corruption. Phase 2 will add metadata-driven automatic sizing,
+container-state/OOM inspection, the isolated scheduler launcher, and backup health
+state reporting; those are not shipped here.
 
 ### Local Evidence And Restore Runbook
 
@@ -155,17 +186,78 @@ To recover a local database, first stop the application writers, choose a named
 completed archive directly under `backups/`, and run:
 
 ```bash
-scripts/restore_db.sh --production heatpump-YYYYMMDDTHHMMSSZ.dump
+export RESTORE_SOURCE_IMAGE=timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
+export RESTORE_SOURCE_TIMESCALE_VERSION=2.26.4
+export RESTORE_EXPECTED_REVISION=030  # Use the trusted source revision, not repository head.
+export RESTORE_REQUIRED_ROLES=heatpump
+scripts/restore_db.sh --production --allow-live-restore heatpump-YYYYMMDDTHHMMSSZ.dump
 ```
 
-The script internally validates the selected archive before requesting the exact
-`RESTORE <archive-name>` confirmation, refuses active API/poller/optimizer/backup/migration writers, uses
-the pinned `backup` and `backup-verify` images for restore tools, checks tables and
-the Alembic revision, then leaves application services stopped. Any failure stops
-the compose services. Test-only restore mode is limited to
-`docker-compose.test.yml`, a unique `restore-db-test-*` project, and a disposable
-`restore_test_*` database; it uses `docker cp` for binary archives and passes the
-test password only through `docker compose exec` child environments.
+These legacy-archive inputs must come from trusted backup records. PostgreSQL
+major 16, TimescaleDB exactly 2.26.4, and the exact pinned image are mandatory;
+there is no version override. Recorded isolated spikes restored
+`heatpump-20261003T071914Z.dump` and `heatpump-20261003T145920Z.dump` at source
+Alembic revision `030`; repository migration head was `031`. Never assume an
+archive has already been migrated to the current head.
+
+The script validates the archive and exact `RESTORE <archive-name>` confirmation,
+refuses active API/poller/optimizer/backup/migration writers, and obtains an external
+restore lock. It restores a fresh `heatpump_restore_*` candidate using pre/post
+Timescale hooks and `pg_restore --exit-on-error --no-owner --no-privileges`. Role
+owners are inspected without filtering the restored archive. Missing roles abort
+production before candidate creation; only canonical disposable targets create
+compatibility roles, always `NOLOGIN`. Candidate checks precede migration to the
+repository head, credential-presence checks, and cutover. Credentials are not printed.
+
+Before renaming, both databases get database-scoped `timescaledb.restoring=on` and
+explicit `_timescaledb_functions.stop_background_workers()` calls. Both stop/start
+functions must resolve through `to_regprocedure` before any rename. The original is
+retained as `heatpump_old_*`; only the renamed live database resets restoring mode
+and calls `_timescaledb_functions.start_background_workers()`. A pre-cutover
+failure drops only an owned candidate. A failed second rename attempts to restore
+the original name. No application service is started automatically, and failures
+keep writers stopped without shutting down PostgreSQL.
+
+Before manually restarting writers, require BK-7A/BK-7B operational evidence: a
+scheduled job's `last_successful_finish` and its probe timestamp must advance past
+`CUTOVER_TIME` in the new live database, while retained-old statistics/probe counts
+stay unchanged for at least two schedule intervals. Keep the old database in
+restoring mode for 24 hours or until explicit operator sign-off; never restart its
+workers while the new live database is active.
+
+For rollback, stop writers, record the printed retained database name, and use the
+same worker-gated rename helper through `restore-tool` with explicit authorization:
+
+```bash
+docker compose --profile maintenance run --rm --no-deps -T \
+   -e RESTORE_ALLOW_LIVE_RESTORE=true -e RESTORE_SOURCE_IMAGE \
+   -e RESTORE_SOURCE_TIMESCALE_VERSION restore-tool \
+   sh /scripts/restore_archive.sh rollback heatpump heatpump_old_TIMESTAMP_PID heatpump_failed_TIMESTAMP
+```
+
+The helper suppresses both databases, terminates their connections, renames current
+live to the failed name, renames retained-old back to live, and resumes only the
+original. Validate again before manually starting writers. If even partial rename
+rollback failed, connect to maintenance database `postgres`, inspect actual names,
+and perform that same rename sequence; do not blindly repeat the recovery command.
+
+`--test` uses only `docker-compose.restore-production.test.yml`, a unique
+`restore-db-production-test-*` project, and `restore_production_test_*` databases.
+It rejects `--allow-live-restore`. Canonical `RESTORE_PRODUCTION_TEST_*` redirection
+is validated before the live gate; adding the live flag never escapes redirection.
+Disposable production tests require an external archive directory. Test restores
+mount archives read-only rather than copying into the live container.
+
+An authorized trusted-host drill of the latest real archive, without cutover:
+
+```bash
+RUN_DOCKER_RESTORE_TESTS=1 RUN_REAL_BACKUP_RESTORE_TESTS=1 \
+   python -m pytest tests/test_restore_db_integration.py::test_BK_13_latest_real_backup_restores_without_filters_or_errors --noconftest -q -s
+```
+
+On Windows, add Git's POSIX shell to `PATH`, set the two flags in PowerShell, and
+pass `--basetemp` and `-o cache_dir` paths outside the repository. These standalone
+drills intentionally use `--noconftest` to avoid app fixtures and repo-local scratch.
 
 Use a restore for data recovery, not to downgrade schema or application code. A
 downgrade needs an explicit, reviewed Alembic/image compatibility plan; restore a
@@ -224,11 +316,15 @@ The Settings page → **SmartThings Integration** section includes a sensor sele
 
 **Faults, COP & compressor**
 - `GET /api/faults` / `POST /api/faults/{id}/resolve`
-- `GET /api/cop/history` / `GET /api/cop/stats` / `POST /api/cop/compute`
+- `GET /api/cop/history` / `GET /api/cop/stats` — Read-only legacy archives, labelled `legacy_unverified_estimate`, `confidence=estimated`, `measured=false`, with `X-COP-Status: retired` even when empty
+- `POST /api/cop/compute` — Retired: HTTP 410 with detail code `cop_retired`; no COP-history writes
+- `GET /api/cop/manual` - Local device choices and manual ledger; DAY by default, MONTH explicitly selected
+- `PUT /api/cop/manual/{device_id}/{granularity}/{period_date}` - Create/correct a manual controller estimate with an opaque decimal-string `expected_revision` (`"0"` creates only when absent)
+- `DELETE /api/cop/manual/{device_id}/{granularity}/{period_date}` - Explicit deletion with the current decimal-string `expected_revision`
 - `GET /api/compressor/activity`
 
 **Models, thermal & calibration**
-- `POST /api/ml/train` — Retrain COP and demand models
+- `POST /api/ml/train` — Demand-only training, with no query/body selectors; preserves the response envelope with an explicit COP retirement error and Demand's own result
 - `GET /api/comfort-model/status` / `POST /api/comfort-model/train` / `GET /api/comfort-model/predict`
 - `GET /api/thermal/status` / `POST /api/thermal/calibrate` / `GET /api/thermal/curve` / `GET /api/thermal/indoor-forecast`
 - `GET /api/thermal/forecast-scorecard` — Scores past indoor forecasts against later sensor readings
@@ -239,9 +335,9 @@ The Settings page → **SmartThings Integration** section includes a sensor sele
 - `POST /api/test-connection` — Probe Panasonic/price/weather/SmartThings connectivity
 
 **Admin / data reset**
-- `POST /api/admin/reset` — Permanently delete selected data scopes so models can train from scratch (`{"scopes": ["indoor_temp", "energy", ...], "reset_models": true}`). Available scopes: `indoor_temp`, `energy`, `device_status`, `weather`, `prices`, `plans`, `logs`. Settings, credentials, and the SmartThings connection are always preserved. Clearing any model-feeding scope (`indoor_temp`, `energy`, `device_status`, `weather`) also resets the trained ML models (COP, demand, comfort, thermal) so predictions don't drift from deleted data.
+- `POST /api/admin/reset` — Permanently delete selected resettable data scopes (`{"scopes": ["indoor_temp", "energy", ...], "reset_models": true}`). Available scopes: `indoor_temp`, `energy`, `device_status`, `weather`, `prices`, `plans`, `logs`. `energy` clears consumption only, never `cop_history`. Clearing any model-feeding scope (`indoor_temp`, `energy`, `device_status`, `weather`) also resets Demand, comfort and thermal models. COP artifacts, COP history, all model baselines, settings, credentials and the SmartThings connection are preserved.
 
-The Settings page → **Danger Zone — Reset Data** card exposes this: tick the data categories to wipe (or *Start everything fresh* to select all), confirm, and the collected time-series data — plus the affected trained models — is cleared. Use it to recover after training on bad data (e.g. a misconfigured indoor-temperature sensor).
+The Settings page → **Danger Zone — Reset Data** card exposes this: tick categories (or *Select all resettable data*), confirm, and only those data scopes and affected retained models are cleared. COP archives, model baselines, manual controller-COP readings and their revision sequence remain intact. Use it to recover after training on bad data (e.g. a misconfigured indoor-temperature sensor).
 
 ## How the Optimizer Works
 
@@ -254,8 +350,10 @@ The `optimizer_layer` setting chooses the planner:
 | Value | Behaviour |
 |-------|-----------|
 | `rules_only` (default) | Always the rules engine. |
-| `milp_preferred` | Always MILP, using COP/demand models only if trained. Falls back to rules if the solver fails; pauses planning if price/weather inputs are incomplete. |
-| `auto` | MILP when COP and demand models are trained **and** the last 14 days contain at least 50 COP and 50 consumption records; otherwise rules. |
+| `milp_preferred` | Explicitly selects MILP, optionally using trained Demand. Existing input gates and solver fallback to rules are unchanged. Heating efficiency is assumed, never learned COP. |
+| `auto` | Always rules during COP retirement, with reason `auto_milp_disabled_cop_retired`. No legacy-history qualification query or automatic MILP promotion. |
+
+Planning retains the bounded assumption `max(1.5, min(6.0, 3.5 + 0.1 * outdoor_temperature_c))`. This is not measured pump performance. DHW thermal kWh are divided by this ratio exactly once; space-heating demand is already electrical kWh and is not divided again. Plans carry `cop_source=assumed` and `cop_measured=false`. The `+ml` version suffix means retained Demand only; `rules_v7` and `milp_v1` versions are unchanged.
 
 ### Rules Engine (`rules_v7`)
 1. **DHW Shifting**: Uses the thermal model to find the cheapest slot before each deadline, with direction-aware heating time estimation
@@ -271,7 +369,7 @@ The `optimizer_layer` setting chooses the planner:
 Solves a 24h cost-minimization problem with:
 - Decision: when to run DHW, how much space heating per hour
 - Objective: minimize Σ(price × kWh_electrical)
-- Constraints: per-hour tank floor (uses `tank_min_temp_offpeak` during sleep/away hours, normal `tank_min_temp` during comfort hours), tank max, comfort bounds, COP curve, hardware rate limits, and the comfort model's predicted indoor response when available
+- Constraints: per-hour tank floor (uses `tank_min_temp_offpeak` during sleep/away hours, normal `tank_min_temp` during comfort hours), tank max, comfort bounds, assumed heating-efficiency curve, hardware rate limits, and the comfort model's predicted indoor response when available
 
 ### Shower mode
 When `shower_mode_enabled` is `true`, a tank drop of at least `shower_drop_threshold` °C between polls starts an immediate Force DHW boost, paired with a Force DHW off that runs on recovery or after `shower_max_duration_minutes`. No boost is started while Force DHW is already on or during the top 5% of the day's prices.
@@ -291,12 +389,44 @@ When `shower_mode_enabled` is `true`, a tank drop of at least `shower_drop_thres
 | Heartbeat | 1 min |
 
 ### ML Models
-- **COP Model**: Predicts COP directly from real thermal data using compressor direction-aware sample pairing
-- **Demand Model**: Forecasts thermal demand from weather + usage patterns
+- **COP Model**: Retired inert compatibility API. `train()` returns an explicit unsupported/error result, `load_latest()` returns false without artifact access, and prediction refuses. Status is always the uncached retirement tombstone (`trained=false`, zero samples/source records, null metrics/date, reason `unverified_thermal_output`), even with legacy artifacts or a previously trained cache entry. The former 50-sample COP gate is retired, not lowered.
+- **Demand Model**: Forecasts electrical heating demand from weather + usage patterns. Training still needs at least 168 usable intervals; raw record counts do not establish readiness.
 - **Comfort Model**: Predicts indoor temperature response, used by both rules and MILP for accurate pre-heating
 - **Thermal model**: Tank and indoor heating response; calibrated via `POST /api/thermal/calibrate`
 - Models are persisted with HMAC-signed pickles (`SECRET_KEY`-bound) and shared between containers via `MODEL_DIR`
-- The comfort model retrains every 6 hours in the `poller`. COP and demand models retrain via `POST /api/ml/train`, the settings page, or seasonal calibration (demand only). The weekly Sunday 03:00 UTC retrain in `packages.ml.main` is not part of the default Compose stack.
+- The comfort model retrains every 6 hours in the `poller`. Demand trains via `POST /api/ml/train`, the existing Demand training control, or seasonal calibration. The optional weekly Sunday 03:00 UTC retrain in `packages.ml.main` loads/trains Demand only and is not part of the default Compose stack. Comfort, thermal, device-isolation and counter-confirmation behavior/cadence are unchanged.
+
+### Controller Total COP
+
+Total COP is manually accessible by going to the heat pump's physical Panasonic controller. The supplied controller screens show **Totalt COP-värde**, marked **Ungefär** (approximate), in day, week and year views. The year view shows monthly bins; a selected month is not an annual COP. Current-day/month values may cover partial periods, and the same day shown in a week view is not an independent sample.
+
+This is a controller-estimated whole-system total COP, not the retired DHW-specific model, measured thermal-output evidence, or the optimizer's planning assumption. Cloud/API access to it has not been established. The manual ledger implemented under `COP-MANUAL-MON-2026-10-04 v1.1` records only deliberately entered readings. It does not ingest images, scrape/OCR screens, discover cloud COP, or backfill legacy archives.
+
+**Under the hood > Diagnostics > Manual controller COP** has explicit local-device selection, day/month entry, correction and deletion. A timezone setting only prefills the form; the operator must identify and confirm the physical controller's IANA timezone. Reading provenance is immutable: `source=controller_estimate`, `acquisition=manual_entry`, `scope=total`, `measured=false`, `accuracy=approximate`, `energy_boundary=unknown`. Energy boundaries, physical device identity and actual accuracy are not certified by this UI.
+
+The supplied October 4 fixtures are entry examples only: yesterday October 3 `3.7`, today October 4 `9.7`, that same selected day repeated in a weekly view, and selected October 2026 month `3.9` in a year view. They are not annual/weekly COP, independent samples, training evidence or ground truth. No averaging of ratios, synthetic zeroes, interpolation or week/year entries is supported. `9.7` is accepted without the planner's separate efficiency cap.
+
+Each `(device_id, day|month, period_date)` stores its frozen timezone and UTC calendar boundaries. Month keys are first-of-month. Boundaries use actual local calendar days, including DST; ambiguous midnight selects the earliest valid instant and nonexistent midnight is rejected. `observed_at` is timezone-aware, no earlier than period start and no later than server now. `partial`, `closed`, and `unknown` are explicit operator choices. `closed` additionally requires observation at or after period end; it is attestation, not certification or automatic promotion. Correcting timezone recomputes boundaries; correcting period identity requires deliberate delete/re-entry.
+
+Revision tokens are opaque decimal JSON strings, never JavaScript numbers. A retained bigint `NO CYCLE` sequence supplies a fresh token for each successful create/correction. Concurrent/stale writes, duplicate `"0"` creation and missing keys for known devices return 409; unknown local devices return 404, invalid entries 422, storage failures 503. Create/correction return the committed row (201/200); deletion returns 204. Rollback or delete/recreate never rewinds/reuses tokens, and exhaustion fails. There is no revision-history table or reconstruction of superseded values.
+
+Read pages contain at most 90 rows, descending by date with exclusive `before`; `next_before` exists only when more rows remain. DAY is the default and MONTH requires `granularity=month`. Device/series cursors are independent. Daily forecast candidates are selected independently of the displayed page in the same read-only snapshot; the DB session closes before bounded thread fitting. The routes inherit installation-wide API bearer/proxy authentication, conditional on configured `API_TOKEN` and/or the existing perimeter, not new per-device authorization. No Panasonic session, Redis or quota call is made. Structured mutation logs contain keys/tokens/outcomes, not reading values.
+
+**Experimental forecasting** controls `manual_cop_monitoring_enabled` (default `false`) only; entry, correction, deletion and retention remain available while off. The forecaster requires 28 consecutive closed current daily revisions through yesterday for one device/timezone, all available at server UTC `issue_at`. Availability is `max(observed_at, created_at, updated_at)`. Existing NumPy/LinearRegression fit local-date ordinal to log controller COP and project tomorrow, two calendar steps beyond yesterday; monthly readings never train it.
+
+Seven matched-clock retrospective folds target the final seven days. Each historical issue is the day before its target at the live request's local hour/minute/second/microsecond. Fold training uses dates no later than target minus two and only current revisions available at that historical issue, with at least 20 rows in every fold. Later corrections/bulk entries are excluded without substituting an unavailable old value. Held-out targets may arrive later for retrospective scoring but must exist by the actual issue. Ambiguous historical clocks follow the live fold; nonexistent clocks refuse rather than shift. These simulations are not previously issued forecasts.
+
+Only `ready` includes a projection, log-linear daily trend and **experimental empirical log-error band, uncalibrated**, based on the linearly interpolated 90th percentile of seven absolute log errors. This is neither a confidence interval nor an efficiency diagnosis. Other statuses (`disabled`, `no_data`, `insufficient_data`, `stale`, `unavailable`) have null forecasts and explicit reasons/counts. Missing optional ML support and failed/nonfinite/nonpositive fits affect this panel only. Forecasts recompute on every GET; no model/cache/artifact, scheduler, alert or publication is created. Fingerprints bind daily keys/revisions, timezone/boundaries and issue time. The UI clears numbers during mutation, disablement and failure and discards obsolete response generations.
+
+Manual data and forecasting have no rules, MILP, auto-selection, executor, Demand/thermal training or device-control influence. COP retirement, assumed planning efficiency, Demand's 168-interval minimum, existing retraining cadence and write guards remain unchanged.
+
+The ordinary additive migration `032_manual_cop_observations` follows `031`, creates only `manual_cop_observations` and `manual_cop_revision_seq`, and does not change archives, add a status-table FK, create a hypertable or backfill readings. Generic/model resets exclude both retained objects. Readings remain until explicit deletion; active deletion does not purge backups and the existing backup policy is unchanged. Operational rollback disables forecasting and restores a retirement-safe build while retaining table, sequence and data; sequence rewind and automatic downgrade/drop are refused. Implementation/isolated-test approval is not release, production-migration, deployment or live-enablement approval.
+
+### Retirement Activation And Rollback
+
+Implementation/test approval does not authorize deployment, activation, real-data training or device operations. Before a separately approved activation, stop/drain every old COP-capable trainer and process, including API workers and optional weekly/manual jobs; verify no in-flight legacy fitting/publication remains before starting retirement-aware workers. Preserve COP artifacts, all baselines and `cop_history` without deletion, re-signing or migration changes.
+
+After that separately approved activation, check the once-at-startup `cop_retired` event, the auto-selection reason, assumed plan provenance and read-only archive/410 contracts. This change does not invalidate pending plans or alter executor/safety-restore semantics. A rollback must use a separately approved retirement-safe build in rules-only operation and retain the archives; do not downgrade migrations. Returning to a COP-capable binary is a new activation decision requiring independent review and human approval, not a routine rollback.
 
 ## Development
 
@@ -317,12 +447,37 @@ python -m packages.poller.main
 
 ### Backend end-to-end tests
 
-`tests/e2e/` needs the disposable Postgres (port 5433) and Redis (port 6380) from `docker-compose.test.yml`. The test database URL and Redis URL must be set before any app module is imported.
+Backend qualification requires newly created, coordinator-owned disposable PostgreSQL and Redis services. CI uses the pinned images in the workflow, published only on `127.0.0.1:5433` and `127.0.0.1:6380`. Local Linux container tests use a private, owner-labelled shared namespace with PostgreSQL listening on 5433 and Redis on 6380; they never share the host network or an existing test stack.
+
+Set the complete profile **before application imports**: `APP_ENVIRONMENT=test`, `API_TOKEN=test-token`, public test-only `SECRET_KEY=deployment-verify-public-test-secret`, dummy ENTSO-E/Panasonic configuration, both checkout roots in `PYTHONPATH`, and an exclusively created empty TEMP `MODEL_DIR`. The only accepted endpoints are:
 
 ```bash
-run-tests.bat               # Windows: starts the test stack, runs tests/e2e, tears down (activates ..\.venv)
-scripts/run-e2e.ps1         # Backend E2E + mocked Playwright suite in an isolated Compose project
+DATABASE_URL=postgresql+asyncpg://heatpump:heatpump_test@127.0.0.1:5433/heatpump_test
+REDIS_URL=redis://127.0.0.1:6380/0
 ```
+
+The harness requires `COP_MANUAL_TEST_OWNED` and `COP_MANUAL_TEST_RECEIPT`, not merely a token prefix or a test setting. `tests/e2e/test_manual_cop_postgresql.py prepare` creates the exclusive TEMP/model roots and receipt. GitHub supplies the actual `job.services` IDs/network/ports through `COP_MANUAL_TEST_SERVICE_CONTEXT`; local coordinators supply a newly created TEMP lease and actual platform creation records. Docker GET inspection verifies service IDs, pinned images, creation times, namespace, loopback publications or owner labels, and PostgreSQL identity before mutation. Unknown, expired, non-test or populated initial migration targets are refused without cleanup. Do not hand-forge receipts or reuse a previously running stack. Legacy `run-tests.bat` and `scripts/run-e2e.ps1` do not establish this proof and are not qualification entry points.
+
+Run these phases serially from the optimizer directory. The migration class owns a fresh empty database, derives 032's predecessor, exercises legacy reversibility through 020, and verifies both populated downgrade refusals. Later reversible migrations use the discovered unique head; another retention boundary fails for review rather than being skipped.
+
+```bash
+python -m alembic heads
+python -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py::TestManualCOPPostgreSQLMigration -q
+python -m alembic upgrade head
+python -m alembic check
+python -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py -k "not TestManualCOPPostgreSQLMigration and not test_sequence_exhaustion_is_503_and_never_wraps" -q
+python -m alembic check
+python -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py::TestManualCOPPostgreSQLAPI::test_sequence_exhaustion_is_503_and_never_wraps -q
+python -m alembic check
+python -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py -q
+python -m alembic check
+```
+
+CI executes each command through `tests/e2e/test_manual_cop_postgresql.py phase NAME -m ...`, with a 600-second child limit, 10-second TERM/KILL grace and an external 660-second parent limit. Backend jobs are capped at 30 minutes; service readiness is bounded at 90 seconds for PostgreSQL and 60 seconds for Redis. A constraint-pinned `tzdata==2026.4` supplement and executable internal Linux TMP are qualification prerequisites. The phase helper retains UTF-8 stdout/stderr, PID/PGID/deadline/exit receipts, source hashes and exact collected/selected node IDs. `seal` requires disjoint complete manual phases and complete ordinary E2E coverage with no skip, xfail or allow-failure exemption. Exhaustion is the last manual mutation; never rewind the sequence to reuse the database.
+
+Ordinary E2E fixtures clear only legacy synthetic rows with quoted `TRUNCATE ... RESTART IDENTITY`, without `CASCADE`. They create missing legacy tables individually and drop only those fixture-created tables in reverse dependency order. Migrated tables, Timescale structures, the retained ledger/sequence/helper and Alembic marker remain intact and are compared across the session. Engines are disposed even on failure; only the resource coordinator destroys the owned services after receipts are sealed and child processes have ended. Unit tests retain their normal global model isolation and the backup contract's six original classifications/assertions in a dedicated scratch child.
+
+These are disposable verification procedures, not release, deployment, production-database, backup-restore, model-training or live-device authorization. Full unit/E2E and dependency qualification, independent review and separate final HIGH release approval remain mandatory.
 
 ### Frontend end-to-end tests
 

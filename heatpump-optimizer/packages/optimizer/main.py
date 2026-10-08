@@ -11,8 +11,6 @@ from sqlalchemy import func, select, update
 
 from packages.core.database import get_session
 from packages.core.models import (
-    COPRecord,
-    ConsumptionRecord,
     DeviceStatusRecord,
     OptimizationRequestRecord,
     PlanActionRecord,
@@ -37,14 +35,11 @@ from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
 from packages.optimizer.executor import PlanExecutor, resolve_learning_mode_state
 from packages.optimizer.executor_core import LearningModeState
-from packages.ml.models import COPModel, DemandModel
+from packages.ml.models import DemandModel
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
 
 logger = structlog.get_logger()
-
-# Minimum data history (days) before trusting ML models in auto mode
-ML_MIN_DATA_DAYS = 14
 
 # Cooldown: skip scheduled optimization if a plan was generated recently
 _OPTIMIZATION_COOLDOWN_S = 300  # 5 minutes
@@ -140,25 +135,22 @@ async def _has_material_near_term_change(session, plan: dict) -> tuple[bool, int
 
 _optimization_lock = asyncio.Lock()
 
-# Global ML model instances (loaded once, reused across optimization cycles)
-_cop_model = COPModel()
 _demand_model = DemandModel()
 
 
 def _new_rules_optimizer() -> RulesOptimizer:
-    """Build rules with the loaded DHW-specific COP model, when available."""
-    return RulesOptimizer(cop_model=_cop_model if _cop_model.is_trained else None)
+    """Build rules using planning assumptions, never a COP estimator."""
+    return RulesOptimizer()
 
 
 def _load_ml_models() -> None:
-    """Load the latest ML model checkpoints from disk."""
-    _cop_model.load_latest()
+    """Load only retained model checkpoints from disk."""
     _demand_model.load_latest()
     comfort_model.load_latest()
     thermal_model.load_latest()
     logger.info(
         "ml_models_loaded",
-        cop_trained=_cop_model.is_trained,
+        cop_trained=False,
         demand_trained=_demand_model.is_trained,
         comfort_trained=comfort_model.is_trained,
         thermal_calibrated=thermal_model.params.last_calibrated is not None,
@@ -168,7 +160,7 @@ def _load_ml_models() -> None:
 def _selected_layer_version(layer_name: str) -> str:
     """Map an optimizer selection to the user-facing layer version string."""
     if layer_name == "milp":
-        if _cop_model.is_trained or _demand_model.is_trained:
+        if _demand_model.is_trained:
             return f"{MILPOptimizer.VERSION}+ml"
         return MILPOptimizer.VERSION
     return RulesOptimizer.VERSION
@@ -191,7 +183,14 @@ async def get_optimizer_status_snapshot(
         }
     return {
         "active_layer": _selected_layer_version(layer_name),
-        "cop_trained": _cop_model.is_trained,
+        "configured_layer": layer,
+        "effective_layer": layer_name,
+        "selection_reason": (
+            "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer"
+        ),
+        "cop_trained": False,
+        "cop_source": "assumed",
+        "cop_measured": False,
         "demand_trained": _demand_model.is_trained,
         "planning_data_quality": planning_data_quality,
     }
@@ -205,58 +204,19 @@ async def _select_optimizer(
     if reload_models:
         _load_ml_models()
 
-    if layer == "rules_only":
-        return "rules", _new_rules_optimizer()
-
-    # milp_preferred or auto: build MILP with ML models if available
-    milp = MILPOptimizer(
-        cop_model=_cop_model if _cop_model.is_trained else None,
-        demand_model=_demand_model if _demand_model.is_trained else None,
-    )
-
     if layer == "milp_preferred":
-        return "milp", milp
+        return "milp", MILPOptimizer(
+            demand_model=_demand_model if _demand_model.is_trained else None,
+        )
 
-    # auto: use MILP only when ML models are trained AND have enough data history
-    if _cop_model.is_trained and _demand_model.is_trained:
-        if await _has_sufficient_ml_data():
-            return "milp", milp
-        else:
-            logger.info(
-                "auto_mode_insufficient_data",
-                required_days=ML_MIN_DATA_DAYS,
-                reason="ML models trained but less than 14 days of data history",
-            )
-
+    if layer == "auto":
+        logger.info(
+            "auto_milp_disabled_cop_retired",
+            configured_layer=layer,
+            effective_layer="rules",
+            cop_source="assumed",
+        )
     return "rules", _new_rules_optimizer()
-
-
-async def _has_sufficient_ml_data() -> bool:
-    """Check that we have at least ML_MIN_DATA_DAYS of COP and consumption history."""
-    from sqlalchemy import func, select
-
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=ML_MIN_DATA_DAYS)
-
-    try:
-        async with get_session() as session:
-            cop_result = await session.execute(
-                select(func.count()).select_from(COPRecord).where(COPRecord.ts >= cutoff)
-            )
-            cop_count = cop_result.scalar() or 0
-
-            cons_result = await session.execute(
-                select(func.count())
-                .select_from(ConsumptionRecord)
-                .where(ConsumptionRecord.ts >= cutoff)
-            )
-            cons_count = cons_result.scalar() or 0
-
-        # Require at least some records spanning the period
-        # 14 days × ~4 COP intervals/day = ~56; ~4 consumption records/day = ~56
-        return cop_count >= 50 and cons_count >= 50
-    except Exception as exc:
-        logger.warning("ml_data_check_failed", error=str(exc))
-        return False
 
 
 async def run_optimization(*, scheduled: bool = False, force_replace: bool = False) -> int | None:
@@ -396,6 +356,13 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             provenance = {
                 "schema_version": 1,
                 "generated_at": generated_at.isoformat(),
+                "optimizer": {
+                    "configured_layer": layer,
+                    "selection_reason": (
+                        "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer"
+                    ),
+                },
+                "heating_efficiency": {"source": "assumed", "measured": False},
                 "price": {
                     "area": price_context.area,
                     "source": price_context.source,
@@ -403,7 +370,7 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 },
                 "input_quality": input_quality,
                 "models": {
-                    "cop_trained": _cop_model.is_trained,
+                    "cop_trained": False,
                     "demand_trained": _demand_model.is_trained,
                     "comfort": {
                         "trained": comfort_model.is_trained,
@@ -420,6 +387,8 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     },
                 },
             }
+            plan["cop_source"] = "assumed"
+            plan["cop_measured"] = False
             plan["input_provenance"] = provenance
             snapshot = plan.get("forecast_snapshot")
             if isinstance(snapshot, dict):
@@ -760,6 +729,12 @@ async def main() -> None:
     configure_logging("optimizer")
 
     logger.info("optimizer_starting")
+    logger.info(
+        "cop_retired",
+        reason="unverified_thermal_output",
+        cop_source="assumed",
+        cop_measured=False,
+    )
 
     # Load ML model checkpoints so MILP can use them
     _load_ml_models()

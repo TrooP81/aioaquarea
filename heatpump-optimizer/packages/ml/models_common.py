@@ -100,6 +100,7 @@ class CounterInterval:
     elapsed_hours: float
     energy_kwh: float
     row: _ConsumptionRowLike
+    is_reset: bool = False
 
 
 def _aware_utc(ts: dt.datetime) -> dt.datetime:
@@ -158,13 +159,17 @@ def iter_counter_change_intervals(
         row: _ConsumptionRowLike,
         start_ts: dt.datetime,
         energy_kwh: float,
+        *,
+        is_reset: bool = False,
     ) -> CounterInterval | None:
         end_ts = _aware_utc(row.ts)
         elapsed_hours = (end_ts - start_ts).total_seconds() / 3600.0
         if not min_interval_hours <= elapsed_hours <= max_interval_hours:
             increment("outside_window")
             return None
-        return CounterInterval(anchor.device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
+        return CounterInterval(
+            anchor.device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row, is_reset
+        )
 
     if confirm_changes:
         anchors: dict[str, _ConsumptionRowLike] = {}
@@ -211,7 +216,7 @@ def iter_counter_change_intervals(
                 ):
                     pending_reset.pop(device_id, None)
                     increment("reset_confirmed")
-                    emitted = interval(anchor, reset_row, boundary, reset_value)
+                    emitted = interval(anchor, reset_row, boundary, reset_value, is_reset=True)
                     if emitted is not None:
                         yield emitted
                     anchors[device_id] = reset_row
@@ -348,6 +353,30 @@ def iter_counter_change_intervals(
                 diagnostics["outside_window"] = diagnostics.get("outside_window", 0) + 1
             continue
         yield CounterInterval(device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
+
+
+def iter_confirmed_counter_changes(
+    rows: Iterable[_ConsumptionRowLike],
+    counter: str,
+    timezone: ZoneInfo,
+    *,
+    diagnostics: dict[str, int] | None = None,
+    confirm_changes: bool = True,
+) -> Iterator[CounterInterval]:
+    """Yield every confirmed counter change before duration-based filtering.
+
+    Session consumers need every tank delta before duration-based filtering;
+    confirmation remains configurable for independent rollback.
+    """
+    yield from iter_counter_change_intervals(
+        rows,
+        counter,
+        timezone,
+        min_interval_hours=0.0,
+        max_interval_hours=float("inf"),
+        diagnostics=diagnostics,
+        confirm_changes=confirm_changes,
+    )
 
 
 try:

@@ -104,7 +104,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     VERSION = "rules_v7"
 
     def __init__(self, cop_model=None):
-        self._dhw_cop_model = cop_model
+        self._dhw_cop_model = None
 
     @staticmethod
     def _unavailable_control_temperature() -> ControlTemperature:
@@ -343,6 +343,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 "horizon_end": horizon_end,
                 "actions": [],
                 "version": self.VERSION,
+                "cop_source": "assumed",
+                "cop_measured": False,
+                "heating_efficiency": {"source": "assumed", "measured": False},
                 "cost_estimate": 0.0,
                 "note": "holiday_mode_active_optimization_suspended",
             }
@@ -701,6 +704,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             "horizon_end": horizon_end,
             "actions": actions,
             "version": self.VERSION,
+            "cop_source": "assumed",
+            "cop_measured": False,
+            "heating_efficiency": {"source": "assumed", "measured": False},
             "cost_estimate": cost_estimate,
             "forecast_snapshot": forecast_snapshot,
             "control_input": {

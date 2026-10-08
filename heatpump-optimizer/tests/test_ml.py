@@ -3,6 +3,8 @@
 import asyncio
 import datetime as dt
 import json
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -60,62 +62,669 @@ def _mock_get_session(results):
     return factory
 
 
+class TestManualCOPCalendar:
+    def test_retained_table_and_sequence_contract(self):
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.schema import CreateSequence, CreateTable
+
+        from packages.core.models import ManualCOPObservationRecord, manual_cop_revision_seq
+        from packages.core.settings_service import SETTINGS_SCHEMA
+
+        table = ManualCOPObservationRecord.__table__
+        assert list(table.primary_key.columns.keys()) == ["device_id", "granularity", "period_date"]
+        assert not table.foreign_keys
+        assert "id" not in table.columns
+        ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
+        assert "ck_manual_cop_calendar" in ddl
+        assert "value > 0 AND value < 'Infinity'" in ddl
+        sequence = str(
+            CreateSequence(manual_cop_revision_seq).compile(dialect=postgresql.dialect())
+        )
+        assert "NO CYCLE" in sequence
+        assert "MAXVALUE 9223372036854775807" in sequence
+        assert SETTINGS_SCHEMA["manual_cop_monitoring_enabled"]["default"] == "false"
+
+    @pytest.mark.parametrize(
+        ("period_date", "hours"),
+        [(dt.date(2026, 3, 29), 23), (dt.date(2026, 10, 25), 25)],
+    )
+    def test_day_boundaries_follow_local_calendar(self, period_date, hours):
+        from packages.core.cop_monitoring import period_bounds
+
+        start, end = period_bounds("day", period_date, "Europe/Stockholm")
+        assert (end - start).total_seconds() == hours * 3600
+        assert start.tzinfo == end.tzinfo == dt.timezone.utc
+
+    def test_ambiguous_midnight_uses_earliest_instant(self):
+        from packages.core.cop_monitoring import period_bounds
+
+        start, _ = period_bounds("day", dt.date(2026, 11, 1), "America/Havana")
+        assert start == dt.datetime(2026, 11, 1, 4, tzinfo=dt.timezone.utc)
+
+    def test_nonexistent_midnight_is_rejected(self):
+        from packages.core.cop_monitoring import period_bounds
+
+        with pytest.raises(ValueError, match="nonexistent"):
+            period_bounds("day", dt.date(2011, 12, 30), "Pacific/Apia")
+
+    @pytest.mark.parametrize("granularity", ["week", "year"])
+    def test_no_week_or_year_ratios(self, granularity):
+        from packages.core.cop_monitoring import period_bounds
+
+        with pytest.raises(ValueError, match="Granularity"):
+            period_bounds(granularity, dt.date(2026, 10, 1), "UTC")
+
+    def test_selected_october_is_month_not_year(self):
+        from packages.core.cop_monitoring import period_bounds
+
+        start, end = period_bounds("month", dt.date(2026, 10, 1), "Europe/Stockholm")
+        assert start == dt.datetime(2026, 9, 30, 22, tzinfo=dt.timezone.utc)
+        assert end == dt.datetime(2026, 10, 31, 23, tzinfo=dt.timezone.utc)
+        with pytest.raises(ValueError, match="first day"):
+            period_bounds("month", dt.date(2026, 10, 4), "Europe/Stockholm")
+
+    @pytest.mark.parametrize(
+        ("observed_at", "completeness", "reason"),
+        [
+            (dt.datetime(2026, 10, 4, 8), "partial", "timezone"),
+            (dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc), "partial", "between"),
+            (dt.datetime(2026, 10, 3, tzinfo=dt.timezone.utc), "partial", "between"),
+            (dt.datetime(2026, 10, 4, 8, tzinfo=dt.timezone.utc), "closed", "closed"),
+        ],
+    )
+    def test_observation_and_attestation_validation(self, observed_at, completeness, reason):
+        from packages.core.cop_monitoring import validate_observation_period
+
+        with pytest.raises(ValueError, match=reason):
+            validate_observation_period(
+                "day",
+                dt.date(2026, 10, 4),
+                "Europe/Stockholm",
+                observed_at,
+                completeness,
+                dt.datetime(2026, 10, 4, 12, tzinfo=dt.timezone.utc),
+            )
+
+    def test_fixture_values_are_entry_only_and_strict(self):
+        from pydantic import ValidationError
+
+        from packages.api.schemas import ManualCOPPut
+
+        body = {
+            "observed_at": "2026-10-04T08:00:00Z",
+            "completeness": "partial",
+            "timezone": "Europe/Stockholm",
+            "expected_revision": "0",
+        }
+        for value in (3.7, 9.7, 3.9):
+            assert ManualCOPPut(value=value, **body).value == value
+        for value in (True, False, "9.7", float("nan"), float("inf"), 0, -1):
+            with pytest.raises(ValidationError):
+                ManualCOPPut(value=value, **body)
+        assert ManualCOPPut(value=9.7, **(body | {"expected_revision": "9007199254740993"}))
+        for value in (0, 9007199254740993, "01", "-1", "9223372036854775808"):
+            with pytest.raises(ValidationError):
+                ManualCOPPut(value=9.7, **(body | {"expected_revision": value}))
+        for field in ("source", "acquisition", "scope", "measured", "accuracy", "energy_boundary"):
+            with pytest.raises(ValidationError):
+                ManualCOPPut(value=9.7, **(body | {field: "override"}))
+
+
+class TestManualCOPForecast:
+    issue_at = dt.datetime(2026, 10, 4, 8, tzinfo=dt.timezone.utc)
+
+    def observations(self, issue_at=None, observed_hours=8):
+        from zoneinfo import ZoneInfo
+
+        from packages.core.cop_monitoring import ManualCOPObservation, period_bounds
+
+        issue_at = issue_at or self.issue_at
+        today = issue_at.astimezone(ZoneInfo("Europe/Stockholm")).date()
+        rows = []
+        for index in range(28):
+            period_date = today - dt.timedelta(days=28 - index)
+            start, end = period_bounds("day", period_date, "Europe/Stockholm")
+            available = end + dt.timedelta(hours=observed_hours)
+            rows.append(
+                ManualCOPObservation(
+                    device_id="fixture-device",
+                    granularity="day",
+                    period_date=period_date,
+                    timezone="Europe/Stockholm",
+                    period_start=start,
+                    period_end=end,
+                    value=3.0 * 1.01**index,
+                    observed_at=available,
+                    completeness="closed",
+                    created_at=available,
+                    updated_at=available,
+                    revision=str(index + 1),
+                )
+            )
+        return tuple(rows)
+
+    def test_two_step_projection_and_seven_matched_clock_folds(self):
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        result = forecast_manual_cop(self.observations(), self.issue_at, True)
+        assert result["status"] == "ready"
+        assert result["target_date"] == dt.date(2026, 10, 5)
+        assert result["counts"]["fold_training_rows"] == list(range(20, 27))
+        assert result["forecast"]["value"] == pytest.approx(3.0 * 1.01**29)
+        assert result["forecast"]["log_daily_trend"] == pytest.approx(np.log(1.01))
+        assert result["forecast"]["lower"] > 0
+        assert "uncalibrated" in result["forecast"]["band_label"]
+
+    def test_empirical_band_linearly_interpolates_seven_nonzero_log_errors(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = list(self.observations())
+        multipliers = (1.15, 0.76, 1.37, 0.88, 1.08, 0.94, 1.28)
+        for index, multiplier in enumerate(multipliers, start=21):
+            rows[index] = replace(rows[index], value=rows[index].value * multiplier)
+        log_values = np.log([row.value for row in rows])
+        errors = []
+        for fold in range(7):
+            training_count = 20 + fold
+            coefficients = np.polyfit(np.arange(training_count), log_values[:training_count], 1)
+            predicted = np.polyval(coefficients, 21 + fold)
+            errors.append(abs(log_values[21 + fold] - predicted))
+        ordered = sorted(errors)
+        assert ordered[5] != pytest.approx(ordered[6])
+        width = 0.6 * ordered[5] + 0.4 * ordered[6]
+        coefficients = np.polyfit(np.arange(28), log_values, 1)
+        projected = np.polyval(coefficients, 29)
+
+        result = forecast_manual_cop(tuple(rows), self.issue_at, True)
+
+        assert result["status"] == "ready"
+        assert result["counts"]["fold_training_rows"] == list(range(20, 27))
+        assert result["forecast"]["value"] == pytest.approx(np.exp(projected), rel=1e-7)
+        assert result["forecast"]["lower"] == pytest.approx(np.exp(projected - width), rel=1e-7)
+        assert result["forecast"]["upper"] == pytest.approx(np.exp(projected + width), rel=1e-7)
+
+    def test_disabled_never_imports_fit_libraries(self):
+        import builtins
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name.startswith(("numpy", "sklearn")):
+                raise AssertionError("Disabled forecast imported ML")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            result = forecast_manual_cop(self.observations(), self.issue_at, False)
+        assert result["status"] == "disabled"
+        assert result["forecast"] is None
+
+    @pytest.mark.parametrize("completeness", ["partial", "unknown"])
+    def test_nonclosed_middle_day_is_not_promoted(self, completeness):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = list(self.observations())
+        rows[4] = replace(rows[4], completeness=completeness)
+        result = forecast_manual_cop(tuple(rows), self.issue_at, True)
+        assert result["status"] == "insufficient_data"
+        assert result["counts"]["available_closed_days"] == 27
+        assert result["forecast"] is None
+
+    def test_gap_and_deleted_current_revision_have_no_reconstructed_value(self):
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = self.observations()
+        result = forecast_manual_cop(rows[:4] + rows[5:], self.issue_at, True)
+        assert result["status"] == "insufficient_data"
+        assert result["forecast"] is None
+
+    def test_late_bulk_entry_refuses_all_historical_folds(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        available = self.issue_at - dt.timedelta(minutes=1)
+        rows = tuple(
+            replace(row, created_at=available, updated_at=available) for row in self.observations()
+        )
+        result = forecast_manual_cop(rows, self.issue_at, True)
+        assert result["status"] == "insufficient_data"
+        assert result["counts"]["available_closed_days"] == 28
+        assert result["counts"]["fold_training_rows"] == [0] * 7
+        assert result["forecast"] is None
+
+    def test_issue_hour_changes_current_revision_availability(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = list(self.observations())
+        correction = dt.datetime(2026, 9, 26, 16, tzinfo=dt.timezone.utc)
+        rows[0] = replace(rows[0], updated_at=correction, revision="9007199254740993")
+        early = forecast_manual_cop(tuple(rows), self.issue_at, True)
+        later = forecast_manual_cop(tuple(rows), self.issue_at.replace(hour=17), True)
+        assert early["status"] == "insufficient_data"
+        assert early["counts"]["fold_training_rows"][0] == 19
+        assert early["forecast"] is None
+        assert later["status"] == "ready"
+        assert later["counts"]["fold_training_rows"][0] == 20
+        assert early["fingerprint"] != later["fingerprint"]
+
+    @pytest.mark.parametrize("timestamp_field", ["observed_at", "created_at", "updated_at"])
+    @pytest.mark.parametrize("cutoff", ["historical", "live"])
+    @pytest.mark.parametrize("microseconds", [0, 1])
+    def test_current_revision_microsecond_cutoffs(self, timestamp_field, cutoff, microseconds):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop, historical_issue_at
+
+        rows = list(self.observations())
+        row_index = 0 if cutoff == "historical" else -7
+        available_at = (
+            historical_issue_at(rows[-7].period_date, self.issue_at, "Europe/Stockholm")
+            if cutoff == "historical"
+            else self.issue_at
+        )
+        rows[row_index] = replace(
+            rows[row_index],
+            revision="9007199254740993",
+            **{timestamp_field: available_at + dt.timedelta(microseconds=microseconds)},
+        )
+
+        result = forecast_manual_cop(tuple(rows), self.issue_at, True)
+
+        assert result["status"] == ("insufficient_data" if microseconds else "ready")
+        expected_live_rows = 27 if cutoff == "live" and microseconds else 28
+        assert result["counts"]["available_closed_days"] == expected_live_rows
+        if microseconds:
+            assert result["forecast"] is None
+            if cutoff == "historical":
+                assert result["counts"]["fold_training_rows"][0] == 19
+        else:
+            expected_fold_rows = (
+                list(range(20, 27)) if cutoff == "historical" else [20, 21, 21, 22, 23, 24, 25]
+            )
+            assert result["counts"]["fold_training_rows"] == expected_fold_rows
+            assert result["forecast"]["value"] == pytest.approx(3.0 * 1.01**29)
+
+    def test_october_3_issue_excludes_18_hour_correction(self):
+        from packages.core.cop_monitoring import historical_issue_at
+
+        issue = historical_issue_at(
+            dt.date(2026, 10, 4),
+            dt.datetime(2026, 10, 5, 8, 2, 3, 4, tzinfo=dt.timezone.utc),
+            "Europe/Stockholm",
+        )
+        assert issue == dt.datetime(2026, 10, 3, 8, 2, 3, 4, tzinfo=dt.timezone.utc)
+        assert dt.datetime(2026, 10, 3, 16, tzinfo=dt.timezone.utc) > issue
+
+    def test_held_out_target_may_arrive_after_historical_but_not_actual_issue(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = list(self.observations())
+        target = rows[-7]
+        available = self.issue_at - dt.timedelta(minutes=1)
+        rows[-7] = replace(target, created_at=available, updated_at=available)
+        assert forecast_manual_cop(tuple(rows), self.issue_at, True)["status"] == "ready"
+        rows[-7] = replace(target, updated_at=self.issue_at + dt.timedelta(minutes=1))
+        result = forecast_manual_cop(tuple(rows), self.issue_at, True)
+        assert result["status"] == "insufficient_data"
+        assert result["forecast"] is None
+
+    @pytest.mark.parametrize("utc_hour", [0, 1])
+    def test_ambiguous_historical_issue_uses_live_fold(self, utc_hour):
+        from packages.core.cop_monitoring import historical_issue_at
+
+        live = dt.datetime(2026, 10, 25, utc_hour, 30, tzinfo=dt.timezone.utc)
+        assert historical_issue_at(dt.date(2026, 10, 26), live, "Europe/Stockholm") == live
+
+    def test_nonexistent_historical_issue_refuses_without_shifting(self):
+        from packages.core.cop_monitoring import forecast_manual_cop, historical_issue_at
+
+        issue = dt.datetime(2026, 4, 5, 0, 30, tzinfo=dt.timezone.utc)
+        with pytest.raises(ValueError, match="nonexistent_historical_issue_time"):
+            historical_issue_at(dt.date(2026, 3, 30), issue, "Europe/Stockholm")
+        result = forecast_manual_cop(self.observations(issue, observed_hours=1), issue, True)
+        assert result["status"] == "unavailable"
+        assert result["reason"] == "nonexistent_historical_issue_time"
+        assert result["forecast"] is None
+
+    def test_mixed_timezones_refuse(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop, period_bounds
+
+        rows = list(self.observations())
+        start, end = period_bounds("day", rows[4].period_date, "UTC")
+        rows[4] = replace(rows[4], timezone="UTC", period_start=start, period_end=end)
+        result = forecast_manual_cop(tuple(rows), self.issue_at, True)
+        assert result["reason"] == "mixed_timezones"
+        assert result["forecast"] is None
+
+    def test_stale_and_month_only_have_no_forecast(self):
+        from dataclasses import replace
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        rows = self.observations()
+        stale = forecast_manual_cop(rows[:-1], self.issue_at, True)
+        assert stale["status"] == "stale"
+        assert stale["forecast"] is None
+        monthly = forecast_manual_cop((replace(rows[0], granularity="month"),), self.issue_at, True)
+        assert monthly["status"] == "no_data"
+        assert monthly["forecast"] is None
+
+    def test_missing_optional_library_is_unavailable_not_legacy_fallback(self):
+        import builtins
+
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name.startswith("sklearn"):
+                raise ImportError("Fixture missing optional ML")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            result = forecast_manual_cop(self.observations(), self.issue_at, True)
+        assert result["status"] == "unavailable"
+        assert result["reason"] == "optional_ml_dependencies_unavailable"
+        assert result["forecast"] is None
+
+    @pytest.mark.parametrize("predicted", [float("nan"), float("inf"), -10000.0])
+    def test_invalid_projection_never_returns_numbers(self, predicted):
+        from packages.core.cop_monitoring import forecast_manual_cop
+
+        estimator = MagicMock(coef_=np.asarray([0.01]))
+        estimator.predict.return_value = np.asarray([predicted])
+        with patch("sklearn.linear_model.LinearRegression", return_value=estimator):
+            result = forecast_manual_cop(self.observations(), self.issue_at, True)
+        assert result["status"] == "unavailable"
+        assert result["forecast"] is None
+
+    @asynccontextmanager
+    async def blocked_workers(self, monkeypatch):
+        from packages.core import cop_monitoring
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Queue()
+        released = threading.Event()
+        stopped = []
+        tasks = []
+        limit = asyncio.Semaphore(2)
+        original_offload = asyncio.to_thread
+
+        def blocked_fit(observations, issue_at, enabled):
+            assert isinstance(observations, tuple)
+            worker = threading.get_ident()
+            loop.call_soon_threadsafe(started.put_nowait, worker)
+            try:
+                assert released.wait(20), "Owned fitting job was not released"
+                return cop_monitoring.monitoring_result(observations, issue_at)
+            finally:
+                stopped.append(worker)
+
+        async def tracked_offload(function, *arguments):
+            tasks.append(asyncio.current_task())
+            return await original_offload(function, *arguments)
+
+        monkeypatch.setattr(cop_monitoring, "_FIT_LIMIT", limit)
+        monkeypatch.setattr(cop_monitoring, "forecast_manual_cop", blocked_fit)
+        monkeypatch.setattr(asyncio, "to_thread", tracked_offload)
+        state = SimpleNamespace(
+            started=started, released=released, stopped=stopped, tasks=tasks, limit=limit
+        )
+        try:
+            yield state
+        finally:
+            released.set()
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
+            assert len(stopped) == len(tasks)
+            assert all(task.done() for task in tasks)
+            assert limit._value == 2
+
+    async def test_fitting_timeout_keeps_permit_until_owned_worker_terminates(self, monkeypatch):
+        from packages.core.cop_monitoring import forecast_snapshot
+
+        async with self.blocked_workers(monkeypatch) as workers:
+            request = asyncio.create_task(
+                forecast_snapshot(self.observations(), self.issue_at, True)
+            )
+            try:
+                await asyncio.wait_for(workers.started.get(), timeout=5)
+                result = await asyncio.wait_for(request, timeout=8)
+                assert result["status"] == "unavailable"
+                assert result["reason"] == "forecast_timeout"
+                assert result["forecast"] is None
+                assert workers.limit._value == 1
+                assert len(workers.tasks) == 1
+                assert not workers.tasks[0].done()
+                assert workers.stopped == []
+            finally:
+                workers.released.set()
+                await asyncio.gather(request, return_exceptions=True)
+
+    async def test_cancelled_workers_retain_both_permits_and_refuse_third_fit(self, monkeypatch):
+        from packages.core.cop_monitoring import forecast_snapshot
+
+        async with self.blocked_workers(monkeypatch) as workers:
+            requests = [
+                asyncio.create_task(forecast_snapshot(self.observations(), self.issue_at, True))
+                for _ in range(2)
+            ]
+            try:
+                identities = [
+                    await asyncio.wait_for(workers.started.get(), timeout=5) for _ in requests
+                ]
+                assert len(set(identities)) == 2
+                assert workers.limit._value == 0
+                for request in requests:
+                    request.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await request
+                assert workers.limit._value == 0
+                assert all(not task.done() for task in workers.tasks)
+                result = await forecast_snapshot(self.observations(), self.issue_at, True)
+                assert result["status"] == "unavailable"
+                assert result["reason"] == "forecast_timeout"
+                assert result["forecast"] is None
+                assert len(workers.tasks) == 2
+                assert workers.started.empty()
+                assert workers.stopped == []
+                assert workers.limit._value == 0
+            finally:
+                workers.released.set()
+                await asyncio.gather(*requests, return_exceptions=True)
+
+    async def test_disabled_snapshot_never_acquires_or_starts_a_worker(self, monkeypatch):
+        from packages.core import cop_monitoring
+
+        limit = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+        offload = AsyncMock(side_effect=AssertionError("Disabled monitoring offloaded a fit"))
+        monkeypatch.setattr(cop_monitoring, "_FIT_LIMIT", limit)
+        monkeypatch.setattr(asyncio, "to_thread", offload)
+        result = await cop_monitoring.forecast_snapshot(self.observations(), self.issue_at, False)
+        assert result["status"] == "disabled"
+        assert result["forecast"] is None
+        limit.acquire.assert_not_awaited()
+        limit.release.assert_not_called()
+        offload.assert_not_awaited()
+
+    async def test_thread_failure_is_panel_only(self, monkeypatch):
+        from packages.core import cop_monitoring
+
+        limit = asyncio.Semaphore(2)
+        monkeypatch.setattr(cop_monitoring, "_FIT_LIMIT", limit)
+
+        with patch(
+            "packages.core.cop_monitoring.forecast_manual_cop", side_effect=RuntimeError("fixture")
+        ):
+            result = await cop_monitoring.forecast_snapshot(
+                self.observations(), self.issue_at, True
+            )
+        assert result["status"] == "unavailable"
+        assert result["reason"] == "forecast_failed"
+        assert result["forecast"] is None
+        assert limit._value == 2
+
+        following = await cop_monitoring.forecast_snapshot(self.observations(), self.issue_at, True)
+        assert following["status"] == "ready"
+        assert following["forecast"]["value"] == pytest.approx(3.0 * 1.01**29)
+        assert limit._value == 2
+
+    def test_monitoring_has_no_control_or_artifact_imports(self):
+        import ast
+        import inspect
+
+        from packages.core import cop_monitoring
+
+        imports = [
+            node.module or ""
+            for node in ast.walk(ast.parse(inspect.getsource(cop_monitoring)))
+            if isinstance(node, ast.ImportFrom)
+        ]
+        assert not any(
+            name.startswith(
+                (
+                    "packages.optimizer",
+                    "packages.ml",
+                    "packages.poller",
+                    "packages.core.services",
+                    "redis",
+                )
+            )
+            for name in imports
+        )
+
+
 class TestCOPModel:
-    def test_untrained_uses_fallback(self):
-        """Untrained model should use default COP curve."""
-        from packages.ml.models import COPModel
+    def test_only_inert_compatibility_methods_remain(self):
+        import ast
+        import inspect
 
-        model = COPModel()
-        assert not model.is_trained
+        from packages.ml import cop_model_core
 
-        # Fallback COP should be in reasonable range
-        cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 1.5 <= cop <= 6.0
+        tree = ast.parse(inspect.getsource(cop_model_core))
+        imports = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+        assert imports == ["__future__"]
+        model_class = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        assert {
+            node.name
+            for node in model_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        } == {
+            "__init__",
+            "reset",
+            "is_trained",
+            "metrics",
+            "last_data_quality",
+            "version",
+            "train",
+            "predict",
+            "predict_cop",
+            "load_latest",
+        }
 
-        # predict() should still return reasonable electrical kWh
-        pred = model.predict(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 0.1 < pred < 5.0
+    @pytest.mark.parametrize("module_name", ["cop_model_core", "models"])
+    async def test_retired_lifecycle_never_accesses_artifacts(self, module_name, tmp_path):
+        import importlib
 
-    def test_fallback_higher_at_cold(self):
-        """Colder outdoor temp → lower COP → higher electrical consumption."""
-        from packages.ml.models import COPModel
+        module = importlib.import_module(f"packages.ml.{module_name}")
+        archives = {
+            "cop_model_legacy.pkl": b"legacy model",
+            "cop_model_weather_dhw_v6_20261001_1200.pkl": b"unverified DHW model",
+            "cop_weather_dhw_v6_mae.json": b'{"mae": 0.1}',
+        }
+        for name, content in archives.items():
+            (tmp_path / name).write_bytes(content)
 
-        model = COPModel()
-        cold_cop = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
-        warm_cop = model.predict_cop(outdoor_temp=15.0, tank_target=50, hour=12)
-        assert cold_cop < warm_cop  # COP increases with outdoor temp
+        with (
+            patch.object(module, "MODEL_DIR", tmp_path),
+            patch.object(Path, "glob", side_effect=AssertionError("COP artifact enumeration")),
+            patch.object(Path, "read_bytes", side_effect=AssertionError("COP artifact read")),
+            patch("packages.ml.safe_persistence.safe_load") as safe_load,
+            patch("packages.ml.safe_persistence.safe_dump") as safe_dump,
+            patch("packages.ml.models_common.prune_old_models") as prune,
+            patch("packages.ml.models_common.write_mae_baseline") as baseline,
+        ):
+            model = module.COPModel()
+            model._model = MagicMock()
+            model._version = "legacy"
+            model._metrics = {"samples": 999, "mae": 0.1}
+            assert model.is_trained is False
+            assert model.version == "retired"
+            assert model.metrics == {}
+            assert model.last_data_quality == {}
+            assert model.load_latest() is False
+            assert await model.train() == {
+                "status": "retired",
+                "supported": False,
+                "error": "cop_model_retired",
+                "reason": "unverified_thermal_output",
+            }
+            for predict in (model.predict, model.predict_cop):
+                with pytest.raises(RuntimeError, match="^cop_model_retired$"):
+                    predict(5.0, 50, 12)
+            model._model.predict.assert_not_called()
+            model.reset()
+            assert model.is_trained is False
+            assert model.version == "retired"
+            safe_load.assert_not_called()
+            safe_dump.assert_not_called()
+            prune.assert_not_called()
+            baseline.assert_not_called()
 
-        cold_pred = model.predict(outdoor_temp=-5.0, tank_target=50, hour=12)
-        warm_pred = model.predict(outdoor_temp=15.0, tank_target=50, hour=12)
-        assert cold_pred > warm_pred  # Electrical consumption higher in cold
+        assert {name: (tmp_path / name).read_bytes() for name in archives} == archives
 
-    def test_predict_cop_fallback(self):
-        """predict_cop should return a reasonable COP range."""
-        from packages.ml.models import COPModel
+    async def test_direction_computation_refuses_without_session(self):
+        from packages.ml.models import DirectionAwareCOP
 
-        model = COPModel()
-        cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 1.5 <= cop <= 6.0
+        with patch("packages.ml.models.get_session", side_effect=AssertionError("COP session")):
+            with pytest.raises(RuntimeError, match="^cop_model_retired$"):
+                await DirectionAwareCOP().compute_cop_intervals()
 
-    def test_make_features_shape(self):
-        """Feature vector should have correct shape."""
-        from packages.ml.models import COPModel
+    @pytest.mark.parametrize("row", [(3.5, 2, 2.0, 5.0), (None, 0, None, None)])
+    async def test_archival_aggregation_is_read_only_and_unverified(self, row):
+        from packages.ml.models import DirectionAwareCOP
 
-        features = COPModel._make_features(5.0, 50, 12)
-        assert features.shape == (7,)
+        result = MagicMock()
+        result.one.return_value = row
+        session = AsyncMock()
+        session.execute.return_value = result
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("packages.ml.models.get_session", return_value=ctx):
+            archive = await DirectionAwareCOP().get_average_cop(hours=48, mode="HEATING_WATER")
 
-    def test_load_latest_no_models(self, tmp_path):
-        """load_latest returns False when no model files exist."""
-        from packages.ml.models import COPModel
-
-        model = COPModel()
-        with patch("packages.ml.models.MODEL_DIR", tmp_path):
-            assert not model.load_latest()
+        assert archive == {
+            "avg_cop": row[0],
+            "sample_count": row[1],
+            "min_cop": row[2],
+            "max_cop": row[3],
+            "period_hours": 48,
+            "mode_filter": "HEATING_WATER",
+            "status": "retired",
+            "provenance": "legacy_unverified_estimate",
+            "confidence": "estimated",
+            "measured": False,
+        }
+        session.execute.assert_awaited_once()
+        assert session.execute.call_args.args[0].is_select
 
     @pytest.mark.parametrize(
         ("model_class", "filename"),
         [
             ("COPModel", "cop_model_weather_dhw_v4_20261001_1200.pkl"),
+            ("COPModel", "cop_model_weather_dhw_v5_20261001_1200.pkl"),
             ("DemandModel", "demand_model_weather_v2_20261001_1200.pkl"),
         ],
     )
@@ -132,90 +741,203 @@ class TestCOPModel:
 
         safe_load.assert_not_called()
 
-    def test_train_and_predict_with_synthetic_data(self, tmp_path):
-        """Train COP model on synthetic COP data and verify predictions."""
-        from packages.ml.models import COPModel, HAS_SKLEARN
 
-        if not HAS_SKLEARN:
-            pytest.skip("scikit-learn not installed")
+class TestCOPRetirementLifecycle:
+    def test_status_tombstone_precedes_cache_and_artifact_inspection(self, tmp_path):
+        from packages.ml import model_status
 
-        from sklearn.ensemble import GradientBoostingRegressor
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-
-        model = COPModel()
-
-        # Simulate training: outdoor_temp + tank_target + hour → COP
-        rng = np.random.RandomState(42)
-        n = 300
-
-        outdoor_temps = rng.uniform(-5, 25, n)
-        tank_targets = rng.uniform(45, 55, n).astype(int)
-        hours = rng.randint(0, 24, n)
-
-        X = np.column_stack(
-            [
-                outdoor_temps,
-                tank_targets,
-                np.sin(2 * np.pi * hours / 24),
-                np.cos(2 * np.pi * hours / 24),
-                np.zeros(n),  # precipitation
-                np.full(n, 60.0),  # humidity
-                np.full(n, 0.5),  # cloud_cover
-            ]
-        )
-        # Higher outdoor → higher COP (physically correct)
-        y = 3.0 + 0.08 * outdoor_temps - 0.02 * tank_targets + rng.normal(0, 0.15, n)
-        y = np.clip(y, 1.5, 6.0)
-
-        pipeline = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    GradientBoostingRegressor(
-                        n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
-                    ),
-                ),
-            ]
-        )
-        pipeline.fit(X, y)
-        model._model = pipeline
-        model._version = "test"
-
-        assert model.is_trained
-
-        # Warm → higher COP than cold
-        cold_cop = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
-        warm_cop = model.predict_cop(outdoor_temp=20.0, tank_target=50, hour=12)
-        assert warm_cop > cold_cop
-
-        # COP should be in physical range
-        cop = model.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 1.5 <= cop <= 6.0
-
-        # predict() (electrical kWh) should still be reasonable
-        pred = model.predict(outdoor_temp=5.0, tank_target=50, hour=12)
-        assert 0.1 < pred < 5.0
-
-        # Save and reload
+        cached = (None, {"trained": True, "samples": 999, "source_records": 999})
         with (
-            patch("packages.ml.models.MODEL_DIR", tmp_path),
-            patch("packages.ml.safe_persistence.settings") as mock_settings,
+            patch.dict(model_status._artifact_status_cache, {"cop": cached}),
+            patch.object(
+                model_status,
+                "_artifacts_with_fingerprint",
+                side_effect=AssertionError("COP fingerprint"),
+            ),
+            patch("packages.ml.models.COPModel", side_effect=AssertionError("COP instance")),
+            patch("packages.ml.safe_persistence.safe_load") as safe_load,
         ):
-            mock_settings.model_dir = str(tmp_path)
-            mock_settings.secret_key = "test-secret-key"
-            from packages.ml.safe_persistence import safe_dump
-            from packages.ml.cop_model_core import COP_MODEL_ARTIFACT_PREFIX
+            status = model_status._inspect_model_artifact("cop", tmp_path)
+            assert status == {
+                "trained": False,
+                "last_trained": None,
+                "samples": 0,
+                "source_records": 0,
+                "metrics": None,
+                "status": "retired",
+                "supported": False,
+                "unavailable_reason": "retired",
+                "reason": "unverified_thermal_output",
+            }
+            status["trained"] = True
+            assert model_status._inspect_model_artifact("cop", tmp_path)["trained"] is False
+            safe_load.assert_not_called()
 
-            model_path = tmp_path / f"{COP_MODEL_ARTIFACT_PREFIX}test.pkl"
-            safe_dump(pipeline, model_path)
+    @pytest.mark.parametrize("trained", [False, True])
+    async def test_startup_only_loads_demand_and_keeps_weekly_cadence(self, trained):
+        from packages.ml import main as ml_main
 
-            model2 = COPModel()
-            assert model2.load_latest()
-            assert model2.is_trained
-            cop2 = model2.predict_cop(outdoor_temp=5.0, tank_target=50, hour=12)
-            assert abs(cop2 - cop) < 0.01
+        demand = MagicMock(is_trained=trained)
+        demand.train = AsyncMock(return_value={"error": "Insufficient data", "samples": 167})
+        scheduler = MagicMock()
+        with (
+            patch.object(ml_main, "demand_model", demand),
+            patch.object(ml_main, "create_scheduler", return_value=scheduler),
+            patch("packages.core.logging.configure_logging"),
+            patch.object(ml_main.asyncio, "sleep", new=AsyncMock(side_effect=KeyboardInterrupt)),
+            patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP train")),
+            patch(
+                "packages.ml.models.COPModel.load_latest", side_effect=AssertionError("COP load")
+            ),
+        ):
+            await ml_main.main()
+
+        demand.load_latest.assert_called_once_with()
+        assert demand.train.await_count == (0 if trained else 1)
+        scheduler.add_job.assert_called_once_with(
+            ml_main.retrain_models,
+            "cron",
+            day_of_week="sun",
+            hour=3,
+            timezone="UTC",
+            id="retrain",
+        )
+        scheduler.shutdown.assert_called_once_with()
+
+    async def test_weekly_and_manual_retrain_only_call_demand(self):
+        from packages.ml import main as ml_main
+
+        demand = MagicMock()
+        demand.train = AsyncMock(return_value={"version": "fixture"})
+        with (
+            patch.object(ml_main, "demand_model", demand),
+            patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP train")),
+        ):
+            await ml_main.retrain_models()
+        demand.train.assert_awaited_once_with()
+
+    @pytest.mark.parametrize("usable_samples", [167, 168])
+    async def test_seasonal_calibration_only_uses_retained_models(self, usable_samples):
+        from packages.ml import models, seasonal_learning
+        from packages.ml.thermal import MIN_LEARNED_RATE_SAMPLES
+
+        class RetiredCOP:
+            def __getattr__(self, name):
+                raise AssertionError(f"COP access: {name}")
+
+        demand = MagicMock(is_trained=False)
+        demand.training_data_quality = AsyncMock(
+            return_value={
+                "usable_samples": usable_samples,
+                "minimum_samples": 168,
+                "remaining_samples": max(0, 168 - usable_samples),
+                "ready_to_train": usable_samples >= 168,
+            }
+        )
+
+        async def train_demand():
+            demand.is_trained = True
+            return {"version": "fixture-demand", "samples": usable_samples}
+
+        demand.train = AsyncMock(side_effect=train_demand)
+        thermal = MagicMock()
+        thermal.params.indoor_heating_samples = MIN_LEARNED_RATE_SAMPLES
+        thermal.calibrate = AsyncMock(return_value={"sample_count": MIN_LEARNED_RATE_SAMPLES})
+        status = {"observe_only_active": True, "auto_train": True, "auto_exit": True}
+        with (
+            patch.object(
+                seasonal_learning,
+                "get_seasonal_calibration_status",
+                new=AsyncMock(side_effect=[status, {**status, "observe_only_active": False}]),
+            ) as read_status,
+            patch.object(seasonal_learning, "set_settings_bulk", new=AsyncMock()) as save_settings,
+            patch.object(models, "demand_model", demand),
+            patch.object(models, "cop_model", RetiredCOP()),
+            patch.object(models, "COPModel", side_effect=AssertionError("COP constructor")),
+            patch("packages.ml.thermal.thermal_model", thermal),
+            patch(
+                "packages.ml.cop_model_core.COPModel.train",
+                side_effect=AssertionError("COP training"),
+            ),
+            patch(
+                "packages.ml.cop_model_core.COPModel.load_latest",
+                side_effect=AssertionError("COP loading"),
+            ),
+            patch(
+                "packages.ml.models.DirectionAwareCOP.compute_cop_intervals",
+                side_effect=AssertionError("COP computation"),
+            ),
+            patch.object(Path, "glob", side_effect=AssertionError("COP artifact enumeration")),
+            patch("packages.ml.safe_persistence.safe_load", side_effect=AssertionError("load")),
+            patch("packages.ml.safe_persistence.safe_dump", side_effect=AssertionError("publish")),
+            patch(
+                "packages.ml.models_common.write_mae_baseline",
+                side_effect=AssertionError("baseline"),
+            ),
+            patch(
+                "packages.ml.models_common.prune_old_models", side_effect=AssertionError("prune")
+            ),
+        ):
+            result = await seasonal_learning.run_seasonal_calibration_cycle()
+
+        demand.training_data_quality.assert_awaited_once_with()
+        thermal.calibrate.assert_awaited_once_with()
+        assert result["demand"]["minimum_samples"] == 168
+        assert result["demand"]["usable_samples"] == usable_samples
+        assert "cop" not in result
+        if usable_samples == 168:
+            demand.train.assert_awaited_once_with()
+            save_settings.assert_awaited_once_with({"seasonal_calibration_enabled": "false"})
+            assert read_status.await_count == 2
+            assert result["cycle"] == result["next_step"] == "completed"
+        else:
+            demand.train.assert_not_awaited()
+            save_settings.assert_not_awaited()
+            assert read_status.await_count == 1
+            assert result["cycle"] == "collecting"
+            assert result["next_step"] == "collect_space_heating_evidence"
+
+    async def test_optimizer_startup_loads_retained_models_and_logs_retirement_once(self):
+        from packages.optimizer import main as optimizer_main
+
+        demand = MagicMock(is_trained=False)
+        comfort = MagicMock(is_trained=False)
+        thermal = MagicMock()
+        thermal.params.last_calibrated = None
+        wrapper = MagicMock()
+        wrapper.start = AsyncMock(side_effect=RuntimeError("fixture startup stop"))
+        with (
+            patch.object(optimizer_main, "_demand_model", demand),
+            patch.object(optimizer_main, "comfort_model", comfort),
+            patch.object(optimizer_main, "thermal_model", thermal),
+            patch.object(optimizer_main, "AquareaWrapper", return_value=wrapper),
+            patch.object(
+                optimizer_main,
+                "get_device_data_quality",
+                new=AsyncMock(return_value={"ready": False, "reasons": ["fixture"]}),
+            ),
+            patch.object(optimizer_main, "logger") as logger,
+            patch("packages.core.logging.configure_logging"),
+            patch(
+                "packages.ml.models.COPModel.load_latest", side_effect=AssertionError("COP load")
+            ),
+            patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP train")),
+        ):
+            with pytest.raises(RuntimeError, match="fixture startup stop"):
+                await optimizer_main.main()
+
+        demand.load_latest.assert_called_once_with()
+        comfort.load_latest.assert_called_once_with()
+        thermal.load_latest.assert_called_once_with()
+        retirement_events = [
+            entry for entry in logger.info.call_args_list if entry.args == ("cop_retired",)
+        ]
+        assert len(retirement_events) == 1
+        assert retirement_events[0].kwargs == {
+            "reason": "unverified_thermal_output",
+            "cop_source": "assumed",
+            "cop_measured": False,
+        }
 
 
 class TestDemandModel:
@@ -554,190 +1276,79 @@ class TestDemandModel:
         assert "one" not in repr(log_info.call_args)
 
 
-class TestCOPCounterWindows:
-    @pytest.mark.asyncio
-    async def test_hourly_tank_steps_yield_one_bounded_sample_per_change(self):
-        from packages.ml.models import COPModel
+class TestDemandEvidenceBoundaries:
+    @pytest.mark.parametrize(("samples", "trained"), [(167, False), (168, True)])
+    async def test_demand_minimum_remains_168(self, samples, trained):
+        from packages.ml.demand_model_core import DemandModel, MIN_TRAINING_SAMPLES
 
-        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
-        model = COPModel()
-        degrees_per_hour = 1.0 / model._tank_kwh_per_degree()
-        consumption = [
-            SimpleNamespace(
-                device_id="one",
-                ts=base + dt.timedelta(minutes=15 * index),
-                heat_kwh=0.0,
-                tank_kwh=0.5 * (index // 4),
-                outdoor_temp=2.0,
-            )
-            for index in range(201)
-        ]
-        statuses = [
-            SimpleNamespace(
-                device_id="one",
-                ts=row.ts,
-                tank_target_temp=50,
-                tank_temp=20.0 + degrees_per_hour * (index // 4),
-                direction="WATER",
-                device_action="HEATING_WATER",
-                zone1_temp=None,
-                defrost_active=False,
-            )
-            for index, row in enumerate(consumption)
-        ]
-        weather = [
-            SimpleNamespace(
-                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
-            )
-        ]
-        context = _FakeSessionCtx(
-            [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
-        )
+        assert MIN_TRAINING_SAMPLES == 168
+        model = DemandModel()
+        regressor = MagicMock()
         with (
-            patch("packages.ml.cop_model_core.get_session", return_value=context),
-            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch.object(
+                model,
+                "_prepare_data",
+                new=AsyncMock(return_value=(np.zeros((samples, 10)), np.ones(samples))),
+            ),
+            patch.object(model, "_make_quantile_model", return_value=regressor),
+            patch("packages.ml.demand_model_core.time_series_cv_mae", return_value=(0.1, 0.01)),
+            patch(
+                "packages.ml.demand_model_core.evaluate_regression",
+                return_value={"deploy": True, "baseline_mae": None},
+            ),
+            patch("packages.ml.safe_persistence.safe_dump") as publish,
+            patch("packages.ml.demand_model_core.prune_old_models"),
+            patch("packages.ml.demand_model_core.write_mae_baseline"),
+            patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP training")),
         ):
-            _, y = await model._prepare_training_data()
+            result = await model.train()
 
-        assert len(y) == 49
-        assert np.all((y >= model.COP_MIN) & (y <= model.COP_MAX))
+        assert model.is_trained is trained
+        assert result["samples"] == samples
+        if trained:
+            assert "version" in result
+            assert regressor.fit.call_count == 3
+            publish.assert_called_once()
+            assert publish.call_args.args[1].name.startswith("demand_model_weather_v3_")
+        else:
+            assert result["error"] == "Insufficient data"
+            regressor.fit.assert_not_called()
+            publish.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_hourly_tank_steps_select_source_date(self):
-        from packages.ml.models import COPModel
+    async def test_demand_interleaved_devices_keep_independent_electrical_counters(self):
+        from packages.ml.demand_model_core import DemandModel, DEMAND_COUNTER_CONFIRMATION_ENABLED
 
-        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
-        model = COPModel()
-        degrees_per_hour = 1.0 / model._tank_kwh_per_degree()
-        consumption = [
+        assert DEMAND_COUNTER_CONFIRMATION_ENABLED is False
+        base = dt.datetime(2026, 1, 5, 8, tzinfo=dt.timezone.utc)
+        rows = [
             SimpleNamespace(
-                device_id="one",
-                ts=base + dt.timedelta(minutes=15 * index),
-                heat_kwh=0.0,
-                tank_kwh=0.5 * (index // 4),
-                outdoor_temp=2.0,
+                device_id=device_id,
+                ts=base + dt.timedelta(hours=hour),
+                heat_kwh=energy,
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=5.0,
+                source_date=None,
             )
-            for index in range(201)
+            for hour, device_id, energy in [
+                (0, "one", 100.0),
+                (0, "two", 900.0),
+                (1, "one", 101.0),
+                (1, "two", 903.0),
+            ]
         ]
-        statuses = [
-            SimpleNamespace(
-                device_id="one",
-                ts=row.ts,
-                tank_target_temp=50,
-                tank_temp=20.0 + degrees_per_hour * (index // 4),
-                direction="WATER",
-                device_action="HEATING_WATER",
-                zone1_temp=None,
-                defrost_active=False,
-            )
-            for index, row in enumerate(consumption)
-        ]
-        weather = [
-            SimpleNamespace(
-                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
-            )
-        ]
-        context = _FakeSessionCtx(
-            [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
-        )
-        with (
-            patch("packages.ml.cop_model_core.get_session", return_value=context),
-            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
-        ):
-            await model._prepare_training_data()
-
-        assert "source_date" in str(context._session.statements[0])
-
-    @pytest.mark.asyncio
-    async def test_realistic_irregular_multi_device_cop_yield_has_safe_diagnostics(self):
-        from packages.ml.models import COPModel
-
-        base = dt.datetime(2026, 1, 5, 6, 0, tzinfo=dt.timezone.utc)
-        model = COPModel()
-        kwh_per_degree = model._tank_kwh_per_degree()
-        consumption = []
-        statuses = []
-        step_times = {
-            "device-a": {
-                dt.datetime(2026, 1, 5, 7, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 8, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 9, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 12, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 13, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc),
-            },
-            "device-b": {
-                dt.datetime(2026, 1, 5, 6, 45, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 7, 45, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 9, 0, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 10, 15, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 11, 30, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 1, 5, 13, 0, tzinfo=dt.timezone.utc),
-            },
-        }
-        counters = {device_id: 0.0 for device_id in step_times}
-        for device_id in step_times:
-            for poll_index in range(0, 41):
-                ts = base + dt.timedelta(minutes=15 * poll_index)
-                if device_id == "device-a" and dt.datetime(
-                    2026, 1, 5, 10, 0, tzinfo=dt.timezone.utc
-                ) <= ts < dt.datetime(2026, 1, 5, 12, 0, tzinfo=dt.timezone.utc):
-                    continue
-                if ts in step_times[device_id]:
-                    counters[device_id] += 0.5
-                consumption.append(
-                    SimpleNamespace(
-                        device_id=device_id,
-                        ts=ts,
-                        heat_kwh=0.0,
-                        tank_kwh=counters[device_id],
-                        outdoor_temp=2.0,
-                    )
-                )
-                statuses.append(
-                    SimpleNamespace(
-                        device_id=device_id,
-                        ts=ts,
-                        tank_target_temp=50,
-                        tank_temp=40.0 + counters[device_id] * 2.0 / kwh_per_degree,
-                        direction="WATER" if ts.hour < 11 else "SPACE",
-                        device_action="HEATING_WATER" if ts.hour < 11 else "IDLE",
-                        zone1_temp=None,
-                        defrost_active=False,
-                    )
-                )
-        consumption.sort(key=lambda row: row.ts)
-        statuses.sort(key=lambda row: row.ts)
-        weather = [
-            SimpleNamespace(
-                ts=base,
-                temperature=2.0,
-                precipitation=0.0,
-                humidity=60.0,
-                cloud_cover=0.5,
-            )
-        ]
+        model = DemandModel()
         with (
             patch(
-                "packages.ml.cop_model_core.get_session",
-                _mock_get_session(
-                    [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
-                ),
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult(rows), _FakeResult([])]),
             ),
-            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
-            patch("packages.ml.cop_model_core._logger.info") as log_info,
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
         ):
-            _, target = await model._prepare_training_data()
+            features, target = await model._prepare_data()
 
-        assert 4 <= len(target) < len(step_times["device-a"]) + len(step_times["device-b"])
-        assert np.all(target == pytest.approx(2.0))
-        assert np.all((target >= model.COP_MIN) & (target <= model.COP_MAX))
-        log_text = repr(log_info.call_args)
-        assert "device-a" not in log_text
-        assert "device-b" not in log_text
-        diagnostics = log_info.call_args.kwargs
-        assert diagnostics["counter_outside_window"] >= 1
-        assert diagnostics["skip_no_dhw_activity"] >= 1
+        assert len(features) == 2
+        assert target.tolist() == pytest.approx([1.0, 3.0])
 
     @pytest.mark.parametrize(
         ("timezone", "start", "end"),
@@ -779,56 +1390,6 @@ class TestCOPCounterWindows:
             )
         )
         assert intervals[0].elapsed_hours == 3.0
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("blocked_status", ["defrost", "mixed_mode"])
-    async def test_cop_rejects_defrost_and_mixed_mode_windows(self, blocked_status):
-        from packages.ml.models import COPModel
-
-        base = dt.datetime(2026, 1, 5, 8, 0, tzinfo=dt.timezone.utc)
-        consumption = [
-            SimpleNamespace(device_id="one", ts=base, heat_kwh=0.0, tank_kwh=0.0, outdoor_temp=2.0),
-            SimpleNamespace(
-                device_id="one",
-                ts=base + dt.timedelta(minutes=30),
-                heat_kwh=0.0,
-                tank_kwh=0.5,
-                outdoor_temp=2.0,
-            ),
-        ]
-        statuses = [
-            SimpleNamespace(
-                device_id="one",
-                ts=base + dt.timedelta(minutes=15 * index),
-                tank_target_temp=50,
-                tank_temp=20.0 + 2.5 * index,
-                direction="WATER",
-                device_action="HEATING_WATER"
-                if blocked_status != "mixed_mode" or index != 1
-                else "HEATING",
-                zone1_temp=None,
-                defrost_active=blocked_status == "defrost" and index == 1,
-            )
-            for index in range(3)
-        ]
-        weather = [
-            SimpleNamespace(
-                ts=base, temperature=2.0, precipitation=0.0, humidity=60.0, cloud_cover=0.5
-            )
-        ]
-        model = COPModel()
-        with (
-            patch(
-                "packages.ml.cop_model_core.get_session",
-                _mock_get_session(
-                    [_FakeResult(consumption), _FakeResult(statuses), _FakeResult(weather)]
-                ),
-            ),
-            patch("packages.ml.cop_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
-        ):
-            X, y = await model._prepare_training_data()
-
-        assert len(X) == len(y) == 0
 
 
 class TestConsumptionIntervals:
@@ -1542,45 +2103,26 @@ class TestThermalModel:
         assert curve[-1]["predicted_temp"] < 52.0
 
 
-class TestMonotonicCOPModel:
-    """COP must rise with outdoor temperature even when trained on bad data."""
+class TestAssumedHeatingEfficiency:
+    @pytest.mark.parametrize(
+        ("temperature", "expected"),
+        [
+            (-100.0, 1.5),
+            (-20.0, 1.5),
+            (-5.0, 3.0),
+            (0.0, 3.5),
+            (5.0, 4.0),
+            (25.0, 6.0),
+            (100.0, 6.0),
+        ],
+    )
+    def test_original_bounded_curve_is_only_a_planning_assumption(self, temperature, expected):
+        from packages.ml.thermal import assumed_heating_efficiency
 
-    @pytest.mark.asyncio
-    async def test_cop_non_decreasing_in_outdoor_on_inverted_data(self):
-        from packages.ml.cop_model_core import COPModel
-
-        rng = np.random.RandomState(0)
-        n = 200
-        outdoor = rng.uniform(-10, 20, n)
-        tank = rng.uniform(45, 55, n)
-        hours = rng.randint(0, 24, n)
-        X = np.column_stack(
-            [
-                outdoor,
-                tank,
-                np.sin(2 * np.pi * hours / 24),
-                np.cos(2 * np.pi * hours / 24),
-                np.zeros(n),  # precipitation
-                np.full(n, 60.0),  # humidity
-                np.full(n, 0.5),  # cloud_cover
-            ]
+        assert assumed_heating_efficiency(temperature) == expected
+        assert assumed_heating_efficiency(temperature) == max(
+            1.5, min(6.0, 3.5 + 0.1 * temperature)
         )
-        # Physically wrong: colder outside -> higher COP.
-        y = np.clip(3.0 - 0.05 * outdoor + rng.normal(0, 0.1, n), 1.5, 6.0)
-
-        model = COPModel()
-
-        async def fake_prep():
-            return X, y
-
-        model._prepare_training_data = fake_prep
-        with patch("packages.ml.safe_persistence.safe_dump"):
-            result = await model.train()
-        assert "version" in result
-
-        cold = model.predict_cop(outdoor_temp=-5.0, tank_target=50, hour=12)
-        warm = model.predict_cop(outdoor_temp=15.0, tank_target=50, hour=12)
-        assert warm >= cold - 1e-6
 
 
 class TestMonotonicDemandModel:
@@ -1699,81 +2241,80 @@ class TestOrchestratorFallback:
 
     @pytest.mark.asyncio
     async def test_auto_uses_rules_without_ml(self):
-        """auto should fall back to rules when ML models are not trained."""
-        from packages.optimizer.main import _select_optimizer, _cop_model, _demand_model
+        """auto remains on rules without a qualification query."""
+        from packages.optimizer.main import _select_optimizer
 
-        # Ensure models are not trained
-        assert not _cop_model.is_trained or not _demand_model.is_trained
-
-        layer_name, optimizer = await _select_optimizer("auto")
-        # Without trained models, auto should pick rules
+        with patch("packages.optimizer.main.get_session", side_effect=AssertionError("auto query")):
+            layer_name, optimizer = await _select_optimizer("auto")
         assert layer_name == "rules"
+        assert type(optimizer).__name__ == "RulesOptimizer"
 
-    @pytest.mark.asyncio
-    async def test_auto_requires_sufficient_data(self):
-        """auto should fall back to rules when ML models are trained but data history is too short."""
-        from packages.optimizer.main import _select_optimizer, _cop_model, _demand_model
+    @pytest.mark.parametrize("trained", [False, True])
+    async def test_auto_ignores_legacy_artifacts_and_never_queries_history(self, trained, tmp_path):
+        from packages.optimizer import main as optimizer_main
 
-        # Temporarily mark models as trained
-        _cop_model._model = MagicMock()
-        _demand_model._model = MagicMock()
+        artifact = tmp_path / "cop_model_weather_dhw_v6_legacy.pkl"
+        artifact.write_bytes(b"legacy trained COP")
+        demand = MagicMock(is_trained=trained)
+        with (
+            patch.object(optimizer_main, "_demand_model", demand),
+            patch.object(optimizer_main.comfort_model, "load_latest"),
+            patch.object(optimizer_main.thermal_model, "load_latest"),
+            patch.object(optimizer_main, "get_session", side_effect=AssertionError("auto query")),
+            patch.object(optimizer_main, "MILPOptimizer", side_effect=AssertionError("auto MILP")),
+            patch(
+                "packages.ml.models.COPModel.load_latest", side_effect=AssertionError("COP load")
+            ),
+        ):
+            layer_name, optimizer = await optimizer_main._select_optimizer(
+                "auto", reload_models=True
+            )
 
-        try:
-            # Mock insufficient data
-            with patch(
-                "packages.optimizer.main._has_sufficient_ml_data",
-                new_callable=AsyncMock,
-                return_value=False,
-            ):
-                layer_name, optimizer = await _select_optimizer("auto")
-                assert layer_name == "rules"
+        assert layer_name == "rules"
+        assert type(optimizer).__name__ == "RulesOptimizer"
+        demand.load_latest.assert_called_once_with()
+        assert artifact.read_bytes() == b"legacy trained COP"
 
-            # Mock sufficient data
-            with patch(
-                "packages.optimizer.main._has_sufficient_ml_data",
-                new_callable=AsyncMock,
-                return_value=True,
-            ):
-                layer_name, optimizer = await _select_optimizer("auto")
-                assert layer_name == "milp"
-        finally:
-            # Restore untrained state
-            _cop_model._model = None
-            _demand_model._model = None
+    @pytest.mark.parametrize("trained", [False, True])
+    async def test_optimizer_status_reports_retirement_and_rules_for_auto(self, trained):
+        from packages.optimizer import main as optimizer_main
 
-    @pytest.mark.asyncio
-    async def test_optimizer_status_snapshot_uses_same_auto_gate(self):
-        """Status snapshot should report the same layer the runtime selector would use."""
-        from packages.optimizer.main import (
-            _cop_model,
-            _demand_model,
-            get_optimizer_status_snapshot,
-        )
+        with (
+            patch.object(optimizer_main, "_demand_model", MagicMock(is_trained=trained)),
+            patch.object(
+                optimizer_main,
+                "get_planning_data_quality",
+                new=AsyncMock(return_value={"control_allowed": True}),
+            ),
+            patch.object(optimizer_main, "get_session", side_effect=AssertionError("auto query")),
+        ):
+            status = await optimizer_main.get_optimizer_status_snapshot("auto")
 
-        _cop_model._model = MagicMock()
-        _demand_model._model = MagicMock()
+        assert status["active_layer"] == "rules_v7"
+        assert status["configured_layer"] == "auto"
+        assert status["effective_layer"] == "rules"
+        assert status["selection_reason"] == "auto_milp_disabled_cop_retired"
+        assert status["cop_trained"] is False
+        assert status["cop_source"] == "assumed"
+        assert status["cop_measured"] is False
+        assert status["demand_trained"] is trained
 
-        try:
-            with patch(
-                "packages.optimizer.main._has_sufficient_ml_data",
-                new_callable=AsyncMock,
-                return_value=False,
-            ):
-                status = await get_optimizer_status_snapshot("auto")
-                assert status["active_layer"] == "rules_v7"
+    @pytest.mark.parametrize("trained", [False, True])
+    async def test_explicit_milp_only_receives_retained_demand(self, trained):
+        from packages.optimizer import main as optimizer_main
 
-            with patch(
-                "packages.optimizer.main._has_sufficient_ml_data",
-                new_callable=AsyncMock,
-                return_value=True,
-            ):
-                status = await get_optimizer_status_snapshot("auto")
-                assert status["active_layer"] == "milp_v1+ml"
-                assert status["cop_trained"] is True
-                assert status["demand_trained"] is True
-        finally:
-            _cop_model._model = None
-            _demand_model._model = None
+        demand = MagicMock(is_trained=trained)
+        with (
+            patch.object(optimizer_main, "_demand_model", demand),
+            patch.object(optimizer_main, "MILPOptimizer") as milp,
+        ):
+            layer_name, optimizer = await optimizer_main._select_optimizer("milp_preferred")
+            version = optimizer_main._selected_layer_version("milp")
+
+        assert layer_name == "milp"
+        assert optimizer is milp.return_value
+        milp.assert_called_once_with(demand_model=demand if trained else None)
+        assert version == (f"{milp.VERSION}+ml" if trained else milp.VERSION)
 
     @pytest.mark.asyncio
     async def test_run_optimization_with_rules_only(self):
@@ -2045,97 +2586,6 @@ def test_model_dir_is_isolated_to_pytest_tmp(isolate_model_dir: Path) -> None:
     assert models_common.MODEL_DIR.resolve() == expected
     assert comfort_model.MODEL_DIR.resolve() == expected
     assert thermal.MODEL_DIR.resolve() == expected
-
-
-class TestDirectionAwareCOP:
-    """Tests for direction-based COP computation."""
-
-    def test_tank_thermal_mass_from_config(self):
-        """Verify tank thermal mass is computed from configured volume."""
-        from packages.ml.models import DirectionAwareCOP
-
-        dac = DirectionAwareCOP()
-        # 300L tank → 0.349 kWh/°C (configurable via tank_volume_liters)
-        tank_kwh = dac._tank_kwh_per_degree()
-        assert 0.1 < tank_kwh < 1.0
-
-    def test_water_circuit_thermal_mass_constant(self):
-        """Verify the renamed water circuit thermal mass constant."""
-        from packages.ml.models import DirectionAwareCOP
-
-        dac = DirectionAwareCOP()
-        assert hasattr(dac, "WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG")
-        assert 0.1 < dac.WATER_CIRCUIT_THERMAL_MASS_KWH_PER_DEG < 2.0
-
-    def test_only_heating_water_uses_tank_temp(self):
-        """
-        When device_action is HEATING_WATER, COP should use tank_temp deltas.
-        When device_action is HEATING, COP should use zone1_temp (water circuit) deltas.
-        Verify that the code path branches correctly.
-        """
-        from packages.ml.models import DirectionAwareCOP
-
-        dac = DirectionAwareCOP()
-
-        # Simulate two records: HEATING_WATER with tank temp rise
-        base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
-
-        record_prev = MagicMock()
-        record_prev.ts = base
-        record_prev.device_action = "HEATING_WATER"
-        record_prev.tank_temp = 45.0
-        record_prev.zone1_temp = 30.0
-        record_prev.outdoor_temp = 5.0
-        record_prev.defrost_active = False
-
-        record_curr = MagicMock()
-        record_curr.ts = base + dt.timedelta(hours=1)
-        record_curr.device_action = "HEATING_WATER"
-        record_curr.tank_temp = 50.0  # +5°C in tank
-        record_curr.zone1_temp = 30.0  # zone unchanged
-        record_curr.outdoor_temp = 5.0
-        record_curr.defrost_active = False
-        record_curr.device_id = "test"
-
-        # For HEATING_WATER: thermal = 5 * tank_kwh_per_degree (from tank temp)
-        # NOT from zone1_temp which didn't change
-        expected_thermal = 5.0 * dac._tank_kwh_per_degree()
-        assert expected_thermal > 0
-
-    def test_idle_and_off_intervals_are_skipped(self):
-        """Intervals with IDLE or OFF action should produce no COP entries."""
-        # This is by design: the compute_cop_intervals loop skips
-        # actions in ("OFF", "IDLE") at the top of the loop
-        from packages.ml.models import DirectionAwareCOP
-
-        dac = DirectionAwareCOP()
-
-        # Verify the tank thermal capacity is available and positive
-        assert dac._tank_kwh_per_degree() > 0
-
-    def test_defrost_intervals_are_skipped(self):
-        """Defrost intervals should not contribute to COP calculation."""
-        base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
-
-        record_prev = MagicMock()
-        record_prev.ts = base
-        record_prev.device_action = "HEATING"
-        record_prev.tank_temp = 45.0
-        record_prev.zone1_temp = 30.0
-        record_prev.outdoor_temp = 5.0
-        record_prev.defrost_active = False
-
-        record_curr = MagicMock()
-        record_curr.ts = base + dt.timedelta(hours=1)
-        record_curr.device_action = "HEATING"
-        record_curr.tank_temp = 45.0
-        record_curr.zone1_temp = 35.0  # zone rose
-        record_curr.outdoor_temp = 5.0
-        record_curr.defrost_active = True  # DEFROST → should be skipped
-
-        # In the real code loop, defrost_active=True causes `continue`
-        # so this interval would never produce a COP entry.
-        assert record_curr.defrost_active is True
 
 
 class TestDemandHeatingOnlyTarget:

@@ -19,9 +19,11 @@ class _FakeSession:
     def __init__(self, count: int = 5):
         self.deleted = []
         self.added = []
+        self.queried = []
         self._count = count
 
     async def scalar(self, stmt):
+        self.queried.append(stmt)
         return self._count
 
     async def execute(self, stmt):
@@ -51,6 +53,14 @@ def _patch_session(session):
 
 
 class TestResetScopeConfig:
+    def test_every_reset_scope_excludes_manual_ledger_and_revision_sequence(self):
+        assert all(
+            model.__tablename__ != "manual_cop_observations"
+            for models in RESET_SCOPES.values()
+            for model in models
+        )
+        assert "manual_cop" not in " ".join(RESET_SCOPES)
+
     def test_model_feeding_scopes_are_known(self):
         assert MODEL_FEEDING_SCOPES.issubset(set(RESET_SCOPES))
 
@@ -58,8 +68,28 @@ class TestResetScopeConfig:
         names = [m.__tablename__ for m in RESET_SCOPES["plans"]]
         assert names.index("plan_actions") < names.index("plans")
 
+    def test_every_reset_scope_excludes_archival_cop_history(self):
+        assert all(
+            model.__tablename__ != "cop_history"
+            for models in RESET_SCOPES.values()
+            for model in models
+        )
+
 
 class TestResetEndpoint:
+    async def test_all_scopes_retain_manual_monitoring_storage(self):
+        session = _FakeSession(count=7)
+        with (
+            _patch_session(session),
+            patch.object(admin, "reset_ml_models", return_value=[]) as reset_models,
+        ):
+            result = await reset_data(ResetRequest(scopes=list(RESET_SCOPES)))
+        reset_models.assert_called_once_with()
+        assert "manual_cop_observations" not in result["deleted_rows"]
+        assert all(
+            "manual_cop" not in str(statement) for statement in session.queried + session.deleted
+        )
+
     @pytest.mark.asyncio
     async def test_unknown_scope_rejected(self):
         with pytest.raises(HTTPException) as exc:
@@ -89,12 +119,14 @@ class TestResetEndpoint:
         session = _FakeSession(count=10)
         with (
             _patch_session(session),
-            patch.object(admin, "reset_ml_models", return_value=["cop_model_x.pkl"]) as mock_reset,
+            patch.object(
+                admin, "reset_ml_models", return_value=["demand_model_x.pkl"]
+            ) as mock_reset,
         ):
             result = await reset_data(ResetRequest(scopes=["indoor_temp"]))
         mock_reset.assert_called_once()
         assert result["models_reset"] is True
-        assert result["deleted_models"] == ["cop_model_x.pkl"]
+        assert result["deleted_models"] == ["demand_model_x.pkl"]
         assert result["deleted_rows"]["indoor_temp_reading"] == 10
 
     @pytest.mark.asyncio
@@ -113,10 +145,23 @@ class TestResetEndpoint:
         assert len(session.added) == 1
         assert session.added[0].action == "reset_data"
 
+    async def test_energy_reset_never_reads_or_deletes_cop_history(self):
+        session = _FakeSession(count=7)
+        with _patch_session(session):
+            result = await reset_data(ResetRequest(scopes=["energy"], reset_models=False))
+
+        assert result["deleted_rows"] == {"consumption": 7}
+        assert result["total_rows_deleted"] == 7
+        assert len(session.deleted) == 1
+        assert session.deleted[0].table.name == "consumption"
+        assert all(
+            "cop_history" not in str(statement) for statement in session.queried + session.deleted
+        )
+
 
 class TestModelResetMethods:
     def test_reset_ml_models_logs_failed_deletion_and_omits_file(self, tmp_path):
-        blocked = tmp_path / "cop_model_blocked.pkl"
+        blocked = tmp_path / "demand_model_blocked.pkl"
         blocked.write_text("x")
         deleted = tmp_path / "demand_model_deleted.pkl"
         deleted.write_text("x")
@@ -140,7 +185,7 @@ class TestModelResetMethods:
             "failed to delete ML model file", file=blocked.name, exc_info=True
         )
 
-    def test_cop_model_reset(self):
+    def test_retired_cop_reset_cannot_activate_a_model(self):
         from packages.ml.cop_model_core import COPModel
 
         m = COPModel()
@@ -149,8 +194,8 @@ class TestModelResetMethods:
         m._metrics = {"r2": 0.9}
         m.reset()
         assert m._model is None
-        assert m._version == "untrained"
-        assert m._metrics == {}
+        assert m.version == "retired"
+        assert m.metrics == {}
         assert m.is_trained is False
 
     def test_demand_model_reset(self):
@@ -189,8 +234,14 @@ class TestModelResetMethods:
         assert m.params.tank_heating_rate == ThermalParams().tank_heating_rate
 
     def test_reset_ml_models_deletes_files(self, tmp_path):
-        cop = tmp_path / "cop_model_1.pkl"
-        cop.write_text("x")
+        archives = {
+            "cop_model_1.pkl": b"legacy COP bytes",
+            "cop_model_weather_dhw_v6_1.pkl": b"unverified DHW COP bytes",
+            "mae_baseline_cop.json": b'{"mae": 0.1}',
+            "mae_baseline_cop_weather_dhw_v6.json": b'{"mae": 0.2}',
+        }
+        for name, content in archives.items():
+            (tmp_path / name).write_bytes(content)
         demand = tmp_path / "demand_model_1.pkl"
         demand.write_text("x")
         comfort = tmp_path / "comfort_model_1.pkl"
@@ -205,15 +256,15 @@ class TestModelResetMethods:
             patch("packages.ml.cop_model_core.MODEL_DIR", tmp_path),
             patch("packages.ml.demand_model_core.MODEL_DIR", tmp_path),
             patch("packages.ml.comfort_model.MODEL_DIR", tmp_path),
+            patch("packages.ml.models.cop_model.reset", side_effect=AssertionError("COP reset")),
         ):
             deleted = admin.reset_ml_models()
 
         assert set(deleted) == {
-            "cop_model_1.pkl",
             "demand_model_1.pkl",
             "comfort_model_1.pkl",
             "thermal_params_v1.pkl",
         }
-        assert not cop.exists()
+        assert {name: (tmp_path / name).read_bytes() for name in archives} == archives
         assert not thermal.exists()
         assert keep.exists()

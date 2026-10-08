@@ -37,7 +37,7 @@ from packages.core.space_heating_gate import (
     project_gate_states,
     resolve_effective_gate,
 )
-from packages.ml.thermal import thermal_model
+from packages.ml.thermal import assumed_heating_efficiency, thermal_model
 from packages.ml.comfort_model import comfort_model
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
 from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
@@ -70,7 +70,7 @@ class MILPOptimizer:
     Minimizes electricity cost over a 24-48h horizon subject to:
     - Tank temperature comfort constraints (tank >= min by deadline hours)
     - Zone temperature bounds
-    - Heat pump COP as a function of outdoor temp (linearized)
+    - Assumed heating efficiency as a function of outdoor temperature
     - Max number of mode changes per day (API rate limit)
 
     Requires `pulp` package.
@@ -89,12 +89,12 @@ class MILPOptimizer:
     def __init__(self, cop_model=None, demand_model=None):
         """
         Args:
-            cop_model: object with .is_trained and .predict_cop(outdoor, tank_target, hour)
+            cop_model: inert legacy compatibility argument
             demand_model: object with .is_trained and .predict_hourly(weather, hours)
         """
         if pulp is None:
             raise ImportError("PuLP is required for MILP optimizer: pip install pulp")
-        self._cop_model = cop_model
+        self._cop_model = None
         self._demand_model = demand_model
 
     async def generate_plan(self) -> dict[str, Any] | None:
@@ -415,36 +415,11 @@ class MILPOptimizer:
         return plan
 
     def _build_cop_function(self, last_status, weather_full: list[dict] | None = None):
-        """Return a callable(outdoor_temp, hour) -> COP."""
-        tank_target = (
-            last_status.tank_target_temp if last_status and last_status.tank_target_temp else 50
+        """Return the assumed planning ratio through the legacy callable interface."""
+        logger.info(
+            "milp_using_assumed_heating_efficiency", cop_source="assumed", cop_measured=False
         )
-        if self._cop_model and self._cop_model.is_trained:
-            logger.info("milp_using_ml_cop_model")
-            weather_by_hour: dict[int, tuple[float, float, float]] = {}
-            for row in weather_full or []:
-                timestamp = row.get("ts")
-                if timestamp is None:
-                    continue
-                precipitation = row.get("precipitation")
-                humidity = row.get("humidity")
-                cloud_cover = row.get("cloud_cover")
-                weather_by_hour[timestamp.hour] = (
-                    max(0.0, float(0.0 if precipitation is None else precipitation)),
-                    max(0.0, min(100.0, float(60.0 if humidity is None else humidity))),
-                    max(0.0, min(1.0, float(0.5 if cloud_cover is None else cloud_cover))),
-                )
-
-            def _ml_cop(outdoor_temp: float, hour: int = 12) -> float:
-                precipitation, humidity, cloud_cover = weather_by_hour.get(hour, (0.0, 60.0, 0.5))
-                return self._cop_model.predict_cop(
-                    outdoor_temp, tank_target, hour, precipitation, humidity, cloud_cover
-                )
-
-            return _ml_cop
-
-        logger.info("milp_using_default_cop_curve")
-        return lambda outdoor_temp, hour=12: self._default_cop_curve(outdoor_temp)
+        return lambda outdoor_temp, hour=12: assumed_heating_efficiency(outdoor_temp)
 
     def _build_demand_estimates(
         self,
@@ -664,10 +639,8 @@ class MILPOptimizer:
 
     @staticmethod
     def _default_cop_curve(outdoor_temp: float) -> float:
-        """Simple linear COP approximation for air-to-water heat pump."""
-        from packages.ml.models import COPModel
-
-        return COPModel._default_cop_curve(outdoor_temp)
+        """Legacy alias for the assumed planning ratio."""
+        return assumed_heating_efficiency(outdoor_temp)
 
     def _solve(
         self,
@@ -977,6 +950,8 @@ class MILPOptimizer:
                             "reason": "milp_optimal",
                             "price": price_vals[h],
                             "cop": cops[h],
+                            "cop_source": "assumed",
+                            "cop_measured": False,
                             "dhw_fraction": round(dhw_frac, 2),
                             "dhw_minutes": dhw_minutes,
                         },
@@ -1235,7 +1210,7 @@ class MILPOptimizer:
             )
 
         version = self.VERSION
-        if self._cop_model and self._cop_model.is_trained:
+        if self._demand_model is not None and self._demand_model.is_trained:
             version += "+ml"
 
         return {
@@ -1244,6 +1219,9 @@ class MILPOptimizer:
             "actions": actions,
             "version": version,
             "engine": "milp",
+            "cop_source": "assumed",
+            "cop_measured": False,
+            "heating_efficiency": {"source": "assumed", "measured": False},
             "cost_estimate": energy_cost,
             "comfort_shortfall": comfort_shortfall,
             "indoor_forecast": indoor_forecast,

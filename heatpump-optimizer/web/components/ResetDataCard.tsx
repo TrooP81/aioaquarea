@@ -18,8 +18,8 @@ const SCOPES: ScopeOption[] = [
   },
   {
     key: "energy",
-    label: "Energy & COP history",
-    description: "Consumption records and computed COP values",
+    label: "Energy history",
+    description: "Consumption records only; retired COP history is retained",
     feedsModels: true,
   },
   {
@@ -92,8 +92,8 @@ export function ResetDataCard() {
     if (selected.size === 0) return;
     const scopes = SCOPES.filter((s) => selected.has(s.key)).map((s) => s.label);
     const message = allSelected
-      ? "Start completely fresh? This permanently deletes ALL collected data and trained models. Settings and your SmartThings connection are kept. This cannot be undone."
-      : `Permanently delete the following? This cannot be undone.\n\n- ${scopes.join("\n- ")}`;
+      ? "Reset all resettable data and affected retained models? COP history, COP artifacts and all model baselines are kept. Manual controller-COP readings and their revision sequence are kept, along with settings and your SmartThings connection. This cannot be undone."
+      : `Permanently delete the following? COP history, COP artifacts and all model baselines are kept. Manual controller-COP readings and their revision sequence are kept. This cannot be undone.\n\n- ${scopes.join("\n- ")}`;
     if (!confirm(message)) return;
 
     setSubmitting(true);
@@ -130,8 +130,10 @@ export function ResetDataCard() {
         Danger Zone — Reset Data
       </h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        Permanently delete collected data so models can train from scratch. Your settings,
-        credentials, and SmartThings connection are always kept. This cannot be undone.
+        Permanently delete selected data and reset affected retained models. COP history,
+        COP artifacts and all model baselines are retained. Manual controller-COP readings
+        and their revision sequence are also retained, along with settings, credentials
+        and your SmartThings connection. This cannot be undone.
       </p>
 
       <label
@@ -146,7 +148,7 @@ export function ResetDataCard() {
         }}
       >
         <input type="checkbox" checked={allSelected} onChange={toggleAll} />
-        Start everything fresh (select all)
+        Select all resettable data
       </label>
 
       <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
@@ -173,7 +175,7 @@ export function ResetDataCard() {
 
       {modelsWillReset && (
         <p style={{ fontSize: "0.75rem", color: "var(--warning, orange)", marginTop: "0.75rem" }}>
-          ⓘ Trained ML models (COP, demand, comfort, thermal) will also be reset, since the data
+          ⓘ Retained models (demand, comfort, thermal) will also be reset, since the data
           they learned from is being cleared.
         </p>
       )}
@@ -189,7 +191,7 @@ export function ResetDataCard() {
         >
           <p style={{ color: "var(--success)", fontSize: "0.85rem" }}>
             Deleted {result.total_rows_deleted} record(s)
-            {result.models_reset ? " and reset trained models." : "."}
+            {result.models_reset ? " and reset retained models." : "."}
           </p>
         </div>
       )}
