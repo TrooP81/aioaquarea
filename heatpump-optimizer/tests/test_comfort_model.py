@@ -13,15 +13,8 @@ import pytest
 
 from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
 from packages.ml.comfort_model import (
-    COMFORT_MODEL_CONSTRAINT_VERSION,
-    COMFORT_MODEL_FORMAT_VERSION,
-    COMFORT_MODEL_KNOT_RANGE,
-    COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
     COMFORT_MODEL_PROJECTION_EPSILON,
-    COMFORT_MODEL_TARGET_KIND,
-    DIRECT_FORECAST_HORIZONS_MINUTES,
     _MONOTONIC_CST,
-    _PASSIVE_MONOTONIC_CST,
     PASSIVE_FEATURE_NAMES,
     CONTROLLED_FEATURE_NAMES,
     ComfortModelCandidate,
@@ -44,6 +37,15 @@ class _AsyncContextManager:
 
     async def __aexit__(self, *args):
         return False
+
+
+def _timestamped_dataset(features, targets):
+    start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    bounds = [
+        (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+        for index in range(len(targets))
+    ]
+    return WindowDataset({60: (features, targets)}, {}, {"device_id": "heatpump"}, {60: bounds})
 
 
 @pytest.mark.parametrize("mode", [None, 0, 1, "1", "2", "3", "heat", "AUTO_COOL", "bad"])
@@ -159,45 +161,45 @@ class TestComfortArtifactRefresh:
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
 
         assert model.refresh_if_changed() is False
-        assert model.artifact_refresh_reason == "artifact_missing"
+        assert model.artifact_refresh_reason == "unqualified_legacy_artifact"
+        assert model.is_trained is False
 
-    def test_AC8_3_bad_newest_artifact_keeps_last_known_good(self, tmp_path, monkeypatch):
+    async def test_AC8_3_bad_committed_artifact_falls_back_without_directory_adoption(
+        self, tmp_path, monkeypatch
+    ):
+        from packages.ml.comfort_model import build_candidate
+        from packages.ml.lifecycle import LifecycleSnapshot
+        from tests.test_ml_lifecycle import qualified_reference
+
         model = ComfortModel()
-        good = MagicMock(n_features_in_=14)
-        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(
-                side_effect=[
-                    {
-                        "model": good,
-                        "format_version": COMFORT_MODEL_FORMAT_VERSION,
-                        "target_kind": COMFORT_MODEL_TARGET_KIND,
-                        "feature_schema": "weather_delta_v7_window_heat_controlled",
-                        "feature_names": list(CONTROLLED_FEATURE_NAMES),
-                        "passive_feature_schema": COMFORT_MODEL_PASSIVE_FEATURE_SCHEMA,
-                        "passive_feature_names": list(PASSIVE_FEATURE_NAMES),
-                        "controlled_constraints": _MONOTONIC_CST,
-                        "passive_constraints": _PASSIVE_MONOTONIC_CST,
-                        "constraint_version": COMFORT_MODEL_CONSTRAINT_VERSION,
-                        "direct_horizons_minutes": DIRECT_FORECAST_HORIZONS_MINUTES,
-                        "knot_range": COMFORT_MODEL_KNOT_RANGE,
-                        "projection_epsilon": COMFORT_MODEL_PROJECTION_EPSILON,
-                    },
-                    ValueError("bad HMAC"),
-                ]
-            ),
+        features, targets, _ = _inverted_dataset()
+        candidate = build_candidate(_timestamped_dataset(features, targets), None)
+        payload = model._candidate_artifact(candidate)
+        reference = qualified_reference("comfort", ("indoor",))
+        authority = AsyncMock()
+        authority.read.return_value = LifecycleSnapshot(
+            "epoch", 7, 8, True, None, None, (reference,)
         )
+        authority.load_committed.return_value = payload
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        legacy_load = MagicMock(side_effect=AssertionError("directory adoption"))
+        monkeypatch.setattr("packages.ml.safe_persistence.safe_load", legacy_load)
         good_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
         bad_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
         good_path.write_bytes(b"good")
 
-        assert model.refresh_if_changed() is True
+        assert await model.arefresh_committed(
+            lifecycle=authority, scope=reference.manifest["scope"]
+        )
+        assert model._model is candidate.model
         bad_path.write_bytes(b"partial")
-
-        assert model.refresh_if_changed() is False
-        assert model._model is good
-        assert model.artifact_refresh_reason == "artifact_integrity_failed"
+        authority.load_committed.side_effect = ValueError("bad HMAC")
+        assert not await model.arefresh_committed(
+            lifecycle=authority, scope=reference.manifest["scope"]
+        )
+        assert model._model is None and model.is_trained is False
+        assert model.artifact_refresh_reason == "lifecycle_unavailable"
+        legacy_load.assert_not_called()
 
 
 class TestPassiveDirectForecastReadiness:
@@ -206,7 +208,7 @@ class TestPassiveDirectForecastReadiness:
         model._model = MagicMock()
         model._passive_direct_models = {60: MagicMock()}
         model._metrics = {
-            "passive_horizons": {"60": {"status": "trained", "mae": 0.6}},
+            "passive_horizons": {"60": {"status": "trained", "mae": 0.6, "persistence_mae": 0.8}},
             # No active heating evidence: full heating control remains blocked.
             "active_heating_rows": 0,
             "active_input_buckets": 4,
@@ -230,6 +232,25 @@ class TestPassiveDirectForecastReadiness:
         assert readiness["ready"] is False
         assert readiness["reason"] == "direct_forecast_mae_above_threshold"
 
+    def test_direct_passive_forecast_must_beat_persistence(self):
+        model = ComfortModel()
+        model._model = MagicMock()
+        model._passive_direct_models = {60: MagicMock()}
+        model._metrics = {
+            "passive_horizons": {
+                "60": {"status": "trained", "mae": 0.178, "persistence_mae": 0.126}
+            }
+        }
+
+        readiness = model.passive_forecast_readiness(60)
+        assert readiness["ready"] is False
+        assert readiness["reason"] == "direct_forecast_not_better_than_persistence"
+
+        model._metrics["passive_horizons"]["60"].pop("persistence_mae")
+        assert model.passive_forecast_readiness(60)["reason"] == (
+            "direct_forecast_not_compared_to_persistence"
+        )
+
 
 class TestComfortControlReadiness:
     def test_requires_active_heating_evidence_and_baseline_improvement(self):
@@ -252,9 +273,13 @@ class TestComfortControlReadiness:
         assert model.control_readiness["reason"] == "not_better_than_persistence_baseline"
 
         model._metrics["baseline_mae"] = 0.4
-        assert model.is_ready_for_control is True
+        assert model.is_ready_for_control is False
+        assert model.control_readiness["reason"] == "observe_only"
 
-    def test_control_margin_is_bounded_by_validated_mae(self):
+        model._metrics.pop("baseline_mae")
+        assert model.control_readiness["reason"] == "persistence_baseline_missing"
+
+    def test_validated_reporting_metrics_never_grant_control_margin(self):
         model = ComfortModel()
         model._model = object()
         model._metrics = {
@@ -267,8 +292,8 @@ class TestComfortControlReadiness:
             "baseline_mae": 0.8,
         }
 
-        assert model.is_ready_for_control is True
-        assert model.control_margin_c == 0.45
+        assert model.is_ready_for_control is False
+        assert model.control_margin_c == 0.0
 
     def test_AC9_3_requires_heat_input_variance(self):
         model = ComfortModel()
@@ -288,7 +313,8 @@ class TestComfortControlReadiness:
         model._metrics["active_input_range_c"] = 2.9
         assert model.control_readiness["reason"] == "insufficient_heat_input_variance"
         model._metrics["active_input_range_c"] = 3.0
-        assert model.is_ready_for_control is True
+        assert model.is_ready_for_control is False
+        assert model.control_readiness["reason"] == "observe_only"
 
 
 class TestComfortModelFeatures:
@@ -545,6 +571,48 @@ class TestComfortModelFeatures:
         build_candidate_bundle(dataset)
         assert model.is_trained is False
 
+    def test_published_fit_is_evaluated_fit(self):
+        import pickle
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        features = np.zeros((500, 14))
+        features[:, 1] = np.tile([5.0, 6.0, 8.0, 9.0, 10.0], 100)
+        features[:, 2] = 1.0
+        features[:, 12] = 21.0
+        targets = features[:, 1] * 0.05
+        bounds = [
+            (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+            for index in range(len(targets))
+        ]
+        dataset = WindowDataset({60: (features, targets)}, {}, {}, {60: bounds})
+        bundle = build_candidate_bundle(dataset)
+        evaluated = bundle["evaluation"]["controlled:60"]
+        restored = pickle.loads(pickle.dumps(bundle["controlled_models"][60]))
+        np.testing.assert_array_equal(
+            restored.predict(evaluated["features"]), evaluated["predictions"]
+        )
+        fit_end = dt.datetime.fromisoformat(evaluated["fit_label_end"])
+        holdout_start = dt.datetime.fromisoformat(evaluated["holdout_issue_start"])
+        assert fit_end + dt.timedelta(hours=12) <= holdout_start
+        assert bundle["metrics"]["direct_horizons"]["60"]["fit_samples"] >= 100
+
+    def test_sensor_and_counter_evidence_are_device_scoped(self):
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        dataset = build_window_dataset(
+            [
+                _IndoorObservation(start, 20.0),
+                _IndoorObservation(start + dt.timedelta(hours=1), 20.5),
+            ],
+            [
+                SimpleNamespace(ts=start, device_id="one"),
+                SimpleNamespace(ts=start, device_id="two"),
+            ],
+            [],
+            (60,),
+        )
+        assert len(dataset.controlled[60][1]) == 0
+        assert dataset.evidence["blocker"] == "device_scope_unavailable"
+
     def test_passive_model_never_trains_keeps_physics_fallback_indefinitely(self):
         dataset = build_window_dataset([], [], [], (60, 180, 360, 720))
         bundle = build_candidate_bundle(dataset)
@@ -761,7 +829,7 @@ class TestComfortModelTraining:
         assert model._model is active
 
     @pytest.mark.asyncio
-    async def test_commit_failure_keeps_candidate_and_marks_recovered(self, tmp_path, monkeypatch):
+    async def test_commit_failure_never_installs_candidate(self, tmp_path, monkeypatch):
         lease = _TrainingLease(commit_error=RuntimeError("commit"))
         model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
         model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
@@ -775,8 +843,8 @@ class TestComfortModelTraining:
 
         result = await model.train()
 
-        assert result["training_notice"] == "training_lock_finalize_recovered"
-        assert model._model.name == "new"
+        assert result["reason"] == "training_lock_finalize_failed"
+        assert model._model is None and model.is_trained is False
         assert lease.invalidated is True
 
     @pytest.mark.asyncio
@@ -944,23 +1012,39 @@ class TestComfortModelTraining:
         assert model.is_trained is False
 
     @pytest.mark.asyncio
-    async def test_retraining_never_replaces_a_worse_checkpoint(self, monkeypatch):
+    async def test_retraining_never_replaces_a_less_skilful_checkpoint(self):
         model = ComfortModel()
         previous_checkpoint = object()
         model._model = previous_checkpoint
-        X = np.tile(np.arange(14, dtype=float), (MIN_TRAINING_ROWS, 1))
-        y = np.linspace(20.0, 30.0, MIN_TRAINING_ROWS)
-
-        async def mock_build(*args, **kwargs):
-            return X, y, len(X)
-
-        model._build_dataset = mock_build
-        monkeypatch.setattr("packages.ml.comfort_model.read_mae_baseline", lambda name: 0.0)
+        model._metrics = {"skill_vs_persistence": 0.99}
+        X, y, _ = _inverted_dataset()
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
 
         result = await model.train(thermal_lag_minutes=60)
 
         assert result["status"] == "regressed"
+        assert result["prior_skill_vs_persistence"] == 0.99
         assert model._model is previous_checkpoint
+
+    def test_candidate_records_persistence_baseline_and_skill(self):
+        from packages.ml.comfort_model import build_candidate
+
+        rng = np.random.default_rng(3)
+        features = rng.normal(size=(200, len(CONTROLLED_FEATURE_NAMES)))
+        features[:, 2] = 1.0
+        targets = rng.normal(0.0, 0.2, size=200)
+        dataset = _timestamped_dataset(features, targets)
+
+        candidate = build_candidate(dataset, None)
+
+        horizon = candidate.metrics["direct_horizons"]["60"]
+        assert horizon["persistence_mae"] == pytest.approx(
+            float(np.mean(np.abs(targets[160:]))), abs=1e-3
+        )
+        assert candidate.metrics["baseline_mae"] == horizon["persistence_mae"]
+        assert candidate.metrics["skill_vs_persistence"] == pytest.approx(
+            1.0 - horizon["mae"] / horizon["persistence_mae"], abs=1e-3
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1077,7 +1161,7 @@ def _inverted_dataset(n=300, seed=0):
         ]
     )
     # Inverted relationship: higher water temp -> lower indoor temp.
-    y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n)
+    y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n) - prev_indoor
     return X, y, n
 
 
@@ -1089,10 +1173,7 @@ class TestComfortModelMonotonicity:
         X, y, n = _inverted_dataset()
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
 
         result = await model.train(thermal_lag_minutes=30)
@@ -1112,10 +1193,7 @@ class TestComfortModelMonotonicity:
         X, y, n = _inverted_dataset(seed=1)
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
         await model.train(thermal_lag_minutes=30)
 
@@ -1129,11 +1207,11 @@ class TestComfortModelMonotonicity:
         X, y, n = _inverted_dataset(seed=2)
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
         result = await model.train(thermal_lag_minutes=30)
         assert result["validated"] is True
         assert "mae" in result and "r2" in result
+        assert result["direct_horizons"]["60"]["fit_samples"] >= 100
+        assert result["direct_horizons"]["60"]["embargo_hours"] == 12
+        assert model.is_ready_for_control is False

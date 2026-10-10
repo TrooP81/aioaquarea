@@ -73,7 +73,36 @@ def _v7_artifact(model):
         "direct_horizons_minutes": DIRECT_FORECAST_HORIZONS_MINUTES,
         "knot_range": COMFORT_MODEL_KNOT_RANGE,
         "projection_epsilon": COMFORT_MODEL_PROJECTION_EPSILON,
+        "direct_models": {60: model},
+        "passive_direct_models": {},
+        "metrics": {"mae": 0.1, "validated": True},
+        "samples": 100,
+        "trained_at": dt.datetime.now(dt.timezone.utc),
+        "thermal_lag": 60,
+        "evaluation": {
+            "controlled:60": {"features": np.zeros((1, 14)), "predictions": np.asarray([0.1])}
+        },
     }
+
+
+def _committed_comfort(monkeypatch):
+    from packages.ml.lifecycle import LifecycleSnapshot
+    from tests.test_forecast_quality import TestProspectiveNativeEvidence
+    from tests.test_ml_lifecycle import qualified_reference
+
+    fitted = MagicMock(n_features_in_=14)
+    fitted.predict.return_value = np.asarray([0.1])
+    reference = qualified_reference("comfort", ("indoor",))
+    authority = AsyncMock()
+    authority.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
+    authority.load_committed.return_value = _v7_artifact(fitted)
+    inputs = TestProspectiveNativeEvidence._inputs()
+    inputs["schemas"]["artifact"] = "comfort_v8"
+    monkeypatch.setattr("packages.ml.lifecycle.Lifecycle", lambda: authority)
+    monkeypatch.setattr(
+        "packages.ml.forecast_quality.materialize_native_inputs", AsyncMock(return_value=inputs)
+    )
+    return authority, reference, fitted
 
 
 class TestAC8ArtifactLifecycle:
@@ -107,9 +136,14 @@ class TestAC8ArtifactLifecycle:
             await models_router.predict_indoor_temp(water_temp=35.0, outdoor_temp=5.0)
             with (
                 patch(
-                    "packages.core.settings_service.get_setting",
-                    new=AsyncMock(return_value="60"),
-                ),
+                    "packages.api.routers.models_router.enqueue_maintenance_request",
+                    new=AsyncMock(
+                        side_effect=lambda *_args: (
+                            events.append("enqueue")
+                            or {"request_id": "fixture", "status": "queued"}
+                        )
+                    ),
+                ) as enqueue,
                 patch(
                     "packages.api.routers.models_router.get_session",
                     return_value=_context(MagicMock(add=MagicMock())),
@@ -117,34 +151,40 @@ class TestAC8ArtifactLifecycle:
             ):
                 await models_router.trigger_comfort_model_training()
 
-        assert events == ["refresh", "refresh", "predict", "required", "refresh", "train"]
-        assert model.arefresh_if_changed.await_count == 3
+        assert events == ["refresh", "refresh", "predict", "required", "enqueue"]
+        assert model.arefresh_if_changed.await_count == 2
+        model.train.assert_not_awaited()
+        enqueue.assert_awaited_once_with("comfort", "api")
 
-    def test_AC8_2_fingerprint_change_loads_newest_and_ignores_old_prefix(
+    async def test_AC8_2_only_committed_identity_loads_and_directory_changes_are_ignored(
         self, tmp_path, monkeypatch
     ):
         model = ComfortModel()
-        candidate = MagicMock(n_features_in_=14)
+        authority, reference, fitted = _committed_comfort(monkeypatch)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(return_value=_v7_artifact(candidate)),
-        )
+        legacy_load = MagicMock(side_effect=AssertionError("directory adoption"))
+        monkeypatch.setattr("packages.ml.safe_persistence.safe_load", legacy_load)
         first = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
         second = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
         first.write_bytes(b"valid")
 
-        assert model.refresh_if_changed() is True
-        assert model.refresh_if_changed() is False
+        assert await model.arefresh_if_changed() is True
+        assert model._qualified_reference.artifact_hash == reference.artifact_hash
         second.write_bytes(b"new")
-        assert model.refresh_if_changed() is True
-        assert model._artifact_fingerprint[0] == second
+        assert await model.arefresh_if_changed() is True
+        assert model._model is fitted
+        assert model._qualified_reference.artifact_hash == reference.artifact_hash
+        authority.load_committed.assert_awaited_with(
+            "comfort", expected_hash=reference.artifact_hash
+        )
 
         legacy = tmp_path / "comfort_model_old_schema.pkl"
         legacy.write_bytes(b"legacy")
         empty_model = ComfortModel()
         empty_model.refresh_if_changed()
-        assert empty_model.artifact_refresh_reason is None
+        assert empty_model.artifact_refresh_reason == "unqualified_legacy_artifact"
+        assert empty_model.is_trained is False
+        legacy_load.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_AC8_2_optimizer_and_poller_refresh_call_sites(self):
@@ -186,26 +226,30 @@ class TestAC8ArtifactLifecycle:
                 new=AsyncMock(side_effect=lambda: events.append("quality") or quality),
             ),
             patch("packages.ml.comfort_model.comfort_model", poller_model),
+            patch(
+                "packages.ml.lifecycle.enqueue_maintenance_request",
+                new=AsyncMock(return_value={"status": "queued"}),
+            ) as enqueue,
         ):
             await poller_main.retrain_comfort_model()
-        assert events == ["refresh", "quality"]
-        poller_model.arefresh_if_changed.assert_awaited_once_with()
+        assert events == []
+        enqueue.assert_awaited_once_with("comfort", "poller_request", automatic=True)
+        poller_model.arefresh_if_changed.assert_not_awaited()
         poller_model.train.assert_not_awaited()
 
-    def test_AC8_3_torn_newest_artifact_keeps_last_known_good(self, tmp_path, monkeypatch):
+    async def test_AC8_3_torn_uncommitted_file_does_not_replace_qualified_incumbent(
+        self, tmp_path, monkeypatch
+    ):
         model = ComfortModel()
-        good = MagicMock(n_features_in_=14)
+        _, reference, good = _committed_comfort(monkeypatch)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[_v7_artifact(good), ValueError("partial HMAC")]),
-        )
         (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(b"good")
-        assert model.refresh_if_changed() is True
+        assert await model.arefresh_if_changed() is True
         (tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl").write_bytes(b"partial")
-        assert model.refresh_if_changed() is False
+        assert await model.arefresh_if_changed() is True
         assert model._model is good
-        assert model.artifact_refresh_reason == "artifact_integrity_failed"
+        assert model.artifact_refresh_reason is None
+        assert model._qualified_reference.artifact_hash == reference.artifact_hash
 
     @pytest.mark.parametrize(
         "exception_type",
@@ -218,52 +262,44 @@ class TestAC8ArtifactLifecycle:
             IndexError,
         ],
     )
-    def test_AC8_3_valid_signed_load_failures_keep_last_known_good_and_log_safe_fields(
+    async def test_AC8_3_committed_load_failures_fall_back_and_log_safe_fields(
         self, tmp_path, monkeypatch, exception_type
     ):
         model = ComfortModel()
-        good = MagicMock(n_features_in_=14)
+        authority, _, good = _committed_comfort(monkeypatch)
         sentinel = "AC8_3_EXCEPTION_MESSAGE_SENTINEL"
         load_error = exception_type(sentinel)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[_v7_artifact(good), load_error]),
-        )
+        authority.load_committed.side_effect = [_v7_artifact(good), load_error]
         good_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
         bad_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
         good_path.write_bytes(b"valid-signed-artifact")
-        assert model.refresh_if_changed() is True
+        assert await model.arefresh_if_changed() is True
         bad_path.write_bytes(b"valid-signed-artifact")
 
         with capture_logs() as logs:
-            assert model.refresh_if_changed() is False
-        assert model._model is good
-        assert model.artifact_refresh_reason == "artifact_integrity_failed"
+            assert await model.arefresh_if_changed() is False
+        assert model._model is None and model.is_trained is False
+        assert model.artifact_refresh_reason == "lifecycle_unavailable"
         assert len(logs) == 1
         log = logs[0]
-        assert log["artifact"] == bad_path.name
-        assert log["exception_type"] == exception_type.__name__
+        assert log["event"] == "comfort_committed_unavailable"
+        assert log["error_type"] == exception_type.__name__
         rendered_log = repr(log)
         assert str(tmp_path) not in rendered_log
         assert sentinel not in rendered_log
 
     @pytest.mark.asyncio
-    async def test_AC8_3_async_refresh_keeps_last_known_good_after_load_failure(
+    async def test_AC8_3_async_refresh_falls_back_after_committed_load_failure(
         self, tmp_path, monkeypatch
     ):
         model = ComfortModel()
-        good = MagicMock(n_features_in_=14)
+        authority, _, good = _committed_comfort(monkeypatch)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(
-                side_effect=[
-                    _v7_artifact(good),
-                    ModuleNotFoundError("AC8_3_ASYNC_EXCEPTION_MESSAGE_SENTINEL"),
-                ]
-            ),
-        )
+        authority.load_committed.side_effect = [
+            _v7_artifact(good),
+            ModuleNotFoundError("AC8_3_ASYNC_EXCEPTION_MESSAGE_SENTINEL"),
+        ]
         (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(
             b"valid-signed-artifact"
         )
@@ -273,24 +309,24 @@ class TestAC8ArtifactLifecycle:
         )
 
         assert await model.arefresh_if_changed() is False
-        assert model._model is good
-        assert model.artifact_refresh_reason == "artifact_integrity_failed"
+        assert model._model is None and model.is_trained is False
+        assert model.artifact_refresh_reason == "lifecycle_unavailable"
 
     @pytest.mark.asyncio
     async def test_AC8_3_status_returns_200_after_unpickle_integrity_failure(
         self, tmp_path, monkeypatch
     ):
         model = ComfortModel()
-        good = MagicMock(n_features_in_=14)
+        authority, _, good = _committed_comfort(monkeypatch)
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
-        monkeypatch.setattr(
-            "packages.ml.safe_persistence.safe_load",
-            MagicMock(side_effect=[_v7_artifact(good), pickle.UnpicklingError("corrupt")]),
-        )
+        authority.load_committed.side_effect = [
+            _v7_artifact(good),
+            pickle.UnpicklingError("corrupt"),
+        ]
         (tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl").write_bytes(
             b"valid-signed-artifact"
         )
-        assert model.refresh_if_changed() is True
+        assert await model.arefresh_if_changed() is True
         (tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl").write_bytes(
             b"valid-signed-artifact"
         )
@@ -304,8 +340,9 @@ class TestAC8ArtifactLifecycle:
                 response = await client.get("/api/comfort-model/status")
 
         assert response.status_code == 200
-        assert response.json()["artifact_refresh_reason"] == "artifact_integrity_failed"
-        assert model._model is good
+        assert response.json()["artifact_refresh_reason"] == "lifecycle_unavailable"
+        assert response.json()["trained"] is False
+        assert model._model is None
 
     def test_AC8_4_two_saves_in_one_second_have_distinct_artifact_names(
         self, tmp_path, monkeypatch
@@ -388,7 +425,15 @@ class TestAC9ComfortEvidence:
             "active_input_range_c": spread,
             "baseline_mae": 0.5,
         }
-        assert model.is_ready_for_control is ready
+        assert model.is_ready_for_control is False
+        expected_reason = (
+            "observe_only"
+            if ready
+            else "insufficient_active_heating_evidence"
+            if active_rows < 20
+            else "insufficient_heat_input_variance"
+        )
+        assert model.control_readiness["reason"] == expected_reason
 
     def test_AC9_3_variance_gated_model_uses_untrained_planner_fallback(self):
         base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
@@ -610,7 +655,8 @@ class TestAC9ComfortEvidence:
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
         (tmp_path / "comfort_model_old_schema.pkl").write_bytes(b"legacy")
         assert model.refresh_if_changed() is False
-        assert model.artifact_refresh_reason == "artifact_missing"
+        assert model.artifact_refresh_reason == "unqualified_legacy_artifact"
+        assert model.is_trained is False
 
 
 class TestAC10FreshnessSafety:
@@ -813,9 +859,14 @@ class TestAC10FreshnessSafety:
                 new=AsyncMock(return_value={"ready": False, "reasons": ["credentials_missing"]}),
             ),
             patch("packages.ml.comfort_model.comfort_model", model),
+            patch(
+                "packages.ml.lifecycle.enqueue_maintenance_request",
+                new=AsyncMock(return_value={"status": "queued"}),
+            ) as enqueue,
         ):
             await poller_main.retrain_comfort_model()
         model.train.assert_not_awaited()
+        enqueue.assert_awaited_once_with("comfort", "poller_request", automatic=True)
 
     @pytest.mark.asyncio
     async def test_AC10_2_periodic_training_skips_when_quality_check_fails(self):
@@ -830,18 +881,24 @@ class TestAC10FreshnessSafety:
                 new=AsyncMock(side_effect=RuntimeError("database unavailable")),
             ),
             patch("packages.ml.comfort_model.comfort_model", model),
+            patch(
+                "packages.ml.lifecycle.enqueue_maintenance_request",
+                new=AsyncMock(return_value={"status": "queued"}),
+            ) as enqueue,
         ):
             await poller_main.retrain_comfort_model()
         model.train.assert_not_awaited()
+        enqueue.assert_awaited_once_with("comfort", "poller_request", automatic=True)
 
     def test_AC10_2_initial_training_is_after_device_quality_gate(self):
         import importlib
 
         source = inspect.getsource(importlib.import_module("packages.optimizer.main").main)
         assert source.index("device_quality = await get_device_data_quality()") < source.index(
-            "comfort_model.train()"
+            "await enqueue_maintenance_request("
         )
         assert 'if not device_quality["ready"]' in source
+        assert "comfort_model.train(" not in source
 
     @pytest.mark.asyncio
     async def test_AC10_3_freshness_blocked_action_returns_pending_without_rescheduling(self):
@@ -865,7 +922,7 @@ class TestAC10FreshnessSafety:
         assert "scheduled_ts" not in values
 
     @pytest.mark.asyncio
-    async def test_AC10_2_quality_check_failure_defers_action_without_device_write(self):
+    async def test_AC10_2_ordinary_guard_precedes_quality_check_without_device_write(self):
         action = SimpleNamespace(
             id=1,
             action_type=str(ActionType.SET_TANK_TEMP),
@@ -883,13 +940,14 @@ class TestAC10FreshnessSafety:
             device_quality_check=AsyncMock(side_effect=RuntimeError("database unavailable")),
         )
         with patch("packages.optimizer.executor_core.get_action_handler") as get_handler:
-            await executor._execute_action(action)
+            with pytest.raises(PermissionError, match="observe-only build"):
+                await executor._execute_action(action)
 
         get_handler.assert_not_called()
-        statement = session.execute.await_args.args[0]
-        values = {key.key: value.value for key, value in statement._values.items()}
-        assert values["status"] == "pending"
-        assert json.loads(values["result_json"])["reason"] == "quality_check_failed"
+        session.execute.assert_not_awaited()
+        executor._device_quality_check.assert_not_awaited()
+        wrapper.get_selected_device_id.assert_not_awaited()
+        wrapper.set_tank_temperature.assert_not_awaited()
 
     def test_P2_AC13_degraded_expiry_preserves_only_linked_restores(self):
         from packages.core.safety_reverts import is_restorative_action
@@ -1030,7 +1088,7 @@ class TestAC10FreshnessSafety:
                 "get_device_data_quality",
                 new=AsyncMock(return_value={"ready": False, "reasons": ["device_status_stale"]}),
             ),
-            patch.object(optimizer_main, "activate_plan") as activate_plan,
+            patch("packages.core.plan_lifecycle.activate_plan") as activate_plan,
         ):
             assert await optimizer_main.run_optimization() is None
         activate_plan.assert_not_called()

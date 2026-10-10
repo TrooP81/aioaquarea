@@ -1,4 +1,4 @@
-import { test, expect, manualCOPObservation, manualCOPResponse, retiredCopModel, type Page } from "./fixtures";
+import { test, expect, controlState, manualCOPObservation, manualCOPResponse, retiredCopModel, type Page } from "./fixtures";
 
 const jsonResponse = (body: unknown) => ({
   status: 200,
@@ -54,7 +54,7 @@ const mockOptimizerStatus = {
 async function mockDashboardRequests(page: Page) {
   const routes: Array<[string | RegExp, unknown]> = [
     ["**/api/dashboard", mockDashboard],
-    ["**/api/control-state", { state: "automatic", headline: "Scheduled control remains active", detail: "Automatic dispatch remains active.", reason_code: "automatic", since: null, until: null, override_id: null, active_override_count: 0, primary_action: null, notices: [], resolved_at: new Date().toISOString() }],
+    ["**/api/control-state", controlState],
     ["**/api/indoor-temp/latest", mockIndoorTemp],
     ["**/api/learning-mode", { enabled: false, since: null, days_elapsed: null }],
     ["**/api/optimizer/status", mockOptimizerStatus],
@@ -328,7 +328,9 @@ test.describe("Responsive Layout", () => {
     await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(0);
     await expect(page.locator('[aria-label^="Demand heating model"]')).toHaveCount(1);
     await expect(page.locator('[aria-label^="Thermal heat-up model"]')).toHaveCount(1);
-    await expect(page.locator(".ml-status-label")).toContainText("0/2 learning models ready");
+    await expect(page.locator('[aria-label^="Comfort forecast model"]')).toHaveCount(1);
+    await expect(page.locator('[aria-label^="Demand heating model"]')).toHaveAttribute("aria-label", /reporting only/);
+    await expect(page.locator(".ml-status-label")).toContainText("0/3 qualified for reporting");
   });
 
   test("skip link moves focus to the main content target", async ({ page }) => {

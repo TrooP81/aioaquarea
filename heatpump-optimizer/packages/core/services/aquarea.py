@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from contextvars import ContextVar
 import datetime as dt
 import hashlib
+import json
 import logging
 import math
 import time
@@ -25,6 +27,7 @@ from aioaquarea import (
     DataNotAvailableError,
     DeviceUnavailableError,
     DeviceInfo,
+    ForceDHW,
     ForceHeater,
     HolidayTimer,
     PowerfulTime,
@@ -177,6 +180,9 @@ class AquareaWrapper:
 
     def __init__(self, *, read_only: bool = False) -> None:
         self._read_only = read_only
+        self.__restore_command: ContextVar[tuple | None] = ContextVar(
+            "aquarea_restore_command", default=None
+        )
         self._client: Client | None = None
         self._session: aiohttp.ClientSession | None = None
         self._redis: redis.Redis | None = None
@@ -201,6 +207,7 @@ class AquareaWrapper:
         self._account_key: str | None = None
         self._weekly_timer = None
         self._weekly_timer_fetched_at: float | None = None
+        self._weekly_timer_fetched_wall_at: dt.datetime | None = None
         self._quota_reliable = True
         self._quota_starvation = {ReadQuotaContext.EXECUTOR_VERIFICATION: _QuotaStarvationState()}
 
@@ -228,13 +235,51 @@ class AquareaWrapper:
 
     @contextmanager
     def safety_write(self):
-        """Allow exactly one safety dispatch to consume reserved write capacity."""
+        """Select reserved quota without granting mutation permission."""
 
         token = safety_write_context.set(True)
         try:
             yield
         finally:
             safety_write_context.reset(token)
+
+    async def _dispatch_linked_restore(self, action, source) -> dict:
+        """Dispatch only the exact command of a validated, claimed linked restore."""
+        from ..safety_reverts import (
+            normalize_zone_id,
+            validate_action_pair,
+            validate_restore_baseline,
+        )
+        from packages.optimizer.actions import ActionType, get_action_handler
+
+        if (
+            action.reverts_action_id is None
+            or source is None
+            or source.id != action.reverts_action_id
+            or action.status != "executing"
+            or action.safety_claimed_at is None
+        ):
+            raise PermissionError("Only claimed, existing linked restores may dispatch")
+        validate_action_pair(source, action)
+        payload = json.loads(action.payload_json) if action.payload_json else {}
+        action_type = ActionType(action.action_type)
+        if action_type is ActionType.FORCE_DHW_OFF:
+            command, values = "force_dhw", (ForceDHW.OFF,)
+        else:
+            baseline = validate_restore_baseline(source, action)
+            command, values = (
+                "set_zone_heat_temperature",
+                (
+                    normalize_zone_id(payload.get("zone_id")),
+                    baseline,
+                ),
+            )
+        token = self.__restore_command.set((asyncio.current_task(), command, values))
+        try:
+            with self.safety_write():
+                return await get_action_handler(action_type).dispatch(self, payload) or {}
+        finally:
+            self.__restore_command.reset(token)
 
     async def _ensure_authenticated(self) -> None:
         """Log in with the credentials saved in Settings unless already authenticated."""
@@ -560,8 +605,8 @@ class AquareaWrapper:
         self._record_live_status(device)
         return device
 
-    async def get_active_weekly_timer_slots(self, at: dt.datetime | None = None) -> tuple:
-        """Read and cache active Panasonic timer slots; failures never block control."""
+    async def get_active_weekly_timer_slots(self, at: dt.datetime | None = None) -> tuple | None:
+        """Cache one timer read per hour; None means unknown, not an empty program."""
         now_monotonic = time.monotonic()
         stale = (
             self._weekly_timer_fetched_at is None
@@ -579,11 +624,40 @@ class AquareaWrapper:
                 logger.warning("Panasonic weekly timer read failed; continuing control: %s", exc)
                 self._weekly_timer = None
             self._weekly_timer_fetched_at = now_monotonic
+            self._weekly_timer_fetched_wall_at = dt.datetime.now(dt.timezone.utc)
 
         if self._weekly_timer is None:
-            return ()
+            return None
         instant = at or dt.datetime.now(dt.timezone.utc)
         return self._weekly_timer.active_slots(instant, self._timezone)
+
+    def cached_native_timer_provenance(self) -> dict:
+        timer = self._weekly_timer
+        if (
+            timer is None
+            or not isinstance(getattr(timer, "enabled", None), bool)
+            or self._weekly_timer_fetched_at is None
+            or time.monotonic() - self._weekly_timer_fetched_at >= _WEEKLY_TIMER_CACHE_SECONDS
+        ):
+            return {"status": "unknown"}
+        return {
+            "status": "known",
+            "enabled": timer.enabled,
+            "fetched_at": self._weekly_timer_fetched_wall_at.isoformat(),
+            "timezone": str(self._timezone),
+            "slots": [
+                {
+                    "day": slot.day.value,
+                    "zone_id": slot.zone_id,
+                    "start": slot.start.isoformat(),
+                    "end": slot.end.isoformat(),
+                    "heat_set": slot.heat_set,
+                    "cool_set": slot.cool_set,
+                    "enabled": slot.enabled,
+                }
+                for slot in timer.slots
+            ],
+        }
 
     async def refresh_consumption(self, at: dt.datetime) -> ConsumptionSnapshot:
         if not self._distributed_quota_enabled():
@@ -774,10 +848,20 @@ class AquareaWrapper:
             device = await self.refresh_device()
         return device
 
-    def _require_write_permission(self) -> None:
+    def _require_write_permission(self, command: str | None = None, values: tuple = ()) -> None:
         if self._read_only:
             raise PermissionError(
                 "AquareaWrapper is read-only; mutating commands are not permitted"
+            )
+        permit = self.__restore_command.get()
+        if (
+            permit is None
+            or permit[0] is not asyncio.current_task()
+            or (command is not None and permit[1:] != (command, values))
+        ):
+            raise PermissionError(
+                "Ordinary writes are prohibited in this observe-only build; "
+                "optimization requires a new reviewed, approved build"
             )
 
     async def _prepare_write(self):
@@ -793,13 +877,13 @@ class AquareaWrapper:
             raise PanasonicCachedStatusError()
 
     async def set_mode(self, mode) -> None:
-        self._require_write_permission()
+        self._require_write_permission("set_mode", (mode,))
         device = await self._prepare_write()
         await device.set_mode(mode)
         logger.info("Set mode to %s", mode)
 
     async def set_tank_temperature(self, temperature: int) -> None:
-        self._require_write_permission()
+        self._require_write_permission("set_tank_temperature", (temperature,))
         device = await self._get_writable_device()
         tank = self._validate_tank_temperature(device, temperature)
         if tank.target_temperature == temperature:
@@ -840,7 +924,7 @@ class AquareaWrapper:
         return tank
 
     async def set_quiet_mode(self, mode):
-        self._require_write_permission()
+        self._require_write_permission("set_quiet_mode", (mode,))
         command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
@@ -859,7 +943,7 @@ class AquareaWrapper:
         return result if command_result_type and isinstance(result, command_result_type) else True
 
     async def force_dhw(self, state):
-        self._require_write_permission()
+        self._require_write_permission("force_dhw", (state,))
         command_result_type = _panasonic_command_result_type()
 
         device = await self._get_writable_device()
@@ -879,35 +963,35 @@ class AquareaWrapper:
 
     async def set_powerful_time(self, duration: PowerfulTime) -> None:
         """Set Panasonic's bounded 30/60/90 minute powerful mode."""
-        self._require_write_permission()
+        self._require_write_permission("set_powerful_time", (duration,))
         device = await self._prepare_write()
         await device.set_powerful_time(duration)
         logger.info("Set powerful mode to %s", duration)
 
     async def set_force_heater(self, state: ForceHeater) -> None:
         """Enable or disable Panasonic's auxiliary-heater override."""
-        self._require_write_permission()
+        self._require_write_permission("set_force_heater", (state,))
         device = await self._prepare_write()
         await device.set_force_heater(state)
         logger.info("Set force heater to %s", state)
 
     async def set_holiday_timer(self, state: HolidayTimer) -> None:
         """Enable or disable the Panasonic holiday timer."""
-        self._require_write_permission()
+        self._require_write_permission("set_holiday_timer", (state,))
         device = await self._prepare_write()
         await device.set_holiday_timer(state)
         logger.info("Set holiday timer to %s", state)
 
     async def request_defrost(self) -> None:
         """Request defrost; the device entity suppresses an already-active request."""
-        self._require_write_permission()
+        self._require_write_permission("request_defrost")
         device = await self._prepare_write()
         await device.request_defrost()
         logger.info("Requested defrost")
 
     async def set_zone_heat_temperature(self, zone_id: int, temperature: int) -> None:
-        self._require_write_permission()
         resolved_zone_id = zone_id or 1
+        self._require_write_permission("set_zone_heat_temperature", (resolved_zone_id, temperature))
         device = await self._get_writable_device()
         zone = self._validate_zone_heat_temperature(device, resolved_zone_id, temperature)
         if zone.heat_target_temperature == temperature:
@@ -962,7 +1046,7 @@ class AquareaWrapper:
         return zone
 
     async def set_special_status(self, status: str) -> None:
-        self._require_write_permission()
+        self._require_write_permission("set_special_status", (status,))
         from aioaquarea.data import SpecialStatus
 
         modes = {"ECO": SpecialStatus.ECO, "COMFORT": SpecialStatus.COMFORT}
@@ -987,7 +1071,7 @@ class AquareaWrapper:
         logger.info("Set special status to %s", status)
 
     async def clear_special_status(self) -> None:
-        self._require_write_permission()
+        self._require_write_permission("clear_special_status")
         device = await self._get_writable_device()
         self._validate_special_status_support(device)
         if device.special_status is None:

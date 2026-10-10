@@ -1,3 +1,5 @@
+import type { ModelReportingState } from "./api-types";
+
 /**
  * Shared UI constants and formatting helpers for the Heat Pump Optimizer dashboard.
  *
@@ -57,6 +59,14 @@ export const LAYER_LABELS: Record<string, string> = {
   rules_only: "Rules",
   milp_preferred: "Optimized",
   auto: "Automatic",
+};
+
+export const MODEL_REPORTING_LABELS: Record<ModelReportingState, string> = {
+  unqualified: "Unqualified",
+  candidate: "Candidate",
+  "qualified-for-reporting": "Qualified for reporting",
+  expired: "Expired",
+  unavailable: "Unavailable",
 };
 
 export const LAYER_TOOLTIPS: Record<string, string> = {
@@ -161,6 +171,16 @@ export function reasonLabel(code: string | null | undefined): string {
     automatic: "Automatic scheduling",
     active_override: "Active pause",
     learning_mode_active: "Learning mode",
+    observe_only_build: "Ordinary writes prohibited in this build",
+    ready_for_control: "Legacy readiness; reporting only",
+    ready_for_reporting: "Ready for reporting; observation unchanged",
+    await_prospective_reporting_qualification: "Await prospective reporting qualification",
+    await_model_maintenance: "Await model maintenance",
+    collect_space_heating_evidence: "Collect space-heating evidence",
+    await_successful_demand_training: "Await successful demand maintenance",
+    collect_indoor_heating_evidence: "Collect indoor-heating evidence",
+    enable_observe_only_campaign: "Observation campaign is not enabled",
+    wait_for_heating_season: "Wait for heating-season evidence",
     comfort_at_risk: "Comfort risk forecast",
     new_plans_paused: "New plans paused",
     control_state_unavailable: "Control state unavailable",
@@ -198,6 +218,10 @@ export function seasonalReasonLabel(code: string | null | undefined): string {
   return recognizedStatus(code, {
     inactive: "Seasonal calibration is inactive",
     active: "Seasonal calibration is active",
+    observe_only_seasonal_calibration_active: "Observation persists until explicit human exit",
+    waiting_for_recent_outdoor_data: "Waiting for recent outdoor data",
+    available_but_not_enabled: "Observation campaign is not enabled",
+    seasonal_reporting_unavailable: "Seasonal reporting unavailable",
     blocked_by_unresolved_safety_revert: "Waiting for unresolved safety restores",
     waiting_for_heating_season: "Waiting for heating season",
   });

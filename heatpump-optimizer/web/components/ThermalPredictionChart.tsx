@@ -46,6 +46,8 @@ interface ThermalStatus {
       indoor_heating_samples: number;
       indoor_cooling_samples: number;
       confidence: string;
+      heating_confidence?: string;
+      cooling_confidence?: string;
       reason?: string | null;
     };
   };
@@ -148,7 +150,10 @@ export function ThermalPredictionChart() {
     try {
       const res = await fetch("/api/thermal/calibrate", { method: "POST" });
       const data = await res.json();
-      if (data.status === "calibrated") {
+      if (!res.ok) throw new Error("Calibration request failed");
+      if (data.status === "queued" && typeof data.request_id === "string") {
+        setCalibrateResult(`Thermal maintenance queued (${data.request_id}).${data.maintenance_enabled === false ? " Maintenance disabled." : ""}`);
+      } else if (data.status === "calibrated") {
         setCalibrateResult(
           `Calibrated from ${data.samples} samples (${data.tank_heating_samples} heating, ${data.tank_cooling_samples} cooling)`
         );
@@ -156,8 +161,8 @@ export function ThermalPredictionChart() {
       } else {
         setCalibrateResult(data.status || "Calibration failed");
       }
-    } catch {
-      setCalibrateResult("Network error");
+    } catch (error) {
+      setCalibrateResult(error instanceof Error ? error.message : "Network error");
     } finally {
       setCalibrating(false);
     }
@@ -289,10 +294,10 @@ export function ThermalPredictionChart() {
     <div className="plan-section">
       <h2 className="chart-title">Thermal Predictions</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        Predicted temperature evolution based on learned heating/cooling rates.
+        Reporting-only temperature estimates.
         {status?.model_params.last_calibrated
-          ? ` Model calibrated from ${status.model_params.sample_count} samples.`
-          : " Model using defaults (calibrate to learn from your data)."}
+          ? ` Historical fit: ${status.model_params.sample_count} samples.`
+          : " Default rates."}
         {learningModeUnavailable
           ? " Learning-state data is unavailable, so this curve is held from active-plan control."
           : curves?.current.learning_mode
@@ -335,6 +340,7 @@ export function ThermalPredictionChart() {
               {status.predictions.tank_cooling.minutes_until_min
                 ? `${Math.round(status.predictions.tank_cooling.minutes_until_min / 60)}h until min`
                 : "Stable"}
+              {" "}({status.predictions.tank_cooling.confidence})
             </div>
           </div>
 
@@ -359,8 +365,10 @@ export function ThermalPredictionChart() {
               </div>
               <div className="metric-sub">
                 {status.predictions.indoor.indoor_heating_rate}°C/h heat
+                {" "}({status.predictions.indoor.heating_confidence ?? "default"})
                 {" / "}
                 {status.predictions.indoor.indoor_cooling_rate}°C/h cool
+                {" "}({status.predictions.indoor.cooling_confidence ?? "default"})
                 {status.predictions.indoor.indoor_heating_samples > 0
                   ? ` (${status.predictions.indoor.indoor_heating_samples} samples)`
                   : " (defaults)"}

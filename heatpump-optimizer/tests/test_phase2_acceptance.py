@@ -18,6 +18,7 @@ from packages.core.models import ShowerEventRecord
 from packages.core.operational_alerts import get_operational_alerts
 from packages.core.resilience import RateLimiter, SafetyWriteCapacityError, safety_write_context
 from packages.core.safety_reverts import UNRESOLVED_STATUSES
+from packages.core.services.aquarea import AquareaWrapper
 from packages.core.service_health import (
     record_safety_watchdog_result,
     service_heartbeat_details,
@@ -60,6 +61,7 @@ def _action(*, action_id=1, attempt_count=0, action_type="force_dhw_off"):
         plan_id=99,
         device_id="device-a",
         action_type=action_type,
+        reverts_action_id=2 if action_type in {"force_dhw_off", "zone_temp_restore"} else None,
         payload_json=json.dumps(payload),
         status="pending",
         safety_attempt_count=attempt_count,
@@ -76,6 +78,32 @@ def _factory(session):
 
 
 class TestPhase2ExecutorAcceptance:
+    @staticmethod
+    def _seed_restore_claim(executor, session, action, source=None):
+        action.status = "executing"
+        action.safety_claimed_at = dt.datetime.now(dt.timezone.utc)
+        action.scheduled_ts = action.safety_claimed_at - dt.timedelta(minutes=1)
+        if source is None:
+            source = SimpleNamespace(
+                id=2,
+                device_id=action.device_id,
+                action_type="zone_temp_boost"
+                if action.action_type == "zone_temp_restore"
+                else "force_dhw_on",
+                payload_json=json.dumps({"zone_id": 1, "baseline_temperature": 21}),
+            )
+        previous_execute = session.execute
+
+        async def execute(statement):
+            if "plan_actions.safety_claimed_at =" in str(statement):
+                return SimpleNamespace(scalar_one_or_none=lambda: action)
+            return await previous_execute(statement)
+
+        session.execute = AsyncMock(side_effect=execute)
+        session.get = AsyncMock(return_value=source)
+        executor._learning_check = AsyncMock(return_value=LearningModeState.INACTIVE)
+        return source
+
     @staticmethod
     def _dispatch_executor(*query_results):
         session = AsyncMock()
@@ -239,8 +267,10 @@ class TestPhase2ExecutorAcceptance:
         "reason", ["device_status_stale", "credentials_missing", "breaker_open"]
     )
     async def test_P2_AC8_deferrals_count_as_failed_safety_cycles(self, reason):
-        executor = PlanExecutor(AsyncMock(), session_factory=_factory(AsyncMock()))
+        session = AsyncMock()
+        executor = PlanExecutor(AsyncMock(), session_factory=_factory(session))
         action = _action()
+        self._seed_restore_claim(executor, session, action)
 
         with (
             patch.object(
@@ -279,11 +309,12 @@ class TestPhase2ExecutorAcceptance:
             device_quality_check=quality_check,
         )
         action = _action()
+        self._seed_restore_claim(executor, session, action)
 
         with capture_logs() as logs:
             await executor._execute_safety_action(action)
 
-        values = _values(session.execute.await_args.args[0])
+        values = _values(session.execute.await_args_list[-1].args[0])
         assert values["status"] == "pending"
         assert values["safety_attempt_count"] == 1
         assert values["safety_next_retry_at"] == frozen_now + dt.timedelta(minutes=1)
@@ -293,7 +324,7 @@ class TestPhase2ExecutorAcceptance:
 
         for _ in range(3):
             await executor._execute_safety_action(action)
-            values = _values(session.execute.await_args.args[0])
+            values = _values(session.execute.await_args_list[-1].args[0])
             action.safety_attempt_count = values["safety_attempt_count"]
 
         assert values["safety_attempt_count"] >= 3
@@ -301,11 +332,14 @@ class TestPhase2ExecutorAcceptance:
     @pytest.mark.asyncio
     async def test_P2_AC7_safety_cycle_performs_one_write_and_no_redispatch(self):
         wrapper = MagicMock()
-        wrapper.safety_write.return_value = MagicMock()
-        executor = PlanExecutor(wrapper, session_factory=_factory(AsyncMock()))
+        wrapper._dispatch_linked_restore = AsyncMock(return_value={"force_dhw": 0})
+        session = AsyncMock()
+        executor = PlanExecutor(wrapper, session_factory=_factory(session))
         action = _action()
+        source = self._seed_restore_claim(executor, session, action)
         handler = MagicMock()
         handler.dispatch = AsyncMock(return_value={"force_dhw": 0})
+        handler.redispatch_expected = AsyncMock()
         failed = VerifyResult(ok=False, observed_value=1, expected_value=0, reason="timeout")
 
         with (
@@ -321,16 +355,19 @@ class TestPhase2ExecutorAcceptance:
         ):
             await executor._execute_safety_action(action)
 
-        handler.dispatch.assert_awaited_once_with(wrapper, {"zone_id": 1})
+        wrapper._dispatch_linked_restore.assert_awaited_once_with(action, source)
+        handler.dispatch.assert_not_awaited()
+        handler.redispatch_expected.assert_not_awaited()
         requeue.assert_awaited_once_with(action, "timeout")
 
     @pytest.mark.asyncio
     async def test_P2_AC7_safety_attempt_calls_the_wrapper_write_once(self):
-        wrapper = MagicMock()
-        wrapper.safety_write.return_value = MagicMock()
+        wrapper = AquareaWrapper()
         wrapper.force_dhw = AsyncMock(return_value=True)
-        executor = PlanExecutor(wrapper, session_factory=_factory(AsyncMock()))
+        session = AsyncMock()
+        executor = PlanExecutor(wrapper, session_factory=_factory(session))
         action = _action()
+        self._seed_restore_claim(executor, session, action)
         failed = VerifyResult(ok=False, observed_value=1, expected_value=0, reason="timeout")
 
         with (
@@ -423,6 +460,9 @@ class TestPhase2ExecutorAcceptance:
             force_dhw=0, zone1_target_temp=None
         )
         session.execute = AsyncMock(return_value=result)
+        session.get = AsyncMock(
+            return_value=SimpleNamespace(payload_json='{"baseline_temperature": 21}')
+        )
         executor = PlanExecutor(AsyncMock(), session_factory=_factory(session))
 
         assert not await executor._safety_already_safe(
@@ -447,6 +487,8 @@ class TestPhase2ExecutorAcceptance:
         executor = PlanExecutor(wrapper, session_factory=_factory(session))
         action = _action(action_type="zone_temp_restore")
         action.payload_json = json.dumps({"zone_id": 1, "temperature": 21})
+        self._seed_restore_claim(executor, session, action)
+        wrapper._dispatch_linked_restore = AsyncMock(return_value={"skip": True})
 
         with (
             patch.object(executor, "_dispatch_precondition", new=AsyncMock(return_value=None)),
@@ -461,6 +503,7 @@ class TestPhase2ExecutorAcceptance:
             verified.assert_awaited_once()
             requeue.assert_not_awaited()
             handler_factory.return_value.dispatch.assert_not_awaited()
+            wrapper._dispatch_linked_restore.assert_not_awaited()
         else:
             verified.assert_not_awaited()
             requeue.assert_awaited_once()
@@ -470,7 +513,12 @@ class TestPhase2ExecutorAcceptance:
         session = AsyncMock()
         status = MagicMock()
         status.scalar_one_or_none.return_value = SimpleNamespace(zone1_target_temp=21)
-        source = SimpleNamespace(payload_json=json.dumps({"baseline_temperature": 22}))
+        source = SimpleNamespace(
+            id=2,
+            device_id="device-a",
+            action_type="zone_temp_boost",
+            payload_json=json.dumps({"zone_id": 1, "baseline_temperature": 22}),
+        )
         session.execute = AsyncMock(return_value=status)
         session.get = AsyncMock(return_value=source)
         wrapper = MagicMock()
@@ -478,6 +526,7 @@ class TestPhase2ExecutorAcceptance:
         executor = PlanExecutor(wrapper, session_factory=_factory(session))
         action = _action(action_type="zone_temp_restore")
         action.reverts_action_id = 2
+        self._seed_restore_claim(executor, session, action, source)
 
         with (
             patch.object(executor, "_dispatch_precondition", new=AsyncMock(return_value=None)),
@@ -504,11 +553,12 @@ class TestPhase2ExecutorAcceptance:
         )
         action = _action(action_type="force_dhw_on")
 
-        await executor._execute_action(action)
-
-        skipped = _values(session.execute.await_args_list[-1].args[0])
-        assert skipped["status"] == "skipped"
-        assert json.loads(skipped["result_json"])["reason"] == "blocked_by_unresolved_revert"
+        result = await executor._dispatch_precondition(action, ActionType.FORCE_DHW_ON, {})
+        assert result["reason"] == "blocked_by_unresolved_revert"
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await executor._execute_action(action)
+        assert session.execute.await_count == 2
+        assert action.status == "pending"
         wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -674,12 +724,13 @@ class TestPhase2ShowerAcceptance:
 
         event = session.add.call_args.args[0]
         assert isinstance(event, ShowerEventRecord)
-        assert event.status == "skipped_unresolved_revert"
+        assert event.status == "skipped_observe_only_build"
         assert event.activation_action_id is None
         assert event.expires_at == current.ts
+        assert session.execute.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_P2_AC16_activation_failure_after_flush_escapes_transaction_for_rollback(self):
+    async def test_P2_AC16_recovery_failure_escapes_transaction_for_rollback(self):
         now = dt.datetime(2026, 9, 25, 10, tzinfo=dt.timezone.utc)
         previous = self._status(now - dt.timedelta(minutes=5), 55)
         current = self._status(now, 43)
@@ -692,10 +743,19 @@ class TestPhase2ShowerAcceptance:
         def on_exit(exc_type, exc):
             exit_args.append((exc_type, exc))
 
-        no_active_event = MagicMock()
-        no_active_event.scalar_one_or_none.return_value = None
+        active_event = MagicMock()
+        active_event.scalar_one_or_none.return_value = ShowerEventRecord(
+            id=1,
+            started_at=now - dt.timedelta(minutes=65),
+            expires_at=now - dt.timedelta(minutes=5),
+            activation_action_id=11762,
+            pre_shower_temp=55,
+            status="active",
+        )
         session = SimpleNamespace(
-            execute=AsyncMock(side_effect=[no_active_event, previous_result, blocked_result]),
+            execute=AsyncMock(
+                side_effect=[active_event, RuntimeError("linked OFF reschedule failed")]
+            ),
             add=MagicMock(),
             flush=AsyncMock(side_effect=RuntimeError("linked OFF insert failed")),
         )
@@ -713,7 +773,6 @@ class TestPhase2ShowerAcceptance:
                     }[key]
                 ),
             ),
-            patch("packages.optimizer.shower_mode.activate_plan", new=AsyncMock()),
             patch(
                 "packages.optimizer.shower_mode.get_session",
                 return_value=_AsyncContext(session, on_exit=on_exit),
@@ -723,6 +782,8 @@ class TestPhase2ShowerAcceptance:
                 await detector.check(current)
 
         assert exit_args and exit_args[0][0] is RuntimeError
+        session.add.assert_not_called()
+        session.flush.assert_not_awaited()
 
 
 class TestPhase2PollerArchitecture:

@@ -91,7 +91,7 @@ function effectiveStatus(action: PlanAction): string {
  * Explain WHY an action ended up in its current state.
  * Covers executed, failed, expired (not-executed), and still-pending actions.
  */
-function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: boolean): string | null {
+function statusExplanation(action: PlanAction, eStatus: string, isActivePlan: boolean): string | null {
   const result = action.result;
 
   switch (eStatus) {
@@ -120,7 +120,7 @@ function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: bo
         return result.detail;
       }
       // Client-side fallback for actions not yet swept by the expiry task
-      if (!isLatestPlan) {
+      if (!isActivePlan) {
         return "Superseded by a newer plan before this action's scheduled time";
       }
       return "Scheduled time passed — waiting for diagnostic sweep";
@@ -145,7 +145,7 @@ function statusExplanation(action: PlanAction, eStatus: string, isLatestPlan: bo
         : "Cancelled because a newer plan replaced this one";
 
     case "pending":
-      return "Waiting to execute at scheduled time";
+      return "Pending action; only existing linked restores may dispatch in this build";
 
     default:
       return null;
@@ -204,7 +204,7 @@ export function PlanHistory() {
       const response = await fetch("/api/plans?limit=50", { signal });
       if (!response.ok) throw new Error(`API error (${response.status})`);
       const data = await response.json();
-      if (!signal.aborted) setPlans(data);
+      if (!signal.aborted) setPlans(data.filter((plan: PlanSummary) => plan.status !== "diagnostic"));
     } catch (e) {
       if (!signal.aborted) setError(e instanceof Error ? e.message : "Failed to load plan history");
     } finally {
@@ -456,8 +456,7 @@ export function PlanHistory() {
                         const isFailed = eStatus === "failed";
                         const reason = formatReason(action.payload);
                         const extras = formatPayloadExtras(action.payload);
-                        const isLatest = plans.length > 0 && plan.id === plans[0].id;
-                        const explanation = statusExplanation(action, eStatus, isLatest);
+                        const explanation = statusExplanation(action, eStatus, plan.status === "active");
                         return (
                           <div
                             key={action.id}

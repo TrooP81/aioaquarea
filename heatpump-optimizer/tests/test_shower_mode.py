@@ -1,5 +1,7 @@
 """Tests for shower mode (reactive DHW boost on rapid tank temp drops)."""
 
+from __future__ import annotations
+
 import datetime as dt
 import json
 from types import SimpleNamespace
@@ -76,10 +78,10 @@ def sample_prices_with_peak(now):
 
 class TestShowerDetection:
     @pytest.mark.asyncio
-    async def test_P2_AC1_shower_drop_creates_linked_durable_off(
+    async def test_P2_AC1_shower_drop_never_creates_new_actions_in_this_build(
         self, detector, now, sample_prices_flat
     ):
-        """A shower activation persists an ON source and its linked OFF obligation."""
+        """A new shower detection cannot introduce an ON or a new obligation."""
         prev_record = _make_status(now - dt.timedelta(minutes=5), tank_temp=55.0)
         current_record = _make_status(now, tank_temp=43.0)  # 12 deg C drop
 
@@ -128,24 +130,18 @@ class TestShowerDetection:
 
             await detector.check(current_record)
 
-        # Should have created a ShowerEventRecord with status="active"
         events = [o for o in added_objects if isinstance(o, ShowerEventRecord)]
         assert len(events) == 1
-        assert events[0].status == "active"
+        assert events[0].status == "skipped_observe_only_build"
         assert events[0].pre_shower_temp == 55.0
 
         assert events[0].device_id == current_record.device_id
-        assert events[0].expires_at is not None
+        assert events[0].expires_at == current_record.ts
+        assert events[0].activation_action_id is None
 
         actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]
-        assert len(actions) == 2
-        source = next(action for action in actions if action.action_type == "force_dhw_on")
-        restore = next(action for action in actions if action.action_type == "force_dhw_off")
-        assert restore.reverts_action_id == source.id
-        assert restore.scheduled_ts == events[0].expires_at
-        payload = json.loads(source.payload_json)
-        assert payload["trigger"] == "shower_mode"
-        assert payload["pre_shower_temp"] == 55.0
+        assert len(actions) == 0
+        mock_session.flush.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_trigger_below_threshold(self, detector, now):
@@ -320,8 +316,10 @@ class TestShowerDetection:
         session.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_skip_during_peak_price(self, detector, now, sample_prices_with_peak):
-        """During peak price hours, records event as skipped_peak without DHW action."""
+    async def test_build_refuses_shower_activation_independent_of_price(
+        self, detector, now, sample_prices_with_peak
+    ):
+        """Peak prices cannot change build-scoped activation refusal."""
         prev_record = _make_status(now - dt.timedelta(minutes=5), tank_temp=55.0)
         current_record = _make_status(now, tank_temp=43.0)  # 12 deg C drop
 
@@ -366,8 +364,9 @@ class TestShowerDetection:
 
         events = [o for o in added_objects if isinstance(o, ShowerEventRecord)]
         assert len(events) == 1
-        assert events[0].status == "skipped_peak"
-        assert events[0].peak_price_skipped is True
+        assert events[0].status == "skipped_observe_only_build"
+        assert events[0].activation_action_id is None
+        mock_get_prices.assert_not_awaited()
 
         # No DHW action should be created
         actions = [o for o in added_objects if isinstance(o, PlanActionRecord)]

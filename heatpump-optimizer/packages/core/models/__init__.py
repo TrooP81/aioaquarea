@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -13,15 +14,18 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Sequence,
     String,
     Text,
+    UniqueConstraint,
     event,
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -81,6 +85,7 @@ class DeviceStatusRecord(Base):
     # Tank limits
     tank_heat_max: Mapped[int | None] = mapped_column(Integer)
     tank_heat_min: Mapped[int | None] = mapped_column(Integer)
+    native_policy_provenance: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
 class SpaceHeatingGateRecord(Base):
@@ -578,4 +583,239 @@ class SmartThingsToken(Base):
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+ML_LIFECYCLE_TOKEN_SEQUENCE = Sequence(
+    "ml_lifecycle_token_seq",
+    metadata=Base.metadata,
+    start=1,
+    minvalue=1,
+    maxvalue=9223372036854775807,
+    cycle=False,
+)
+
+
+class MLLifecycleStateRecord(Base):
+    """Installation authority; component references are the artifact roles below."""
+
+    __tablename__ = "ml_lifecycle_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_ml_lifecycle_singleton"),
+        CheckConstraint("revision > 0 AND fence > 0", name="ck_ml_lifecycle_tokens"),
+        CheckConstraint(
+            "(lease_owner IS NULL) = (lease_expires_at IS NULL)", name="ck_ml_lifecycle_lease"
+        ),
+        CheckConstraint("jsonb_typeof(checkpoints) = 'object'", name="ck_ml_lifecycle_checkpoints"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1, server_default="1")
+    epoch: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    revision: Mapped[int] = mapped_column(
+        BigInteger, server_default=ML_LIFECYCLE_TOKEN_SEQUENCE.next_value(), nullable=False
+    )
+    fence: Mapped[int] = mapped_column(
+        BigInteger, server_default=ML_LIFECYCLE_TOKEN_SEQUENCE.next_value(), nullable=False
+    )
+    maintenance_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default="false", nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    next_maintenance_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_demand_attempt_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    checkpoints: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}", nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp(), nullable=False
+    )
+
+
+class MLArtifactRecord(Base):
+    __tablename__ = "ml_artifacts"
+    __table_args__ = (
+        CheckConstraint("artifact_hash ~ '^[0-9a-f]{64}$'", name="ck_ml_artifact_hash"),
+        CheckConstraint("committed_revision > 0", name="ck_ml_artifact_revision"),
+        CheckConstraint(
+            "role IN ('candidate', 'incumbent', 'rollback', 'retained', 'unreferenced')",
+            name="ck_ml_artifact_role",
+        ),
+        CheckConstraint("jsonb_typeof(manifest) = 'object'", name="ck_ml_artifact_manifest"),
+        CheckConstraint(
+            "jsonb_typeof(qualification_scope) = 'object'", name="ck_ml_artifact_scope"
+        ),
+        CheckConstraint(
+            "(qualified_at IS NULL AND qualification_expires_at IS NULL AND last_valid_outcome_at IS NULL) OR "
+            "(qualified_at IS NOT NULL AND last_valid_outcome_at IS NOT NULL AND "
+            "qualification_expires_at IS NOT NULL AND last_valid_outcome_at <= qualified_at AND "
+            "qualified_at < qualification_expires_at AND "
+            "qualification_expires_at <= last_valid_outcome_at + INTERVAL '72 hours')",
+            name="ck_ml_artifact_qualification",
+        ),
+        UniqueConstraint("epoch", "component", "fit_id", name="uq_ml_artifact_fit"),
+        Index(
+            "uq_ml_artifact_candidate",
+            "epoch",
+            "component",
+            unique=True,
+            postgresql_where=text("role = 'candidate'"),
+        ),
+        Index(
+            "uq_ml_artifact_incumbent",
+            "epoch",
+            "component",
+            unique=True,
+            postgresql_where=text("role = 'incumbent'"),
+        ),
+        Index("ix_ml_artifact_pruning", "role", "created_at", "retained_until"),
+    )
+
+    artifact_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    epoch: Mapped[str] = mapped_column(ForeignKey("ml_lifecycle_state.epoch"), nullable=False)
+    component: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    fit_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    committed_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    qualified_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    qualification_expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_valid_outcome_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    qualification_scope: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, server_default="{}", nullable=False
+    )
+    retained_until: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp(), nullable=False
+    )
+
+
+class MLMaintenanceRequestRecord(Base):
+    __tablename__ = "ml_maintenance_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_ml_request_status",
+        ),
+        CheckConstraint("fence IS NULL OR fence > 0", name="ck_ml_request_fence"),
+        UniqueConstraint("epoch", "component", "dedup_key", name="uq_ml_request_dedup"),
+        Index(
+            "uq_ml_request_running",
+            "epoch",
+            "component",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index("ix_ml_request_queue", "status", "requested_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    epoch: Mapped[str] = mapped_column(ForeignKey("ml_lifecycle_state.epoch"), nullable=False)
+    component: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), server_default="queued", nullable=False)
+    fence: Mapped[int | None] = mapped_column(BigInteger)
+    requested_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp(), nullable=False
+    )
+    attempted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}", nullable=False)
+
+
+class MLForecastIssueRecord(Base):
+    __tablename__ = "ml_forecast_issues"
+    __table_args__ = (
+        CheckConstraint("horizon_minutes > 0", name="ck_ml_issue_horizon"),
+        CheckConstraint("issued_at < target_at", name="ck_ml_issue_times"),
+        CheckConstraint(
+            "issue_kind IN ('prospective_native', 'counterfactual', 'retrospective_actual_action')",
+            name="ck_ml_issue_kind",
+        ),
+        CheckConstraint("snapshot_hash ~ '^[0-9a-f]{64}$'", name="ck_ml_issue_snapshot"),
+        CheckConstraint(
+            "incumbent_hash IS NOT NULL OR candidate_hash IS NOT NULL", name="ck_ml_issue_pair"
+        ),
+        UniqueConstraint(
+            "epoch",
+            "device_id",
+            "component",
+            "cohort_key",
+            "horizon_minutes",
+            name="uq_ml_issue_cohort",
+        ),
+        UniqueConstraint(
+            "id", "epoch", "device_id", "component", "horizon_minutes", name="uq_ml_issue_identity"
+        ),
+        Index("ix_ml_issue_collection", "epoch", "component", "id"),
+        Index("ix_ml_issue_target", "target_at", "id"),
+        Index("ix_ml_issue_incumbent", "incumbent_hash"),
+        Index("ix_ml_issue_candidate", "candidate_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    epoch: Mapped[str] = mapped_column(ForeignKey("ml_lifecycle_state.epoch"), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    component: Mapped[str] = mapped_column(String(64), nullable=False)
+    cohort_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    horizon_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    issue_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_schema: Mapped[str] = mapped_column(String(64), nullable=False)
+    issued_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    device_day: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    incumbent_hash: Mapped[str | None] = mapped_column(ForeignKey("ml_artifacts.artifact_hash"))
+    candidate_hash: Mapped[str | None] = mapped_column(ForeignKey("ml_artifacts.artifact_hash"))
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    predictions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    expected_horizons: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp(), nullable=False
+    )
+
+
+class MLForecastOutcomeRecord(Base):
+    __tablename__ = "ml_forecast_outcomes"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["issue_id", "epoch", "device_id", "component", "horizon_minutes"],
+            [
+                "ml_forecast_issues.id",
+                "ml_forecast_issues.epoch",
+                "ml_forecast_issues.device_id",
+                "ml_forecast_issues.component",
+                "ml_forecast_issues.horizon_minutes",
+            ],
+            name="fk_ml_outcome_issue",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'valid', 'excluded', 'incomplete')", name="ck_ml_outcome_status"
+        ),
+        CheckConstraint(
+            "status <> 'excluded' OR exclusion_reason IS NOT NULL", name="ck_ml_outcome_exclusion"
+        ),
+        UniqueConstraint(
+            "epoch",
+            "device_id",
+            "component",
+            "canonical_key",
+            "horizon_minutes",
+            name="uq_ml_outcome_canonical",
+        ),
+        Index("ix_ml_outcome_reconcile", "status", "updated_at", "issue_id"),
+    )
+
+    issue_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    epoch: Mapped[str] = mapped_column(String(36), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    component: Mapped[str] = mapped_column(String(64), nullable=False)
+    horizon_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(128))
+    observed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}", nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp(), nullable=False
     )

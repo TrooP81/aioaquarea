@@ -35,20 +35,29 @@ async def get_seasonal_calibration_status(
     else:
         now = now.astimezone(dt.timezone.utc)
 
-    enabled, threshold_c, minimum_days, auto_train, auto_exit = await _settings()
+    enabled, threshold_c, minimum_days, auto_train, _auto_exit = await _settings()
+    campaign_since = await get_setting("_seasonal_calibration_campaign_since")
+    campaign_active = bool(enabled and campaign_since)
     since = now - dt.timedelta(days=minimum_days)
-    async with get_session() as session:
-        average_outdoor, readings = (
-            await session.execute(
-                select(
-                    func.avg(DeviceStatusRecord.outdoor_temp),
-                    func.count(DeviceStatusRecord.outdoor_temp),
-                ).where(
-                    DeviceStatusRecord.ts >= since,
-                    DeviceStatusRecord.outdoor_temp.is_not(None),
+    outdoor_data_reliable = True
+    try:
+        async with get_session() as session:
+            average_outdoor, readings = (
+                await session.execute(
+                    select(
+                        func.avg(DeviceStatusRecord.outdoor_temp),
+                        func.count(DeviceStatusRecord.outdoor_temp),
+                    ).where(
+                        DeviceStatusRecord.ts >= since,
+                        DeviceStatusRecord.outdoor_temp.is_not(None),
+                    )
                 )
-            )
-        ).one()
+            ).one()
+    except Exception:
+        if not campaign_active:
+            raise
+        average_outdoor, readings = None, 0
+        outdoor_data_reliable = False
 
     average_c = round(float(average_outdoor), 1) if average_outdoor is not None else None
     # A day's normal 5-minute polls is enough to avoid treating one cold sample
@@ -57,7 +66,7 @@ async def get_seasonal_calibration_status(
     heating_season = bool(enough_readings and average_c is not None and average_c <= threshold_c)
     safety_deferred_since: dt.datetime | None = None
     unresolved_summary = {"count": 0}
-    if enabled and heating_season:
+    if enabled and heating_season and not campaign_active:
         from packages.core.safety_reverts import unresolved_revert_summary
 
         async with get_session() as session:
@@ -78,7 +87,14 @@ async def get_seasonal_calibration_status(
     elif await get_setting("_seasonal_calibration_safety_deferred_since"):
         await set_settings_bulk({"_seasonal_calibration_safety_deferred_since": ""})
 
-    if not enough_readings:
+    if enabled and heating_season and safety_deferred_since is None and not campaign_active:
+        campaign_since = now.isoformat()
+        await set_settings_bulk({"_seasonal_calibration_campaign_since": campaign_since})
+        campaign_active = True
+
+    if campaign_active:
+        reason = "observe_only_seasonal_calibration_active"
+    elif not enough_readings:
         reason = "waiting_for_recent_outdoor_data"
     elif not heating_season:
         reason = "waiting_for_heating_season"
@@ -97,15 +113,17 @@ async def get_seasonal_calibration_status(
 
     return {
         "enabled": enabled,
-        "observe_only_active": bool(enabled and heating_season and safety_deferred_since is None),
+        "observe_only_active": campaign_active,
+        "campaign_since": campaign_since or None,
         "heating_season_detected": heating_season,
         "reason": reason,
         "average_outdoor_c": average_c,
+        "outdoor_data_reliable": outdoor_data_reliable,
         "outdoor_readings": int(readings or 0),
         "window_days": minimum_days,
         "activation_threshold_c": threshold_c,
         "auto_train": auto_train,
-        "auto_exit": auto_exit,
+        "auto_exit": False,
         "seasonal_blocked_by_unresolved_safety_revert": safety_deferred_since is not None,
         "seasonal_first_deferred_at": (
             safety_deferred_since.isoformat() if safety_deferred_since is not None else None
@@ -123,54 +141,48 @@ async def _settings() -> tuple[bool, float, int, bool, bool]:
         await get_float_setting("seasonal_calibration_max_outdoor_c"),
         await get_int_setting("seasonal_calibration_window_days"),
         await get_bool_setting("seasonal_calibration_auto_train"),
-        await get_bool_setting("seasonal_calibration_auto_exit"),
+        False,
     )
 
 
 async def run_seasonal_calibration_cycle() -> dict[str, object]:
-    """Train only when an opted-in cold-weather campaign has sufficient data.
-
-    This is called by the poller on a low-frequency schedule.  It never
-    changes heat-pump controls; it only calibrates local models and can turn
-    off the *explicitly enabled* observe-only switch when both the demand and
-    indoor-heating evidence are ready.
-    """
+    """Queue opted-in seasonal maintenance without fitting or exiting observation."""
 
     status = await get_seasonal_calibration_status()
     if not status["observe_only_active"]:
         return {**status, "cycle": "not_active"}
+    if not await get_bool_setting("ml_maintenance_enabled"):
+        return {**status, "cycle": "maintenance_disabled", "requests": []}
 
+    from packages.ml.lifecycle import enqueue_maintenance_request
     from packages.ml.models import demand_model
     from packages.ml.thermal import MIN_LEARNED_RATE_SAMPLES, thermal_model
 
     quality = await demand_model.training_data_quality()
-    thermal_result = await thermal_model.calibrate()
+    await demand_model.arefresh_committed()
+    await thermal_model.arefresh_if_changed()
     indoor_samples = int(thermal_model.params.indoor_heating_samples)
     demand_ready = bool(quality.get("ready_to_train"))
-    indoor_ready = indoor_samples >= MIN_LEARNED_RATE_SAMPLES
+    thermal_result = None
     train_result: dict[str, object] | None = None
-    if status["auto_train"] and demand_ready:
-        train_result = await demand_model.train()
+    slot = int(dt.datetime.now(dt.timezone.utc).timestamp() // (6 * 3600))
+    if status["auto_train"]:
+        thermal_result = await enqueue_maintenance_request(
+            "thermal", "seasonal", automatic=True, dedup_key=f"seasonal:{slot}"
+        )
+        if demand_ready:
+            train_result = await enqueue_maintenance_request(
+                "demand", "seasonal", automatic=True, dedup_key=f"seasonal:{slot}"
+            )
 
     trained_demand = demand_model.is_trained
-    completed = trained_demand and indoor_ready
-    if completed and status["auto_exit"]:
-        await set_settings_bulk({"seasonal_calibration_enabled": "false"})
-        status = await get_seasonal_calibration_status()
-
-    next_step = "collect_space_heating_evidence"
-    if not demand_ready:
-        next_step = "collect_space_heating_evidence"
-    elif not trained_demand:
-        next_step = "await_successful_demand_training"
-    elif not indoor_ready:
-        next_step = "collect_indoor_heating_evidence"
-    elif completed:
-        next_step = "completed"
+    requests = [request for request in (train_result, thermal_result) if request is not None]
+    next_step = "await_model_maintenance" if requests else "collect_space_heating_evidence"
     return {
         **status,
-        "cycle": "completed" if completed else "collecting",
+        "cycle": "queued" if requests else "collecting",
         "next_step": next_step,
+        "requests": requests,
         "demand": {
             "usable_samples": quality.get("usable_samples"),
             "minimum_samples": quality.get("minimum_samples"),
@@ -195,10 +207,11 @@ async def get_seasonal_calibration_progress() -> dict[str, object]:
     from packages.ml.thermal import MIN_LEARNED_RATE_SAMPLES, thermal_model
 
     quality = await demand_model.training_data_quality()
-    thermal_model.load_latest()
+    await demand_model.arefresh_committed()
+    await thermal_model.arefresh_if_changed()
     indoor_samples = int(thermal_model.params.indoor_heating_samples)
     demand_ready = bool(quality.get("ready_to_train"))
-    if not status["heating_season_detected"]:
+    if not status["heating_season_detected"] and not status["observe_only_active"]:
         next_step = "wait_for_heating_season"
     elif not status["enabled"]:
         next_step = "enable_observe_only_campaign"
@@ -206,10 +219,10 @@ async def get_seasonal_calibration_progress() -> dict[str, object]:
         next_step = "collect_space_heating_evidence"
     elif not demand_model.is_trained:
         next_step = "await_successful_demand_training"
-    elif indoor_samples < MIN_LEARNED_RATE_SAMPLES:
+    elif thermal_model.confidence_for("indoor_heating") != "learned":
         next_step = "collect_indoor_heating_evidence"
     else:
-        next_step = "ready_to_complete"
+        next_step = "await_prospective_reporting_qualification"
     return {
         **status,
         "next_step": next_step,

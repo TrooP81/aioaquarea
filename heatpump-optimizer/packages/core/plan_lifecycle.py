@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models import PlanActionRecord, PlanRecord
 
 ACTIVE_PLAN_STATUS = "active"
+DIAGNOSTIC_PLAN_STATUS = "diagnostic"
 SUPERSEDED_PLAN_STATUS = "superseded"
 CANCELLED_ACTION_STATUS = "cancelled"
 
@@ -28,6 +29,8 @@ async def activate_plan(
     first-ever plan, when there is no existing row to lock.
     """
 
+    if plan.status == DIAGNOSTIC_PLAN_STATUS:
+        raise ValueError("Diagnostic plans cannot be activated")
     active_ids = await supersede_active_plan(session, reason=reason)
     plan.status = ACTIVE_PLAN_STATUS
     session.add(plan)

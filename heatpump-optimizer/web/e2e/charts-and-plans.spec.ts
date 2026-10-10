@@ -1,4 +1,4 @@
-import { test, expect } from "./fixtures";
+import { test, expect, controlState } from "./fixtures";
 
 const mockPrices = Array.from({ length: 48 }, (_, i) => ({
   ts: new Date(Date.now() - (12 - i) * 3600000).toISOString(),
@@ -58,6 +58,7 @@ const mockDashboard = {
   today_cost_eur: 1.23,
   active_plan: {
     id: 42,
+    status: "active",
     optimizer_version: "rules_v1",
     cost_estimate_eur: 2.85,
     price_currency: "EUR",
@@ -262,19 +263,12 @@ test.describe("Plan View", () => {
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          state: "automatic",
-          headline: "Scheduled control remains active",
-          detail: "Automatic dispatch remains active.",
-          reason_code: "automatic",
-          primary_action: null,
-          notices: [],
-        }),
+        body: JSON.stringify(controlState),
       })
     );
   });
 
-  test("shows active plan info", async ({ page }) => {
+  test("shows legacy plan info without promising ordinary dispatch", async ({ page }, testInfo) => {
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({
         status: 200,
@@ -301,6 +295,7 @@ test.describe("Plan View", () => {
         contentType: "application/json",
         body: JSON.stringify({
           id: 42,
+          status: "active",
           created_at: new Date().toISOString(),
           horizon_start: new Date().toISOString(),
           horizon_end: new Date(Date.now() + 86400000).toISOString(),
@@ -327,6 +322,7 @@ test.describe("Plan View", () => {
         body: JSON.stringify([
           {
             id: 42,
+            status: "active",
             created_at: new Date().toISOString(),
             horizon_start: new Date().toISOString(),
             horizon_end: new Date(Date.now() + 86400000).toISOString(),
@@ -341,25 +337,27 @@ test.describe("Plan View", () => {
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
 
-    // DecisionSummary is the dashboard's sole next-action presentation.
     const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
     await expect(decisionSummary).toBeVisible({ timeout: 10000 });
-    await expect(decisionSummary).toContainText("Heat hot water");
+    await expect(decisionSummary).toContainText("Observe-only build");
+    await expect(decisionSummary).toContainText("No ordinary command");
+    await expect(decisionSummary).toContainText("Ordinary writes are prohibited in this build");
+    await expect(decisionSummary).not.toContainText("Heat hot water");
 
     await page.getByRole("tab", { name: "Timeline" }).click();
 
-    // Active Plan section should show the plan header
-    await expect(page.getByRole("heading", { name: "Active Plan" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Legacy plan (read-only)" })).toBeVisible();
     await expect(page.locator(".plan-cost-value")).toContainText("EUR");
     await expect(page.locator(".plan-cost-value")).not.toContainText("kr");
 
-    // Should show human-readable status "Scheduled" instead of raw "pending"
-    await expect(page.locator("#dashboard-panel-timeline .plan-action-status", { hasText: "Scheduled" }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator("#dashboard-panel-timeline .plan-action-status", { hasText: "Pending (legacy)" }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator("#dashboard-panel-timeline .plan-next-callout")).toHaveCount(0);
 
-    // Should show human-readable action label
     await expect(
       page.locator("#dashboard-panel-timeline .plan-action-type").getByText("Heat hot water"),
     ).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(await page.evaluate(() => window.innerWidth) + 1);
+    await page.screenshot({ path: testInfo.outputPath("obs6r1-legacy-plan.png"), fullPage: true });
   });
 
   test("handles no active plan gracefully", async ({ page }) => {
@@ -387,10 +385,11 @@ test.describe("Plan View", () => {
     // DecisionSummary presents the no-plan state without a separate empty card.
     const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
     await expect(decisionSummary).toBeVisible({ timeout: 5000 });
-    await expect(decisionSummary).toContainText("No pending command");
+    await expect(decisionSummary).toContainText("No ordinary command");
   });
 
   test("shows error state when plan actions fail to load", async ({ page }) => {
+    let planRequests = 0;
     await page.route("**/api/dashboard", (route) =>
       route.fulfill({
         status: 200,
@@ -405,9 +404,10 @@ test.describe("Plan View", () => {
       route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
     );
     // Plan actions endpoint returns 500
-    await page.route("**/api/plans/**", (route) =>
-      route.fulfill({ status: 500, contentType: "application/json", body: "{}" })
-    );
+    await page.route("**/api/plans/**", (route) => {
+      planRequests += 1;
+      return route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+    });
     await page.route("**/api/plans", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
     );
@@ -415,7 +415,10 @@ test.describe("Plan View", () => {
     await page.goto("/");
     await page.getByRole("tab", { name: "Timeline" }).click();
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
-    // Should display error message instead of empty list
-    await expect(page.locator(".plan-error")).toBeVisible({ timeout: 5000 });
+    await expect.poll(() => planRequests).toBeGreaterThan(0);
+    await expect(page.getByRole("alert", { name: "Legacy plan detail error" })).toContainText("Could not load plan actions");
+    await expect(page.locator(".timeline-source-errors")).toContainText("plan unavailable");
+    await expect(page.getByTestId("explanation-timeline")).toBeVisible();
+    await expect(page.locator("#dashboard-panel-timeline .plan-actions")).toHaveCount(0);
   });
 });

@@ -182,7 +182,7 @@ test("control-state fetch failure is presented as unavailable rather than automa
   await expect(page.locator(".decision-summary")).not.toContainText("System is following the current plan");
 });
 
-test("resume rejects a non-override endpoint", async ({ page }) => {
+test("clear override rejects a non-override endpoint", async ({ page }) => {
   let unexpectedRequest = false;
   await page.route("**/api/dashboard", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockDashboard) })
@@ -200,7 +200,7 @@ test("resume rejects a non-override endpoint", async ({ page }) => {
         until: new Date(Date.now() + 3_600_000).toISOString(),
         override_id: 55,
         active_override_count: 1,
-        primary_action: { kind: "request", label: "Resume automatic control", endpoint: "/api/not-overrides/55", method: "DELETE" },
+        primary_action: { kind: "request", label: "Clear override", endpoint: "/api/not-overrides/55", method: "DELETE" },
         notices: [],
         resolved_at: new Date().toISOString(),
       }),
@@ -212,7 +212,7 @@ test("resume rejects a non-override endpoint", async ({ page }) => {
   });
 
   await page.goto("/");
-  const resume = page.getByRole("button", { name: "Resume automatic control" });
+  const resume = page.getByRole("button", { name: "Clear override" });
   await expect(resume).toBeVisible();
   await resume.click();
   expect(unexpectedRequest).toBe(false);
@@ -238,7 +238,7 @@ for (const [description, payload] of [
   });
 }
 
-test("pause flow previews the end time and resumes with DELETE then refetch", async ({ page }) => {
+test("pause flow previews the end time and clears the override with DELETE then refetch", async ({ page }) => {
   let paused = false;
   await page.route("**/api/dashboard", (route) =>
     route.fulfill({
@@ -252,8 +252,8 @@ test("pause flow previews the end time and resumes with DELETE then refetch", as
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(paused
-        ? { state: "paused_by_user", headline: "Automatic control is paused", detail: "Ordinary scheduled actions are skipped; safety reverts may still run.", reason_code: "active_override", since: new Date().toISOString(), until: new Date(Date.now() + 7_200_000).toISOString(), override_id: 55, active_override_count: 1, primary_action: { kind: "request", label: "Resume automatic control", endpoint: "/api/overrides/55", method: "DELETE" }, notices: [], resolved_at: new Date().toISOString() }
-        : { state: "automatic", headline: "Scheduled control remains active", detail: "Automatic dispatch remains active.", reason_code: "automatic", since: null, until: null, override_id: null, active_override_count: 0, primary_action: null, notices: [], resolved_at: new Date().toISOString() }),
+        ? { state: "paused_by_user", headline: "User override is active", detail: "Ordinary writes remain prohibited in this build.", reason_code: "active_override", since: new Date().toISOString(), until: new Date(Date.now() + 7_200_000).toISOString(), override_id: 55, active_override_count: 1, primary_action: { kind: "request", label: "Clear override", endpoint: "/api/overrides/55", method: "DELETE" }, notices: [], resolved_at: new Date().toISOString() }
+        : { state: "observing", headline: "Observe-only build", detail: "Ordinary writes remain prohibited in this build.", reason_code: "observe_only_build", since: null, until: null, override_id: null, active_override_count: 0, primary_action: null, notices: [], resolved_at: new Date().toISOString() }),
     })
   );
   await page.route("**/api/overrides", (route) => {
@@ -277,7 +277,7 @@ test("pause flow previews the end time and resumes with DELETE then refetch", as
   await expect(page.locator(".banner").filter({ hasText: /Pause for 2 hours, ending at/ })).toBeVisible();
   await page.getByRole("button", { name: "Confirm pause" }).click();
 
-  const resume = page.getByRole("button", { name: "Resume automatic control" });
+  const resume = page.getByRole("button", { name: "Clear override" });
   await expect(resume).toBeVisible();
   await resume.click();
   await expect(resume).toHaveCount(0);

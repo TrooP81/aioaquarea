@@ -1,6 +1,8 @@
 # Heat Pump Optimizer
 
-Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricity prices, weather forecasts, and device state to automatically minimize your heating costs while maintaining comfort.
+Observe-only monitoring, diagnostic cost planning, and forecast evaluation for Panasonic Aquarea heat pumps.
+
+**Observe-only build (C1).** Ordinary writes are prohibited in this build. Enabling optimization requires a new reviewed, approved build, not a setting, successful training, or reporting qualification. New plans are non-active diagnostics; legacy active rows may remain until superseded and are read-only references. Only existing linked safety restores may run outside positive observation, subject to their existing checks and embargoes.
 
 ## Architecture
 
@@ -24,17 +26,17 @@ Cost-optimizing controller for Panasonic Aquarea heat pumps. Monitors electricit
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
 - **Weather-aware**: Open-Meteo forecast for assumed heating efficiency, demand forecasting and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
-- **Rules-based optimizer (`rules_v7`)**: DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort, quiet mode, action verification
-- **MILP optimizer (`milp_v1`)**: Optimal 24h scheduling via linear programming, with schedule-aware off-peak tank floor
-- **Shower mode**: Optional reactive DHW boost when the tank temperature drops sharply between polls
-- **Seasonal calibration**: Optional observe-only period during cold weather to collect natural heating data and train demand/thermal models
+- **Rules-based optimizer (`rules_v7`)**: Diagnostic DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort and quiet-mode proposals; no ordinary dispatch
+- **MILP optimizer (`milp_v1`)**: Diagnostic 24h scheduling via linear programming, with schedule-aware off-peak tank floor
+- **Shower mode**: Retained settings; ordinary DHW boosts are disabled in this build
+- **Seasonal calibration**: Opt-in cold-weather observation, persisting until explicit human exit; maintenance can queue demand/thermal candidates for reporting
 - **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
 - **COP retirement**: Unverified legacy estimates are archived; no active COP training, loading, inference or live computation
 - **Retained models**: Electrical heating-demand forecasting, indoor comfort and calibrated thermal response
-- **Action verification**: Confirms commands took effect by polling device after execution
+- **Action verification**: Retained checks for existing linked safety restores, not authority for new ordinary commands
 - **Manual overrides**: Always-wins pause button for the optimizer; survives optimizer reruns
-- **Learning mode**: Manually toggleable observe-only mode — the optimizer keeps planning but sends no device commands, so the heat pump runs naturally while clean training data is collected over a long period
-- **On-demand actions**: "Optimize now" queues a durable re-plan for the optimizer service; "Poll now" triggers a device refresh
+- **Learning mode**: Positive observation suppresses both ordinary actions and linked restores. Turning learning mode off does not enable optimization, and does not end an active seasonal campaign
+- **On-demand actions**: "Optimize now" queues a durable diagnostic re-plan; "Poll now" triggers a device refresh
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
 - **Operational alerts**: In-app (and optional webhook) alerts for stale data, adaptor outages, failed actions, and degraded forecasts
@@ -112,8 +114,8 @@ Panasonic Comfort Cloud username and password are entered in the dashboard **Set
 |---------|-------------------|-------------|
 | `web` | `WEB_PORT` (4444) | Dashboard UI |
 | `api` | `API_PORT` (8500) | REST API + Swagger docs (`/docs`) |
-| `poller` | — | Data collection (device + prices + weather + SmartThings), comfort-model retraining, seasonal calibration, alert delivery |
-| `optimizer` | — | Plan generation + action execution |
+| `poller` | — | Data collection, reporting-only model maintenance (default off), seasonal observation, alert delivery |
+| `optimizer` | — | Diagnostic planning and existing linked safety restores; ordinary dispatch disabled |
 | `migrate` | — | One-shot `alembic upgrade head`; `poller`, `optimizer`, and `api` start after it succeeds |
 | `db` | `DB_PORT` (5434 → container 5432) | TimescaleDB |
 | `redis` | (internal only) | Panasonic auth circuit-breaker state |
@@ -270,7 +272,7 @@ Thermal calibration is explicit: use `POST /api/thermal/calibrate` after enough 
 The full, always-current OpenAPI spec is available at `http://localhost:8500/docs`. When `API_TOKEN` is set, every route requires `Authorization: Bearer <token>` except `/health`, `/health/ready`, and `/api/smartthings/oauth/callback`. The dashboard's server-side proxy adds the token for you. Highlights:
 
 **Overview & history**
-- `GET /api/dashboard` — Overview (status, current price, today's kWh, hourly-priced today's cost, active plan, override flag)
+- `GET /api/dashboard` - Overview (status, prices, today's energy/cost, any stored legacy active plan, override flag)
 - `GET /api/control-state` — Persisted optimizer control state (no device I/O)
 - `GET /api/status/history?hours=24` — Device status history
 - `GET /api/device/settings` — Last-known device-reported settings
@@ -288,9 +290,9 @@ The full, always-current OpenAPI spec is available at `http://localhost:8500/doc
 
 **Optimizer & overrides**
 - `GET /api/plans` / `GET /api/plans/{id}` — Plans and plan details with actions
-- `GET /api/optimizer/status` — Current optimizer mode, ML model readiness, and learning-mode state
-- `GET /api/learning-mode` / `POST /api/learning-mode` — Read or toggle observe-only learning mode (`{"enabled": true|false}`)
-- `POST /api/optimize-now` — Queue a durable re-plan; poll `GET /api/optimize-now/{request_id}` for its status and resulting plan
+- `GET /api/optimizer/status` - Diagnostic planner, five-state model reporting lifecycle, and observation state; never control readiness
+- `GET /api/learning-mode` / `POST /api/learning-mode` - Read or toggle manual observation (`{"enabled": true|false}`); off does not permit ordinary writes
+- `POST /api/optimize-now` - Queue a durable diagnostic re-plan; poll `GET /api/optimize-now/{request_id}` for its status and non-active resulting plan
 - `GET /api/plan-activity` / `GET /api/outcomes/summary` / `GET /api/operations/alerts` — Dashboard lifecycle, measured outcome, and operational-health data
 - `POST /api/operations/safety-reverts/{action_id}/resolve` — Resolve a deferred safety revert once fresh evidence proves it safe
 - `POST /api/poll-now` — Force an immediate device poll
@@ -324,9 +326,11 @@ The Settings page → **SmartThings Integration** section includes a sensor sele
 - `GET /api/compressor/activity`
 
 **Models, thermal & calibration**
-- `POST /api/ml/train` — Demand-only training, with no query/body selectors; preserves the response envelope with an explicit COP retirement error and Demand's own result
-- `GET /api/comfort-model/status` / `POST /api/comfort-model/train` / `GET /api/comfort-model/predict`
-- `GET /api/thermal/status` / `POST /api/thermal/calibrate` / `GET /api/thermal/curve` / `GET /api/thermal/indoor-forecast`
+- `POST /api/ml/train` - HTTP 202, parameter-free Demand maintenance request; `demand.request_id` plus the unchanged COP retirement result
+- `POST /api/comfort-model/train` / `POST /api/thermal/calibrate` - HTTP 202 queued maintenance, with `request_id`; no fitting in the API worker
+- `GET /api/ml/requests/{request_id}` - Read queued/running/succeeded/failed/cancelled progress and `maintenance_disabled` when applicable; unknown IDs return 404
+- `GET /api/comfort-model/status` / `GET /api/comfort-model/predict` - Reporting lifecycle and available qualified-model prediction
+- `GET /api/thermal/status` / `GET /api/thermal/curve` / `GET /api/thermal/indoor-forecast` - Reporting lifecycle and diagnostic forecasts
 - `GET /api/thermal/forecast-scorecard` — Scores past indoor forecasts against later sensor readings
 - `GET /api/thermal/heat-curve-advice` — Suggests a small manual Panasonic heat-curve adjustment (never sends a command)
 
@@ -341,7 +345,7 @@ The Settings page → **Danger Zone — Reset Data** card exposes this: tick cat
 
 ## How the Optimizer Works
 
-The `optimizer` service re-plans every hour and checks for due actions every minute. Plans are skipped (no new plan, existing actions keep their state) while device status is not fresh enough for control.
+The `optimizer` service re-plans diagnostics every hour. Its minute dispatch check cannot send ordinary actions in this build. Existing linked restores retain their separate safety checks and wait while observation is positive. The planner logic below describes proposals, not executable commands.
 
 ### Layer selection
 
@@ -350,7 +354,7 @@ The `optimizer_layer` setting chooses the planner:
 | Value | Behaviour |
 |-------|-----------|
 | `rules_only` (default) | Always the rules engine. |
-| `milp_preferred` | Explicitly selects MILP, optionally using trained Demand. Existing input gates and solver fallback to rules are unchanged. Heating efficiency is assumed, never learned COP. |
+| `milp_preferred` | Selects diagnostic MILP, optionally using reporting-qualified Demand. Existing input gates and solver fallback to rules are unchanged. Heating efficiency is assumed, never learned COP. |
 | `auto` | Always rules during COP retirement, with reason `auto_milp_disabled_cop_retired`. No legacy-history qualification query or automatic MILP promotion. |
 
 Planning retains the bounded assumption `max(1.5, min(6.0, 3.5 + 0.1 * outdoor_temperature_c))`. This is not measured pump performance. DHW thermal kWh are divided by this ratio exactly once; space-heating demand is already electrical kWh and is not divided again. Plans carry `cop_source=assumed` and `cop_measured=false`. The `+ml` version suffix means retained Demand only; `rules_v7` and `milp_v1` versions are unchanged.
@@ -372,7 +376,7 @@ Solves a 24h cost-minimization problem with:
 - Constraints: per-hour tank floor (uses `tank_min_temp_offpeak` during sleep/away hours, normal `tank_min_temp` during comfort hours), tank max, comfort bounds, assumed heating-efficiency curve, hardware rate limits, and the comfort model's predicted indoor response when available
 
 ### Shower mode
-When `shower_mode_enabled` is `true`, a tank drop of at least `shower_drop_threshold` °C between polls starts an immediate Force DHW boost, paired with a Force DHW off that runs on recovery or after `shower_max_duration_minutes`. No boost is started while Force DHW is already on or during the top 5% of the day's prices.
+No ordinary Force DHW boost starts in this build, even if the retained `shower_mode_enabled` setting is true. A previously linked Force DHW off obligation follows the existing restore checks; positive observation also suppresses that lane.
 
 ### Poller schedule
 
@@ -383,18 +387,25 @@ When `shower_mode_enabled` is `true`, a tank drop of at least `shower_drop_thres
 | Prices | 15 min |
 | Weather | 30 min |
 | SmartThings indoor temperature | `smartthings_poll_interval` (300 s) |
-| Comfort model retrain | 6 h |
+| Model maintenance (only when `ml_maintenance_enabled=true`) | 6 h UTC; Demand attempts at least 24 h apart |
 | Seasonal calibration check | 6 h |
 | Operational alert delivery | 5 min |
 | Heartbeat | 1 min |
 
 ### ML Models
 - **COP Model**: Retired inert compatibility API. `train()` returns an explicit unsupported/error result, `load_latest()` returns false without artifact access, and prediction refuses. Status is always the uncached retirement tombstone (`trained=false`, zero samples/source records, null metrics/date, reason `unverified_thermal_output`), even with legacy artifacts or a previously trained cache entry. The former 50-sample COP gate is retired, not lowered.
-- **Demand Model**: Forecasts electrical heating demand from weather + usage patterns. Training still needs at least 168 usable intervals; raw record counts do not establish readiness.
-- **Comfort Model**: Predicts indoor temperature response, used by both rules and MILP for accurate pre-heating
-- **Thermal model**: Tank and indoor heating response; calibrated via `POST /api/thermal/calibrate`
-- Models are persisted with HMAC-signed pickles (`SECRET_KEY`-bound) and shared between containers via `MODEL_DIR`
-- The comfort model retrains every 6 hours in the `poller`. Demand trains via `POST /api/ml/train`, the existing Demand training control, or seasonal calibration. The optional weekly Sunday 03:00 UTC retrain in `packages.ml.main` loads/trains Demand only and is not part of the default Compose stack. Comfort, thermal, device-isolation and counter-confirmation behavior/cadence are unchanged.
+- **Demand Model**: Electrical heating-demand forecasting; at least 168 usable fit intervals. Raw counts and historical CV alone cannot qualify a reporting incumbent.
+- **Comfort Model**: Indoor-response forecasting with separate declared heads/horizons, persistence comparators and prospective skill gates; no control authority.
+- **Thermal model**: Tank, zone and indoor heating/standby rates from supported whole segments; unsupported, unqualified or expired rates use defaults.
+- Exact-fit artifacts are signed, hash-addressed and `SECRET_KEY`-bound in `MODEL_DIR`. Frozen candidates are not planning incumbents; only compatible, fresh reporting-qualified incumbents can support diagnostic forecasts.
+
+`ml_maintenance_enabled` defaults to `false`. Explicit training routes queue durable HTTP 202 requests even while off; request status then says `maintenance_disabled`. Only the poller owns fitting/publication: six-hour UTC maintenance, at least 24 hours between Demand attempts (including failures/restarts), renewable leases and fenced compare-and-swap. API/planner/status reads do not fit or adopt models. The optional weekly entry point also queues requests; it is not a default Compose service.
+
+The five reporting states are `unqualified`, `candidate`, `qualified-for-reporting`, `expired`, and `unavailable`. A fit is not qualification. Status separates incumbent and candidate progress, evidence counts/diversity, exclusions, last valid outcome, cadence and next decision checkpoint. None of these states permits ordinary writes. Qualification expires at most 72 hours after its last distinct supporting valid outcome, or immediately on incompatible scope.
+
+Only prospective unchanged-native-policy evidence qualifies: at least 14 elapsed days, 14 device-day clusters, 20 issue cohorts and 60 valid pairs, with declared horizon/outdoor-bin coverage and improvement against both frozen comparators. Sequential policy `prospective_native_fixed_daily_v1` fixes 71 daily looks at frozen-fit ages 15 through 85 days; six-hour reviews/retries add no looks. The first possible checkpoint is fit time plus 15 days, not a two-week promise. Sparse/excluded evidence can require weeks or months, or postpone qualification indefinitely; maintenance off makes no automatic progress. See [qualification and sequential-decision details](docs/configuration-reference.md#model-maintenance).
+
+Migration `033` follows `032`: retained lifecycle authority, artifacts, maintenance requests, immutable prospective issues with retained outcomes, native-policy provenance and a non-cycling fencing-token sequence. It neither adopts legacy files nor enables control. Downgrade refuses populated lifecycle storage or any issued token; a separately reviewed compatible observe-only rollback must retain these records.
 
 ### Controller Total COP
 
@@ -503,10 +514,11 @@ npm run test:e2e:live
 
 ## Safety
 
+- **C1**: Ordinary writes are prohibited in this build; optimization requires a new reviewed, approved build. No setting, model fit or reporting qualification overrides this contract.
 - Manual override **always wins** over the optimizer
-- **Learning mode** suppresses all device commands while enabled (optimizer observes only) — useful for safely collecting training data. Unresolved safety restores wait until control resumes, so normal activation is blocked until they close; forcing activation is exceptional and audited.
+- **Learning mode** suppresses both dispatch lanes while positive. Turning it off never enables ordinary writes; an active seasonal campaign must also be explicitly exited. Normal observation activation waits for unresolved linked restores; forced activation is exceptional and audited.
 - Rate limiter prevents API abuse (30 reads/h, 20 writes/h)
 - Every Panasonic write first requires live (not cloud-cached) adaptor status no older than 60 seconds
 - Circuit breaker disables auth for 15 min after 3 failures (state shared across services via Redis)
 - All actions are audit-logged
-- Emergency: set any override via the API to immediately pause everything
+- Existing overrides and restore embargoes keep their gate precedence; clearing an override does not enable ordinary control or bypass restore checks.

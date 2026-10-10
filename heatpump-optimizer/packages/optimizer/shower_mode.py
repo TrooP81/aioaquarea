@@ -10,18 +10,13 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_session
-from packages.core.plan_lifecycle import activate_plan
 from packages.core.models import (
-    AuditLogRecord,
     DeviceStatusRecord,
     PlanActionRecord,
-    PlanRecord,
     ShowerEventRecord,
 )
 from packages.core.settings_service import get_setting
-from packages.core.safety_reverts import unresolved_revert_predicate
 from packages.optimizer.data_access import get_prices
-from packages.optimizer.actions import ActionType
 
 logger = structlog.get_logger()
 
@@ -95,130 +90,18 @@ class ShowerDetector:
             )
             return
 
-        # Peak price check — skip boost during top 5% most expensive hours
-        if await self._is_peak_price(session, current.ts):
-            event = ShowerEventRecord(
+        session.add(
+            ShowerEventRecord(
                 started_at=current.ts,
+                expires_at=current.ts,
+                device_id=current.device_id,
                 pre_shower_temp=prev.tank_temp,
-                status="skipped_peak",
-                peak_price_skipped=True,
-            )
-            session.add(event)
-            logger.info(
-                "shower_detected_but_peak_price",
-                drop=drop,
-                pre_temp=prev.tank_temp,
-            )
-            return
-
-        now = dt.datetime.now(dt.timezone.utc)
-        max_duration = int(await get_setting("shower_max_duration_minutes"))
-        expires_at = now + dt.timedelta(minutes=max_duration)
-
-        blocked = (
-            await session.execute(
-                select(PlanActionRecord.id)
-                .where(
-                    unresolved_revert_predicate(),
-                    PlanActionRecord.device_id == current.device_id,
-                    PlanActionRecord.action_type == str(ActionType.FORCE_DHW_OFF),
-                )
-                .with_for_update()
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if blocked is not None:
-            session.add(
-                ShowerEventRecord(
-                    started_at=current.ts,
-                    expires_at=current.ts,
-                    device_id=current.device_id,
-                    pre_shower_temp=prev.tank_temp,
-                    status="skipped_unresolved_revert",
-                )
-            )
-            logger.warning(
-                "shower_mode_trigger_blocked",
-                reason="blocked_by_unresolved_revert",
-                device_id=current.device_id,
-                action_id=blocked,
-            )
-            return
-
-        # Persist the event and both sides of the obligation in one transaction.
-        event = ShowerEventRecord(
-            started_at=current.ts,
-            pre_shower_temp=prev.tank_temp,
-            status="active",
-            device_id=current.device_id,
-            expires_at=expires_at,
-        )
-        session.add(event)
-
-        # Inject immediate force_dhw_on action
-        plan = PlanRecord(
-            horizon_start=now,
-            horizon_end=now + dt.timedelta(hours=1),
-            plan_json="[]",
-            optimizer_version="shower_reactive",
-        )
-        await activate_plan(
-            session,
-            plan,
-            reason="shower_mode_reactive_override",
-        )
-
-        action = PlanActionRecord(
-            plan_id=plan.id,
-            scheduled_ts=now,
-            action_type=str(ActionType.FORCE_DHW_ON),
-            payload_json=json.dumps(
-                {
-                    "trigger": "shower_mode",
-                    "pre_shower_temp": prev.tank_temp,
-                    "drop_detected": drop,
-                    "reason": f"tank_drop_{drop:.1f}C_in_{elapsed_minutes:.0f}min",
-                }
-            ),
-            device_id=current.device_id,
-            status="pending",
-        )
-        session.add(action)
-        await session.flush()
-        event.activation_action_id = action.id
-        session.add(
-            PlanActionRecord(
-                plan_id=plan.id,
-                reverts_action_id=action.id,
-                scheduled_ts=expires_at,
-                action_type=str(ActionType.FORCE_DHW_OFF),
-                payload_json=json.dumps({"trigger": "shower_mode", "reason": "expiry"}),
-                device_id=current.device_id,
-                status="pending",
+                status="skipped_observe_only_build",
             )
         )
-
-        # Audit log
-        session.add(
-            AuditLogRecord(
-                actor="shower_detector",
-                action="shower_mode_activated",
-                payload_json=json.dumps(
-                    {
-                        "pre_shower_temp": prev.tank_temp,
-                        "current_temp": current.tank_temp,
-                        "drop": drop,
-                    }
-                ),
-                result="force_dhw_on_scheduled",
-            )
-        )
-
         logger.info(
-            "shower_mode_activated",
-            drop=drop,
-            pre_temp=prev.tank_temp,
-            current_temp=current.tank_temp,
+            "shower_mode_activation_refused",
+            reason="observe_only_build",
         )
 
     async def _check_recovery(

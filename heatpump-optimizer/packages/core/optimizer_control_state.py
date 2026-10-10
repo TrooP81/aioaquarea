@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
 
 import structlog
@@ -61,6 +61,11 @@ class ControlStateSnapshot:
     primary_action: ControlStateAction | None = None
     notices: list[ControlStateNotice] = field(default_factory=list)
     resolved_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+    model_lifecycle: dict[str, dict[str, object]] = field(default_factory=dict)
+    build_policy: Literal["observe_only"] = "observe_only"
+    control_ready: bool = False
+    ordinary_writes_allowed: bool = False
+    optimization_requires_new_build: bool = True
 
 
 def active_override_query(now: dt.datetime):
@@ -169,6 +174,17 @@ async def resolve_control_state(
     now: dt.datetime | None = None,
     comfort_assessment: Mapping[str, object] | None = None,
 ) -> ControlStateSnapshot:
+    from packages.ml.model_status import get_model_reporting_statuses
+
+    snapshot = await _resolve_control_state(now=now, comfort_assessment=comfort_assessment)
+    return replace(snapshot, model_lifecycle=await get_model_reporting_statuses())
+
+
+async def _resolve_control_state(
+    *,
+    now: dt.datetime | None = None,
+    comfort_assessment: Mapping[str, object] | None = None,
+) -> ControlStateSnapshot:
     """Resolve persisted control gates without contacting Panasonic."""
 
     now = _as_utc(now) or dt.datetime.now(dt.timezone.utc)
@@ -213,8 +229,8 @@ async def resolve_control_state(
                 )
                 return ControlStateSnapshot(
                     state="paused_by_user",
-                    headline="Automatic control is paused",
-                    detail="Ordinary scheduled actions are skipped; safety reverts may still run.",
+                    headline="User override is active",
+                    detail="Ordinary writes are prohibited in this build; existing linked restores may still run outside positive observation.",
                     reason_code="active_override",
                     since=_as_utc(override.ts_from),
                     until=_as_utc(override.ts_to),
@@ -222,7 +238,7 @@ async def resolve_control_state(
                     active_override_count=active_override_count,
                     primary_action=ControlStateAction(
                         kind="request",
-                        label="Resume automatic control",
+                        label="Clear override",
                         endpoint=f"/api/overrides/{override.id}",
                         method="DELETE",
                     ),
@@ -235,7 +251,7 @@ async def resolve_control_state(
                 return ControlStateSnapshot(
                     state="observing",
                     headline="Observation mode is active",
-                    detail="No actions are dispatched, including safety reverts.",
+                    detail="No actions are dispatched, including linked restores. Optimization requires a new reviewed, approved build.",
                     reason_code="learning_mode_active",
                     primary_action=ControlStateAction(
                         kind="link", label="View plan", href="/?view=timeline"
@@ -255,7 +271,7 @@ async def resolve_control_state(
                 return ControlStateSnapshot(
                     state="comfort_at_risk",
                     headline="Comfort may need attention",
-                    detail="Automatic dispatch remains active; the forecast indicates comfort risk.",
+                    detail="The forecast indicates comfort risk; this build does not dispatch ordinary writes.",
                     reason_code="comfort_at_risk",
                     primary_action=ControlStateAction(
                         kind="link", label="View plan", href="/?view=timeline"
@@ -270,8 +286,8 @@ async def resolve_control_state(
                         code="new_plans_paused",
                         severity="warning",
                         detail=(
-                            "New plans paused: required planning inputs are unavailable; "
-                            "already-scheduled actions still run."
+                            "Diagnostic planning inputs are unavailable; "
+                            "ordinary writes remain prohibited in this build."
                         ),
                     )
                 ]
@@ -286,14 +302,14 @@ async def resolve_control_state(
                     ControlStateNotice(
                         code="safety_restore_pending",
                         severity="info",
-                        detail="A safety restore remains pending but does not block the next action.",
+                        detail="An existing linked safety restore remains pending.",
                     )
                 )
             return ControlStateSnapshot(
-                state="automatic",
-                headline="Scheduled control remains active",
-                detail="Automatic dispatch remains active.",
-                reason_code="new_plans_paused" if notices else "automatic",
+                state="observing",
+                headline="Observe-only build",
+                detail="Ordinary writes are prohibited in this build. Optimization requires a new reviewed, approved build; only existing linked restores may run outside positive observation.",
+                reason_code="observe_only_build",
                 primary_action=ControlStateAction(
                     kind="link", label="View plan", href="/?view=timeline"
                 ),
@@ -314,8 +330,8 @@ async def resolve_control_state(
 def _holding(reason_code: str, now: dt.datetime) -> ControlStateSnapshot:
     return ControlStateSnapshot(
         state="holding",
-        headline="Automatic control is holding",
-        detail="Ordinary affected actions are held or deferred; safety reverts may still run.",
+        headline="Control evidence is unavailable",
+        detail="Ordinary writes are prohibited in this build; linked restores still require their existing checks.",
         reason_code=reason_code,
         primary_action=ControlStateAction(kind="link", label="View plan", href="/?view=timeline"),
         resolved_at=now,

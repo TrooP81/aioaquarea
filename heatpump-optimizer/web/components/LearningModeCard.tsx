@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Banner } from "./Banner";
+import type { ModelLifecycleStatuses } from "@/lib/api-types";
 
 interface LearningModeState {
   enabled: boolean;
@@ -21,6 +22,7 @@ interface LearningModeState {
 interface ModelsReady {
   ready: number;
   total: number;
+  unavailable: number;
 }
 
 function formatDate(iso: string | null): string {
@@ -62,11 +64,15 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
       .then(([lm, opt]) => {
         setState(lm);
         if (opt) {
-          const ready = [
-            opt.demand_model?.trained,
-            opt.thermal_model?.calibrated,
-          ].filter(Boolean).length;
-          setModels({ ready, total: 2 });
+          const lifecycle: ModelLifecycleStatuses = opt.model_lifecycle ?? {};
+          const states = [lifecycle.demand?.status, lifecycle.comfort?.status, lifecycle.thermal?.status];
+          setModels({
+            ready: states.filter((value) => value === "qualified-for-reporting").length,
+            unavailable: states.filter((value) => !value || value === "unavailable").length,
+            total: 3,
+          });
+        } else {
+          setModels(null);
         }
         setError(null);
       })
@@ -81,7 +87,7 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
     const next = !state.enabled;
     const confirmMsg = next
       ? "Enable learning mode? The optimizer will keep planning but will not send any commands to the heat pump, so it runs naturally while training data is collected. This stays on until you turn it off."
-      : "Disable learning mode? The optimizer will resume sending commands to the heat pump.";
+      : "Disable manual learning mode? Seasonal observation, if active, stays on. Existing linked safety restores may run only outside all positive observation; ordinary writes remain prohibited in this build.";
     if (!window.confirm(confirmMsg)) return;
 
     setSaving(true);
@@ -97,7 +103,7 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
         const obligations = blocked.detail?.obligations;
         const count = obligations?.count ?? "an";
         setMessage({
-          text: `${count} unresolved safety restore${count === 1 ? "" : "s"} must wait until control resumes.`,
+          text: `${count} unresolved safety restore${count === 1 ? "" : "s"} will be held while observation is active.`,
           ok: false,
         });
         const force = window.confirm(
@@ -117,7 +123,9 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
       const data: LearningModeState = await res.json();
       setState(data);
       setMessage({
-        text: next ? "Learning mode enabled" : "Learning mode disabled",
+        text: next ? "Learning mode enabled" : data.effective_active
+          ? "Manual learning mode disabled; seasonal observation remains active"
+          : "Learning mode disabled",
         ok: true,
       });
       onChange?.();
@@ -132,9 +140,8 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
     <div className="plan-section">
       <h2 className="chart-title">Learning Mode</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        Train the system over a long period. While on, the optimizer observes only — it keeps
-        generating plans but sends no commands to the heat pump, so natural usage data is collected
-        for the ML models. Toggle off to let the optimizer act.
+        Ordinary writes are prohibited in this build. Optimization requires a new reviewed,
+        approved build. Learning mode also holds existing linked safety restores.
       </p>
 
       {error && <Banner tone="danger"><p>{error}</p></Banner>}
@@ -150,10 +157,12 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
         <>
           <div className="controls" style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
             <span
-              className={`status-badge ${state.enabled ? "online" : "offline"}`}
+              className={`status-badge ${(state.effective_active ?? state.enabled) ? "online" : "offline"}`}
               role="status"
             >
-              {state.enabled ? "● Learning" : "● Off"}
+              {state.state_reliable === false ? "Observation state unavailable" : (state.effective_active ?? state.enabled)
+                ? state.enabled ? "Learning" : "Learning (seasonal)"
+                : "Off"}
             </span>
             <button
               className={`btn ${state.enabled ? "btn-danger" : "btn-primary"}`}
@@ -180,17 +189,19 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
               <div>
                 Restore types: {state.open_revert_obligations.action_types.join(", ") || "unknown"}
               </div>
-              <div>Safety restores wait until control resumes.</div>
+              <div>Safety restores are held while observation is active.</div>
             </div>
           )}
 
-          {state.enabled && (
+          {(state.effective_active ?? state.enabled) && (
             <div className="model-card-details" style={{ marginTop: "1rem" }}>
               <div>Started: {formatDate(state.since)}</div>
               <div>Collecting data for: {formatDuration(state.days_elapsed)}</div>
+              {state.sources?.includes("seasonal") && <div>Seasonal observation remains active until explicit human exit.</div>}
               {models && (
                 <div>
-                  Models ready: {models.ready}/{models.total}
+                  Qualified for reporting: {models.ready}/{models.total}
+                  {models.unavailable > 0 && ` (${models.unavailable} unavailable)`}
                 </div>
               )}
             </div>

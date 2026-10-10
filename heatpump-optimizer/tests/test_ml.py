@@ -780,8 +780,10 @@ class TestCOPRetirementLifecycle:
         demand = MagicMock(is_trained=trained)
         demand.train = AsyncMock(return_value={"error": "Insufficient data", "samples": 167})
         scheduler = MagicMock()
+        enqueue = AsyncMock(return_value={"request_id": "fixture", "status": "queued"})
         with (
             patch.object(ml_main, "demand_model", demand),
+            patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
             patch.object(ml_main, "create_scheduler", return_value=scheduler),
             patch("packages.core.logging.configure_logging"),
             patch.object(ml_main.asyncio, "sleep", new=AsyncMock(side_effect=KeyboardInterrupt)),
@@ -793,7 +795,8 @@ class TestCOPRetirementLifecycle:
             await ml_main.main()
 
         demand.load_latest.assert_called_once_with()
-        assert demand.train.await_count == (0 if trained else 1)
+        demand.train.assert_not_awaited()
+        enqueue.assert_awaited_once_with("demand", "ml_startup", automatic=True)
         scheduler.add_job.assert_called_once_with(
             ml_main.retrain_models,
             "cron",
@@ -801,20 +804,24 @@ class TestCOPRetirementLifecycle:
             hour=3,
             timezone="UTC",
             id="retrain",
+            kwargs={"automatic": True, "source": "ml_schedule"},
         )
         scheduler.shutdown.assert_called_once_with()
 
-    async def test_weekly_and_manual_retrain_only_call_demand(self):
+    async def test_weekly_and_manual_retrain_only_enqueue_demand(self):
         from packages.ml import main as ml_main
 
         demand = MagicMock()
         demand.train = AsyncMock(return_value={"version": "fixture"})
+        enqueue = AsyncMock(return_value={"request_id": "fixture", "status": "queued"})
         with (
             patch.object(ml_main, "demand_model", demand),
+            patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
             patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP train")),
         ):
             await ml_main.retrain_models()
-        demand.train.assert_awaited_once_with()
+        enqueue.assert_awaited_once_with("demand", "ml_entrypoint", automatic=False)
+        demand.train.assert_not_awaited()
 
     @pytest.mark.parametrize("usable_samples", [167, 168])
     async def test_seasonal_calibration_only_uses_retained_models(self, usable_samples):
@@ -825,7 +832,7 @@ class TestCOPRetirementLifecycle:
             def __getattr__(self, name):
                 raise AssertionError(f"COP access: {name}")
 
-        demand = MagicMock(is_trained=False)
+        demand = MagicMock(is_trained=False, arefresh_committed=AsyncMock(return_value=False))
         demand.training_data_quality = AsyncMock(
             return_value={
                 "usable_samples": usable_samples,
@@ -840,16 +847,25 @@ class TestCOPRetirementLifecycle:
             return {"version": "fixture-demand", "samples": usable_samples}
 
         demand.train = AsyncMock(side_effect=train_demand)
-        thermal = MagicMock()
+        thermal = MagicMock(arefresh_if_changed=AsyncMock(return_value=False))
         thermal.params.indoor_heating_samples = MIN_LEARNED_RATE_SAMPLES
+        thermal.confidence_for.return_value = "learned"
         thermal.calibrate = AsyncMock(return_value={"sample_count": MIN_LEARNED_RATE_SAMPLES})
         status = {"observe_only_active": True, "auto_train": True, "auto_exit": True}
+        enqueue = AsyncMock(
+            side_effect=lambda component, source, **kwargs: {
+                "request_id": component,
+                "status": "queued",
+            }
+        )
         with (
             patch.object(
                 seasonal_learning,
                 "get_seasonal_calibration_status",
                 new=AsyncMock(side_effect=[status, {**status, "observe_only_active": False}]),
             ) as read_status,
+            patch.object(seasonal_learning, "get_bool_setting", new=AsyncMock(return_value=True)),
+            patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
             patch.object(seasonal_learning, "set_settings_bulk", new=AsyncMock()) as save_settings,
             patch.object(models, "demand_model", demand),
             patch.object(models, "cop_model", RetiredCOP()),
@@ -881,21 +897,20 @@ class TestCOPRetirementLifecycle:
             result = await seasonal_learning.run_seasonal_calibration_cycle()
 
         demand.training_data_quality.assert_awaited_once_with()
-        thermal.calibrate.assert_awaited_once_with()
+        demand.arefresh_committed.assert_awaited_once_with()
+        thermal.arefresh_if_changed.assert_awaited_once_with()
+        thermal.calibrate.assert_not_awaited()
         assert result["demand"]["minimum_samples"] == 168
         assert result["demand"]["usable_samples"] == usable_samples
         assert "cop" not in result
-        if usable_samples == 168:
-            demand.train.assert_awaited_once_with()
-            save_settings.assert_awaited_once_with({"seasonal_calibration_enabled": "false"})
-            assert read_status.await_count == 2
-            assert result["cycle"] == result["next_step"] == "completed"
-        else:
-            demand.train.assert_not_awaited()
-            save_settings.assert_not_awaited()
-            assert read_status.await_count == 1
-            assert result["cycle"] == "collecting"
-            assert result["next_step"] == "collect_space_heating_evidence"
+        demand.train.assert_not_awaited()
+        save_settings.assert_not_awaited()
+        assert read_status.await_count == 1
+        assert result["cycle"] == "queued"
+        assert result["next_step"] == "await_model_maintenance"
+        components = [call.args[0] for call in enqueue.await_args_list]
+        assert components == (["thermal", "demand"] if usable_samples == 168 else ["thermal"])
+        assert all(call.kwargs["automatic"] is True for call in enqueue.await_args_list)
 
     async def test_optimizer_startup_loads_retained_models_and_logs_retirement_once(self):
         from packages.optimizer import main as optimizer_main
@@ -941,6 +956,315 @@ class TestCOPRetirementLifecycle:
 
 
 class TestDemandModel:
+    @staticmethod
+    def _lifecycle_preprocessing_rows(hours=24):
+        base = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        consumption = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(hours=index),
+                heat_kwh=float(index),
+                cool_kwh=0.0,
+                tank_kwh=0.0,
+                outdoor_temp=5.0,
+                source_date=base.date(),
+            )
+            for index in range(hours + 1)
+        ]
+        statuses = [
+            SimpleNamespace(
+                device_id="one",
+                ts=base + dt.timedelta(minutes=5 * index),
+                space_heating_active=True,
+                space_heating_evidence="confirmed",
+                defrost_active=False,
+            )
+            for index in range(hours * 12 + 1)
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=base + dt.timedelta(hours=index), temperature=5.0, wind_speed=3.0, irradiance=0.0
+            )
+            for index in range(hours + 1)
+        ]
+        return [_FakeResult(consumption), _FakeResult(weather), _FakeResult(statuses)]
+
+    async def test_demand_materialization_yields_before_interval_preprocessing(self, monkeypatch):
+        import threading
+        from packages.ml.demand_model_core import DemandModel
+        from packages.ml.thermal import ThermalModel
+
+        event_thread = threading.get_ident()
+        preprocessing_threads = []
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        original = ThermalModel._continuous_indoor_state
+
+        def checked_state(*args, **kwargs):
+            preprocessing_threads.append(threading.get_ident())
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ThermalModel, "_continuous_indoor_state", checked_state)
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session(self._lifecycle_preprocessing_rows()),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            data = await DemandModel().materialize_candidate()
+        assert data is not None and len(data["targets"]) >= 20
+        assert heartbeat.is_set(), "materialization never yielded to the event-loop heartbeat"
+        assert preprocessing_threads and event_thread not in preprocessing_threads
+
+    @pytest.mark.parametrize("hours", [12, 24])
+    async def test_demand_status_history_is_indexed_once(self, monkeypatch, hours):
+        import builtins
+        from packages.ml.demand_model_core import DemandModel
+        from packages.ml import thermal
+
+        full_sorts = MagicMock(wraps=builtins.sorted)
+        monkeypatch.setattr(thermal, "sorted", full_sorts, raising=False)
+        intervals = []
+        original = thermal.ThermalModel._continuous_indoor_state
+
+        def checked_state(*args, **kwargs):
+            intervals.append(kwargs.get("status_times"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(thermal.ThermalModel, "_continuous_indoor_state", checked_state)
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session(self._lifecycle_preprocessing_rows(hours)),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            data = await DemandModel().materialize_candidate()
+        assert data is not None and len(data["targets"]) >= hours - 1
+        assert full_sorts.call_count <= 1
+        assert intervals and all(times is not None for times in intervals)
+        assert len({id(times) for times in intervals}) == 1
+
+    async def test_confirmed_zero_status_history_is_indexed_once(self, monkeypatch):
+        import builtins
+        from packages.ml.demand_model_core import DemandModel
+        from packages.ml import thermal
+
+        results = self._lifecycle_preprocessing_rows()
+        for row in results[0]._rows:
+            row.heat_kwh = 0.0
+        for status in results[2]._rows:
+            status.space_heating_active = False
+        full_sorts = MagicMock(wraps=builtins.sorted)
+        monkeypatch.setattr(thermal, "sorted", full_sorts, raising=False)
+        with (
+            patch("packages.ml.demand_model_core.get_session", _mock_get_session(results)),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            data = await DemandModel().materialize_candidate()
+        assert data is not None and len(data["targets"]) == 23
+        assert np.all(data["targets"] == 0)
+        assert full_sorts.call_count <= 1
+
+    async def test_cancelled_preprocessing_retains_worker_until_exit(self, monkeypatch):
+        from packages.ml.demand_model_core import DemandModel
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        original = DemandModel._preprocess_materialized
+
+        def paused(data):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5), "test failed to release preprocessing worker"
+            return original(data)
+
+        monkeypatch.setattr(DemandModel, "_preprocess_materialized", staticmethod(paused))
+        model = DemandModel()
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session(self._lifecycle_preprocessing_rows()),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            task = asyncio.create_task(model.materialize_candidate())
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                task.cancel()
+                yielded = asyncio.Event()
+                loop.call_soon(yielded.set)
+                await yielded.wait()
+                assert not task.done() and model._sample_bounds == []
+            finally:
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert model._sample_bounds == []
+
+    @pytest.mark.parametrize("request_count", [8, 50])
+    async def test_demand_status_overload_materializes_only_once(self, monkeypatch, request_count):
+        from packages.ml import demand_model_core as demand
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        original = demand.DemandModel._preprocess_materialized
+
+        def paused(data):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(10), "test did not release diagnostic worker"
+            return original(data)
+
+        factory = MagicMock(wraps=_mock_get_session(self._lifecycle_preprocessing_rows()))
+        timezone = AsyncMock(return_value="UTC")
+        monkeypatch.setattr(demand, "get_session", factory)
+        monkeypatch.setattr(demand, "get_user_tz", timezone)
+        monkeypatch.setattr(demand.DemandModel, "_preprocess_materialized", staticmethod(paused))
+        models = [demand.DemandModel() for _ in range(request_count)]
+        tasks = [asyncio.create_task(model.training_data_quality()) for model in models]
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.sleep(0)
+            assert factory.call_count == 1, (
+                "status callers materialized separate history-sized jobs"
+            )
+            assert timezone.await_count == 1
+        finally:
+            release.set()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(isinstance(result, dict) for result in results)
+        assert all(result == results[0] for result in results)
+        assert all(model.last_data_quality == results[0] for model in models)
+
+    async def test_cancelled_status_waiter_releases_immediately_without_new_inputs(
+        self, monkeypatch
+    ):
+        from packages.ml import demand_model_core as demand
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        original = demand.DemandModel._preprocess_materialized
+
+        def paused(data):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(10), "test did not release diagnostic worker"
+            return original(data)
+
+        factory = MagicMock(wraps=_mock_get_session(self._lifecycle_preprocessing_rows()))
+        monkeypatch.setattr(demand, "get_session", factory)
+        monkeypatch.setattr(demand, "get_user_tz", AsyncMock(return_value="UTC"))
+        monkeypatch.setattr(demand.DemandModel, "_preprocess_materialized", staticmethod(paused))
+        running = asyncio.create_task(demand.DemandModel().training_data_quality())
+        waiting = None
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            waiting = asyncio.create_task(demand.DemandModel().training_data_quality())
+            await asyncio.sleep(0)
+            waiting.cancel()
+            yielded = asyncio.Event()
+            loop.call_soon(yielded.set)
+            await yielded.wait()
+            assert waiting.done() and waiting.cancelled(), "cancelled waiter retained its backlog"
+            assert not running.done(), "running worker lost ownership before exit"
+            assert factory.call_count == 1
+        finally:
+            release.set()
+            await asyncio.gather(
+                *[task for task in (running, waiting) if task is not None], return_exceptions=True
+            )
+
+    async def test_diagnostic_materialization_uses_lifecycle_row_and_time_bounds(self):
+        from packages.ml.demand_model_core import DemandModel
+
+        cutoff = dt.datetime(2026, 10, 9, tzinfo=dt.timezone.utc)
+        context = _FakeSessionCtx([_FakeResult([]), _FakeResult([])])
+        with (
+            patch("packages.ml.demand_model_core.get_session", return_value=context),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+        ):
+            await DemandModel()._prepare_data(cutoff=cutoff)
+        assert len(context._session.statements) == 2
+        for statement in context._session.statements:
+            params = statement.compile().params
+            assert 50_001 in params.values(), "diagnostic query has no overflow sentinel limit"
+            assert cutoff in params.values()
+        assert (
+            cutoff - dt.timedelta(days=90)
+            in context._session.statements[0].compile().params.values()
+        )
+        assert (
+            cutoff - dt.timedelta(days=90, hours=2)
+            in context._session.statements[1].compile().params.values()
+        )
+
+    async def test_diagnostic_materialization_rejects_overflow_before_preprocessing(self):
+        from packages.ml.demand_model_core import DemandModel
+
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                _mock_get_session([_FakeResult([SimpleNamespace()] * 50_001), _FakeResult([])]),
+            ),
+            patch("packages.ml.demand_model_core.get_user_tz", new=AsyncMock(return_value="UTC")),
+            patch.object(DemandModel, "_preprocess_materialized") as preprocess,
+        ):
+            with pytest.raises(ValueError, match="Demand materialization overflow"):
+                await DemandModel().training_data_quality()
+        preprocess.assert_not_called()
+
+    async def test_cancelled_preparation_before_materialization_releases_admission(
+        self, monkeypatch
+    ):
+        from packages.ml import demand_model_core as demand
+
+        started = asyncio.Event()
+
+        async def timezone():
+            started.set()
+            await asyncio.Future()
+
+        factory = MagicMock(side_effect=AssertionError("cancelled admission read history"))
+        monkeypatch.setattr(demand, "get_user_tz", timezone)
+        monkeypatch.setattr(demand, "get_session", factory)
+        task = asyncio.create_task(demand.DemandModel().training_data_quality())
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        factory.assert_not_called()
+        assert asyncio.get_running_loop() not in demand._PREPARATION_FLIGHTS
+
+    async def test_incompatible_preparation_is_busy_without_materializing(self, monkeypatch):
+        from packages.ml import demand_model_core as demand
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        original = demand.DemandModel._preprocess_materialized
+
+        def paused(data):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(10), "test did not release lifecycle worker"
+            return original(data)
+
+        factory = MagicMock(wraps=_mock_get_session(self._lifecycle_preprocessing_rows()))
+        monkeypatch.setattr(demand, "get_session", factory)
+        monkeypatch.setattr(demand, "get_user_tz", AsyncMock(return_value="UTC"))
+        monkeypatch.setattr(demand.DemandModel, "_preprocess_materialized", staticmethod(paused))
+        task = asyncio.create_task(demand.DemandModel().materialize_candidate())
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            status = await demand.DemandModel().training_data_quality()
+            assert status["training_blocker"] == "preparation_busy"
+            assert status["ready_to_train"] is False
+            assert factory.call_count == 1 and not task.done()
+        finally:
+            release.set()
+            await task
+
     def test_untrained_uses_fallback(self):
         """Untrained model should produce reasonable fallback predictions."""
         from packages.ml.models import DemandModel
@@ -1277,43 +1601,228 @@ class TestDemandModel:
 
 
 class TestDemandEvidenceBoundaries:
+    def test_published_fit_is_evaluated_fit(self):
+        import pickle
+        from packages.ml.demand_model_core import build_demand_candidate
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        features = np.zeros((500, 10))
+        features[:, 0] = np.tile(np.arange(-5.0, 20.0), 20)
+        targets = np.maximum(0.0, 3.0 - 0.1 * features[:, 0])
+        bounds = [
+            (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+            for index in range(len(targets))
+        ]
+        candidate = build_demand_candidate(
+            {"features": features, "targets": targets, "bounds": bounds, "device_id": "one"}
+        )
+        assert candidate is not None
+        restored = pickle.loads(pickle.dumps(candidate))
+        for name in ("median", "lower", "upper"):
+            np.testing.assert_array_equal(
+                restored[name].predict(candidate["evaluation"]["features"]),
+                candidate["evaluation"]["predictions"][name],
+            )
+        assert candidate["metrics"]["fit_samples"] >= 168
+        assert dt.datetime.fromisoformat(candidate["evaluation"]["fit_label_end"]) + dt.timedelta(
+            hours=4
+        ) <= dt.datetime.fromisoformat(candidate["evaluation"]["holdout_issue_start"])
+
+    def test_equal_counters_without_fresh_continuity_are_not_zero(self):
+        from zoneinfo import ZoneInfo
+        from packages.ml.models_common import iter_confirmed_zero_intervals
+
+        start = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        counters = [
+            SimpleNamespace(
+                device_id="one",
+                ts=start + dt.timedelta(minutes=15 * index),
+                heat_kwh=1.0,
+                source_date=start.date(),
+            )
+            for index in range(2)
+        ]
+        assert list(iter_confirmed_zero_intervals(counters, [], ZoneInfo("UTC"))) == []
+        stale = [
+            SimpleNamespace(
+                device_id="one", ts=start - dt.timedelta(hours=1), space_heating_active=False
+            )
+        ]
+        assert list(iter_confirmed_zero_intervals(counters, stale, ZoneInfo("UTC"))) == []
+        fresh = [
+            SimpleNamespace(
+                device_id="one",
+                ts=start + dt.timedelta(minutes=5 * index),
+                space_heating_active=False,
+            )
+            for index in range(4)
+        ]
+        assert len(list(iter_confirmed_zero_intervals(counters, fresh, ZoneInfo("UTC")))) == 1
+        counters[-1].source_date = start.date() - dt.timedelta(days=1)
+        assert list(iter_confirmed_zero_intervals(counters, fresh, ZoneInfo("UTC"))) == []
+
+    @pytest.mark.parametrize(
+        ("timezone_name", "start"),
+        [
+            ("Europe/Stockholm", dt.datetime(2026, 10, 1, 22, tzinfo=dt.timezone.utc)),
+            ("America/New_York", dt.datetime(2026, 10, 2, 3, tzinfo=dt.timezone.utc)),
+        ],
+    )
+    def test_confirmed_zeros_require_device_local_source_day(self, timezone_name, start):
+        from zoneinfo import ZoneInfo
+        from packages.ml.models_common import iter_confirmed_zero_intervals
+
+        timezone = ZoneInfo(timezone_name)
+        source_day = start.astimezone(timezone).date()
+        counters = [
+            SimpleNamespace(
+                device_id="one",
+                ts=start + dt.timedelta(minutes=15 * index),
+                heat_kwh=1.0,
+                source_date=source_day,
+            )
+            for index in range(2)
+        ]
+        fresh = [
+            SimpleNamespace(
+                device_id="one",
+                ts=start + dt.timedelta(minutes=5 * index),
+                space_heating_active=False,
+            )
+            for index in range(4)
+        ]
+        assert len(list(iter_confirmed_zero_intervals(counters, fresh, timezone))) == 1
+        for counter in counters:
+            counter.source_date = start.date()
+        assert list(iter_confirmed_zero_intervals(counters, fresh, timezone)) == []
+
+    def test_sensor_and_counter_evidence_are_device_scoped(self):
+        from zoneinfo import ZoneInfo
+        from packages.ml.models_common import iter_confirmed_zero_intervals
+
+        start = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        counters = [
+            SimpleNamespace(
+                device_id="one",
+                ts=start + dt.timedelta(minutes=15 * index),
+                heat_kwh=1.0,
+                source_date=start.date(),
+            )
+            for index in range(2)
+        ]
+        other_device = [
+            SimpleNamespace(
+                device_id="two",
+                ts=start + dt.timedelta(minutes=5 * index),
+                space_heating_active=False,
+            )
+            for index in range(4)
+        ]
+        assert list(iter_confirmed_zero_intervals(counters, other_device, ZoneInfo("UTC"))) == []
+
     @pytest.mark.parametrize(("samples", "trained"), [(167, False), (168, True)])
     async def test_demand_minimum_remains_168(self, samples, trained):
-        from packages.ml.demand_model_core import DemandModel, MIN_TRAINING_SAMPLES
+        from packages.ml.demand_model_core import (
+            DemandModel,
+            MIN_TRAINING_SAMPLES,
+            build_demand_candidate,
+        )
 
         assert MIN_TRAINING_SAMPLES == 168
+        model = DemandModel()
+        total = samples + 47
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        features = np.zeros((total, 10))
+        features[:, 0] = np.resize(np.arange(-5.0, 20.0), total)
+        targets = 3.0 - 0.1 * features[:, 0]
+        candidate = build_demand_candidate(
+            {
+                "features": features,
+                "targets": targets,
+                "bounds": [
+                    (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+                    for index in range(total)
+                ],
+                "device_id": "one",
+            }
+        )
+        assert (candidate is not None) is trained
+        assert model.is_trained is False
+        if trained:
+            assert candidate["metrics"]["fit_samples"] == 168
+            assert candidate["metrics"]["holdout_samples"] >= 24
+
+    async def test_demand_without_skill_over_naive_mean_is_not_deployed(self):
+        from packages.ml.demand_model_core import DemandModel
+
         model = DemandModel()
         regressor = MagicMock()
         with (
             patch.object(
                 model,
                 "_prepare_data",
-                new=AsyncMock(return_value=(np.zeros((samples, 10)), np.ones(samples))),
+                new=AsyncMock(return_value=(np.zeros((200, 10)), np.ones(200))),
             ),
             patch.object(model, "_make_quantile_model", return_value=regressor),
-            patch("packages.ml.demand_model_core.time_series_cv_mae", return_value=(0.1, 0.01)),
-            patch(
-                "packages.ml.demand_model_core.evaluate_regression",
-                return_value={"deploy": True, "baseline_mae": None},
-            ),
+            patch("packages.ml.demand_model_core.time_series_cv_mae", return_value=(0.98, 0.1)),
+            patch("packages.ml.demand_model_core.time_series_cv_naive_mae", return_value=1.0),
             patch("packages.ml.safe_persistence.safe_dump") as publish,
-            patch("packages.ml.demand_model_core.prune_old_models"),
-            patch("packages.ml.demand_model_core.write_mae_baseline"),
-            patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP training")),
         ):
             result = await model.train()
 
-        assert model.is_trained is trained
-        assert result["samples"] == samples
-        if trained:
-            assert "version" in result
-            assert regressor.fit.call_count == 3
-            publish.assert_called_once()
-            assert publish.call_args.args[1].name.startswith("demand_model_weather_v3_")
-        else:
-            assert result["error"] == "Insufficient data"
-            regressor.fit.assert_not_called()
-            publish.assert_not_called()
+        assert result["status"] == "no_skill"
+        assert result["skill_vs_naive"] == pytest.approx(0.02)
+        assert model.is_trained is False
+        regressor.fit.assert_not_called()
+        publish.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("status", "mae", "deploy"), [("no_skill", 0.98, True), ("regressed", 0.5, False)]
+    )
+    async def test_rejected_retrain_does_not_keep_unvalidated_loaded_demand(
+        self, status, mae, deploy
+    ):
+        from packages.ml.demand_model_core import DemandModel
+
+        model = DemandModel()
+        deployed = MagicMock()
+        deployed.predict.return_value = np.array([99.0])
+        model._model = deployed
+        model._model_lower = deployed
+        model._model_upper = deployed
+        model._version = "20260930_0000"
+        model._metrics = {"mae": 0.1, "skill_vs_naive": 0.2}
+        candidate = MagicMock()
+        with (
+            patch.object(
+                model,
+                "_prepare_data",
+                new=AsyncMock(return_value=(np.zeros((200, 10)), np.ones(200))),
+            ),
+            patch.object(model, "_make_quantile_model", return_value=candidate),
+            patch("packages.ml.demand_model_core.time_series_cv_mae", return_value=(mae, 0.01)),
+            patch("packages.ml.demand_model_core.time_series_cv_naive_mae", return_value=1.0),
+            patch(
+                "packages.ml.demand_model_core.evaluate_regression",
+                return_value={"deploy": deploy, "baseline_mae": 0.1},
+            ),
+            patch("packages.ml.safe_persistence.safe_dump") as publish,
+        ):
+            result = await model.train()
+
+        assert result["status"] == status
+        candidate.fit.assert_not_called()
+        publish.assert_not_called()
+        assert model.predict_hourly([{"temperature": 5.0}], hours=1) == [2.5]
+        assert model.is_trained is False
+
+    def test_naive_baseline_uses_training_fold_means(self):
+        from packages.ml.models_common import time_series_cv_naive_mae
+
+        y = np.array([1.0] * 10 + [3.0] * 10)
+
+        assert time_series_cv_naive_mae(y, max_splits=1) == pytest.approx(1.0)
+        assert time_series_cv_naive_mae(np.full(30, 2.0)) == 0.0
 
     async def test_demand_interleaved_devices_keep_independent_electrical_counters(self):
         from packages.ml.demand_model_core import DemandModel, DEMAND_COUNTER_CONFIRMATION_ENABLED
@@ -2163,13 +2672,26 @@ class TestMonotonicDemandModel:
 
         model._prepare_data = fake_prep
         with patch("packages.ml.safe_persistence.safe_dump"):
+            refused = await model.train()
+        # Physically inverted data has no skill once monotonicity is enforced.
+        assert refused["status"] == "no_skill"
+        assert model.is_trained is False
+
+        with (
+            patch("packages.ml.safe_persistence.safe_dump") as publish,
+            patch("packages.ml.demand_model_core.time_series_cv_naive_mae", return_value=100.0),
+        ):
             result = await model.train()
-        assert "version" in result
+        assert result["status"] == "maintenance_required"
+        assert model.is_trained is False
+        publish.assert_not_called()
+        fitted = model._make_quantile_model(0.5)
+        fitted.fit(X[:240], y[:240])
 
         f_warm = DemandModel._make_features(15.0, 3.0, 0.0, 12, 2).reshape(1, -1)
         f_cold = DemandModel._make_features(-5.0, 3.0, 0.0, 12, 2).reshape(1, -1)
-        warm = float(model._model.predict(f_warm)[0])
-        cold = float(model._model.predict(f_cold)[0])
+        warm = float(fitted.predict(f_warm)[0])
+        cold = float(fitted.predict(f_cold)[0])
         assert cold >= warm - 1e-6
 
 

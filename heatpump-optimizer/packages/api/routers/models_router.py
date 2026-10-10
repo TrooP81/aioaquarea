@@ -4,10 +4,12 @@ import asyncio
 import datetime as dt
 import json
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import desc, select
+from sqlalchemy.exc import SQLAlchemyError
 import structlog
 
 from packages.api._helpers import get_price_area
@@ -24,6 +26,8 @@ from packages.core.models import (
     WeatherRecord,
 )
 from packages.ml.forecast_quality import get_forecast_scorecard as build_forecast_scorecard
+from packages.ml.lifecycle import Lifecycle, LifecycleUnavailable, enqueue_maintenance_request
+from packages.core.settings_service import get_bool_setting
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -107,10 +111,29 @@ async def _read_live_forecast_quality() -> dict[str, object]:
     )
 
 
+def _reporting_forecast_quality(forecast_quality: dict) -> dict:
+    """Expose validation evidence without advertising write permission."""
+    return {
+        **forecast_quality,
+        "control_allowed": False,
+        "control_reason": "observe_only_build",
+    }
+
+
 @router.get("/api/thermal/forecast-scorecard")
 async def get_forecast_scorecard():
     """Score immutable indoor forecasts against later sensor observations."""
-    return await build_forecast_scorecard()
+    from copy import deepcopy
+
+    scorecard = deepcopy(await build_forecast_scorecard())
+    for family in [
+        scorecard,
+        *(scorecard.get(name) for name in ("fallback", "passive_weather_model", "all_forecasts")),
+    ]:
+        if isinstance(family, dict) and isinstance(family.get("quality_gate"), dict):
+            family["quality_gate"]["control_allowed"] = False
+    scorecard["ordinary_writes_allowed"] = False
+    return scorecard
 
 
 @router.get("/api/sensors/diagnostics")
@@ -370,12 +393,18 @@ def _enforce_physical_ordering(
 @router.get("/api/comfort-model/status")
 async def get_comfort_model_status():
     from packages.ml.comfort_model import comfort_model
+    from packages.ml.models import MODEL_DIR
+    from packages.ml.model_status import get_model_status
 
     await comfort_model.arefresh_if_changed()
+    lifecycle_status = await get_model_status("comfort", MODEL_DIR)
     return {
+        "lifecycle": lifecycle_status,
+        "reporting_state": lifecycle_status["status"],
         "trained": comfort_model.is_trained,
-        "control_ready": comfort_model.is_ready_for_control,
-        "control_readiness": comfort_model.control_readiness,
+        "control_ready": False,
+        "control_readiness": {"ready": False, "reason": "observe_only_build"},
+        "ordinary_writes_allowed": False,
         "last_trained": comfort_model.last_trained.isoformat()
         if comfort_model.last_trained
         else None,
@@ -391,40 +420,45 @@ async def get_comfort_model_status():
     }
 
 
-@router.post("/api/comfort-model/train")
-async def trigger_comfort_model_training():
-    import structlog
-    import traceback
-
-    from packages.core.settings_service import get_setting
-    from packages.ml.comfort_model import comfort_model
-
-    _log = structlog.get_logger()
-    await comfort_model.arefresh_if_changed()
-    lag_str = await get_setting("thermal_lag_minutes")
-    lag = int(lag_str) if lag_str else None
-
+async def _queue_training(component: str, action: str) -> dict[str, Any]:
     try:
-        result = await comfort_model.train(thermal_lag_minutes=lag)
-        result["control_ready"] = comfort_model.is_ready_for_control
-        result["control_readiness"] = comfort_model.control_readiness
-        if result.get("status") in {"training_in_progress", "training_skipped"}:
-            _log.info("comfort_train_deferred", **result)
-    except Exception as exc:
-        _log.error("comfort_train_error", error=str(exc), traceback=traceback.format_exc())
-        result = {"error": f"Training failed: {exc}"}
-
+        result = await enqueue_maintenance_request(component, "api")
+        if result is None:
+            raise LifecycleUnavailable("maintenance_request_unavailable")
+    except (SQLAlchemyError, LifecycleUnavailable) as error:
+        logger.warning(
+            "ml_maintenance_request_unavailable",
+            component=component,
+            error_type=type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503, detail={"code": "ml_maintenance_unavailable"}
+        ) from error
+    result["control_ready"] = False
+    result["control_readiness"] = {"ready": False, "reason": "observe_only_build"}
     async with get_session() as session:
         session.add(
             AuditLogRecord(
                 actor="user",
-                action="train_comfort_model",
+                action=action,
                 payload_json=json.dumps(result, default=str),
-                result=result.get("status", "unknown"),
+                result="queued",
             )
         )
-
     return result
+
+
+@router.post("/api/comfort-model/train", status_code=202)
+async def trigger_comfort_model_training():
+    return await _queue_training("comfort", "train_comfort_model")
+
+
+@router.get("/api/ml/requests/{request_id}")
+async def get_maintenance_request(request_id: UUID):
+    request = await Lifecycle().get_request(str(request_id))
+    if request is None:
+        raise HTTPException(status_code=404, detail="Maintenance request not found")
+    return request.response(await get_bool_setting("ml_maintenance_enabled"))
 
 
 @router.get("/api/comfort-model/predict")
@@ -474,48 +508,27 @@ async def predict_indoor_temp(
     }
 
 
-@router.post("/api/ml/train")
+@router.post("/api/ml/train", status_code=202)
 async def trigger_ml_training():
-    import structlog
-    import traceback
-
-    from packages.ml.models import DemandModel
-
-    _log = structlog.get_logger()
-    demand = DemandModel()
-
     cop_result = {
         "status": "retired",
         "supported": False,
         "error": "cop_model_retired",
         "reason": "unverified_thermal_output",
     }
-
-    try:
-        demand_result = await demand.train()
-    except Exception as exc:
-        _log.error("demand_train_error", error=str(exc), traceback=traceback.format_exc())
-        demand_result = {"error": f"Training failed: {exc}"}
-
-    async with get_session() as session:
-        session.add(
-            AuditLogRecord(
-                actor="user",
-                action="train_ml_models",
-                payload_json=json.dumps({"cop": cop_result, "demand": demand_result}, default=str),
-                result="ok",
-            )
-        )
-
+    demand_result = await _queue_training("demand", "train_ml_models")
     return {"cop": cop_result, "demand": demand_result}
 
 
 @router.get("/api/thermal/status")
 async def get_thermal_status():
     from packages.core.control_temperature import get_control_temperature
+    from packages.ml.models import MODEL_DIR
+    from packages.ml.model_status import get_model_status
     from packages.ml.thermal import thermal_model
 
-    thermal_model.load_latest()
+    await thermal_model.arefresh_if_changed()
+    lifecycle_status = await get_model_status("thermal", MODEL_DIR)
     async with get_session() as session:
         result = await session.execute(
             select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
@@ -524,6 +537,11 @@ async def get_thermal_status():
 
     if not status:
         return {
+            "lifecycle": lifecycle_status,
+            "reporting_state": lifecycle_status["status"],
+            "control_ready": False,
+            "control_readiness": {"ready": False, "reason": "observe_only_build"},
+            "ordinary_writes_allowed": False,
             "current_indoor": None,
             "outdoor_temp": None,
             "forecast": [],
@@ -575,6 +593,11 @@ async def get_thermal_status():
     )
 
     return {
+        "lifecycle": lifecycle_status,
+        "reporting_state": lifecycle_status["status"],
+        "control_ready": False,
+        "control_readiness": {"ready": False, "reason": "observe_only_build"},
+        "ordinary_writes_allowed": False,
         "current": {
             "tank_temp": current_tank,
             "tank_target": tank_target,
@@ -643,7 +666,9 @@ async def get_thermal_status():
             "calibration_status": thermal_model.params.calibration_status,
             "component_confidence": {
                 "tank_heating": thermal_model.confidence_for("tank_heating"),
+                "tank_cooling": thermal_model.confidence_for("tank_cooling"),
                 "zone_heating": thermal_model.confidence_for("zone_heating"),
+                "zone_cooling": thermal_model.confidence_for("zone_cooling"),
                 "indoor_heating": thermal_model.confidence_for("indoor_heating"),
                 "indoor_cooling": thermal_model.confidence_for("indoor_cooling"),
             },
@@ -651,11 +676,9 @@ async def get_thermal_status():
     }
 
 
-@router.post("/api/thermal/calibrate")
+@router.post("/api/thermal/calibrate", status_code=202)
 async def calibrate_thermal_model():
-    from packages.ml.thermal import thermal_model
-
-    return await thermal_model.calibrate()
+    return await _queue_training("thermal", "calibrate_thermal_model")
 
 
 @router.get("/api/thermal/curve")
@@ -670,7 +693,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     from packages.ml.thermal import thermal_model
     from packages.optimizer.executor_core import LearningModeState, resolve_learning_mode_state
 
-    thermal_model.load_latest()
+    await thermal_model.arefresh_if_changed()
     async with get_session() as session:
         result = await session.execute(
             select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
@@ -705,12 +728,7 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         else:
             tank_min_per_hour.append(float(tank_min_temp_offpeak))
 
-    # Prefer the actual optimizer plan: the MILP chose *when* to reheat DHW based
-    # on price/COP, so the "with heating" curve should follow those scheduled
-    # cycles rather than a generic deadband. In learning mode the executor
-    # dispatches nothing — the plan is created but not run, so the tank follows
-    # the heat pump's native behaviour — so we fall back to the deadband estimate
-    # and flag it instead of pretending the plan drives the tank.
+    # Ordinary plans never drive the heat pump in this build.
     try:
         learning_mode_state = await resolve_learning_mode_state()
     except asyncio.CancelledError:
@@ -727,24 +745,6 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         active_plan = plan_result.scalar_one_or_none()
         if active_plan:
             plan_id = active_plan.id
-            if learning_mode_state is LearningModeState.INACTIVE:
-                actions_result = await session.execute(
-                    select(PlanActionRecord)
-                    .where(PlanActionRecord.plan_id == active_plan.id)
-                    .order_by(PlanActionRecord.scheduled_ts)
-                )
-                for action in actions_result.scalars().all():
-                    if action.action_type != "force_dhw_on":
-                        continue
-                    hour_offset = int((action.scheduled_ts - hour_start).total_seconds() // 3600)
-                    if hour_offset < 0 or hour_offset >= hours:
-                        continue
-                    payload = json.loads(action.payload_json) if action.payload_json else {}
-                    minutes = float(payload.get("dhw_minutes", 60))
-                    dhw_minutes_per_hour[hour_offset] = min(
-                        60.0, dhw_minutes_per_hour[hour_offset] + minutes
-                    )
-                plan_driven = any(m > 0 for m in dhw_minutes_per_hour)
 
     tank_standby_curve = thermal_model.predict_temperature_curve(
         current_temp=current_tank,
@@ -1040,7 +1040,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     )
     from packages.ml.thermal import thermal_model
 
-    thermal_model.load_latest()
+    await thermal_model.arefresh_if_changed()
     forecast_quality = await _read_live_forecast_quality()
     price_area = await get_price_area()
     async with get_session() as session:
@@ -1285,7 +1285,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "sensor_age_seconds": sensor_age_seconds,
             "current_vs_plan_delta_c": current_vs_plan_delta_c,
             "space_heating_gate": gate_payload,
-            "forecast_quality": forecast_quality,
+            "forecast_quality": _reporting_forecast_quality(forecast_quality),
         }
 
     if current_indoor is None:
@@ -1311,7 +1311,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                 if control_temperature.latest_reading is not None
                 else None
             ),
-            "forecast_quality": forecast_quality,
+            "forecast_quality": _reporting_forecast_quality(forecast_quality),
         }
 
     # Schedule-aware comfort setpoint per hour, matching the optimizer: the home
@@ -1434,7 +1434,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "fresh_inlier_max": room_envelope.fresh_inlier_max if room_envelope else None,
             "affected_rooms": list(room_envelope.rooms_above_max) if room_envelope else [],
         },
-        "forecast_quality": forecast_quality,
+        "forecast_quality": _reporting_forecast_quality(forecast_quality),
         "forecast_provenance": {
             "current_live_indoor_c": current_indoor,
             "control_input": {

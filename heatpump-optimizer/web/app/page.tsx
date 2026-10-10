@@ -64,6 +64,7 @@ interface DashboardData {
   today_cost_complete: boolean;
   active_plan: {
     id: number;
+    status: string;
     optimizer_version: string;
     cost_estimate_eur: number | null;
     actions_count: number;
@@ -366,6 +367,7 @@ function DashboardPage() {
     );
   }
 
+  const activePlan = data?.active_plan?.status === "active" ? data.active_plan : null;
   const headerStatus = data?.current_status
     ? (data.current_status_fresh === false ? "stale" : "online")
     : "offline";
@@ -422,7 +424,7 @@ function DashboardPage() {
       </p>
 
       {pollResult && (
-        <Banner tone={pollResult.success ? "info" : pollResult.tone ?? "warning"}>
+        <Banner tone={pollResult.success ? "info" : pollResult.tone ?? "warning"} label="Heat pump refresh result">
           <p>{pollResult.message}</p>
           <button className="btn btn-sm" onClick={() => setPollResult(null)}>
             Dismiss
@@ -435,10 +437,10 @@ function DashboardPage() {
       )}
 
       {controlState && (
-        <Banner tone={controlState.state === "comfort_at_risk" ? "warning" : controlState.state === "automatic" ? "info" : "warning"}>
+        <Banner tone={controlState.state === "observing" || controlState.state === "automatic" ? "info" : "warning"} label="Optimizer build and control state">
           <p><strong>{controlState.headline}</strong> {controlState.detail}</p>
           {controlState.primary_action?.kind === "request" && controlState.active_override_count === 1 && (
-            <button className="btn btn-danger" onClick={cancelOverride}>{controlState.primary_action.label}</button>
+            <button className="btn btn-danger" onClick={cancelOverride}>Clear override</button>
           )}
           {controlState.notices.map((notice) => <p key={notice.code}>{notice.detail}</p>)}
         </Banner>
@@ -453,7 +455,7 @@ function DashboardPage() {
         hidden={activeSection !== "home"}
       >
         <DecisionSummary
-          plan={data?.active_plan ?? null}
+          plan={activePlan}
           indoorTemp={indoorTemp?.avg_temperature ?? null}
           indoorTimestamp={indoorTemp?.latest_reading ?? null}
           indoorStale={indoorTemp?.last_fresh_reading !== indoorTemp?.latest_reading}
@@ -479,13 +481,13 @@ function DashboardPage() {
         {activeSection === "timeline" && (
           <>
             <PlanView
-              plan={data?.active_plan ?? null}
+              plan={activePlan}
               controlledActions={timelineActions}
               controlledError={timelineActionsError}
               controlledLoading={timelineActionsLoading}
             />
             <TimelineWorkspace
-              planId={data?.active_plan?.id}
+              planId={activePlan?.id}
               controlState={controlState}
               onActivity={(actions, activityError, activityLoading) => { setTimelineActivity(actions); setTimelineActivityError(activityError); setTimelineActivityLoading(activityLoading); }}
               onActions={(actions, actionsError, actionsLoading) => { setTimelineActions(actions); setTimelineActionsError(actionsError); setTimelineActionsLoading(actionsLoading); }}

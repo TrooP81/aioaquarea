@@ -969,7 +969,7 @@ class TestPhase2ApiAcceptance:
         assert active_ids == [plan.id]
 
     @pytest.mark.asyncio(loop_scope="session")
-    async def test_P2_AC4_shower_activation_preserves_tagged_restore(self):
+    async def test_OBS1_shower_denial_preserves_existing_plan_and_tagged_restore(self):
         now = dt.datetime.now(dt.timezone.utc)
         previous = DeviceStatusRecord(
             ts=now - dt.timedelta(minutes=5),
@@ -1042,10 +1042,26 @@ class TestPhase2ApiAcceptance:
                     {"plan_id": first.id},
                 )
             ).all()
-        assert rows[0].status == "cancelled"
+        assert len(rows) == 3
+        assert rows[0].action_type == "quiet_mode_on"
+        assert rows[0].status == "pending"
         assert rows[1].reverts_action_id is None
+        assert rows[1].status == "executed"
         assert rows[2].reverts_action_id is not None
         assert rows[2].status == "pending"
+        async with get_session() as session:
+            assert await session.scalar(text("SELECT count(*) FROM plans")) == 1
+            shower_events = (await session.execute(select(ShowerEventRecord))).scalars().all()
+            assert len(shower_events) == 1
+            assert shower_events[0].status == "skipped_observe_only_build"
+            assert shower_events[0].activation_action_id is None
+            assert await detector._get_active_event(session, current.device_id) is None
+            assert (
+                await session.scalar(
+                    text("SELECT status FROM plans WHERE id = :id"), {"id": first.id}
+                )
+                == "active"
+            )
 
     @pytest.mark.asyncio(loop_scope="session")
     async def test_A2_watchdog_due_query_ignores_skipped_and_closed_events(self):
@@ -1091,7 +1107,7 @@ class TestPhase2ApiAcceptance:
         assert rows[5].status == "active"
 
     @pytest.mark.asyncio(loop_scope="session")
-    async def test_P2_AC16_real_failure_after_on_flush_rolls_back_everything(self):
+    async def test_OBS1_shower_refuses_before_any_on_or_restore_flush(self):
         now = dt.datetime.now(dt.timezone.utc)
         previous = DeviceStatusRecord(
             ts=now - dt.timedelta(minutes=5),
@@ -1140,8 +1156,7 @@ class TestPhase2ApiAcceptance:
                         }[key],
                     ),
                 )
-                with pytest.raises(Exception, match="injected linked OFF failure"):
-                    await detector.check(current)
+                await detector.check(current)
         finally:
             await _migration_sql(
                 engine, "DROP TRIGGER test_reject_safety_off_trigger ON plan_actions"
@@ -1149,6 +1164,10 @@ class TestPhase2ApiAcceptance:
             await _migration_sql(engine, "DROP FUNCTION test_reject_safety_off()")
 
         async with get_session() as session:
-            assert await session.scalar(text("SELECT count(*) FROM shower_events")) == 0
+            shower_events = (await session.execute(select(ShowerEventRecord))).scalars().all()
+            assert len(shower_events) == 1
+            assert shower_events[0].status == "skipped_observe_only_build"
+            assert shower_events[0].activation_action_id is None
+            assert await detector._get_active_event(session, current.device_id) is None
             assert await session.scalar(text("SELECT count(*) FROM plans")) == 0
             assert await session.scalar(text("SELECT count(*) FROM plan_actions")) == 0

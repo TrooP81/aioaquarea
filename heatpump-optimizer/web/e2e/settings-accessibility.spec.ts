@@ -1,6 +1,8 @@
 import { expect, test, type Page } from "./fixtures";
 
 const settings = {
+  ml_maintenance_enabled: { value: "false", type: "bool", description: "Model maintenance" },
+  seasonal_calibration_auto_exit: { value: "true", type: "bool", description: "Legacy automatic exit", read_only: true },
   price_provider: { value: "manual", type: "text", description: "Price provider", options: ["manual", "entsoe", "tibber"] },
   manual_price_eur_per_kwh: { value: "0.12", type: "float", description: "Manual price" },
   entsoe_api_token: { value: "***", type: "secret", description: "ENTSO-E token" },
@@ -15,20 +17,30 @@ async function mockSettings(
   onSave?: (payload: Record<string, string>) => void,
   saveResponse: { status?: number; body?: unknown } = {},
 ) {
+  let persisted = settings;
   await page.route("**/api/**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
   await page.route("**/api/settings", (route) => {
     if (route.request().method() === "PUT") {
-      onSave?.(JSON.parse(route.request().postData() || "{}").settings);
+      const payload: Record<string, string> = JSON.parse(route.request().postData() || "{}").settings;
+      onSave?.(payload);
+      if ((saveResponse.status ?? 200) < 400) {
+        for (const [key, value] of Object.entries(payload)) {
+          if (key in persisted) {
+            const settingKey = key as keyof typeof settings;
+            persisted = { ...persisted, [settingKey]: { ...persisted[settingKey], value } };
+          }
+        }
+      }
       return route.fulfill({
         status: saveResponse.status ?? 200,
         contentType: "application/json",
-        body: JSON.stringify(saveResponse.body ?? settings),
+        body: JSON.stringify(saveResponse.body ?? persisted),
       });
     }
     return route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(settings),
+      body: JSON.stringify(persisted),
     });
   });
   await page.route("**/api/currency", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR" }) }));
@@ -36,6 +48,47 @@ async function mockSettings(
   await page.route("**/api/comfort-schedule", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ weekday: [], weekend: [] }) }));
   await page.route("**/api/comfort-schedule/learned", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ weekday: {}, weekend: {} }) }));
 }
+
+test("model maintenance defaults off and saves only explicit enablement", async ({ page }, testInfo) => {
+  let saved: Record<string, string> | undefined;
+  await mockSettings(page, (payload) => { saved = payload; }, {
+    body: { ...settings, ml_maintenance_enabled: { ...settings.ml_maintenance_enabled, value: "true" } },
+  });
+  await page.goto("/settings");
+  const toggle = page.getByRole("checkbox", { name: "Model maintenance", exact: true });
+  await expect(toggle).not.toBeChecked();
+  await toggle.check();
+  await page.getByRole("button", { name: /Save 1 change/ }).click();
+  await expect.poll(() => saved).toEqual({ ml_maintenance_enabled: "true" });
+  await expect(toggle).toBeChecked();
+  await page.reload();
+  await expect(toggle).toBeChecked();
+  await toggle.scrollIntoViewIfNeeded();
+  const box = await toggle.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(await page.evaluate(() => window.innerWidth));
+  await page.screenshot({ path: testInfo.outputPath("ml-maintenance-settings.png") });
+});
+
+test("maintenance defaults off and legacy auto-exit is read-only and ineffective", async ({ page }, testInfo) => {
+  let saved: Record<string, string> | undefined;
+  await mockSettings(page, (payload) => { saved = payload; });
+  await page.goto("/settings");
+  await expect(page.getByRole("checkbox", { name: "Model maintenance", exact: true })).not.toBeChecked();
+  await page.getByRole("button", { name: "Show advanced" }).click();
+  const autoExit = page.getByRole("checkbox", { name: "Automatic observation exit", exact: true });
+  await expect(autoExit).toBeDisabled();
+  await expect(autoExit).not.toBeChecked();
+  await expect(page.getByText("Always false. Observation persists until explicit human exit; legacy stored values are ineffective.")).toBeVisible();
+  await page.getByRole("checkbox", { name: "Model maintenance", exact: true }).check();
+  await page.getByRole("button", { name: /Save 1 change/ }).click();
+  await expect.poll(() => saved).toEqual({ ml_maintenance_enabled: "true" });
+  await expect(autoExit).toBeDisabled();
+  await expect(autoExit).not.toBeChecked();
+  await autoExit.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("obs6-auto-exit-disabled.png") });
+});
 
 test("settings exposes one skip target and validates without sending invalid drafts", async ({ page }) => {
   let saves = 0;
@@ -200,7 +253,7 @@ test("settings focuses the first invalid field in declared order", async ({ page
 test("comfort schedule has a single roving cell and 44px touch targets", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.getByRole("checkbox");
+  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
   await expect(cells).toHaveCount(48);
   await expect(page.locator('[role="checkbox"][tabindex="0"]')).toHaveCount(1);
   const size = await cells.first().evaluate((cell) => {
@@ -219,7 +272,7 @@ test("comfort schedule has a single roving cell and 44px touch targets", async (
 test("comfort schedule keyboard interaction changes only selection state", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.getByRole("checkbox");
+  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
 
   await cells.first().focus();
   await page.keyboard.press("ArrowRight");
@@ -244,7 +297,7 @@ test("comfort schedule keyboard interaction changes only selection state", async
 test("comfort schedule syncs the roving cell when selected with the mouse", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.getByRole("checkbox");
+  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
 
   await cells.nth(30).click();
 

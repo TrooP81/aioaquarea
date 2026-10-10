@@ -1,3 +1,62 @@
+export type ModelReportingState =
+    | "unqualified"
+    | "candidate"
+    | "qualified-for-reporting"
+    | "expired"
+    | "unavailable";
+
+export type ModelComponent = "demand" | "comfort" | "thermal";
+
+export interface ModelReportingProgress {
+    last_valid_outcome_at?: string | null;
+    maintenance_enabled?: boolean | null;
+    cadence_hours?: number | null;
+    cadence_reason?: string | null;
+    next_cadence_at?: string | null;
+    evidence_for?: string | null;
+    evidence_as_of?: string | null;
+    evidence_reason?: string | null;
+    counts?: {
+        pairs: number;
+        device_day_clusters: number;
+        issue_cohorts: number;
+        horizons: Record<string, number>;
+        outdoor_bins: Record<string, number>;
+    } | null;
+    missing_counts?: {
+        paired_outcomes: number;
+        device_day_clusters: number;
+        issue_cohorts: number;
+        elapsed_days: number | null;
+    } | null;
+    missing_diversity?: {
+        populated_outdoor_bins: number;
+        pairs_per_horizon: Record<string, number>;
+        pairs_per_outdoor_bin: Record<string, number>;
+    } | null;
+    exclusion_counts?: Record<string, number>;
+    pending_outcomes?: number | null;
+    next_decision_checkpoint?: { index: number; at: string; due: boolean; policy: string } | null;
+    last_decision?: { index: number; status: string | null; reason: string | null } | null;
+}
+
+export interface ModelLifecycleStatus extends ModelReportingProgress {
+    status: ModelReportingState;
+    incumbent_status?: ModelReportingState;
+    candidate_status?: ModelReportingState | null;
+    candidate_progress?: ModelReportingProgress & { status: ModelReportingState; control_ready: false } | null;
+    last_trained?: string | null;
+    samples?: number;
+    last_valid_outcome_at?: string | null;
+    qualification_expires_at?: string | null;
+    qualification_scope?: { horizons?: number[]; capabilities?: string[] };
+    control_ready: false;
+    ordinary_writes_allowed: false;
+    control_readiness?: { ready: false; reason: string };
+}
+
+export type ModelLifecycleStatuses = Partial<Record<ModelComponent, ModelLifecycleStatus>>;
+
 export type ControlStateName =
     | "paused_by_user"
     | "observing"
@@ -31,6 +90,11 @@ export interface ControlState {
     primary_action: ControlStateAction | null;
     notices: ControlStateNotice[];
     resolved_at: string;
+    model_lifecycle?: ModelLifecycleStatuses;
+    build_policy?: "observe_only";
+    control_ready?: false;
+    ordinary_writes_allowed?: false;
+    optimization_requires_new_build?: true;
 }
 
 export interface SpaceHeatingGate {

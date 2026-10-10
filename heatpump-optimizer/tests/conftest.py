@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import socket
 import sys
 import tempfile
 import warnings
@@ -54,12 +55,16 @@ def isolate_model_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return model_dir
 
 
-def pytest_configure() -> None:
-    """Force test temp files into a writable repo-local path on Windows."""
+def pytest_configure(config: pytest.Config) -> None:
+    """Honor an explicit disposable temp directory on Windows."""
     if os.name != "nt":
         return
 
-    local_tmp = Path(__file__).resolve().parents[1] / ".pytest_tmp"
+    local_tmp = (
+        Path(config.option.basetemp)
+        if config.option.basetemp
+        else Path(__file__).resolve().parents[1] / ".pytest_tmp"
+    )
     local_tmp.mkdir(parents=True, exist_ok=True)
 
     os.environ["TMPDIR"] = str(local_tmp)
@@ -76,6 +81,29 @@ def pytest_configure() -> None:
         message=r"coroutine 'Connection\._cancel' was never awaited",
         category=RuntimeWarning,
     )
+
+
+@pytest.fixture(autouse=True)
+def offline_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forbid real connections when explicitly running offline verification."""
+    if os.environ.get("HPO_TEST_OFFLINE") != "1":
+        return
+
+    original_connect = socket.socket.connect
+
+    def reject_connection(*_args, **_kwargs):
+        raise AssertionError("Real network access is disabled for offline verification")
+
+    def connect_socketpair_only(connection, address):
+        caller = sys._getframe(1).f_code
+        if caller.co_name == "_fallback_socketpair" and caller.co_filename == socket.__file__:
+            return original_connect(connection, address)
+        return reject_connection(connection, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect_socketpair_only)
+    monkeypatch.setattr(socket.socket, "connect_ex", reject_connection)
+    monkeypatch.setattr(socket, "create_connection", reject_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", reject_connection)
 
 
 def pytest_sessionfinish(session, exitstatus):

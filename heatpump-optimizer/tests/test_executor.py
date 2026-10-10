@@ -1,5 +1,7 @@
 """Tests for the PlanExecutor and action registry."""
 
+from __future__ import annotations
+
 import asyncio
 import datetime as dt
 import json
@@ -146,10 +148,10 @@ async def test_core_executors_keep_injected_session_factories_isolated():
         first_executor.execute_due_actions(), second_executor.execute_due_actions()
     )
 
-    assert first_factory.call_count == 2
-    assert second_factory.call_count == 2
-    assert first_session.execute.await_count == 4
-    assert second_session.execute.await_count == 4
+    assert first_factory.call_count == 1
+    assert second_factory.call_count == 1
+    assert first_session.execute.await_count == 2
+    assert second_session.execute.await_count == 2
 
 
 class TestRegistry:
@@ -294,7 +296,9 @@ class TestExecuteAction:
         assert mismatch.expected_value == 2
 
     @pytest.mark.asyncio
-    async def test_force_dhw_on_dispatches_and_verifies(self, executor, mock_wrapper):
+    async def test_force_dhw_on_is_refused_without_dispatch_or_verification(
+        self, executor, mock_wrapper
+    ):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
         mock_wrapper.refresh_device.return_value = _device(force_dhw=1)
 
@@ -306,10 +310,12 @@ class TestExecuteAction:
             mock_session.add = MagicMock()
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await executor._execute_action(action)
+            with pytest.raises(PermissionError, match="observe-only build"):
+                await executor._execute_action(action)
 
-        mock_wrapper.force_dhw.assert_awaited_once()
-        assert mock_session.execute.await_count >= 3
+        mock_wrapper.force_dhw.assert_not_awaited()
+        mock_wrapper.refresh_device.assert_not_awaited()
+        mock_session.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_dhw_on_skips_when_live_tank_is_already_at_target(
@@ -319,20 +325,15 @@ class TestExecuteAction:
             tank=SimpleNamespace(temperature=52.0, target_temperature=52.0),
             zones={0: _zone(35)},
         )
-        action = _make_action(str(ActionType.FORCE_DHW_ON))
-
-        with patch("packages.optimizer.executor.get_session") as mock_gs:
-            mock_session = AsyncMock()
-            mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await executor._execute_action(action)
+        result = await ACTION_REGISTRY[ActionType.FORCE_DHW_ON].dispatch(mock_wrapper, {})
 
         mock_wrapper.force_dhw.assert_not_awaited()
-        assert mock_session.execute.await_count == 1
+        assert result["skip"] is True
+        assert result["reason"] == "tank_at_target"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("action_factory", [SimpleNamespace, PlanActionRecord])
-    async def test_action_enforces_precondition_before_dispatch_for_duck_typed_and_orm_actions(
+    async def test_action_guard_precedes_precondition_for_duck_typed_and_orm_actions(
         self, executor, mock_wrapper, action_factory
     ):
         action = action_factory(
@@ -346,12 +347,11 @@ class TestExecuteAction:
         )
         executor._defer_action = AsyncMock()
 
-        await executor._execute_action(action)
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await executor._execute_action(action)
 
-        executor._dispatch_precondition.assert_awaited_once_with(
-            action, ActionType.FORCE_DHW_ON, {}
-        )
-        executor._defer_action.assert_awaited_once()
+        executor._dispatch_precondition.assert_not_awaited()
+        executor._defer_action.assert_not_awaited()
         mock_wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -370,10 +370,11 @@ class TestExecuteAction:
         executor._dispatch_precondition = AsyncMock(return_value=precondition_result)
         executor._skip_action = AsyncMock()
 
-        await executor._execute_action(action)
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await executor._execute_action(action)
 
-        executor._dispatch_precondition.assert_awaited_once_with(action, action_type, {})
-        executor._skip_action.assert_awaited_once_with(action, precondition_result)
+        executor._dispatch_precondition.assert_not_awaited()
+        executor._skip_action.assert_not_awaited()
         mock_wrapper.force_dhw.assert_not_awaited()
         mock_wrapper.set_special_status.assert_not_awaited()
         mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
@@ -470,7 +471,7 @@ class TestExecuteAction:
         mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_set_tank_temp_dispatches(self, executor, mock_wrapper):
+    async def test_set_tank_temp_is_refused(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.SET_TANK_TEMP), {"temperature": 52})
         mock_wrapper.refresh_device.return_value = _device(tank_temp=52)
 
@@ -482,17 +483,20 @@ class TestExecuteAction:
             mock_session.add = MagicMock()
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(PermissionError, match="observe-only build"):
+                await executor._execute_action(action)
+
+        mock_wrapper.set_tank_temperature.assert_not_awaited()
+        mock_session.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_type_is_refused_before_parsing(self, executor):
+        action = _make_action("unknown_action_xyz")
+        with pytest.raises(PermissionError, match="observe-only build"):
             await executor._execute_action(action)
 
-        mock_wrapper.set_tank_temperature.assert_awaited_once_with(52)
-
     @pytest.mark.asyncio
-    async def test_unknown_action_type_does_not_crash(self, executor):
-        action = _make_action("unknown_action_xyz")
-        await executor._execute_action(action)
-
-    @pytest.mark.asyncio
-    async def test_action_failure_records_error(self, executor, mock_wrapper):
+    async def test_ordinary_action_failure_cannot_reach_the_device(self, executor, mock_wrapper):
         mock_wrapper.force_dhw.side_effect = RuntimeError("Connection lost")
         action = _make_action(str(ActionType.FORCE_DHW_ON))
 
@@ -500,9 +504,11 @@ class TestExecuteAction:
             mock_ctx = AsyncMock()
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await executor._execute_action(action)
+            with pytest.raises(PermissionError, match="observe-only build"):
+                await executor._execute_action(action)
 
-        assert mock_ctx.execute.await_count == 1
+        mock_ctx.execute.assert_not_awaited()
+        mock_wrapper.force_dhw.assert_not_awaited()
 
 
 class TestVerification:
@@ -511,11 +517,15 @@ class TestVerification:
         self, executor, mock_wrapper
     ):
         action = _make_action(str(ActionType.FORCE_DHW_OFF))
+        action.reverts_action_id = 2
         action.safety_attempt_count = 0
         handler = MagicMock()
         handler.dispatch = AsyncMock(return_value={"force_dhw": "OFF"})
         handler.redispatch_expected = AsyncMock()
         executor._dispatch_precondition = AsyncMock(return_value=None)
+        source = _make_action(str(ActionType.FORCE_DHW_ON))
+        executor._load_claimed_restore = AsyncMock(return_value=(action, source))
+        mock_wrapper._dispatch_linked_restore = AsyncMock(return_value={"force_dhw": "OFF"})
         executor._safety_already_safe = AsyncMock(return_value=False)
         executor._poll_until_verified = AsyncMock(
             return_value=(VerifyResult(ok=False, reason="mismatch"), 2)
@@ -538,6 +548,7 @@ class TestVerification:
         assert verification_call["phase"] == "safety"
         assert verification_call["checkpoints"] == SAFETY_VERIFY_CHECKPOINTS_S
         assert verification_call["live_checkpoints"] == frozenset({15, 60})
+        mock_wrapper._dispatch_linked_restore.assert_awaited_once_with(action, source)
         handler.redispatch_expected.assert_not_awaited()
         executor._requeue_safety_action.assert_awaited_once_with(action, "mismatch")
 
@@ -607,7 +618,7 @@ class TestVerification:
         handler.redispatch_expected.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dispatch_exception_is_failed(self, executor):
+    async def test_ordinary_dispatch_exception_is_unreachable(self, executor):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
         handler = MagicMock()
         handler.dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed"))
@@ -620,16 +631,14 @@ class TestVerification:
             mock_session = AsyncMock()
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
-            await executor._execute_action(action)
+            with pytest.raises(PermissionError, match="observe-only build"):
+                await executor._execute_action(action)
 
-        statuses = [
-            _extract_stmt_values(call.args[0]).get("status")
-            for call in mock_session.execute.await_args_list
-        ]
-        assert "failed" in statuses
+        handler.dispatch.assert_not_awaited()
+        mock_session.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_redispatch_exception_is_failed(self, executor):
+    async def test_redispatch_exception_is_unreachable(self, executor):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
         handler = MagicMock()
         handler.dispatch = AsyncMock(return_value={"force_dhw": "ON"})
@@ -647,14 +656,14 @@ class TestVerification:
             mock_session = AsyncMock()
             mock_get_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_get_session.return_value.__aexit__ = AsyncMock(return_value=False)
-            await executor._execute_action(action)
+            await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
 
-        handler.redispatch_expected.assert_awaited_once()
+        handler.redispatch_expected.assert_not_awaited()
         statuses = [
             _extract_stmt_values(call.args[0]).get("status")
             for call in mock_session.execute.await_args_list
         ]
-        assert "failed" in statuses
+        assert "executed_unverified" in statuses
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("matches", [True, False], ids=["match", "mismatch"])
@@ -908,7 +917,7 @@ class TestVerification:
         )
 
     @pytest.mark.asyncio
-    async def test_timeout_then_retry_success(self, executor, mock_wrapper):
+    async def test_ordinary_mismatch_never_redispatches(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
         first = VerifyResult(ok=False, observed_value=0, expected_value=1, reason="mismatch")
         second = VerifyResult(ok=True, observed_value=1, expected_value=1)
@@ -925,12 +934,15 @@ class TestVerification:
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
             await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
 
-        assert poll.await_count == 2
+        assert poll.await_count == 1
         handler_dispatch_calls = mock_wrapper.force_dhw.await_count
-        assert handler_dispatch_calls == 1
+        assert handler_dispatch_calls == 0
+        outcome = _extract_stmt_values(mock_session.execute.await_args_list[0].args[0])
+        assert outcome["status"] == "executed_unverified"
+        assert json.loads(outcome["result_json"])["reason"] == "ordinary_write_prohibited"
 
     @pytest.mark.asyncio
-    async def test_persistent_mismatch_fails(self, executor):
+    async def test_persistent_mismatch_is_unverified_without_a_retry(self, executor):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
         failed = VerifyResult(ok=False, observed_value=0, expected_value=1, reason="mismatch")
 
@@ -945,6 +957,9 @@ class TestVerification:
             await executor._verify_with_retry(action, {}, {"force_dhw": "ON"})
 
         assert mock_session.execute.await_count >= 1
+        outcome = _extract_stmt_values(mock_session.execute.await_args_list[0].args[0])
+        assert outcome["status"] == "executed_unverified"
+        assert json.loads(outcome["result_json"])["reason"] == "ordinary_write_prohibited"
 
     def test_force_dhw_on_accepts_panasonic_auto_stop_at_tank_target(self):
         device = SimpleNamespace(
@@ -982,7 +997,9 @@ class TestVerification:
         mock_wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_zone_boost_retry_reuses_original_absolute_target(self, executor, mock_wrapper):
+    async def test_zone_boost_retry_is_refused_without_compounding_target(
+        self, executor, mock_wrapper
+    ):
         action = _make_action(str(ActionType.ZONE_TEMP_BOOST), {"offset": 2, "zone_id": 0})
         # A concurrent/read-after-write value of 38C made the old retry path
         # calculate 40C instead of repeating the original 37C command.
@@ -1009,7 +1026,7 @@ class TestVerification:
             )
 
         mock_wrapper.get_device.assert_not_awaited()
-        mock_wrapper.set_zone_heat_temperature.assert_awaited_once_with(0, 37)
+        mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_every_action_type_has_verifier_coverage(self, mock_wrapper):
@@ -1070,6 +1087,48 @@ class TestVerification:
 
 
 class TestExecuteDueActions:
+    @pytest.mark.parametrize("action_type", list(ActionType))
+    async def test_guard_refuses_before_preflight(self, executor, action_type):
+        action = _make_action(str(action_type))
+        executor._dispatch_precondition = AsyncMock()
+        executor._session_factory = MagicMock()
+
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await executor._execute_action(action)
+
+        executor._dispatch_precondition.assert_not_awaited()
+        executor._session_factory.assert_not_called()
+        executor._wrapper.get_device.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "origin",
+        ["rules", "milp", "fallback", "force", "legacy", "reuse", "restart", "guarded_rollback"],
+    )
+    @pytest.mark.parametrize("state", [LearningModeState.INACTIVE, LearningModeState.UNKNOWN])
+    async def test_ordinary_writes_impossible(self, executor, origin, state):
+        action = _make_action(str(ActionType.FORCE_DHW_ON))
+        action.plan_origin = origin
+        action.status = "pending"
+        executor._learning_check = AsyncMock(return_value=state)
+        executor._claim_due_safety_action = AsyncMock(return_value=None)
+        session = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [action]
+        session.execute.return_value = result
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor._session_factory = MagicMock(return_value=context)
+        executor._execute_action = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        executor._claim_due_safety_action.assert_awaited_once()
+        executor._session_factory.assert_not_called()
+        executor._execute_action.assert_not_awaited()
+        executor._wrapper.force_dhw.assert_not_awaited()
+        assert action.status == "pending"
+
     @pytest.mark.asyncio
     async def test_active_override_blocks_execution(self, executor):
         override_mock = MagicMock()
@@ -1090,14 +1149,16 @@ class TestExecuteDueActions:
             override_result.scalars.return_value.all.return_value = [override_mock]
             actions_result = MagicMock()
             actions_result.scalars.return_value.all.return_value = []
-            mock_session.execute = AsyncMock(side_effect=[None, override_result, actions_result])
+            safety_result = MagicMock()
+            safety_result.scalar_one_or_none.return_value = None
+            mock_session.execute = AsyncMock(side_effect=[None, safety_result])
 
             await executor.execute_due_actions()
 
         executor._wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_active_override_marks_due_actions_skipped(self, executor):
+    async def test_active_override_leaves_ordinary_actions_untouched(self, executor):
         override_mock = MagicMock()
         override_mock.reason = "comfort_schedule"
         action_mock = _make_action(str(ActionType.COMFORT_MODE_ON))
@@ -1126,10 +1187,11 @@ class TestExecuteDueActions:
             await executor.execute_due_actions()
 
         executor._wrapper.set_special_status.assert_not_awaited()
-        assert mock_session.execute.call_count == 6
+        assert mock_session.execute.call_count == 2
+        assert action_mock.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_due_actions_are_claimed_without_a_global_freshness_gate(self, executor):
+    async def test_ordinary_due_actions_are_not_claimed(self, executor):
         action_mock = _make_action(str(ActionType.FORCE_DHW_ON))
         with patch("packages.optimizer.executor.get_session") as mock_gs:
             mock_session = AsyncMock()
@@ -1149,11 +1211,12 @@ class TestExecuteDueActions:
             with patch.object(executor, "_execute_action", new=AsyncMock()) as execute_action:
                 await executor.execute_due_actions()
 
-        execute_action.assert_awaited_once_with(action_mock)
-        assert mock_session.execute.call_count == 5
+        execute_action.assert_not_awaited()
+        assert mock_session.execute.call_count == 2
+        assert action_mock.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_pending_action_dispatches_when_planning_control_is_not_allowed(self, executor):
+    async def test_pending_action_is_refused_when_planning_control_is_not_allowed(self, executor):
         action_mock = _make_action(str(ActionType.FORCE_DHW_ON))
         session = AsyncMock()
         context = MagicMock()
@@ -1176,7 +1239,8 @@ class TestExecuteDueActions:
         ):
             await executor.execute_due_actions()
 
-        executor._execute_action.assert_awaited_once_with(action_mock)
+        executor._execute_action.assert_not_awaited()
+        executor._session_factory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_paused_state_still_permits_a_due_safety_revert(self, executor):
@@ -1333,7 +1397,7 @@ async def test_executor_dhw_action_bypasses_room_heating_gate(executor):
 
 
 @pytest.mark.asyncio
-async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_stale(
+async def test_AC10_3_executor_defers_restore_when_selected_device_status_is_stale(
     executor, mock_wrapper
 ):
     status_result = MagicMock()
@@ -1343,17 +1407,17 @@ async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_s
     context = MagicMock()
     context.__aenter__ = AsyncMock(return_value=mock_session)
     context.__aexit__ = AsyncMock(return_value=False)
-    action = _make_action(str(ActionType.FORCE_DHW_ON))
+    action = _make_action(str(ActionType.FORCE_DHW_OFF))
+    action.reverts_action_id = 2
+    executor._load_claimed_restore = AsyncMock(return_value=(action, MagicMock()))
+    executor._requeue_safety_action = AsyncMock()
 
     with patch("packages.optimizer.executor.get_session", return_value=context):
-        await executor._execute_action(action)
+        await executor._execute_safety_action(action)
 
-    skipped_values = _extract_stmt_values(mock_session.execute.await_args_list[1].args[0])
-    assert skipped_values["status"] == "pending"
-    assert json.loads(skipped_values["result_json"]) == {
-        "reason": "device_status_stale",
-        "device_id": "device-a",
-    }
+    executor._requeue_safety_action.assert_awaited_once_with(action, "device_status_stale")
+    mock_wrapper.force_dhw.assert_not_awaited()
+    assert mock_session.execute.await_count == 1
     mock_wrapper.force_dhw.assert_not_awaited()
     mock_wrapper.set_special_status.assert_not_awaited()
     mock_wrapper.set_zone_heat_temperature.assert_not_awaited()
@@ -1362,6 +1426,151 @@ async def test_AC10_3_executor_defers_force_dhw_when_selected_device_status_is_s
 
 
 class TestLearningMode:
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            "unlinked",
+            "unclaimed",
+            "missing_restore",
+            "missing_source",
+            "invalid_pair",
+            "stale_claim",
+            "baseline_mismatch",
+        ],
+    )
+    async def test_invalid_restore_claim_refuses_before_preflight(self, executor, defect):
+        now = dt.datetime.now(dt.timezone.utc)
+        source = PlanActionRecord(
+            id=11762, plan_id=1, device_id="device-a", action_type="force_dhw_on", payload_json="{}"
+        )
+        restore = PlanActionRecord(
+            id=11763,
+            plan_id=1,
+            device_id="device-a",
+            action_type="force_dhw_off",
+            payload_json="{}",
+            reverts_action_id=source.id,
+            status="executing",
+            safety_claimed_at=now,
+            scheduled_ts=now,
+        )
+        if defect == "unlinked":
+            restore.reverts_action_id = None
+        elif defect == "unclaimed":
+            restore.safety_claimed_at = None
+        elif defect == "invalid_pair":
+            source.action_type = "set_tank_temp"
+        elif defect == "baseline_mismatch":
+            source.action_type = "zone_temp_boost"
+            source.payload_json = '{"baseline_temperature": 35}'
+            restore.action_type = "zone_temp_restore"
+            restore.payload_json = '{"temperature": 36}'
+        session = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = (
+            None if defect in {"missing_restore", "stale_claim"} else restore
+        )
+        session.execute.return_value = result
+        session.get.return_value = None if defect == "missing_source" else source
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor._session_factory = MagicMock(return_value=context)
+        executor._dispatch_precondition = AsyncMock()
+        executor._requeue_safety_action = AsyncMock()
+
+        if defect == "unlinked":
+            with pytest.raises(PermissionError, match="linked restores"):
+                await executor._execute_safety_action(restore)
+            executor._requeue_safety_action.assert_not_awaited()
+        else:
+            await executor._execute_safety_action(restore)
+            executor._requeue_safety_action.assert_awaited_once()
+        executor._dispatch_precondition.assert_not_awaited()
+        executor._wrapper._dispatch_linked_restore.assert_not_awaited()
+        executor._wrapper.get_device.assert_not_awaited()
+
+    async def test_positive_observation_after_claim_holds_the_restore(self, executor):
+        action = _make_action("force_dhw_off")
+        action.reverts_action_id = 11762
+        executor._learning_check = AsyncMock(return_value=LearningModeState.ACTIVE)
+        executor._load_claimed_restore = AsyncMock()
+        executor._requeue_safety_action = AsyncMock()
+
+        await executor._execute_safety_action(action)
+
+        executor._load_claimed_restore.assert_not_awaited()
+        executor._wrapper._dispatch_linked_restore.assert_not_awaited()
+        executor._requeue_safety_action.assert_awaited_once_with(action, "learning_mode_active")
+
+    @pytest.mark.parametrize("state", [LearningModeState.UNKNOWN, LearningModeState.INACTIVE])
+    async def test_linked_restore_still_dispatches(self, state):
+        import time
+
+        from aioaquarea import ForceDHW
+        from aioaquarea.data import StatusDataMode
+        from packages.core.resilience import safety_write_context
+        from packages.core.services.aquarea import AquareaWrapper
+
+        now = dt.datetime.now(dt.timezone.utc)
+        source = PlanActionRecord(
+            id=11762, plan_id=1, device_id="device-a", action_type="force_dhw_on", payload_json="{}"
+        )
+        restore = PlanActionRecord(
+            id=11763,
+            plan_id=1,
+            device_id="device-a",
+            action_type="force_dhw_off",
+            payload_json="{}",
+            reverts_action_id=source.id,
+            status="executing",
+            scheduled_ts=now,
+            safety_claimed_at=now,
+        )
+        device = SimpleNamespace(
+            status_data_mode=StatusDataMode.LIVE,
+            force_dhw=ForceDHW.ON,
+            set_force_dhw=AsyncMock(),
+        )
+        wrapper = AquareaWrapper()
+        wrapper.get_device = AsyncMock(return_value=device)
+        wrapper._last_live_status_at = time.monotonic()
+
+        async def reserve_write():
+            assert safety_write_context.get() is True
+
+        wrapper._write_limiter = SimpleNamespace(acquire=AsyncMock(side_effect=reserve_write))
+        session = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = restore
+        session.execute.return_value = result
+        session.get.return_value = source
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        executor = CorePlanExecutor(
+            wrapper,
+            session_factory=MagicMock(return_value=context),
+            learning_check=AsyncMock(return_value=state),
+        )
+        executor._claim_due_safety_action = AsyncMock(return_value=restore)
+        executor._dispatch_precondition = AsyncMock(return_value=None)
+        executor._safety_already_safe = AsyncMock(return_value=False)
+        executor._poll_until_verified = AsyncMock(return_value=(VerifyResult(ok=True), 2))
+        executor._mark_verified = AsyncMock()
+
+        await executor.execute_due_actions()
+
+        session.get.assert_awaited_once_with(PlanActionRecord, source.id)
+        device.set_force_dhw.assert_awaited_once_with(ForceDHW.OFF)
+        wrapper._write_limiter.acquire.assert_awaited_once()
+        executor._dispatch_precondition.assert_awaited_once()
+        executor._mark_verified.assert_awaited_once()
+        assert executor._poll_until_verified.await_args.kwargs["lane"] == "safety"
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await wrapper.force_dhw(ForceDHW.ON)
+        assert device.set_force_dhw.await_count == 1
+
     @pytest.mark.asyncio
     async def test_real_learning_lookup_failure_blocks_ordinary_dispatch(self):
         executor = PlanExecutor(AsyncMock())
@@ -1491,7 +1700,7 @@ class TestLearningMode:
         executor._wrapper.force_dhw.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_learning_mode_off_does_not_skip(self, executor):
+    async def test_learning_mode_off_does_not_enable_ordinary_actions(self, executor):
         with (
             patch("packages.optimizer.executor.get_session") as mock_gs,
             patch(
@@ -1509,15 +1718,13 @@ class TestLearningMode:
             actions_result.scalars.return_value.all.return_value = []
             safety_result = MagicMock()
             safety_result.scalar_one_or_none.return_value = None
-            mock_session.execute = AsyncMock(
-                side_effect=[safety_result, override_result, actions_result]
-            )
+            mock_session.execute = AsyncMock(side_effect=[None, safety_result])
 
             await executor.execute_due_actions()
 
         # No safety action, no overrides, no learning mode, no due actions.
         executor._wrapper.force_dhw.assert_not_awaited()
-        assert mock_session.execute.call_count == 3
+        assert mock_session.execute.call_count == 2
 
 
 class TestConstants:

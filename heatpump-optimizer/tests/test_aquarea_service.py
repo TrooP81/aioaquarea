@@ -1,7 +1,10 @@
 """Panasonic wrapper request-budget regression tests."""
 
+from __future__ import annotations
+
 import asyncio
 import datetime as dt
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,6 +30,7 @@ from packages.core.services.aquarea import (
     PanasonicCredentialsMissingError,
 )
 from packages.core.resilience import RedisCircuitBreaker
+from packages.core.models import PlanActionRecord
 
 
 class FakeRedis:
@@ -60,7 +64,31 @@ def _wrapper() -> AquareaWrapper:
     return wrapper
 
 
+async def _dispatch_restore(wrapper, *, zone_id=None, temperature=None):
+    payload = {} if zone_id is None else {"zone_id": zone_id, "temperature": temperature}
+    source_payload = (
+        {} if zone_id is None else {"zone_id": zone_id, "baseline_temperature": temperature}
+    )
+    source = PlanActionRecord(
+        id=1,
+        device_id="device-a",
+        action_type="force_dhw_on" if zone_id is None else "zone_temp_boost",
+        payload_json=json.dumps(source_payload),
+    )
+    restore = PlanActionRecord(
+        id=2,
+        device_id="device-a",
+        action_type="force_dhw_off" if zone_id is None else "zone_temp_restore",
+        payload_json=json.dumps(payload),
+        reverts_action_id=source.id,
+        status="executing",
+        safety_claimed_at=dt.datetime.now(dt.timezone.utc),
+    )
+    return await wrapper._dispatch_linked_restore(restore, source)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [True, False])
 @pytest.mark.parametrize(
     "method,args",
     [
@@ -77,18 +105,41 @@ def _wrapper() -> AquareaWrapper:
         ("clear_special_status", ()),
     ],
 )
-async def test_read_only_wrapper_rejects_all_mutating_methods_without_io(method, args) -> None:
-    wrapper = AquareaWrapper(read_only=True)
+async def test_read_only_wrapper_rejects_all_mutating_methods_without_io(
+    method, args, read_only
+) -> None:
+    wrapper = AquareaWrapper(read_only=read_only)
     wrapper._client = AsyncMock()
     wrapper._read_limiter = SimpleNamespace(acquire=AsyncMock())
     wrapper._write_limiter = SimpleNamespace(acquire=AsyncMock())
 
-    with pytest.raises(PermissionError, match="read-only"):
+    with wrapper.safety_write(), pytest.raises(PermissionError, match="read-only|observe-only"):
         await getattr(wrapper, method)(*args)
 
     wrapper._read_limiter.acquire.assert_not_awaited()
     wrapper._write_limiter.acquire.assert_not_awaited()
     wrapper._client.get_devices.assert_not_awaited()
+
+
+@pytest.mark.parametrize("attempt", ["ordinary_command", "inherited_task"])
+async def test_restore_scope_cannot_authorize_ordinary_commands_or_child_tasks(attempt):
+    wrapper = _wrapper()
+    wrapper.get_device = AsyncMock()
+
+    async def dispatch(client, _payload):
+        if attempt == "inherited_task":
+            return await asyncio.create_task(client.force_dhw(ForceDHW.OFF))
+        return await client.force_dhw(ForceDHW.ON)
+
+    handler = SimpleNamespace(dispatch=dispatch)
+    with patch("packages.optimizer.actions.get_action_handler", return_value=handler):
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await _dispatch_restore(wrapper)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.force_dhw(ForceDHW.OFF)
+    wrapper.get_device.assert_not_awaited()
+    wrapper._read_limiter.acquire.assert_not_awaited()
+    wrapper._write_limiter.acquire.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -225,6 +276,40 @@ async def test_weekly_timer_read_is_cached_and_evaluated_in_user_timezone() -> N
     device.get_weekly_timer.assert_awaited_once()
     wrapper._read_limiter.acquire.assert_awaited_once()
     timer.active_slots.assert_called_with(instant, wrapper._timezone)
+
+
+async def test_failed_timer_read_is_unknown_and_cached_for_one_hour():
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        status_data_mode=StatusDataMode.LIVE,
+        get_weekly_timer=AsyncMock(side_effect=RuntimeError("offline timer")),
+    )
+    wrapper._device = device
+    assert await wrapper.get_active_weekly_timer_slots() is None
+    assert await wrapper.get_active_weekly_timer_slots() is None
+    assert wrapper.cached_native_timer_provenance() == {"status": "unknown"}
+    device.get_weekly_timer.assert_awaited_once()
+    wrapper._read_limiter.acquire.assert_awaited_once()
+
+
+async def test_known_disabled_timer_has_explicit_native_provenance():
+    wrapper = _wrapper()
+    wrapper._device = SimpleNamespace(
+        status_data_mode=StatusDataMode.LIVE,
+        get_weekly_timer=AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=False,
+                slots=(),
+                active_slots=MagicMock(return_value=()),
+            )
+        ),
+    )
+    assert await wrapper.get_active_weekly_timer_slots() == ()
+    provenance = wrapper.cached_native_timer_provenance()
+    assert provenance["status"] == "known"
+    assert provenance["enabled"] is False
+    assert provenance["slots"] == []
+    assert provenance["fetched_at"]
 
 
 @pytest.mark.asyncio
@@ -452,7 +537,7 @@ async def test_successful_live_refresh_resets_adapter_backoff() -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_extended_panasonic_commands_share_write_budget(
+async def test_extended_panasonic_commands_are_refused_without_write_budget(
     method_name: str,
     device_method: str,
     value: PowerfulTime | ForceHeater | HolidayTimer,
@@ -465,23 +550,27 @@ async def test_extended_panasonic_commands_share_write_budget(
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await getattr(wrapper, method_name)(value)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await getattr(wrapper, method_name)(value)
 
-    wrapper._write_limiter.acquire.assert_awaited_once()
-    getattr(device, device_method).assert_awaited_once_with(value)
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    wrapper._read_limiter.acquire.assert_not_awaited()
+    getattr(device, device_method).assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_defrost_command_uses_write_budget_and_device_guardrail() -> None:
+async def test_defrost_command_is_refused_before_budget_or_device_access() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(request_defrost=AsyncMock(), status_data_mode=StatusDataMode.LIVE)
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.request_defrost()
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.request_defrost()
 
-    wrapper._write_limiter.acquire.assert_awaited_once()
-    device.request_defrost.assert_awaited_once()
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    wrapper._read_limiter.acquire.assert_not_awaited()
+    device.request_defrost.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -490,17 +579,18 @@ async def test_stale_command_preflight_refreshes_live_status() -> None:
     device = SimpleNamespace(
         refresh_data=AsyncMock(),
         status_data_mode=StatusDataMode.LIVE,
-        set_force_heater=AsyncMock(),
+        force_dhw=ForceDHW.ON,
+        set_force_dhw=AsyncMock(),
     )
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic() - 61.0
 
-    await wrapper.set_force_heater(ForceHeater.OFF)
+    await _dispatch_restore(wrapper)
 
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
     wrapper._write_limiter.acquire.assert_awaited_once()
-    device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)
+    device.set_force_dhw.assert_awaited_once_with(ForceDHW.OFF)
 
 
 @pytest.mark.asyncio
@@ -509,16 +599,17 @@ async def test_cached_command_preflight_does_not_spend_write_budget() -> None:
     device = SimpleNamespace(
         refresh_data=AsyncMock(),
         status_data_mode=StatusDataMode.CACHED,
-        set_force_heater=AsyncMock(),
+        force_dhw=ForceDHW.ON,
+        set_force_dhw=AsyncMock(),
     )
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCachedStatusError, match="cloud-cached"):
-        await wrapper.set_force_heater(ForceHeater.ON)
+        await _dispatch_restore(wrapper)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
-    device.set_force_heater.assert_not_awaited()
+    device.set_force_dhw.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -527,7 +618,8 @@ async def test_write_wait_rechecks_status_before_command() -> None:
     device = SimpleNamespace(
         refresh_data=AsyncMock(),
         status_data_mode=StatusDataMode.LIVE,
-        set_force_heater=AsyncMock(),
+        force_dhw=ForceDHW.ON,
+        set_force_dhw=AsyncMock(),
     )
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
@@ -537,16 +629,34 @@ async def test_write_wait_rechecks_status_before_command() -> None:
 
     wrapper._write_limiter.acquire.side_effect = age_status_during_wait
 
-    await wrapper.set_force_heater(ForceHeater.OFF)
+    await _dispatch_restore(wrapper)
 
     wrapper._write_limiter.acquire.assert_awaited_once()
     wrapper._read_limiter.acquire.assert_awaited_once()
     device.refresh_data.assert_awaited_once_with(allow_cached_fallback=False)
-    device.set_force_heater.assert_awaited_once_with(ForceHeater.OFF)
+    device.set_force_dhw.assert_awaited_once_with(ForceDHW.OFF)
 
 
 @pytest.mark.asyncio
 async def test_force_dhw_skips_already_applied_state() -> None:
+    wrapper = _wrapper()
+    device = SimpleNamespace(
+        force_dhw=ForceDHW.OFF,
+        status_data_mode=StatusDataMode.LIVE,
+        set_force_dhw=AsyncMock(),
+    )
+    wrapper._device = device
+    wrapper._last_live_status_at = time.monotonic()
+
+    result = await _dispatch_restore(wrapper)
+
+    assert result == {"skip": True, "reason": "force_dhw_already_off"}
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_force_dhw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_force_dhw_writes_changed_state_once() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(
         force_dhw=ForceDHW.ON,
@@ -556,36 +666,18 @@ async def test_force_dhw_skips_already_applied_state() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    changed = await wrapper.force_dhw(ForceDHW.ON)
+    result = await _dispatch_restore(wrapper)
 
-    assert changed is False
-    wrapper._write_limiter.acquire.assert_not_awaited()
-    device.set_force_dhw.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_force_dhw_writes_changed_state_once() -> None:
-    wrapper = _wrapper()
-    device = SimpleNamespace(
-        force_dhw=ForceDHW.OFF,
-        status_data_mode=StatusDataMode.LIVE,
-        set_force_dhw=AsyncMock(),
-    )
-    wrapper._device = device
-    wrapper._last_live_status_at = time.monotonic()
-
-    changed = await wrapper.force_dhw(ForceDHW.ON)
-
-    assert changed is True
+    assert result["force_dhw"] == "OFF"
     wrapper._write_limiter.acquire.assert_awaited_once()
-    device.set_force_dhw.assert_awaited_once_with(ForceDHW.ON)
+    device.set_force_dhw.assert_awaited_once_with(ForceDHW.OFF)
 
 
 @pytest.mark.asyncio
 async def test_force_dhw_rechecks_state_after_write_wait() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(
-        force_dhw=ForceDHW.OFF,
+        force_dhw=ForceDHW.ON,
         status_data_mode=StatusDataMode.LIVE,
         set_force_dhw=AsyncMock(),
     )
@@ -593,19 +685,19 @@ async def test_force_dhw_rechecks_state_after_write_wait() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     async def apply_state_during_wait() -> None:
-        device.force_dhw = ForceDHW.ON
+        device.force_dhw = ForceDHW.OFF
 
     wrapper._write_limiter.acquire.side_effect = apply_state_during_wait
 
-    changed = await wrapper.force_dhw(ForceDHW.ON)
+    result = await _dispatch_restore(wrapper)
 
-    assert changed is False
+    assert result == {"skip": True, "reason": "force_dhw_already_off"}
     wrapper._write_limiter.acquire.assert_awaited_once()
     device.set_force_dhw.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_quiet_mode_skips_already_applied_level() -> None:
+async def test_quiet_mode_is_refused_even_at_already_applied_level() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(
         quiet_mode=QuietMode.LEVEL2,
@@ -615,15 +707,15 @@ async def test_quiet_mode_skips_already_applied_level() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
-    assert changed is False
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_quiet_mode.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_quiet_mode_writes_changed_level_once() -> None:
+async def test_quiet_mode_is_refused_at_changed_level() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(
         quiet_mode=QuietMode.LEVEL1,
@@ -633,15 +725,15 @@ async def test_quiet_mode_writes_changed_level_once() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
-    assert changed is True
-    wrapper._write_limiter.acquire.assert_awaited_once()
-    device.set_quiet_mode.assert_awaited_once_with(QuietMode.LEVEL2)
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_quiet_mode.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_quiet_mode_rechecks_level_after_write_wait() -> None:
+async def test_quiet_mode_never_enters_write_wait() -> None:
     wrapper = _wrapper()
     device = SimpleNamespace(
         quiet_mode=QuietMode.LEVEL1,
@@ -656,15 +748,16 @@ async def test_quiet_mode_rechecks_level_after_write_wait() -> None:
 
     wrapper._write_limiter.acquire.side_effect = apply_level_during_wait
 
-    changed = await wrapper.set_quiet_mode(QuietMode.LEVEL2)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_quiet_mode(QuietMode.LEVEL2)
 
-    assert changed is False
-    wrapper._write_limiter.acquire.assert_awaited_once()
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    assert device.quiet_mode == QuietMode.LEVEL1
     device.set_quiet_mode.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_tank_temperature_uses_tank_entity_api() -> None:
+async def test_tank_temperature_never_reaches_tank_entity_api() -> None:
     wrapper = _wrapper()
     tank = SimpleNamespace(
         heat_min=40,
@@ -676,14 +769,15 @@ async def test_tank_temperature_uses_tank_entity_api() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_tank_temperature(52)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_tank_temperature(52)
 
-    wrapper._write_limiter.acquire.assert_awaited_once()
-    tank.set_target_temperature.assert_awaited_once_with(52)
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    tank.set_target_temperature.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_tank_temperature_skips_already_applied_target() -> None:
+async def test_tank_temperature_is_refused_even_at_already_applied_target() -> None:
     wrapper = _wrapper()
     tank = SimpleNamespace(
         heat_min=40,
@@ -694,7 +788,8 @@ async def test_tank_temperature_skips_already_applied_target() -> None:
     wrapper._device = SimpleNamespace(tank=tank, status_data_mode=StatusDataMode.LIVE)
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_tank_temperature(52)
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_tank_temperature(52)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     tank.set_target_temperature.assert_not_awaited()
@@ -707,6 +802,8 @@ async def test_tank_temperature_rejects_missing_tank_before_write_budget() -> No
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCommandValidationError, match="no writable"):
+        wrapper._validate_tank_temperature(wrapper._device, 52)
+    with pytest.raises(PermissionError, match="observe-only build"):
         await wrapper.set_tank_temperature(52)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
@@ -725,6 +822,8 @@ async def test_tank_temperature_rejects_live_out_of_range_target() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCommandValidationError, match="outside.*40-60"):
+        wrapper._validate_tank_temperature(wrapper._device, 65)
+    with pytest.raises(PermissionError, match="observe-only build"):
         await wrapper.set_tank_temperature(65)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
@@ -743,7 +842,7 @@ async def test_zone_temperature_skips_already_applied_target() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_zone_heat_temperature(1, 37)
+    await _dispatch_restore(wrapper, zone_id=1, temperature=37)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_temperature.assert_not_awaited()
@@ -752,7 +851,7 @@ async def test_zone_temperature_skips_already_applied_target() -> None:
 @pytest.mark.asyncio
 async def test_zone_temperature_writes_changed_target_once() -> None:
     wrapper = _wrapper()
-    zone = SimpleNamespace(heat_target_temperature=35, heat_min=20, heat_max=65)
+    zone = SimpleNamespace(heat_target_temperature=37, heat_min=20, heat_max=65)
     device = SimpleNamespace(
         zones={1: zone},
         status_data_mode=StatusDataMode.LIVE,
@@ -761,10 +860,10 @@ async def test_zone_temperature_writes_changed_target_once() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_zone_heat_temperature(1, 37)
+    await _dispatch_restore(wrapper, zone_id=1, temperature=35)
 
     wrapper._write_limiter.acquire.assert_awaited_once()
-    device.set_temperature.assert_awaited_once_with(37, zone_id=1)
+    device.set_temperature.assert_awaited_once_with(35, zone_id=1)
 
 
 @pytest.mark.asyncio
@@ -772,7 +871,7 @@ async def test_zone_temperature_normalizes_zero_based_optimizer_zone_to_panasoni
     None
 ):
     wrapper = _wrapper()
-    zone = SimpleNamespace(heat_target_temperature=35, heat_min=20, heat_max=65)
+    zone = SimpleNamespace(heat_target_temperature=37, heat_min=20, heat_max=65)
     device = SimpleNamespace(
         zones={1: zone},
         status_data_mode=StatusDataMode.LIVE,
@@ -781,15 +880,15 @@ async def test_zone_temperature_normalizes_zero_based_optimizer_zone_to_panasoni
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_zone_heat_temperature(0, 37)
+    await _dispatch_restore(wrapper, zone_id=0, temperature=35)
 
-    device.set_temperature.assert_awaited_once_with(37, zone_id=1)
+    device.set_temperature.assert_awaited_once_with(35, zone_id=1)
 
 
 @pytest.mark.asyncio
 async def test_zone_temperature_accepts_live_curve_shift_range() -> None:
     wrapper = _wrapper()
-    zone = SimpleNamespace(heat_target_temperature=-5, heat_min=-5, heat_max=5)
+    zone = SimpleNamespace(heat_target_temperature=-3, heat_min=-5, heat_max=5)
     device = SimpleNamespace(
         zones={1: zone},
         status_data_mode=StatusDataMode.LIVE,
@@ -798,9 +897,9 @@ async def test_zone_temperature_accepts_live_curve_shift_range() -> None:
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_zone_heat_temperature(1, -3)
+    await _dispatch_restore(wrapper, zone_id=1, temperature=-5)
 
-    device.set_temperature.assert_awaited_once_with(-3, zone_id=1)
+    device.set_temperature.assert_awaited_once_with(-5, zone_id=1)
 
 
 @pytest.mark.asyncio
@@ -816,7 +915,10 @@ async def test_zone_temperature_rejects_target_outside_live_range() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCommandValidationError, match="outside.*-5-5"):
-        await wrapper.set_zone_heat_temperature(1, 6)
+        wrapper._validate_zone_heat_temperature(device, 1, 6)
+    result = await _dispatch_restore(wrapper, zone_id=1, temperature=6)
+    assert result["skip"] is True
+    assert result["reason"] == "zone_restore_outside_live_range"
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_temperature.assert_not_awaited()
@@ -835,7 +937,10 @@ async def test_zone_temperature_rejects_missing_live_range() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCommandValidationError, match="did not report"):
-        await wrapper.set_zone_heat_temperature(1, -3)
+        wrapper._validate_zone_heat_temperature(device, 1, -3)
+    result = await _dispatch_restore(wrapper, zone_id=1, temperature=-3)
+    assert result["skip"] is True
+    assert result["reason"] == "zone_restore_outside_live_range"
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_temperature.assert_not_awaited()
@@ -861,29 +966,31 @@ def _special_status_device(status=None, *, supports: bool = True, eco_heat=-2):
 
 
 @pytest.mark.asyncio
-async def test_special_status_skips_already_applied_mode() -> None:
+async def test_special_status_is_refused_even_at_already_applied_mode() -> None:
     wrapper = _wrapper()
     device = _special_status_device(SpecialStatus.ECO)
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_special_status("ECO")
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_special_status("ECO")
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_special_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_special_status_writes_valid_changed_mode_once() -> None:
+async def test_special_status_is_refused_at_valid_changed_mode() -> None:
     wrapper = _wrapper()
     device = _special_status_device(None)
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.set_special_status("COMFORT")
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.set_special_status("COMFORT")
 
-    wrapper._write_limiter.acquire.assert_awaited_once()
-    device.set_special_status.assert_awaited_once_with(SpecialStatus.COMFORT)
+    wrapper._write_limiter.acquire.assert_not_awaited()
+    device.set_special_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -894,22 +1001,24 @@ async def test_special_status_rejects_unsafe_or_unknown_mode() -> None:
     wrapper._last_live_status_at = time.monotonic()
 
     with pytest.raises(PanasonicCommandValidationError, match="safe ECO/COMFORT"):
-        await wrapper.set_special_status("ECO")
-    with pytest.raises(PanasonicCommandValidationError, match="Unsupported"):
-        await wrapper.set_special_status("BOOST")
+        wrapper._validate_special_status_support(device)
+    for mode in ("ECO", "BOOST"):
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await wrapper.set_special_status(mode)
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_special_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_clear_special_status_skips_when_already_normal() -> None:
+async def test_clear_special_status_is_refused_even_when_already_normal() -> None:
     wrapper = _wrapper()
     device = _special_status_device(None)
     wrapper._device = device
     wrapper._last_live_status_at = time.monotonic()
 
-    await wrapper.clear_special_status()
+    with pytest.raises(PermissionError, match="observe-only build"):
+        await wrapper.clear_special_status()
 
     wrapper._write_limiter.acquire.assert_not_awaited()
     device.set_special_status.assert_not_awaited()

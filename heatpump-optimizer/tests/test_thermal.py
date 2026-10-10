@@ -1,9 +1,11 @@
 """Tests for thermal model calibration and predictions."""
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
+import pytest
 
 from packages.ml.thermal import ThermalModel, ThermalPrediction
 
@@ -90,30 +92,159 @@ class TestThermalPredictions:
         assert pred.estimated_minutes > 0
         assert pred.confidence == "default"
 
-    def test_zone_cooling_fit_rejects_unsafe_extrapolation(self):
-        # A sparse warm-weather line with a huge negative intercept used to
-        # persist as an impossible standby loss (for example -49 °C/h).
-        samples = [(-50.0 + (2.0 * outdoor), outdoor) for outdoor in range(20, 26)]
 
-        assert ThermalModel._robust_zone_cooling_fit(samples) is None
+def _dhw_cycle_records(cycles, reheat_rate, standby_loss, outdoor=10.0):
+    """Realistic DHW cycles: 40-min reheats, 4 h standby, whole-degree tank readings."""
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    records, tank, minute = [], 44.0, 0
+    for _ in range(cycles):
+        for phase, steps, rate in (("HEATING_WATER", 9, reheat_rate), ("OFF", 49, standby_loss)):
+            for _ in range(steps):
+                rec = _make_status_record(
+                    base + dt.timedelta(minutes=minute), float(round(tank)), outdoor
+                )
+                rec.device_action = phase
+                records.append(rec)
+                tank += rate * 5 / 60
+                minute += 5
+    return records
 
-    def test_invalid_persisted_zone_cooling_is_reset_to_safe_defaults(self):
+
+async def _calibrate_records(model, records):
+    device_result = MagicMock()
+    device_result.scalars.return_value.all.return_value = records
+    empty = MagicMock()
+    empty.scalars.return_value.all.return_value = []
+    empty.scalar_one_or_none.return_value = None
+    calls = [0]
+
+    async def execute(_stmt):
+        calls[0] += 1
+        return device_result if calls[0] == 1 else empty
+
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=execute)
+    with (
+        patch("packages.ml.thermal.get_session") as ctx,
+        patch.object(ThermalModel, "save"),
+    ):
+        ctx.return_value.__aenter__ = AsyncMock(return_value=session)
+        ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        return await model.calibrate()
+
+
+class TestTankRateValidation:
+    def test_published_fit_is_evaluated_fit(self, isolate_model_dir):
+        from packages.ml import thermal
+        from packages.ml.safe_persistence import safe_load
+
         model = ThermalModel()
-        model.params.zone_standby_loss = -49.0
+        samples = [(12.0, 10.0, 0.5)] * 28 + [(11.8, 10.0, 0.5)] * 12
+        with patch.object(model, "_fit_rate", wraps=model._fit_rate) as fit:
+            model._validate_rate_component("tank_heating", samples)
+        assert fit.call_count == 1
+        assert model.params.calibration_status["tank_heating"] == "validated"
+        assert model.params.tank_heating_rate == 12.0
+        with patch.object(thermal, "MODEL_DIR", isolate_model_dir):
+            model.save()
+            payload = safe_load(model._artifact_path())
+        assert payload["schema_version"] == 5
+        assert payload["params"]["tank_heating_rate"] == 12.0
+        assert payload["validation"]["tank_heating"]["evaluated_parameters"] == [12.0, 0.0]
 
-        model._sanitize_zone_cooling_params()
+    async def test_insufficient_data_clears_stale_calibration(self):
+        model = ThermalModel()
+        model.params.last_calibrated = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        model.params.tank_heating_rate = 19.0
+        model.params.calibration_status["tank_heating"] = "validated"
+        result = await _calibrate_records(model, [])
+        assert result["status"] == "insufficient_data"
+        assert model.params.last_calibrated is None
+        assert model.params.tank_heating_rate == 4.0
+        assert model.confidence_for("tank_heating") == "default"
 
-        assert model.params.zone_standby_loss == -0.3
-        assert model.params.calibration_status["zone_cooling"].startswith("rejected_previous")
+    def test_on_off_on_full_interval_is_rejected(self):
+        start = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        records = [
+            SimpleNamespace(
+                ts=start + dt.timedelta(minutes=5 * index),
+                device_id="heatpump-one",
+                space_heating_active=active,
+            )
+            for index, active in enumerate((True, False, True, True))
+        ]
+        state, status = ThermalModel._continuous_indoor_state(
+            records, start, start + dt.timedelta(minutes=15)
+        )
+        assert state is None and status is None
+
+    async def test_reheat_and_standby_rates_are_learned_from_quantised_cycles(self):
+        model = ThermalModel()
+
+        result = await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2))
+
+        assert model.params.calibration_status["tank_heating"] == "validated"
+        assert model.params.calibration_status["tank_cooling"] == "validated"
+        assert 10.0 < model._tank_heating_rate(10.0) < 14.0
+        assert -1.6 < model._tank_loss_rate(10.0) < -0.8
+        assert model.confidence_for("tank_heating") == "default"
+        assert (
+            result["validation"]["tank_heating"]["candidate_mae_c"]
+            < (result["validation"]["tank_heating"]["default_mae_c"])
+        )
+
+    async def test_latched_heating_without_temperature_rise_is_not_learned(self):
+        """A status that stays HEATING_WATER for days must not become a heating rate."""
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        records = []
+        for i in range(600):
+            rec = _make_status_record(base + dt.timedelta(minutes=5 * i), 51.0, 10.0)
+            rec.device_action = "HEATING_WATER"
+            records.append(rec)
+        model = ThermalModel()
+
+        await _calibrate_records(model, records)
+
+        assert model.params.calibration_status["tank_heating"] == "insufficient_samples"
+        assert model.params.tank_heating_rate == 4.0
+        assert model.confidence_for("tank_heating") == "default"
+
+    async def test_previously_learned_rate_is_replaced_by_default_when_rejected(self):
+        model = ThermalModel()
+        model.params.tank_standby_loss = -3.0
+        model.params.zone_heating_rate = 15.0
+
+        await _calibrate_records(model, _dhw_cycle_records(2, 12.0, -1.2))
+
+        assert model.params.tank_standby_loss == -0.5
+        assert model.params.zone_heating_rate == 1.5
+
+    async def test_learned_rate_is_not_extrapolated_beyond_observed_outdoor_range(self):
+        model = ThermalModel()
+
+        await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2, outdoor=10.0))
+
+        assert model.params.rate_outdoor_ranges["tank_heating"] == [10.0, 10.0]
+        assert 10.0 < model._tank_heating_rate(12.0) < 14.0
+        assert model._tank_heating_rate(-10.0) == pytest.approx(4.0 + 0.08 * -10.0)
+
+    def test_outdoor_slope_requires_wide_outdoor_range(self):
+        narrow = [(10.0 + outdoor, outdoor, 0.5) for outdoor in (14.0, 16.0, 18.0, 20.0, 21.0)]
+        wide = [(10.0 - 0.2 * outdoor, outdoor, 0.5) for outdoor in (-5.0, 0.0, 5.0, 10.0, 15.0)]
+
+        assert ThermalModel._fit_rate(narrow)[1] == 0.0
+        assert ThermalModel._fit_rate(wide)[1] == pytest.approx(-0.2)
 
 
 class TestThermalPersistence:
     def test_shared_calibration_round_trip(self, tmp_path):
         from packages.ml import thermal as thermal_module
+        from packages.ml.safe_persistence import safe_load
 
         source = ThermalModel()
         source.params.tank_heating_rate = 6.2
         source.params.indoor_heating_samples = 8
+        source.params.calibration_status = {"indoor_heating": "validated"}
         source.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
 
         with (
@@ -125,11 +256,14 @@ class TestThermalPersistence:
             source.save()
 
             loaded = ThermalModel()
-            assert loaded.load_latest() is True
+            archived = safe_load(source._artifact_path())
+            assert archived["params"]["tank_heating_rate"] == 6.2
+            assert archived["params"]["indoor_heating_samples"] == 8
+            assert loaded.load_latest() is False
 
-        assert loaded.params.tank_heating_rate == 6.2
-        assert loaded.params.indoor_heating_samples == 8
-        assert loaded.confidence_for("indoor_heating") == "learned"
+        assert loaded.params.tank_heating_rate == 4.0
+        assert loaded.params.indoor_heating_samples == 0
+        assert loaded.confidence_for("indoor_heating") == "default"
 
     def test_zone_heating_already_at_target(self):
         model = ThermalModel()
@@ -247,40 +381,17 @@ class TestCalibrate:
         assert result["records"] == 5
 
     async def test_calibrate_with_heating_data(self):
-        """Calibration with records showing clear tank heating."""
+        """Calibration learns the reheat rate from repeated DHW cycles."""
         model = ThermalModel()
+        records = _dhw_cycle_records(20, 5.0, -1.2)
 
-        # Generate 40 records with tank heating (4°C/h at outdoor=10)
-        records = _generate_heating_records(n=40, heating_rate=5.0, outdoor=10.0)
-
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = records
-
-        # Second session (indoor readings) returns empty
-        mock_indoor_result = MagicMock()
-        mock_indoor_result.scalars.return_value.all.return_value = []
-
-        call_count = [0]
-
-        async def _mock_execute(stmt):
-            call_count[0] += 1
-            return mock_result if call_count[0] <= 1 else mock_indoor_result
-
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(side_effect=_mock_execute)
-
-        with patch("packages.ml.thermal.get_session") as mock_ctx:
-            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-            result = await model.calibrate()
+        result = await _calibrate_records(model, records)
 
         assert result["status"] == "calibrated"
-        assert result["samples"] == 40
+        assert result["samples"] == len(records)
         assert result["tank_heating_samples"] > 0
         assert model.params.last_calibrated is not None
-        # Learned rate should be around 5°C/h (at outdoor=10)
-        effective_rate = model._tank_heating_rate(10.0)
-        assert 3.0 < effective_rate < 8.0
+        assert 3.0 < model._tank_heating_rate(10.0) < 8.0
 
     async def test_defrost_intervals_filtered(self):
         """Records with defrost_active=True should be skipped."""
@@ -324,33 +435,20 @@ class TestCalibrate:
         assert result["status"] == "calibrated"
         assert result["defrost_intervals_filtered"] > 0
 
-    async def test_calibrate_confidence_becomes_learned(self):
-        """After calibration, predictions should have confidence='learned'."""
+    async def test_calibrated_confidence_requires_prospective_qualification(self):
+        """Fit validation alone does not qualify tank predictions for reporting."""
+        from tests.test_ml_lifecycle import qualified_reference
+
         model = ThermalModel()
-        records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
 
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = records
-
-        mock_indoor_result = MagicMock()
-        mock_indoor_result.scalars.return_value.all.return_value = []
-
-        call_count = [0]
-
-        async def _mock_execute(stmt):
-            call_count[0] += 1
-            return mock_result if call_count[0] <= 1 else mock_indoor_result
-
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(side_effect=_mock_execute)
-
-        with patch("packages.ml.thermal.get_session") as mock_ctx:
-            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-            await model.calibrate()
+        await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2))
 
         pred = model.predict_tank_heating_time(42.0, 50.0, outdoor_temp=10.0)
-        assert pred.confidence == "learned"
+        assert pred.confidence == "default"
+        model._qualified_reference = qualified_reference("thermal", ("tank_heating",))
+        assert (
+            model.predict_tank_heating_time(42.0, 50.0, outdoor_temp=10.0).confidence == "learned"
+        )
 
 
 class TestInternalRates:
@@ -408,6 +506,8 @@ class TestIndoorPredictions:
         assert pred.confidence == "default"
 
     def test_indoor_confidence_requires_indoor_evidence(self):
+        from tests.test_ml_lifecycle import qualified_reference
+
         model = ThermalModel()
         model.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
 
@@ -416,6 +516,15 @@ class TestIndoorPredictions:
         )
 
         model.params.indoor_heating_samples = 5
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "default"
+        )
+
+        model.params.calibration_status["indoor_heating"] = "validated"
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "default"
+        )
+        model._qualified_reference = qualified_reference()
         assert (
             model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "learned"
         )
@@ -1303,3 +1412,116 @@ class TestCalibrateIndoorRates:
         assert model.params.indoor_cooling_rate == -0.3
         assert model.params.indoor_heating_samples == 0
         assert model.params.indoor_cooling_samples == 0
+
+
+class TestIndoorRateValidation:
+    """Indoor rates must come from one consistent series and beat persistence."""
+
+    BASE = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+
+    @staticmethod
+    def _reading(ts, temperature, device_id="room-a"):
+        return SimpleNamespace(timestamp=ts, temperature=temperature, device_id=device_id)
+
+    def _statuses(self, hours, heating_at):
+        return [
+            SimpleNamespace(
+                ts=self.BASE + dt.timedelta(minutes=5 * i),
+                space_heating_active=heating_at(i * 5 / 60),
+                outdoor_temp=5.0,
+            )
+            for i in range(hours * 12)
+        ]
+
+    async def _calibrate(self, readings, statuses, reference_sensor_id=None):
+        model = ThermalModel()
+        results = []
+        for value in (readings, reference_sensor_id, []):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = value
+            result.scalar_one_or_none.return_value = value
+            results.append(result)
+        session = AsyncMock()
+        session.execute = AsyncMock(side_effect=results)
+        with patch("packages.ml.thermal.get_session") as ctx:
+            ctx.return_value.__aenter__ = AsyncMock(return_value=session)
+            ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            await model._calibrate_indoor_rates(self.BASE, statuses)
+        model.params.last_calibrated = self.BASE
+        return model
+
+    async def test_interleaved_room_offsets_do_not_create_rates(self):
+        """Four steady rooms ~1 °C apart must not look like heating or cooling."""
+        offsets = {"room-a": 22.5, "room-b": 23.4, "room-c": 23.1, "room-d": 23.3}
+        readings = [
+            self._reading(self.BASE + dt.timedelta(minutes=5 * i), temperature, device)
+            for i in range(48 * 12)
+            for device, temperature in offsets.items()
+        ]
+        statuses = self._statuses(48, lambda hour: int(hour) % 4 < 2)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] != "validated"
+        assert model.params.calibration_status["indoor_cooling"] != "validated"
+        assert model.params.indoor_heating_rate == 0.5
+        assert model.params.indoor_cooling_rate == -0.3
+        assert model.confidence_for("indoor_heating") == "default"
+
+    async def test_sensor_noise_alone_is_rejected(self):
+        """Symmetric noise around a steady room has no skill over persistence."""
+        rng = np.random.default_rng(7)
+        readings = [
+            self._reading(
+                self.BASE + dt.timedelta(minutes=5 * i), round(22.0 + rng.normal(0, 0.2), 1)
+            )
+            for i in range(72 * 12)
+        ]
+        statuses = self._statuses(72, lambda hour: int(hour) % 4 < 2)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] == (
+            "rejected_no_skill_over_baseline"
+        )
+        assert model.params.indoor_heating_rate == 0.5
+        assert model.confidence_for("indoor_heating") == "default"
+        assert model.validation["indoor_heating"]["holdout_samples"] > 0
+
+    async def test_real_heating_response_is_learned(self):
+        """A room that warms 0.6 °C/h with heat on and cools 0.4 °C/h off is validated."""
+        heating_at = lambda hour: int(hour) % 6 < 3  # noqa: E731
+        readings = []
+        temperature = 21.0
+        for i in range(96 * 12):
+            hour = i * 5 / 60
+            readings.append(
+                self._reading(self.BASE + dt.timedelta(minutes=5 * i), round(temperature, 2))
+            )
+            temperature += (0.6 if heating_at(hour) else -0.4) * 5 / 60
+        statuses = self._statuses(96, heating_at)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] == "validated"
+        assert model.params.calibration_status["indoor_cooling"] == "validated"
+        assert abs(model.params.indoor_heating_rate - 0.6) < 0.05
+        assert abs(model.params.indoor_cooling_rate + 0.4) < 0.05
+        assert model.confidence_for("indoor_heating") == "default"
+
+    async def test_reference_sensor_is_used_instead_of_other_rooms(self):
+        """With a configured reference room, other rooms cannot distort the series."""
+        heating_at = lambda hour: int(hour) % 6 < 3  # noqa: E731
+        readings = []
+        temperature = 21.0
+        for i in range(96 * 12):
+            ts = self.BASE + dt.timedelta(minutes=5 * i)
+            readings.append(self._reading(ts, round(temperature, 2), "reference"))
+            readings.append(self._reading(ts, 25.0 + (i % 2) * 2.0, "noisy-room"))
+            temperature += (0.6 if heating_at(i * 5 / 60) else -0.4) * 5 / 60
+        statuses = self._statuses(96, heating_at)
+
+        model = await self._calibrate(readings, statuses, reference_sensor_id="reference")
+
+        assert model.params.calibration_status["indoor_heating"] == "validated"
+        assert abs(model.params.indoor_heating_rate - 0.6) < 0.05

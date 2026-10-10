@@ -172,9 +172,9 @@ test("timeline keeps forecast and control-state comfort risk messaging consisten
     await expect(riskPanel.getByText(summary, { exact: true })).toHaveCount(1);
 });
 
-test("timeline keeps active-plan actions separate from activity outcomes and supports every activity filter", async ({ page }) => {
+test("timeline keeps legacy-plan actions separate from activity outcomes and supports every activity filter", async ({ page }) => {
     await timelineFixture(page);
-    const activePlan = { id: 42, created_at: iso(-1), horizon_start: iso(-1), horizon_end: iso(23), optimizer_version: "rules_v7", cost_estimate_eur: 1.25, actions_count: 2 };
+    const activePlan = { id: 42, status: "active", created_at: iso(-1), horizon_start: iso(-1), horizon_end: iso(23), optimizer_version: "rules_v7", cost_estimate_eur: 1.25, actions_count: 2 };
     let activityRequest = "";
     await page.route("**/api/dashboard", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ current_status: null, active_plan: activePlan }) }));
     await page.route("**/api/plans/42", (route) => route.fulfill({
@@ -202,10 +202,13 @@ test("timeline keeps active-plan actions separate from activity outcomes and sup
     await expect.poll(() => activityRequest).toContain("status=pending");
     await expect(activityRequest).toContain("status=dispatched");
 
-    const activePlanView = page.locator("#dashboard-panel-timeline .plan-section").filter({ has: page.getByRole("heading", { name: "Active Plan" }) });
+    const activePlanView = page.locator("#dashboard-panel-timeline .plan-section").filter({ has: page.getByRole("heading", { name: "Legacy plan (read-only)" }) });
     await expect(activePlanView.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
     await expect(activePlanView.getByRole("progressbar")).toHaveAttribute("aria-valuemax", "2");
     await expect(activePlanView.getByText("Normal mode on")).toHaveCount(0);
+    await expect(activePlanView.locator(".plan-action")).toHaveCount(2);
+    await expect(activePlanView).toContainText("Ordinary writes are prohibited in this build");
+    await expect(activePlanView.locator(".plan-next-callout")).toHaveCount(0);
 
     const actionList = page.locator(".timeline-action-list");
     await expect(actionList.getByText("Historical outcome (Plan #17)")).toBeVisible();
@@ -289,6 +292,7 @@ test("Timeline requests each source once per shared refresh tick", async ({ page
     const sourceCounts = { prices: 0, indoor: 0, forecast: 0, activity: 0, settings: 0, plan: 0 };
     const activePlan = {
         id: 4,
+        status: "active",
         created_at: iso(-1),
         horizon_start: iso(-1),
         horizon_end: iso(23),
@@ -306,37 +310,36 @@ test("Timeline requests each source once per shared refresh tick", async ({ page
 
     await page.goto("/");
     await expect.poll(() => sourceCounts.forecast).toBeGreaterThan(0);
-    await expect.poll(() => sourceCounts.plan).toBeGreaterThan(0);
     await expect(page.locator(".decision-summary")).toBeVisible();
     await expect(page.getByText("Loading forecast details...", { exact: true })).toHaveCount(0);
-    await expect(page.getByText("Checking plan...", { exact: true })).toHaveCount(0);
-    await expect(page.locator(".decision-summary")).toContainText("No pending command");
+    await expect(page.locator(".decision-summary")).toContainText("No ordinary command");
+    await expect(page.locator(".decision-summary")).toContainText("Ordinary writes are prohibited in this build");
+    expect(sourceCounts.plan).toBe(0);
     const beforeActivation = { ...sourceCounts };
     await page.getByRole("tab", { name: "Timeline" }).click();
     await expect(page.getByTestId("explanation-timeline")).toBeVisible();
     expect(await page.evaluate(() => (window as unknown as { __timelineRefreshIntervals: Map<number, () => void> }).__timelineRefreshIntervals.size)).toBe(1);
 
-    expect(sourceCounts.prices).toBeGreaterThan(beforeActivation.prices);
-    expect(sourceCounts.indoor).toBeGreaterThan(beforeActivation.indoor);
-    expect(sourceCounts.forecast).toBeGreaterThan(beforeActivation.forecast);
-    expect(sourceCounts.activity).toBeGreaterThan(beforeActivation.activity);
-    expect(sourceCounts.settings).toBeGreaterThan(beforeActivation.settings);
-    expect(sourceCounts.plan).toBeGreaterThan(beforeActivation.plan);
-    const afterActivation = { ...sourceCounts };
-    await page.evaluate(() => Array.from(
-        (window as unknown as { __timelineRefreshIntervals: Map<number, () => void> }).__timelineRefreshIntervals.values(),
-    ).forEach((callback) => callback()));
-    await expect.poll(() => sourceCounts).toEqual({
-        prices: afterActivation.prices + 1,
-        indoor: afterActivation.indoor + 1,
-        forecast: afterActivation.forecast + 1,
-        activity: afterActivation.activity + 1,
-        settings: afterActivation.settings + 1,
-        plan: afterActivation.plan + 1,
-    });
+    for (const source of Object.keys(sourceCounts) as Array<keyof typeof sourceCounts>) {
+        expect(sourceCounts[source]).toBeGreaterThan(beforeActivation[source]);
+    }
+    for (const tick of [1, 2]) {
+        const beforeTick = { ...sourceCounts };
+        await page.evaluate(() => Array.from(
+            (window as unknown as { __timelineRefreshIntervals: Map<number, () => void> }).__timelineRefreshIntervals.values(),
+        ).forEach((callback) => callback()));
+        await expect.poll(() => sourceCounts, { message: `Source counts after shared refresh tick ${tick}` }).toEqual({
+            prices: beforeTick.prices + 1,
+            indoor: beforeTick.indoor + 1,
+            forecast: beforeTick.forecast + 1,
+            activity: beforeTick.activity + 1,
+            settings: beforeTick.settings + 1,
+            plan: beforeTick.plan + 1,
+        });
+    }
 });
 
-test("a delayed response for an old active plan cannot replace newer Timeline actions", async ({ page }) => {
+test("a delayed response for an old legacy plan cannot replace newer Timeline actions", async ({ page }) => {
     await page.addInitScript(() => {
         const intervals = new Map<number, () => void>();
         const originalSetInterval = window.setInterval;
@@ -352,26 +355,33 @@ test("a delayed response for an old active plan cannot replace newer Timeline ac
         }) as typeof window.clearInterval;
         Object.defineProperty(window, "__timelineRefreshIntervals", { value: intervals });
     });
-    const oldPlan = { id: 4, created_at: iso(-1), horizon_start: iso(-1), horizon_end: iso(23), optimizer_version: "rules_v7", cost_estimate_eur: 1.25, actions_count: 1 };
+    const oldPlan = { id: 4, status: "active", created_at: iso(-1), horizon_start: iso(-1), horizon_end: iso(23), optimizer_version: "rules_v7", cost_estimate_eur: 1.25, actions_count: 1 };
     const newPlan = { ...oldPlan, id: 5 };
     let useNewPlan = false;
+    let oldPlanRequests = 0;
+    let oldPlanResponsesSettled = 0;
     let releaseOldPlan!: () => void;
     const oldPlanResponse = new Promise<void>((resolve) => { releaseOldPlan = resolve; });
     await page.route("**/api/dashboard", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ current_status: null, active_plan: useNewPlan ? newPlan : oldPlan }) }));
     await page.route("**/api/plans/4", async (route) => {
+        oldPlanRequests += 1;
         await oldPlanResponse;
         await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...oldPlan, actions: [{ id: 4, scheduled_ts: iso(1), action_type: "force_dhw_on", payload: {}, status: "pending" }] }) }).catch(() => undefined);
+        oldPlanResponsesSettled += 1;
     });
     await page.route("**/api/plans/5", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...newPlan, actions: [{ id: 5, scheduled_ts: iso(1), action_type: "zone_temp_boost", payload: {}, status: "pending" }] }) }));
 
     await page.goto("/?view=timeline");
+    await expect.poll(() => oldPlanRequests).toBeGreaterThan(0);
     useNewPlan = true;
     await page.evaluate(() => Array.from(
         (window as unknown as { __timelineRefreshIntervals: Map<number, () => void> }).__timelineRefreshIntervals.values(),
     ).forEach((callback) => callback()));
     const planActions = page.locator("#dashboard-panel-timeline .plan-actions");
-    await expect(page.locator("#dashboard-panel-timeline .plan-next-callout").getByRole("img", { name: "Boost heating" })).toBeVisible();
+    await expect(planActions.getByRole("img", { name: "Boost heating" })).toBeVisible();
+    await expect(page.locator("#dashboard-panel-timeline .plan-next-callout")).toHaveCount(0);
     releaseOldPlan();
+    await expect.poll(() => oldPlanResponsesSettled).toBe(oldPlanRequests);
     await expect(planActions.getByRole("img", { name: "Boost heating" })).toBeVisible();
     await expect(planActions.getByRole("img", { name: "Heat hot water" })).toHaveCount(0);
 });

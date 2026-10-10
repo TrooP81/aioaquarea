@@ -1,4 +1,4 @@
-import { expect, test } from "./fixtures";
+import { controlState, expect, test } from "./fixtures";
 
 test("renders fallback indoor forecast warning without browser errors", async ({ page }) => {
     const browserErrors: string[] = [];
@@ -14,13 +14,7 @@ test("renders fallback indoor forecast warning without browser errors", async ({
         route.fulfill({
             status: 200,
             contentType: "application/json",
-            body: JSON.stringify({
-                state: "automatic",
-                headline: "Scheduled control remains active",
-                detail: "Automatic dispatch remains active.",
-                reason_code: "automatic",
-                notices: [],
-            }),
+            body: JSON.stringify(controlState),
         }),
     );
     const json = (body: unknown) => ({

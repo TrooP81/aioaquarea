@@ -68,7 +68,7 @@ export function Controls({ controlState, onChanged }: { controlState: ControlSta
 
       {controlState?.state === "paused_by_user" && (
         <p className="text-warning text-sm">
-          Paused until {formatTime(controlState.until)}. {controlState.active_override_count > 1 ? "Another active override remains after a resume." : "Resume is available in the header."}
+          Override until {formatTime(controlState.until)}. {controlState.active_override_count > 1 ? "Another active override remains after clearing this one." : "Clear override is available in the header."} Ordinary writes remain prohibited in this build.
         </p>
       )}
       {confirming && (

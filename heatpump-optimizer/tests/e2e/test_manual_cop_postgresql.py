@@ -1735,14 +1735,22 @@ class TestManualCOPPostgreSQLMigration:
                 sequence_names = [name for name, kind in relations if kind == "S"]
                 assert {model.__tablename__ for model in models} <= set(table_names)
                 assert sequence_names
+                legacy_metadata = MetaData()
+                await connection.run_sync(
+                    lambda current: legacy_metadata.reflect(
+                        bind=current, only=[model.__tablename__ for model in models]
+                    )
+                )
 
                 async def legacy_state(current):
                     state = {
                         model.__tablename__: tuple(
                             (
                                 await current.execute(
-                                    select(model.__table__).order_by(
-                                        *model.__table__.primary_key.columns
+                                    select(legacy_metadata.tables[model.__tablename__]).order_by(
+                                        *legacy_metadata.tables[
+                                            model.__tablename__
+                                        ].primary_key.columns
                                     )
                                 )
                             ).all()
@@ -1802,7 +1810,8 @@ class TestManualCOPPostgreSQLMigration:
                             continue
                         identifier = current.dialect.identifier_preparer.quote(name)
                         state["raw_rows"][name] = tuple(
-                            (
+                            json.loads(value)
+                            for value in (
                                 await current.execute(
                                     text(
                                         f"SELECT to_jsonb(record)::text FROM public.{identifier} "
@@ -1881,6 +1890,9 @@ class TestManualCOPPostgreSQLMigration:
                     tokens.append(token)
             async with engine.connect() as connection:
                 retained = await retained_storage_state(connection)
+            next_native_position = 1 + max(
+                column[2] for column in retained_legacy["columns"] if column[0] == "device_status"
+            )
             for operation, target in (
                 (command.upgrade, head),
                 (command.downgrade, "032"),
@@ -1891,7 +1903,31 @@ class TestManualCOPPostgreSQLMigration:
                     assert await retained_storage_state(connection) == retained | {
                         "marker": (target,)
                     }
-                    assert await legacy_state(connection) == retained_legacy
+                    expected_legacy = copy.deepcopy(retained_legacy)
+                    if target == head and head != "032":
+                        expected_legacy["columns"] = tuple(
+                            sorted(
+                                (
+                                    *expected_legacy["columns"],
+                                    (
+                                        "device_status",
+                                        "native_policy_provenance",
+                                        next_native_position,
+                                        "jsonb",
+                                        False,
+                                        None,
+                                    ),
+                                ),
+                                key=lambda column: (column[0], column[2]),
+                            )
+                        )
+                        expected_legacy["raw_rows"]["device_status"] = tuple(
+                            row | {"native_policy_provenance": None}
+                            for row in expected_legacy["raw_rows"]["device_status"]
+                        )
+                    assert await legacy_state(connection) == expected_legacy
+                    if target == head and head != "032":
+                        next_native_position += 1
                 if target == head:
                     await asyncio.to_thread(command.check, config)
         finally:
@@ -2195,6 +2231,7 @@ class TestManualCOPPostgreSQLAPI:
             "total_rows_deleted": consumption_count,
             "models_reset": reset_models,
             "deleted_models": [],
+            "model_lifecycle": None,
         }
         async with database.engine.connect() as connection:
             assert (

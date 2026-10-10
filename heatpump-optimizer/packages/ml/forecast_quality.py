@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import statistics
 from collections import defaultdict
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import numpy as np
 import structlog
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, or_, select
 
 from packages.core.database import get_session
-from packages.core.models import IndoorTempReading, PlanActionRecord, PlanRecord
+from packages.core.models import (
+    ConsumptionRecord,
+    DeviceStatusRecord,
+    IndoorTempReading,
+    OverrideRecord,
+    PlanActionRecord,
+    PlanRecord,
+    PriceRecord,
+    WeatherRecord,
+)
 from packages.optimizer.executor_core import (
     INITIAL_VERIFY_CHECKPOINTS_S,
     REDISPATCH_VERIFY_CHECKPOINTS_S,
@@ -57,6 +72,1315 @@ UNOBSERVED_REGIME_MARGIN_C = {
     "cloudy": 0.1,
 }
 WEATHER_REGIMES = tuple(UNOBSERVED_REGIME_MARGIN_C)
+
+NATIVE_POLICY_SCHEMA = "native_unchanged_v1"
+NATIVE_ESTIMATOR_SCHEMA = "native_persistence_15m_v1"
+QUALIFICATION_POLICY_SCHEMA = "prospective_native_fixed_daily_v1"
+DECISION_OFFSETS_HOURS = tuple(range(15 * 24, 85 * 24 + 1, 24))
+QUALIFICATION_FAMILY_ALPHA = 0.05
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_CHUNK = 128
+BOOTSTRAP_BLOCK_DAYS = 2
+MAX_QUALIFICATION_PAIRS = 50_000
+MIN_PROSPECTIVE_DAYS = 14
+MIN_DEVICE_DAY_CLUSTERS = 14
+MIN_ISSUE_COHORTS = 20
+MIN_PROSPECTIVE_PAIRS = 60
+MIN_OUTDOOR_BIN_PAIRS = 12
+MIN_POPULATED_OUTDOOR_BINS = 3
+MIN_RELATIVE_MAE_IMPROVEMENT = 0.05
+MIN_DEMAND_MAE_IMPROVEMENT_RELATIVE = 0.05
+MIN_TEMPERATURE_MAE_IMPROVEMENT_C = 0.10
+NATIVE_TOLERANCES = {
+    "status_gap_seconds": 900,
+    "sensor_age_seconds": 900,
+    "outcome_match_seconds": 600,
+    "timer_age_seconds": 3600,
+    "weather_age_seconds": 7200,
+    "supply_resolution_c": 1.0,
+    "tank_resolution_c": 1.0,
+    "indoor_resolution_c": 0.1,
+    "setpoint_change_c": 0.0,
+    "heat_state_changes": 0,
+}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def evidence_hash(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def timer_fingerprint(timer: Mapping[str, Any]) -> str:
+    return evidence_hash(
+        {key: timer.get(key) for key in ("status", "enabled", "slots", "timezone")}
+    )
+
+
+def native_scope(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "policy_schema": NATIVE_POLICY_SCHEMA,
+        "estimator_schema": NATIVE_ESTIMATOR_SCHEMA,
+        "sensor_fingerprint": evidence_hash(snapshot["sensor_basis"]),
+        "policy_fingerprint": evidence_hash(
+            {
+                "settings": snapshot["native_settings"],
+                "timer": timer_fingerprint(snapshot["timer"]),
+            }
+        ),
+        "schema_fingerprint": evidence_hash(snapshot["schemas"]),
+        "tolerances": dict(NATIVE_TOLERANCES),
+    }
+
+
+@dataclass(frozen=True)
+class FrozenNativeIssue:
+    epoch: str
+    device_id: str
+    component: str
+    cohort_key: str
+    issued_at: dt.datetime
+    horizons: tuple[int, ...]
+    incumbent_hash: str | None
+    candidate_hash: str
+    snapshot_json: str
+    predictions_json: str
+
+    def rows(self) -> list[dict[str, Any]]:
+        snapshot = json.loads(self.snapshot_json)
+        predictions = json.loads(self.predictions_json)
+        return [
+            {
+                "epoch": self.epoch,
+                "device_id": self.device_id,
+                "component": self.component,
+                "cohort_key": self.cohort_key,
+                "horizon_minutes": horizon,
+                "issue_kind": "prospective_native",
+                "policy_schema": NATIVE_POLICY_SCHEMA,
+                "issued_at": self.issued_at,
+                "target_at": self.issued_at + dt.timedelta(minutes=horizon),
+                "device_day": self.issued_at.date(),
+                "incumbent_hash": self.incumbent_hash,
+                "candidate_hash": self.candidate_hash,
+                "snapshot_hash": evidence_hash(snapshot),
+                "input_snapshot": json.loads(self.snapshot_json),
+                "predictions": predictions[str(horizon)],
+                "expected_horizons": list(self.horizons),
+            }
+            for horizon in self.horizons
+        ]
+
+
+def estimate_native_trajectory(
+    inputs: Mapping[str, Any], horizons: tuple[int, ...]
+) -> dict[str, Any] | None:
+    issued_at = as_utc(inputs.get("issued_at"))
+    history = inputs.get("status_history", [])
+    timer = inputs.get("timer", {})
+    timer_at = as_utc(timer.get("fetched_at"))
+    if (
+        issued_at is None
+        or not history
+        or not horizons
+        or min(horizons) <= 0
+        or max(horizons) > 1440
+        or timer.get("status") != "known"
+        or not isinstance(timer.get("enabled"), bool)
+        or timer_at is None
+        or not 0 <= (issued_at - timer_at).total_seconds() <= 3600
+        or (timer["enabled"] and any(slot.get("enabled") for slot in timer.get("slots", [])))
+        or inputs.get("actions")
+    ):
+        return None
+    times = [as_utc(row.get("ts")) for row in history]
+    if (
+        any(value is None or value > issued_at for value in times)
+        or times[0] > issued_at - dt.timedelta(hours=1)
+        or (issued_at - times[-1]).total_seconds() > 900
+        or any(
+            not 0 < (right - left).total_seconds() <= 900 for left, right in zip(times, times[1:])
+        )
+    ):
+        return None
+    latest = history[-1]
+    active = latest.get("space_heating_active")
+    if not isinstance(active, bool) or latest.get("space_heating_evidence") == "not_confirmed":
+        return None
+    if latest.get("defrost_active") is not False:
+        return None
+    if latest.get("device_action") == "COOLING":
+        return None
+    dhw = latest.get("device_action") == "HEATING_WATER" or latest.get("direction") == "WATER"
+    native = inputs.get("native_settings", {})
+    if any(
+        native.get(key) not in (0, False) for key in ("force_dhw", "force_heater", "holiday_mode")
+    ):
+        return None
+    if native.get("operation_status") not in (0, 1) or native.get("mode") is None:
+        return None
+    sensor_history = inputs.get("sensor_history", [])
+    sensor_times = [as_utc(row.get("timestamp") or row.get("ts")) for row in sensor_history]
+    if (
+        not sensor_times
+        or any(value is None or value > issued_at for value in sensor_times)
+        or (issued_at - sensor_times[-1]).total_seconds() > NATIVE_TOLERANCES["sensor_age_seconds"]
+    ):
+        return None
+    if any(
+        not isinstance(native.get(key), (float, int))
+        for key in ("zone1_target_temp", "tank_target_temp")
+    ):
+        return None
+    weather = inputs.get("weather", [])
+    for horizon in horizons:
+        target = issued_at + dt.timedelta(minutes=horizon)
+        matching = [
+            row
+            for row in weather
+            if (timestamp := as_utc(row.get("ts"))) is not None
+            and abs((timestamp - target).total_seconds()) <= 3600
+        ]
+        if not matching:
+            return None
+        for row in matching:
+            retrieved = as_utc(row.get("forecast_issued_at"))
+            if retrieved is None or not 0 <= (issued_at - retrieved).total_seconds() <= 7200:
+                return None
+            if not isinstance(row.get("temperature"), (int, float)) or not math.isfinite(
+                row["temperature"]
+            ):
+                return None
+    supply = latest.get("zone1_temp")
+    if not isinstance(supply, (int, float)) or not math.isfinite(supply):
+        return None
+    return {
+        "schema": NATIVE_ESTIMATOR_SCHEMA,
+        "assumption": "last_confirmed_native_state_and_supply_persist",
+        "steps": [
+            {
+                "minute": minute,
+                "space_heating_active": active,
+                "dhw_active": dhw,
+                "zone_supply_c": float(supply),
+            }
+            for minute in range(15, max(horizons) + 15, 15)
+        ],
+    }
+
+
+def freeze_native_pair(
+    inputs: Mapping[str, Any],
+    *,
+    epoch: str,
+    component: str,
+    candidate_hash: str,
+    incumbent_hash: str | None,
+    horizons: tuple[int, ...],
+    candidate_predictor: Callable,
+    incumbent_predictor: Callable,
+    baseline_predictor: Callable,
+) -> FrozenNativeIssue | None:
+    snapshot = json.loads(_canonical_json(dict(inputs)))
+    trajectory = estimate_native_trajectory(snapshot, horizons)
+    if trajectory is None:
+        return None
+    if component in {"comfort", "demand"} and trajectory["steps"][0]["dhw_active"]:
+        return None
+    snapshot["policy_schema"] = NATIVE_POLICY_SCHEMA
+    snapshot["expected_native_trajectory"] = trajectory
+    snapshot["tolerances"] = dict(NATIVE_TOLERANCES)
+    snapshot["scope"] = native_scope(snapshot)
+    frozen = _canonical_json(snapshot)
+    predictions = {}
+    for name, predictor in (
+        ("candidate", candidate_predictor),
+        ("incumbent", incumbent_predictor),
+        ("baseline", baseline_predictor),
+    ):
+        values = predictor(json.loads(frozen), horizons)
+        if set(values) != set(horizons) or any(
+            not math.isfinite(float(value)) for value in values.values()
+        ):
+            return None
+        for horizon in horizons:
+            predictions.setdefault(str(horizon), {})[name] = float(values[horizon])
+    issued_at = as_utc(snapshot["issued_at"])
+    cohort = evidence_hash(
+        {
+            "device_id": snapshot["device_id"],
+            "component": component,
+            "issued_at": issued_at.isoformat(),
+            "capability": snapshot["capability"],
+        }
+    )
+    return FrozenNativeIssue(
+        epoch,
+        snapshot["device_id"],
+        component,
+        cohort,
+        issued_at,
+        horizons,
+        incumbent_hash,
+        candidate_hash,
+        frozen,
+        _canonical_json(predictions),
+    )
+
+
+def native_trace_exclusion(
+    issue: Mapping[str, Any], trace: Mapping[str, Any]
+) -> tuple[str, str] | None:
+    if (
+        issue["issue_kind"] != "prospective_native"
+        or issue["policy_schema"] != NATIVE_POLICY_SCHEMA
+    ):
+        return "excluded", "not_prospective_native"
+    if issue["input_snapshot"].get("unavailable_reason"):
+        return "excluded", "unconstructable_native_policy"
+    if trace.get("lookup_complete") is not True or trace.get("overflow"):
+        return "incomplete", "execution_lookup_incomplete"
+    if (
+        trace.get("overrides") is None
+        or trace.get("restores") is None
+        or trace.get("actions") is None
+    ):
+        return "incomplete", "execution_lookup_incomplete"
+    if trace["overrides"]:
+        return "excluded", "override"
+    if trace["restores"]:
+        return "excluded", "unresolved_restore"
+    for action in trace["actions"]:
+        if action.get("never_dispatched") is True:
+            continue
+        if action.get("dispatched") is True:
+            return "excluded", "unmatched_action"
+        return "incomplete", "unknown_dispatch"
+    snapshot = issue["input_snapshot"]
+    if trace.get("scope") != snapshot["scope"]:
+        return "excluded", "incompatible_scope"
+    statuses = trace.get("statuses", [])
+    start, end = issue["issued_at"], issue["target_at"]
+    times = [as_utc(row.get("ts")) for row in statuses]
+    if (
+        not times
+        or any(value is None for value in times)
+        or not 0 <= (start - times[0]).total_seconds() <= 900
+        or abs((end - times[-1]).total_seconds()) > 600
+        or any(
+            not 0 < (right - left).total_seconds() <= 900 for left, right in zip(times, times[1:])
+        )
+    ):
+        return "excluded", "stale_or_gapped_telemetry"
+    expected = snapshot["expected_native_trajectory"]["steps"][0]
+    for status, timestamp in zip(statuses, times):
+        if status.get("device_id") != issue["device_id"]:
+            return "excluded", "device_scope_mismatch"
+        provenance = status.get("native_policy_provenance")
+        if not isinstance(provenance, dict) or provenance.get("schema") != NATIVE_POLICY_SCHEMA:
+            return "excluded", "unknown_execution"
+        timer = provenance.get("timer", {})
+        timer_at = as_utc(timer.get("fetched_at"))
+        if (
+            timer.get("status") != "known"
+            or timer_at is None
+            or not 0 <= (timestamp - timer_at).total_seconds() <= 3600
+        ):
+            return "excluded", "unknown_timer"
+        if timer_fingerprint(timer) != timer_fingerprint(snapshot["timer"]):
+            return "excluded", "timer_effect"
+        if provenance.get("settings") != snapshot["native_settings"]:
+            return "excluded", "native_policy_changed"
+        dhw = status.get("device_action") == "HEATING_WATER" or status.get("direction") == "WATER"
+        if dhw != expected["dhw_active"] or (dhw and issue["component"] in {"comfort", "demand"}):
+            return "excluded", "dhw_diversion"
+        active = status.get("space_heating_active")
+        if not isinstance(active, bool) or status.get("space_heating_evidence") == "not_confirmed":
+            return "excluded", "unknown_execution"
+        if status.get("defrost_active") is not False:
+            return "excluded", "unknown_execution"
+        if active != expected["space_heating_active"]:
+            return "excluded", "native_trajectory_mismatch"
+        supply = status.get("zone1_temp")
+        if not isinstance(supply, (int, float)) or not math.isfinite(supply):
+            return "excluded", "unknown_execution"
+        if abs(supply - expected["zone_supply_c"]) > NATIVE_TOLERANCES["supply_resolution_c"]:
+            return "excluded", "native_trajectory_mismatch"
+    return None
+
+
+def reconcile_native_issue(
+    issue: Mapping[str, Any],
+    trace: Mapping[str, Any],
+    *,
+    observed: float | None,
+    observed_at: dt.datetime | None,
+    now: dt.datetime,
+) -> dict[str, Any]:
+    result = {"status": "pending", "exclusion_reason": None, "observed_at": None, "result": {}}
+    if issue["target_at"] > now:
+        return result
+    exclusion = native_trace_exclusion(issue, trace)
+    if exclusion:
+        result.update(status=exclusion[0], exclusion_reason=exclusion[1])
+        return result
+    if (
+        observed is None
+        or observed_at is None
+        or not math.isfinite(observed)
+        or observed_at > now
+        or abs((observed_at - issue["target_at"]).total_seconds()) > 600
+    ):
+        result.update(status="incomplete", exclusion_reason="missing_or_invalid_target")
+        return result
+    snapshot = issue["input_snapshot"]
+    weather = min(
+        snapshot["weather"],
+        key=lambda row: abs((as_utc(row["ts"]) - issue["target_at"]).total_seconds()),
+    )
+    predictions = issue["predictions"]
+    result.update(
+        status="valid",
+        observed_at=observed_at,
+        result={
+            "observed": observed,
+            "observed_at": observed_at.isoformat(),
+            "issued_at": issue["issued_at"].isoformat(),
+            "target_at": issue["target_at"].isoformat(),
+            "device_id": issue["device_id"],
+            "cohort_key": issue["cohort_key"],
+            "canonical_key": issue["cohort_key"],
+            "horizon_minutes": issue["horizon_minutes"],
+            "issue_kind": issue["issue_kind"],
+            "policy_schema": issue["policy_schema"],
+            "candidate_hash": issue["candidate_hash"],
+            "incumbent_hash": issue["incumbent_hash"],
+            "outdoor_bin": math.floor(weather["temperature"] / 2) * 2,
+            "scope": snapshot["scope"],
+            "capability": snapshot["capability"],
+            **predictions,
+        },
+    )
+    return result
+
+
+def decision_checkpoint(
+    frozen_at: dt.datetime,
+    now: dt.datetime,
+    completed: tuple[int, ...] = (),
+) -> int | None:
+    for index, hours in enumerate(DECISION_OFFSETS_HOURS):
+        if index not in completed and now >= frozen_at + dt.timedelta(hours=hours):
+            return index
+    return None
+
+
+def paired_block_bootstrap(
+    pairs: list[dict[str, Any]],
+    comparator: str,
+    *,
+    seed: int,
+    alpha: float,
+    cluster_days: set[tuple[str, dt.date]] | None = None,
+) -> dict[str, float | int]:
+    if len(pairs) > MAX_QUALIFICATION_PAIRS or not 0 < alpha <= 0.05:
+        raise ValueError("Bootstrap resource or alpha bound exceeded")
+    days = {}
+    for pair in pairs:
+        day = as_utc(pair["issued_at"]).date()
+        key = (pair["device_id"], day)
+        candidate = abs(pair["candidate"] - pair["observed"])
+        improvement = abs(pair[comparator] - pair["observed"]) - candidate
+        total, count = days.get(key, (0.0, 0))
+        days[key] = (total + improvement, count + 1)
+    for key in cluster_days or ():
+        days.setdefault(key, (0.0, 0))
+    blocks = [
+        (
+            days[key][0] + days[(key[0], key[1] + dt.timedelta(days=1))][0],
+            days[key][1] + days[(key[0], key[1] + dt.timedelta(days=1))][1],
+        )
+        for key in sorted(days)
+        if (key[0], key[1] + dt.timedelta(days=1)) in days
+        and days[key][1] + days[(key[0], key[1] + dt.timedelta(days=1))][1] > 0
+    ]
+    if len(blocks) < 7:
+        raise ValueError("Insufficient contiguous 48-hour blocks")
+    totals = np.asarray([value[0] for value in blocks])
+    counts = np.asarray([value[1] for value in blocks])
+    draws = math.ceil(len(days) / BOOTSTRAP_BLOCK_DAYS)
+    rng = np.random.default_rng(seed)
+    resampled = np.empty(BOOTSTRAP_RESAMPLES)
+    for offset in range(0, BOOTSTRAP_RESAMPLES, BOOTSTRAP_CHUNK):
+        size = min(BOOTSTRAP_CHUNK, BOOTSTRAP_RESAMPLES - offset)
+        indices = rng.integers(0, len(blocks), size=(size, draws))
+        resampled[offset : offset + size] = totals[indices].sum(axis=1) / counts[indices].sum(
+            axis=1
+        )
+    ordered = np.sort(resampled)
+    support_bound = float(np.min(totals / counts))
+    allocated_bound = float(ordered[max(0, math.floor(alpha * BOOTSTRAP_RESAMPLES) - 1)])
+    return {
+        "lb95": float(ordered[max(0, math.floor(0.05 * BOOTSTRAP_RESAMPLES) - 1)]),
+        "sequential_lower_bound": min(support_bound, allocated_bound),
+        "finite_resample_support_bound": support_bound,
+        "alpha": alpha,
+        "resamples": BOOTSTRAP_RESAMPLES,
+        "moving_block_hours": 48,
+        "blocks": len(blocks),
+    }
+
+
+def qualify_prospective(
+    pairs: list[dict[str, Any]],
+    *,
+    component: str,
+    candidate_hash: str,
+    frozen_at: dt.datetime,
+    data_cutoff: dt.datetime,
+    now: dt.datetime,
+    horizons: tuple[int, ...],
+    scope: dict[str, Any],
+    capabilities: tuple[str, ...],
+    coverage_complete: bool,
+    checkpoint: int | None = None,
+    completed: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    result = {
+        "qualified": False,
+        "control_ready": False,
+        "ordinary_writes_allowed": False,
+        "unit": "kW" if component == "demand" else "degC",
+        "policy": QUALIFICATION_POLICY_SCHEMA,
+        "reason": "insufficient_evidence",
+        "exclusions": {},
+        "counts": {},
+    }
+    if not coverage_complete or len(pairs) > MAX_QUALIFICATION_PAIRS:
+        return {**result, "reason": "incomplete_coverage"}
+    checkpoint = (
+        decision_checkpoint(frozen_at, now, completed) if checkpoint is None else checkpoint
+    )
+    if (
+        checkpoint is None
+        or checkpoint in completed
+        or not 0 <= checkpoint < len(DECISION_OFFSETS_HOURS)
+        or now < frozen_at + dt.timedelta(hours=DECISION_OFFSETS_HOURS[checkpoint])
+    ):
+        return {**result, "reason": "decision_not_due"}
+    result["checkpoint"] = checkpoint
+    issue_cutoff = frozen_at + dt.timedelta(hours=DECISION_OFFSETS_HOURS[checkpoint] - 24)
+    excluded = defaultdict(int)
+    by_horizon = defaultdict(lambda: defaultdict(int))
+    by_bin = defaultdict(lambda: defaultdict(int))
+    valid = []
+    seen = {}
+    for pair in pairs:
+        reason = pair.get("exclusion_reason")
+        issued = as_utc(pair.get("issued_at"))
+        target = as_utc(pair.get("target_at"))
+        observed_at = as_utc(pair.get("observed_at"))
+        if (
+            pair.get("issue_kind") != "prospective_native"
+            or pair.get("policy_schema") != NATIVE_POLICY_SCHEMA
+        ):
+            reason = "not_prospective_native"
+        elif pair.get("candidate_hash") != candidate_hash or pair.get("scope") != scope:
+            return {**result, "reason": "incompatible_scope"}
+        elif pair.get("status", "valid") in {"pending", "incomplete"}:
+            return {**result, "reason": "incomplete_coverage"}
+        elif issued is None or target is None or issued < frozen_at or issued < data_cutoff:
+            reason = "fit_or_holdout_overlap"
+        elif issued > issue_cutoff or target > now:
+            continue
+        elif (
+            observed_at is None
+            or observed_at > now
+            or abs((observed_at - target).total_seconds()) > 600
+        ):
+            reason = "invalid_target_time"
+        elif (
+            pair.get("horizon_minutes") not in horizons
+            or pair.get("capability") not in capabilities
+        ):
+            reason = "undeclared_capability"
+        elif any(
+            not isinstance(pair.get(key), (int, float)) or not math.isfinite(pair[key])
+            for key in ("observed", "candidate", "incumbent", "baseline")
+        ):
+            reason = "non_finite_pair"
+        if reason or pair.get("status") == "excluded":
+            reason = pair.get("exclusion_reason") or reason or "excluded"
+            excluded[reason] += 1
+            by_horizon[str(pair.get("horizon_minutes"))][reason] += 1
+            by_bin[str(pair.get("outdoor_bin"))][reason] += 1
+            continue
+        key = (
+            pair["device_id"],
+            pair["canonical_key"],
+            pair["horizon_minutes"],
+            pair["capability"],
+        )
+        if key in seen:
+            if evidence_hash(pair) != evidence_hash(seen[key]):
+                return {**result, "reason": "conflicting_duplicate"}
+            continue
+        seen[key] = pair
+        valid.append(pair)
+    result["exclusions"] = dict(excluded)
+    result["exclusions_by_horizon"] = {key: dict(value) for key, value in by_horizon.items()}
+    result["exclusions_by_outdoor_bin"] = {key: dict(value) for key, value in by_bin.items()}
+    clusters = {(pair["device_id"], as_utc(pair["issued_at"]).date()) for pair in valid}
+    cohorts = {(pair["device_id"], pair["cohort_key"]) for pair in valid}
+    horizon_counts = {str(h): sum(pair["horizon_minutes"] == h for pair in valid) for h in horizons}
+    bin_counts = {
+        str(outdoor): sum(pair["outdoor_bin"] == outdoor for pair in valid)
+        for outdoor in sorted({pair["outdoor_bin"] for pair in valid})
+    }
+    result["counts"] = {
+        "pairs": len(valid),
+        "device_day_clusters": len(clusters),
+        "issue_cohorts": len(cohorts),
+        "horizons": horizon_counts,
+        "outdoor_bins": bin_counts,
+    }
+    if (
+        now - frozen_at < dt.timedelta(days=14)
+        or frozen_at < data_cutoff
+        or len(valid) < MIN_PROSPECTIVE_PAIRS
+        or len(clusters) < MIN_DEVICE_DAY_CLUSTERS
+        or len(cohorts) < MIN_ISSUE_COHORTS
+        or not horizons
+        or not capabilities
+        or any(count < 12 for count in horizon_counts.values())
+        or sum(count >= 12 for count in bin_counts.values()) < 3
+    ):
+        return result
+    latest = max(as_utc(pair["observed_at"]) for pair in valid)
+    if now >= latest + dt.timedelta(hours=72):
+        return {**result, "reason": "outcomes_expired", "last_valid_outcome_at": latest.isoformat()}
+    groups = {"overall": valid}
+    for capability in capabilities:
+        selected = [pair for pair in valid if pair["capability"] == capability]
+        if len(selected) < 60 or any(
+            sum(pair["horizon_minutes"] == h for pair in selected) < 12 for h in horizons
+        ):
+            return {**result, "reason": "capability_insufficient_evidence"}
+        groups[capability] = selected
+        for horizon in horizons:
+            groups[f"{capability}:horizon:{horizon}"] = [
+                pair for pair in selected if pair["horizon_minutes"] == horizon
+            ]
+    for outdoor, count in bin_counts.items():
+        if count >= 12:
+            groups[f"outdoor:{outdoor}"] = [
+                pair for pair in valid if str(pair["outdoor_bin"]) == outdoor
+            ]
+    alpha = QUALIFICATION_FAMILY_ALPHA / (len(DECISION_OFFSETS_HOURS) * len(groups) * 2)
+    evidence = {}
+    for name, selected in groups.items():
+        actual = np.asarray([pair["observed"] for pair in selected])
+        prediction = np.asarray([pair["candidate"] for pair in selected])
+        candidate_errors = np.abs(prediction - actual)
+        if np.var(actual) <= 1e-12:
+            return {**result, "reason": "flat_evidence"}
+        if component != "demand":
+            bucket = score_bucket(
+                candidate_errors.tolist(),
+                (prediction - actual).tolist(),
+                prediction.tolist(),
+                actual.tolist(),
+                [pair["baseline"] - pair["observed"] for pair in selected],
+            )
+            maximum_mae = 0.60 if component == "comfort" else MAX_GATE_MAE_C
+            if (
+                bucket["mae"] > maximum_mae
+                or bucket["r2"] is None
+                or bucket["r2"] < 0.15
+                or abs(bucket["bias"]) > 0.50
+                or bucket["p90_abs_error"] > 2.0
+            ):
+                return {**result, "reason": "temperature_reporting_gate"}
+        evidence[name] = {}
+        for comparator in ("incumbent", "baseline"):
+            other_errors = np.asarray(
+                [abs(pair[comparator] - pair["observed"]) for pair in selected]
+            )
+            improvement = float(np.mean(other_errors - candidate_errors))
+            other_mae = float(np.mean(other_errors))
+            relative = improvement / other_mae if other_mae > 0 else 0.0
+            if np.var(other_errors - candidate_errors) <= 1e-12:
+                return {**result, "reason": "flat_evidence"}
+            seed = int(
+                evidence_hash(
+                    {
+                        "candidate": candidate_hash,
+                        "group": name,
+                        "comparator": comparator,
+                        "checkpoint": checkpoint,
+                    }
+                )[:16],
+                16,
+            )
+            try:
+                interval = paired_block_bootstrap(
+                    selected, comparator, seed=seed, alpha=alpha, cluster_days=clusters
+                )
+            except ValueError:
+                return {**result, "reason": "insufficient_contiguous_blocks"}
+            evidence[name][comparator] = {
+                **interval,
+                "mean_improvement": improvement,
+                "candidate_mae": float(np.mean(candidate_errors)),
+                "relative_mae_improvement": relative,
+            }
+            absolute = (
+                MIN_DEMAND_MAE_IMPROVEMENT_RELATIVE * other_mae
+                if component == "demand"
+                else MIN_TEMPERATURE_MAE_IMPROVEMENT_C
+            )
+            evidence[name][comparator]["absolute_mae_requirement"] = absolute
+            if (
+                relative < MIN_RELATIVE_MAE_IMPROVEMENT
+                or improvement < absolute
+                or interval["lb95"] <= 0
+                or interval["sequential_lower_bound"] <= 0
+            ):
+                return {**result, "reason": "no_prospective_skill", "evidence": evidence}
+    return {
+        **result,
+        "qualified": True,
+        "reason": "qualified_for_reporting",
+        "evidence": evidence,
+        "last_valid_outcome_at": latest.isoformat(),
+        "expires_at": (latest + dt.timedelta(hours=72)).isoformat(),
+        "scope": {
+            **scope,
+            "horizons": list(horizons),
+            "capabilities": list(capabilities),
+            "outdoor_bins": [int(key) for key, count in bin_counts.items() if count >= 12],
+            "qualification_policy": QUALIFICATION_POLICY_SCHEMA,
+        },
+        "evidence_hash": evidence_hash(valid),
+    }
+
+
+def _plain_record(row: Any, model: Any) -> dict[str, Any]:
+    result = {}
+    for column in model.__table__.columns:
+        value = getattr(row, column.name)
+        result[column.name] = (
+            value.isoformat() if isinstance(value, (dt.datetime, dt.date)) else value
+        )
+    return result
+
+
+async def materialize_native_inputs(
+    component: str,
+    *,
+    now: dt.datetime,
+    device_id: str | None = None,
+    timer_reader: Any | None = None,
+    capabilities: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    from packages.core.device_status_snapshot import native_policy_settings
+    from packages.core.settings_service import get_all_settings
+    from packages.ml.comfort_model import ComfortModel
+    from packages.ml.lifecycle import LIFECYCLE_SCHEMAS
+
+    values = await get_all_settings()
+    if timer_reader is not None:
+        await timer_reader.get_active_weekly_timer_slots(now)
+        timer = timer_reader.cached_native_timer_provenance()
+    else:
+        timer = None
+    since = now - dt.timedelta(hours=2)
+    async with get_session() as session:
+        query = select(DeviceStatusRecord).where(
+            DeviceStatusRecord.ts >= since, DeviceStatusRecord.ts <= now
+        )
+        if device_id is not None:
+            query = query.where(DeviceStatusRecord.device_id == device_id)
+        statuses = (
+            (await session.execute(query.order_by(DeviceStatusRecord.ts).limit(1001)))
+            .scalars()
+            .all()
+        )
+        if not statuses or len(statuses) > 1000:
+            return None
+        devices = {row.device_id for row in statuses}
+        if len(devices) != 1:
+            return None
+        latest = statuses[-1]
+        device_id = latest.device_id
+        weather_provider = str(values.get("weather_provider") or "open-meteo")
+        weather = (
+            (
+                await session.execute(
+                    select(WeatherRecord)
+                    .where(
+                        WeatherRecord.source == weather_provider,
+                        WeatherRecord.ts >= now - dt.timedelta(hours=1),
+                        WeatherRecord.ts <= now + dt.timedelta(hours=24),
+                        WeatherRecord.forecast_issued_at <= now,
+                        WeatherRecord.forecast_issued_at >= now - dt.timedelta(hours=2),
+                    )
+                    .order_by(WeatherRecord.ts)
+                    .limit(101)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        prices = (
+            (
+                await session.execute(
+                    select(PriceRecord)
+                    .where(
+                        PriceRecord.ts >= now - dt.timedelta(hours=1),
+                        PriceRecord.ts <= now + dt.timedelta(hours=24),
+                        PriceRecord.fetched_at <= now,
+                    )
+                    .order_by(PriceRecord.ts)
+                    .limit(101)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        raw_indoor = (
+            (
+                await session.execute(
+                    select(IndoorTempReading)
+                    .where(
+                        IndoorTempReading.timestamp >= since,
+                        IndoorTempReading.timestamp <= now,
+                        IndoorTempReading.is_stale.is_(False),
+                    )
+                    .order_by(IndoorTempReading.timestamp)
+                    .limit(5001)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        counters = (
+            (
+                await session.execute(
+                    select(ConsumptionRecord)
+                    .where(
+                        ConsumptionRecord.device_id == device_id,
+                        ConsumptionRecord.ts >= since,
+                        ConsumptionRecord.ts <= now,
+                    )
+                    .order_by(ConsumptionRecord.ts)
+                    .limit(101)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if max(len(weather), len(prices), len(counters)) > 100 or len(raw_indoor) > 5000:
+            return None
+        reference_sensor = str(values.get("comfort_reference_sensor_id") or "").strip()
+        readings, strategy, _ = ComfortModel._select_indoor_observations(
+            raw_indoor, reference_sensor
+        )
+        sensor_ids = (
+            [reference_sensor]
+            if reference_sensor
+            else sorted({row.device_id for row in raw_indoor})
+        )
+        fresh_ids = {
+            row.device_id for row in raw_indoor if 0 <= (now - row.timestamp).total_seconds() <= 900
+        }
+        indoor_available = bool(
+            readings
+            and sensor_ids
+            and set(sensor_ids) <= fresh_ids
+            and 0 <= (now - readings[-1].timestamp).total_seconds() <= 900
+        )
+        status_history = [_plain_record(row, DeviceStatusRecord) for row in statuses]
+        native = native_policy_settings(latest)
+        provenance = latest.native_policy_provenance or {}
+        timer = timer if isinstance(timer, dict) else provenance.get("timer", {"status": "unknown"})
+        dhw = latest.direction == "WATER" or latest.device_action == "HEATING_WATER"
+        if component == "thermal":
+            tank_capability = "tank_heating" if dhw else "tank_cooling"
+            indoor_capability = (
+                "indoor_heating" if latest.space_heating_active else "indoor_cooling"
+            )
+            capability = (
+                tank_capability
+                if not capabilities or tank_capability in capabilities
+                else indoor_capability
+            )
+            if capabilities and capability not in capabilities:
+                return None
+        else:
+            capability = "indoor" if component == "comfort" else "demand"
+        if component == "comfort" or capability.startswith("indoor_"):
+            if not indoor_available:
+                return None
+            basis = {"kind": strategy, "sensor_ids": sensor_ids, "resolution_c": 0.1}
+            history = [
+                {"timestamp": row.timestamp.isoformat(), "temperature": row.temperature}
+                for row in readings
+            ]
+        elif component == "demand":
+            basis = {"kind": "heatpump_counter", "sensor_ids": [device_id], "counter": "heat_kwh"}
+            history = [_plain_record(row, ConsumptionRecord) for row in counters]
+        else:
+            basis = {
+                "kind": "heatpump_temperature",
+                "sensor_ids": [device_id],
+                "field": "tank_temp",
+                "resolution_c": 1.0,
+            }
+            history = [
+                {"timestamp": row.ts.isoformat(), "temperature": row.tank_temp} for row in statuses
+            ]
+        current_indoor = readings[-1].temperature if indoor_available else None
+        older = [row for row in readings if row.timestamp <= now - dt.timedelta(hours=1)]
+        trend = current_indoor - older[-1].temperature if indoor_available and older else 0.0
+        return {
+            "issued_at": now.isoformat(),
+            "device_id": device_id,
+            "capability": capability,
+            "sensor_basis": basis,
+            "sensor_history": history,
+            "status_history": status_history,
+            "native_settings": native,
+            "timer": timer,
+            "weather": [_plain_record(row, WeatherRecord) for row in weather],
+            "pricing": {
+                "available": bool(prices),
+                "points": [_plain_record(row, PriceRecord) for row in prices],
+            },
+            "indoor_temperature": current_indoor,
+            "indoor_trend": trend,
+            "tank_temperature": latest.tank_temp,
+            "schemas": {
+                "input": "frozen_native_inputs_v1",
+                "artifact": LIFECYCLE_SCHEMAS[component],
+                "weather_provider": weather_provider,
+                "price_provider": str(values.get("price_provider") or "unknown"),
+            },
+            "reference_sensor_id": reference_sensor,
+            "weather_provider": weather_provider,
+            "timezone": str(values.get("timezone") or "Europe/Amsterdam"),
+        }
+
+
+def predict_native(
+    component: str,
+    payload: dict[str, Any] | None,
+    snapshot: dict[str, Any],
+    horizons: tuple[int, ...],
+    *,
+    baseline: bool = False,
+) -> dict[int, float]:
+    from packages.ml.comfort_model import ComfortModel
+    from packages.ml.demand_model_core import DemandModel
+    from packages.ml.thermal import ThermalModel, _RATE_COMPONENTS
+
+    issued = as_utc(snapshot["issued_at"])
+    expected = snapshot["expected_native_trajectory"]["steps"][0]
+    predictions = {}
+    for horizon in horizons:
+        target = issued + dt.timedelta(minutes=horizon)
+        weather = min(
+            snapshot["weather"], key=lambda row: abs((as_utc(row["ts"]) - target).total_seconds())
+        )
+        outdoor = float(weather["temperature"])
+        if component == "demand":
+            if baseline:
+                prediction = float(payload["baseline_kw"])
+            elif payload is None:
+                prediction = max(0.5, 3.0 - 0.1 * outdoor)
+            else:
+                features = DemandModel._make_features(
+                    outdoor,
+                    weather.get("wind_speed") or 0.0,
+                    weather.get("irradiance") or 0.0,
+                    target.hour,
+                    target.weekday(),
+                    weather.get("precipitation") or 0.0,
+                    weather.get("humidity") or 60.0,
+                    weather.get("cloud_cover") or 0.0,
+                )
+                prediction = max(0.0, float(payload["median"].predict(features.reshape(1, -1))[0]))
+        elif component == "comfort":
+            current = float(snapshot["indoor_temperature"])
+            if payload is None or baseline:
+                prediction = current
+            else:
+                active = float(expected["space_heating_active"])
+                features = ComfortModel._controlled_window_features(
+                    mean_supply_lift=max(expected["zone_supply_c"] - current, 0.0) * active,
+                    mean_target_lift=max(
+                        snapshot["native_settings"]["zone1_target_temp"] - current, 0.0
+                    )
+                    * active,
+                    window_heat_fraction=active,
+                    final_hour_heat_fraction=active,
+                    outdoor_temp=outdoor,
+                    wind_speed=weather.get("wind_speed") or 0.0,
+                    irradiance=weather.get("irradiance") or 0.0,
+                    precipitation=weather.get("precipitation") or 0.0,
+                    humidity=weather.get("humidity") or 60.0,
+                    cloud_cover=weather.get("cloud_cover") or 0.0,
+                    hour=target.hour,
+                    issue_indoor_temp=current,
+                    issue_indoor_trend=snapshot["indoor_trend"],
+                )
+                prediction = current + float(
+                    payload["direct_models"][horizon].predict(features.reshape(1, -1))[0]
+                )
+        else:
+            capability = snapshot["capability"]
+            current = float(
+                snapshot["tank_temperature"]
+                if capability.startswith("tank_")
+                else snapshot["indoor_temperature"]
+            )
+            if baseline:
+                prediction = current
+            else:
+                model = ThermalModel()
+                if payload is not None:
+                    model.params = model._decode_params(payload["params"])
+                prediction = (
+                    current
+                    + getattr(model, _RATE_COMPONENTS[capability][2])(outdoor) * horizon / 60
+                )
+        predictions[horizon] = prediction
+    return predictions
+
+
+def check_exact_fit(component: str, payload: dict[str, Any]) -> None:
+    from packages.ml.thermal import ThermalModel, _RATE_COMPONENTS
+
+    if component == "demand":
+        evaluation = payload["evaluation"]
+        for name in ("median", "lower", "upper"):
+            if not np.array_equal(
+                payload[name].predict(evaluation["features"]), evaluation["predictions"][name]
+            ):
+                raise ValueError("Demand evaluated-fit round trip mismatch")
+    elif component == "comfort":
+        for name, evaluation in payload["evaluation"].items():
+            family, horizon = name.split(":")
+            models = (
+                payload["direct_models"]
+                if family == "controlled"
+                else payload["passive_direct_models"]
+            )
+            if not np.array_equal(
+                models[int(horizon)].predict(evaluation["features"]), evaluation["predictions"]
+            ):
+                raise ValueError("Comfort evaluated-fit round trip mismatch")
+    else:
+        model = ThermalModel()
+        model.params = model._decode_params(payload["params"])
+        for capability in payload["declared_components"]:
+            evaluation = payload["validation"][capability]
+            predicted = [
+                getattr(model, _RATE_COMPONENTS[capability][2])(outdoor) * hours
+                for outdoor, hours in evaluation["holdout_features"]
+            ]
+            if not np.array_equal(predicted, evaluation["holdout_predictions"]):
+                raise ValueError("Thermal evaluated-fit round trip mismatch")
+
+
+async def materialize_execution_page(page: dict[str, Any], *, now: dt.datetime) -> dict[str, Any]:
+    from packages.core.safety_reverts import (
+        historical_revert_overlap_rows,
+        unresolved_revert_device_ids,
+    )
+
+    issues = [entry["issue"] for entry in page["rows"]]
+    if not issues:
+        return {
+            "complete": True,
+            "statuses": [],
+            "readings": [],
+            "counters": [],
+            "actions": [],
+            "overrides": [],
+            "restores": set(),
+            "historical_restores": [],
+        }
+    start = min(row["issued_at"] for row in issues)
+    end = min(now, max(row["target_at"] for row in issues))
+    device_ids = {row["device_id"] for row in issues}
+    limit = 30_001
+    async with get_session() as session:
+        statuses = (
+            (
+                await session.execute(
+                    select(DeviceStatusRecord)
+                    .where(
+                        DeviceStatusRecord.device_id.in_(device_ids),
+                        DeviceStatusRecord.ts >= start - dt.timedelta(minutes=15),
+                        DeviceStatusRecord.ts <= min(now, end + dt.timedelta(minutes=10)),
+                    )
+                    .order_by(DeviceStatusRecord.ts)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        readings = (
+            (
+                await session.execute(
+                    select(IndoorTempReading)
+                    .where(
+                        IndoorTempReading.timestamp >= start - dt.timedelta(minutes=15),
+                        IndoorTempReading.timestamp <= min(now, end + dt.timedelta(minutes=10)),
+                        IndoorTempReading.is_stale.is_(False),
+                    )
+                    .order_by(IndoorTempReading.timestamp)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        counters = (
+            (
+                await session.execute(
+                    select(ConsumptionRecord)
+                    .where(
+                        ConsumptionRecord.device_id.in_(device_ids),
+                        ConsumptionRecord.ts >= start - dt.timedelta(hours=2),
+                        ConsumptionRecord.ts <= min(now, end + dt.timedelta(minutes=10)),
+                    )
+                    .order_by(ConsumptionRecord.ts)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        actions = (
+            (
+                await session.execute(
+                    select(PlanActionRecord)
+                    .where(
+                        PlanActionRecord.device_id.in_(device_ids),
+                        or_(
+                            and_(
+                                PlanActionRecord.executed_at >= start - CARRYOVER_LOOKBACK,
+                                PlanActionRecord.executed_at <= end + DISPATCH_DRIFT_MARGIN,
+                            ),
+                            and_(
+                                PlanActionRecord.scheduled_ts >= start - CARRYOVER_LOOKBACK,
+                                PlanActionRecord.scheduled_ts <= end + DISPATCH_DRIFT_MARGIN,
+                            ),
+                        ),
+                    )
+                    .order_by(PlanActionRecord.id)
+                    .limit(MAX_DISPATCH_ACTION_LOOKUP + 1)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        overrides = (
+            (
+                await session.execute(
+                    select(OverrideRecord)
+                    .where(
+                        OverrideRecord.ts_from <= end,
+                        OverrideRecord.ts_to >= start,
+                    )
+                    .limit(MAX_DISPATCH_ACTION_LOOKUP + 1)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        restores, failed = await unresolved_revert_device_ids(session)
+        historical, overflow = await historical_revert_overlap_rows(
+            session,
+            horizon_start=start,
+            horizon_end=end,
+            drift_margin=DISPATCH_DRIFT_MARGIN,
+        )
+        complete = (
+            not failed and not overflow and max(len(statuses), len(readings), len(counters)) < limit
+        )
+        complete = complete and max(len(actions), len(overrides)) <= MAX_DISPATCH_ACTION_LOOKUP
+        return {
+            "complete": complete,
+            "statuses": [_plain_record(row, DeviceStatusRecord) for row in statuses],
+            "readings": [_plain_record(row, IndoorTempReading) for row in readings],
+            "counters": [_plain_record(row, ConsumptionRecord) for row in counters],
+            "actions": [_plain_record(row, PlanActionRecord) for row in actions],
+            "overrides": [_plain_record(row, OverrideRecord) for row in overrides],
+            "restores": restores,
+            "historical_restores": historical,
+        }
+
+
+def reconcile_materialized_page(
+    page: dict[str, Any], evidence: dict[str, Any], *, now: dt.datetime, scope: dict[str, Any]
+) -> list[dict[str, Any]]:
+    from packages.ml.models_common import (
+        iter_confirmed_zero_intervals,
+        iter_counter_change_intervals,
+    )
+
+    outcomes = []
+    for entry in page["rows"]:
+        issue = entry["issue"]
+        prior = entry["outcome"]
+        start, target = issue["issued_at"], issue["target_at"]
+        all_statuses = [
+            row for row in evidence["statuses"] if row["device_id"] == issue["device_id"]
+        ]
+        before = [row for row in all_statuses if as_utc(row["ts"]) <= start]
+        statuses = ([before[-1]] if before else []) + [
+            row
+            for row in all_statuses
+            if start < as_utc(row["ts"]) <= min(now, target + dt.timedelta(minutes=10))
+        ]
+        actions = []
+        for action in evidence["actions"]:
+            if action["device_id"] != issue["device_id"]:
+                continue
+            timestamp = as_utc(action["executed_at"]) or as_utc(action["scheduled_ts"])
+            if (
+                timestamp is None
+                or not start - CARRYOVER_LOOKBACK <= timestamp <= target + DISPATCH_DRIFT_MARGIN
+            ):
+                continue
+            try:
+                result = json.loads(action["result_json"] or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            dispatched = _has_persisted_dispatch_proof(
+                action["status"], result, action["verify_attempts"]
+            )
+            never = result.get("never_dispatched") is True or result.get("dispatched") is False
+            if (
+                action["status"] == "pending"
+                and action["executed_at"] is None
+                and not action["verify_attempts"]
+            ):
+                never = action["expected_state_json"] is None and not action["result_json"]
+            actions.append({"dispatched": dispatched, "never_dispatched": never and not dispatched})
+        overlaps = [
+            row
+            for row in evidence["overrides"]
+            if as_utc(row["ts_from"]) <= target and as_utc(row["ts_to"]) >= start
+        ]
+        open_restores = issue["device_id"] in evidence["restores"] or any(
+            device == issue["device_id"]
+            and executed <= target + DISPATCH_DRIFT_MARGIN
+            and (restored is None or restored >= start)
+            for device, executed, _, restored in evidence["historical_restores"]
+        )
+        trace = {
+            "lookup_complete": evidence["complete"],
+            "overflow": False,
+            "scope": scope,
+            "statuses": statuses,
+            "actions": actions,
+            "overrides": overlaps,
+            "restores": [True] if open_restores else [],
+        }
+        observed = observed_at = None
+        if issue["input_snapshot"].get("unavailable_reason"):
+            outcomes.append(
+                reconcile_native_issue(issue, trace, observed=None, observed_at=None, now=now)
+            )
+            continue
+        basis = issue["input_snapshot"]["sensor_basis"]
+        if issue["component"] == "demand":
+            counters = [
+                SimpleNamespace(
+                    **{
+                        **row,
+                        "ts": as_utc(row["ts"]),
+                        "source_date": dt.date.fromisoformat(row["source_date"])
+                        if row["source_date"]
+                        else None,
+                    }
+                )
+                for row in evidence["counters"]
+                if row["device_id"] == issue["device_id"]
+            ]
+            status_objects = [
+                SimpleNamespace(**{**row, "ts": as_utc(row["ts"])}) for row in all_statuses
+            ]
+            timezone = ZoneInfo(issue["input_snapshot"]["timezone"])
+            intervals = list(iter_counter_change_intervals(counters, "heat_kwh", timezone))
+            matches = [
+                row
+                for row in intervals
+                if 0.75 <= row.elapsed_hours <= 1.25
+                and abs((row.end_ts - target).total_seconds()) <= 600
+            ]
+            if matches:
+                match = min(matches, key=lambda row: abs((row.end_ts - target).total_seconds()))
+                observed, observed_at = match.energy_kwh / match.elapsed_hours, match.end_ts
+            else:
+                zeros = [
+                    row
+                    for row in iter_confirmed_zero_intervals(counters, status_objects, timezone)
+                    if target - dt.timedelta(hours=1) <= row.start_ts and row.end_ts <= target
+                ]
+                if zeros and sum(row.elapsed_hours for row in zeros) >= 1.0:
+                    observed, observed_at = 0.0, zeros[-1].end_ts
+        elif basis["kind"] == "heatpump_temperature":
+            matches = [
+                row
+                for row in statuses
+                if abs((as_utc(row["ts"]) - target).total_seconds()) <= 600
+                and isinstance(row.get(basis["field"]), (int, float))
+            ]
+            if matches:
+                match = min(
+                    matches, key=lambda row: abs((as_utc(row["ts"]) - target).total_seconds())
+                )
+                observed, observed_at = float(match[basis["field"]]), as_utc(match["ts"])
+        else:
+            selected = []
+            for sensor in basis["sensor_ids"]:
+                matches = [
+                    row
+                    for row in evidence["readings"]
+                    if row["device_id"] == sensor
+                    and abs((as_utc(row["timestamp"]) - target).total_seconds()) <= 600
+                    and isinstance(row.get("temperature"), (int, float))
+                    and 5 <= row["temperature"] <= 35
+                ]
+                if matches:
+                    selected.append(
+                        min(
+                            matches,
+                            key=lambda row: abs(
+                                (as_utc(row["timestamp"]) - target).total_seconds()
+                            ),
+                        )
+                    )
+            if len(selected) == len(basis["sensor_ids"]):
+                observed = float(statistics.median(row["temperature"] for row in selected))
+                observed_at = max(as_utc(row["timestamp"]) for row in selected)
+        if prior and prior["status"] == "valid":
+            observed = prior["result"]["observed"]
+            observed_at = prior["observed_at"]
+        outcomes.append(
+            reconcile_native_issue(
+                issue, trace, observed=observed, observed_at=observed_at, now=now
+            )
+        )
+    return outcomes
 
 
 def as_utc(value: str | dt.datetime) -> dt.datetime | None:
@@ -1090,6 +2414,36 @@ def _source_score(
     }
 
 
+async def complete_plan_window(
+    session: Any, *, since: dt.datetime, until: dt.datetime, page_size: int = 100
+) -> tuple[list[Any], bool, int | None]:
+    if not 1 <= page_size <= 100:
+        raise ValueError("Plan pages must contain at most 100 rows")
+    collected, cursor, high_water = [], None, None
+    while True:
+        query = select(PlanRecord).where(
+            PlanRecord.created_at >= since, PlanRecord.created_at <= until
+        )
+        if cursor is not None:
+            query = query.where(PlanRecord.id < cursor, PlanRecord.id <= high_water)
+        rows = (
+            (await session.execute(query.order_by(desc(PlanRecord.id)).limit(page_size)))
+            .scalars()
+            .all()
+        )
+        if rows and high_water is None:
+            high_water = max(row.id for row in rows)
+        collected.extend(rows)
+        if len(collected) > MAX_QUALIFICATION_PAIRS:
+            return [], False, high_water
+        if len(rows) < page_size:
+            return collected, True, high_water
+        next_cursor = min(row.id for row in rows)
+        if cursor is not None and next_cursor >= cursor:
+            return [], False, high_water
+        cursor = next_cursor
+
+
 async def get_forecast_scorecard(
     *,
     now: dt.datetime | None = None,
@@ -1185,17 +2539,8 @@ async def get_forecast_scorecard(
     dispatch_lookup_overflowed = False
 
     async with get_session() as session:
-        plans = (
-            (
-                await session.execute(
-                    select(PlanRecord)
-                    .where(PlanRecord.created_at >= since)
-                    .order_by(desc(PlanRecord.created_at))
-                    .limit(max_plans)
-                )
-            )
-            .scalars()
-            .all()
+        plans, plan_coverage_complete, plan_high_water = await complete_plan_window(
+            session, since=since, until=now, page_size=min(100, max(1, max_plans))
         )
         readings = (
             await session.execute(
@@ -1476,6 +2821,10 @@ async def get_forecast_scorecard(
         # learned comfort model, because it is the only forecast family that
         # may authorise ML control.
         "plans_scored": learned["plans_scored"],
+        "forecast_kind": "counterfactual",
+        "prospective_qualification_eligible": False,
+        "evidence_coverage_complete": plan_coverage_complete,
+        "high_water_plan_id": plan_high_water,
         "overall": overall,
         "horizons": horizons,
         "horizon_quality": learned["horizon_quality"],
@@ -1529,7 +2878,7 @@ async def get_forecast_scorecard(
             "minimum_regime_samples": MIN_REGIME_GATE_SAMPLES,
         },
         "note": (
-            "Learned-model control evidence uses only v2 plan forecasts and outcomes from the same "
-            "selected room sensor method within 30 minutes. Rules fallback evidence is reported separately."
+            "Counterfactual plan forecasts are reporting-only and cannot qualify a model. "
+            "Prospective native-policy qualification uses separate immutable issues and outcomes."
         ),
     }

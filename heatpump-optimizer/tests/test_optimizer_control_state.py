@@ -25,6 +25,15 @@ def reset_dashboard_comfort_assessment_cache(monkeypatch):
 
     monkeypatch.setattr(dashboard, "_comfort_assessment_cache", None)
     monkeypatch.setattr(dashboard, "_comfort_assessment_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_reporting_statuses",
+        AsyncMock(
+            return_value={
+                component: {"status": "unavailable", "control_ready": False}
+                for component in ("demand", "comfort", "thermal")
+            }
+        ),
+    )
 
 
 class _Session:
@@ -99,17 +108,23 @@ async def test_control_state_pause_has_precedence_and_observing_notice(monkeypat
     assert result.override_id == 7
     assert result.active_override_count == 2
     assert result.notices[0].code == "observing_suppresses_safety_reverts"
+    assert result.control_ready is result.ordinary_writes_allowed is False
+    assert result.optimization_requires_new_build is True
+    assert set(result.model_lifecycle) == {"demand", "comfort", "thermal"}
+    serialized = ControlStateResponse.model_validate(result, from_attributes=True).model_dump()
+    assert serialized["model_lifecycle"] == result.model_lifecycle
+    assert serialized["build_policy"] == "observe_only"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "comfort_state, expected",
     [
-        ("degraded", "automatic"),
-        ("unavailable", "automatic"),
-        ("conflict", "automatic"),
-        ("room_overheat_suppression", "automatic"),
-        ("on_target", "automatic"),
+        ("degraded", "observing"),
+        ("unavailable", "observing"),
+        ("conflict", "observing"),
+        ("room_overheat_suppression", "observing"),
+        ("on_target", "observing"),
         ("at_risk", "comfort_at_risk"),
     ],
 )
@@ -141,22 +156,25 @@ async def test_control_state_only_selects_comfort_risk_for_at_risk(
     result = await resolve_control_state(now=now, comfort_assessment={"state": comfort_state})
 
     assert result.state == expected
+    if expected == "observing":
+        assert result.reason_code == "observe_only_build"
+        assert "new reviewed, approved build" in result.detail
 
 
 @pytest.mark.asyncio
-async def test_control_state_forecast_failure_falls_through_to_automatic(monkeypatch):
+async def test_control_state_forecast_failure_preserves_observe_only_build(monkeypatch):
     from packages.api.routers import dashboard
 
     monkeypatch.setattr(
         "packages.api.routers.models_router.get_indoor_forecast",
         AsyncMock(side_effect=RuntimeError("forecast unavailable")),
     )
-    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    resolve = AsyncMock(return_value=SimpleNamespace(state="observing"))
     monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
 
     result = await dashboard.get_control_state()
 
-    assert result.state == "automatic"
+    assert result.state == "observing"
     assert resolve.await_args.kwargs["comfort_assessment"] is None
 
 
@@ -165,7 +183,7 @@ async def test_control_state_caches_successful_comfort_assessment(monkeypatch):
     from packages.api.routers import dashboard
 
     forecast = AsyncMock(return_value={"comfort_assessment": {"state": "at_risk"}})
-    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    resolve = AsyncMock(return_value=SimpleNamespace(state="observing"))
     monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
     monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
 
@@ -198,7 +216,7 @@ async def test_control_state_coalesces_concurrent_comfort_assessment_refreshes(m
         return {"comfort_assessment": {"state": "at_risk"}}
 
     forecast = AsyncMock(side_effect=forecast_call)
-    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    resolve = AsyncMock(return_value=SimpleNamespace(state="observing"))
     monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
     monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
 
@@ -220,7 +238,7 @@ async def test_control_state_does_not_cache_comfort_assessment_failure(monkeypat
     forecast = AsyncMock(
         side_effect=[RuntimeError("forecast unavailable"), {"comfort_assessment": {}}]
     )
-    resolve = AsyncMock(return_value=SimpleNamespace(state="automatic"))
+    resolve = AsyncMock(return_value=SimpleNamespace(state="observing"))
     monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
     monkeypatch.setattr(dashboard, "resolve_control_state", resolve)
 
@@ -323,7 +341,7 @@ def _patch_control_state_dependencies(
             "at_risk",
             "comfort_at_risk",
         ),
-        (None, LearningStateSnapshot(False, False, True), True, False, "on_target", "automatic"),
+        (None, LearningStateSnapshot(False, False, True), True, False, "on_target", "observing"),
     ],
     ids=[
         "pause-wins",
@@ -332,7 +350,7 @@ def _patch_control_state_dependencies(
         "quality-wins",
         "revert-wins",
         "comfort-risk",
-        "automatic-fallback",
+        "observe-only-build",
     ],
 )
 async def test_control_state_pairwise_precedence_table(
@@ -362,6 +380,53 @@ async def test_control_state_pairwise_precedence_table(
     )
 
     assert result.state == expected
+    assert result.build_policy == "observe_only"
+    assert result.control_ready is result.ordinary_writes_allowed is False
+    assert result.optimization_requires_new_build is True
+    messages = [result.headline, result.detail, *(notice.detail for notice in result.notices)]
+    assert all(
+        "automatic dispatch" not in message.lower() and "scheduled control" not in message.lower()
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize("control_allowed", [True, False])
+@pytest.mark.parametrize("unresolved_revert", [True, False])
+async def test_observe_only_producer_never_claims_active_dispatch(
+    monkeypatch, control_allowed, unresolved_revert
+):
+    _patch_control_state_dependencies(
+        monkeypatch,
+        learning=LearningStateSnapshot(False, False, True),
+        control_allowed=control_allowed,
+        unresolved_revert=unresolved_revert,
+    )
+
+    result = await resolve_control_state()
+
+    assert result.state == "observing"
+    assert result.reason_code == "observe_only_build"
+    assert result.headline == "Observe-only build"
+    assert result.detail == (
+        "Ordinary writes are prohibited in this build. Optimization requires a new reviewed, "
+        "approved build; only existing linked restores may run outside positive observation."
+    )
+    assert result.control_ready is result.ordinary_writes_allowed is False
+    assert result.optimization_requires_new_build is True
+    assert result.primary_action is not None
+    assert result.primary_action.kind == "link"
+    assert result.primary_action.href == "/?view=timeline"
+    expected_notices = set()
+    if not control_allowed:
+        expected_notices.add("new_plans_paused")
+    if unresolved_revert:
+        expected_notices.add("safety_restore_pending")
+    assert {notice.code for notice in result.notices} == expected_notices
+    assert all(
+        "automatic dispatch" not in notice.detail.lower()
+        and "scheduled control" not in notice.detail.lower()
+        for notice in result.notices
+    )
 
 
 @pytest.mark.asyncio
@@ -451,7 +516,7 @@ def test_matching_unresolved_revert_embargoes_next_dhw_action():
 
 
 @pytest.mark.asyncio
-async def test_control_state_stays_automatic_for_unrelated_revert(monkeypatch):
+async def test_control_state_stays_observe_only_for_unrelated_revert(monkeypatch):
     _patch_control_state_dependencies(
         monkeypatch,
         learning=LearningStateSnapshot(False, False, True),
@@ -461,7 +526,8 @@ async def test_control_state_stays_automatic_for_unrelated_revert(monkeypatch):
 
     result = await resolve_control_state()
 
-    assert result.state == "automatic"
+    assert result.state == "observing"
+    assert result.reason_code == "observe_only_build"
     assert [notice.code for notice in result.notices] == ["safety_restore_pending"]
 
 
@@ -494,7 +560,8 @@ async def test_control_state_without_next_action_reports_pending_revert_as_notic
 
     result = await resolve_control_state()
 
-    assert result.state == "automatic"
+    assert result.state == "observing"
+    assert result.reason_code == "observe_only_build"
     assert [notice.code for notice in result.notices] == ["safety_restore_pending"]
 
 
@@ -546,7 +613,7 @@ async def test_next_pending_action_embargo_query_uses_real_session_path(revert_d
 @pytest.mark.parametrize(
     "manual_enabled, seasonal_active, reliable, expected",
     [
-        (False, False, True, "automatic"),
+        (False, False, True, "observing"),
         (True, False, True, "observing"),
         (False, True, True, "observing"),
         (True, True, True, "observing"),
@@ -580,7 +647,7 @@ async def test_control_state_maps_all_learning_combinations(
 
 
 @pytest.mark.asyncio
-async def test_control_allowed_false_stays_automatic_with_new_plans_notice(monkeypatch):
+async def test_control_allowed_false_stays_observe_only_with_diagnostic_notice(monkeypatch):
     _patch_control_state_dependencies(
         monkeypatch,
         learning=LearningStateSnapshot(False, False, True),
@@ -589,11 +656,12 @@ async def test_control_allowed_false_stays_automatic_with_new_plans_notice(monke
 
     result = await resolve_control_state()
 
-    assert result.state == "automatic"
+    assert result.state == "observing"
+    assert result.reason_code == "observe_only_build"
     assert [(notice.code, notice.severity) for notice in result.notices] == [
         ("new_plans_paused", "warning")
     ]
-    assert "already-scheduled actions still run" in result.notices[0].detail
+    assert "ordinary writes remain prohibited" in result.notices[0].detail
 
 
 @pytest.mark.asyncio

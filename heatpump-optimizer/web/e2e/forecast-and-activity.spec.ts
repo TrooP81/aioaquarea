@@ -5,6 +5,7 @@ const now = new Date();
 test("shows rainfall and separates actual activity from plan revisions", async ({ page }) => {
   const activePlan = {
     id: 42,
+    status: "active",
     created_at: now.toISOString(),
     horizon_start: now.toISOString(),
     horizon_end: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),

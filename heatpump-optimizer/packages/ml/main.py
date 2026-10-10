@@ -14,16 +14,17 @@ logger = structlog.get_logger()
 demand_model = DemandModel()
 
 
-async def retrain_models() -> None:
-    """Retrain retained Demand on latest data."""
-    logger.info("ml_retrain_starting")
+async def retrain_models(*, automatic: bool = False, source: str = "ml_entrypoint") -> dict | None:
+    """Request Demand maintenance; only the poller may fit it."""
+    from packages.ml.lifecycle import enqueue_maintenance_request
 
-    demand_result = await demand_model.train()
-    logger.info("demand_model_trained", **demand_result)
+    result = await enqueue_maintenance_request("demand", source, automatic=automatic)
+    logger.info("demand_maintenance_requested", request=result)
+    return result
 
 
 async def main() -> None:
-    """ML service main loop — retrains weekly, serves predictions via the API."""
+    """Queue startup and weekly Demand requests; never fit inside this service."""
     from packages.core.logging import configure_logging
 
     configure_logging("ml")
@@ -32,18 +33,10 @@ async def main() -> None:
     demand_model.load_latest()
     logger.info("ml_models_loaded", demand=demand_model.is_trained)
 
-    # A missing model is common after an intentional feature or target-schema
-    # upgrade. Train immediately rather than leaving the optimiser on an old
-    # checkpoint or waiting for the weekly maintenance window. If there is not
-    # yet enough data, the train methods return a safe insufficient-data result
-    # and the rules layer remains active.
-    if not demand_model.is_trained:
-        logger.info("ml_initial_training_needed")
-        await retrain_models()
+    await retrain_models(automatic=True, source="ml_startup")
 
     scheduler = create_scheduler()
 
-    # Retrain weekly
     scheduler.add_job(
         retrain_models,
         "cron",
@@ -51,6 +44,7 @@ async def main() -> None:
         hour=3,
         timezone="UTC",
         id="retrain",
+        kwargs={"automatic": True, "source": "ml_schedule"},
     )
 
     scheduler.start()

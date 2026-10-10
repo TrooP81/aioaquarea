@@ -11,26 +11,18 @@ from sqlalchemy import func, select, update
 
 from packages.core.database import get_session
 from packages.core.models import (
-    DeviceStatusRecord,
     OptimizationRequestRecord,
     PlanActionRecord,
     PlanRecord,
 )
-from packages.core.plan_lifecycle import activate_plan
-from packages.core.safety_reverts import (
-    dhw_embargoed,
-    unresolved_revert_predicate,
-    validate_action_pair,
-    zone_embargoed,
-)
+from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.pricing import get_active_price_context
 from packages.core.services import AquareaWrapper
-from packages.core.scheduling import create_scheduler, utc_after
+from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.core.settings_service import get_setting
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
-from packages.optimizer.actions import ActionType
 from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
 from packages.optimizer.executor import PlanExecutor, resolve_learning_mode_state
@@ -183,6 +175,9 @@ async def get_optimizer_status_snapshot(
         }
     return {
         "active_layer": _selected_layer_version(layer_name),
+        "ordinary_writes_allowed": False,
+        "control_ready": False,
+        "build_policy": "observe_only",
         "configured_layer": layer,
         "effective_layer": layer_name,
         "selection_reason": (
@@ -220,16 +215,15 @@ async def _select_optimizer(
 
 
 async def run_optimization(*, scheduled: bool = False, force_replace: bool = False) -> int | None:
-    """Run the optimizer and store the plan, with layer selection and fallback.
+    """Store a non-executable diagnostic with layer selection and fallback.
 
     Args:
         scheduled: True when called by the hourly scheduler.  If a plan was
             generated recently (within _OPTIMIZATION_COOLDOWN_S), the
             scheduled run is skipped so a manual "Optimize Now" plan isn't
             immediately overwritten.
-        force_replace: True for an explicit manual replan. This bypasses only
-            the near-term plan-stability comparison, so a user-requested
-            safety correction can replace later pending actions as well.
+        force_replace: Retained for request compatibility; diagnostics never
+            reuse, activate, or replace executable plans in this build.
     """
     import time as _time
 
@@ -246,9 +240,7 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             )
             return None
 
-    # The scheduler and a queued manual request share a process.  Serialising
-    # the complete solve avoids two plans being calculated from the same state;
-    # activate_plan then provides the database-level guard across processes.
+    # Serialize scheduled and queued diagnostic generation within this process.
     async with _optimization_lock:
         try:
             learning_mode_state = await resolve_learning_mode_state()
@@ -266,6 +258,7 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             return None
         try:
             layer = await get_setting("optimizer_layer") or "rules_only"
+            await _demand_model.arefresh_committed()
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
             await comfort_model.arefresh_if_changed()
             try:
@@ -374,7 +367,7 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     "demand_trained": _demand_model.is_trained,
                     "comfort": {
                         "trained": comfort_model.is_trained,
-                        "control_readiness": comfort_model.control_readiness,
+                        "control_readiness": {"ready": False, "reason": "observe_only_build"},
                         "metrics": comfort_model.metrics,
                     },
                     "thermal": {
@@ -406,76 +399,10 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 provenance["price_risk"] = price_risk_summary(
                     snapshot.get("price_forecast", []), input_quality
                 )
+            plan["actions"] = []
+            plan["diagnostic"] = True
+            provenance["execution_policy"] = "observe_only_build"
             async with get_session() as session:
-                if not force_replace:
-                    is_material, existing_plan_id = await _has_material_near_term_change(
-                        session, plan
-                    )
-                    if not is_material and existing_plan_id is not None:
-                        logger.info(
-                            "plan_reuse_no_material_near_term_change",
-                            plan_id=existing_plan_id,
-                            horizon_hours=_PLAN_STABILITY_WINDOW_HOURS,
-                        )
-                        return existing_plan_id
-
-                unresolved_actions = (
-                    (
-                        await session.execute(
-                            select(PlanActionRecord).where(unresolved_revert_predicate())
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                statuses = (
-                    (
-                        await session.execute(
-                            select(DeviceStatusRecord).order_by(DeviceStatusRecord.ts.desc())
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                latest_status = {}
-                for status in statuses:
-                    latest_status.setdefault(status.device_id, status)
-                blocked_keys: set[str] = set()
-                retained_actions: list[dict] = []
-                for raw_action in plan["actions"]:
-                    device_id = (
-                        raw_action.get("device_id")
-                        or plan.get("device_id")
-                        or snapshot.get("device_id")
-                    )
-                    action = {**raw_action, "device_id": str(device_id) if device_id else None}
-                    action_type = str(action.get("type"))
-                    reason = None
-                    if action_type == str(ActionType.FORCE_DHW_ON) and dhw_embargoed(
-                        unresolved_actions, action["device_id"]
-                    ):
-                        reason = "blocked_by_unresolved_dhw_revert"
-                    elif zone_embargoed(
-                        unresolved_actions, action, latest_status.get(action["device_id"])
-                    ):
-                        reason = "blocked_by_unresolved_zone_revert"
-                    if reason:
-                        if action.get("action_key"):
-                            blocked_keys.add(action["action_key"])
-                        logger.warning(
-                            "plan_action_embargoed",
-                            reason=reason,
-                            action_type=action_type,
-                            device_id=action["device_id"],
-                        )
-                        continue
-                    retained_actions.append(action)
-                plan["actions"] = [
-                    action
-                    for action in retained_actions
-                    if action.get("reverts_action_key") not in blocked_keys
-                ]
-
                 plan_record = PlanRecord(
                     horizon_start=plan["horizon_start"],
                     horizon_end=plan["horizon_end"],
@@ -489,64 +416,10 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     price_currency=price_context.currency,
                     price_source=price_context.source,
                     input_provenance_json=json.dumps(provenance, default=str),
-                    status="active",
+                    status=DIAGNOSTIC_PLAN_STATUS,
+                    status_reason="observe_only_build",
                 )
-                await activate_plan(session, plan_record)
-
-                action_rows: list[tuple[dict, PlanActionRecord]] = []
-                action_keys: dict[str, tuple[dict, PlanActionRecord]] = {}
-                restore_actions: list[dict] = []
-                for action in plan["actions"]:
-                    if action.get("reverts_action_key"):
-                        restore_actions.append(action)
-                        continue
-                    action_key = action.get("action_key")
-                    if action_key is not None and action_key in action_keys:
-                        raise ValueError(f"duplicate safety action key: {action_key}")
-                    action_record = PlanActionRecord(
-                        plan_id=plan_record.id,
-                        scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
-                        action_type=str(ActionType(action["type"])),
-                        payload_json=json.dumps(action.get("payload", {})),
-                        device_id=action["device_id"],
-                        status="pending",
-                    )
-                    session.add(action_record)
-                    action_rows.append((action, action_record))
-                    if action_key is not None:
-                        action_keys[action_key] = (action, action_record)
-
-                await session.flush()
-                _validate_unique_restore_keys(restore_actions)
-                for action in restore_actions:
-                    reverts_action_key = action["reverts_action_key"]
-                    source = action_keys.get(reverts_action_key)
-                    if source is None:
-                        raise ValueError(f"unpaired safety restore: {reverts_action_key}")
-                    source_action, source_record = source
-                    validate_action_pair(source_action, action)
-                    action_record = PlanActionRecord(
-                        plan_id=plan_record.id,
-                        reverts_action_id=source_record.id,
-                        scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
-                        action_type=str(ActionType(action["type"])),
-                        payload_json=json.dumps(action.get("payload", {})),
-                        device_id=action["device_id"],
-                        status="pending",
-                    )
-                    session.add(action_record)
-
-                linked_sources = {action["reverts_action_key"] for action in restore_actions}
-                for action, _ in action_rows:
-                    if (
-                        str(action["type"])
-                        in {
-                            str(ActionType.FORCE_DHW_ON),
-                            str(ActionType.ZONE_TEMP_BOOST),
-                        }
-                        and action.get("action_key") not in linked_sources
-                    ):
-                        raise ValueError(f"unpaired safety source: {action.get('action_key')}")
+                session.add(plan_record)
                 await session.flush()
 
             _last_plan_generated_at = _time.monotonic()
@@ -629,7 +502,7 @@ async def process_pending_optimization_requests() -> None:
         request.plan_id = plan_id
         if plan_id is None:
             request.status = "failed"
-            request.error = "No executable plan could be generated; check data availability."
+            request.error = "No diagnostic plan could be generated; check data availability."
         else:
             request.status = "completed"
             request.error = None
@@ -739,9 +612,8 @@ async def main() -> None:
     # Load ML model checkpoints so MILP can use them
     _load_ml_models()
 
-    # The comfort model's causal feature schema is versioned separately from
-    # COP and demand. Train it once after a schema upgrade instead of running
-    # an older, leaky checkpoint or waiting for a manual request.
+    from packages.ml.lifecycle import enqueue_maintenance_request
+
     try:
         device_quality = await get_device_data_quality()
     except Exception as exc:  # noqa: BLE001 - training requires verified device readiness
@@ -757,11 +629,13 @@ async def main() -> None:
             )
         elif not comfort_model.is_trained:
             logger.info("comfort_model_initial_training_needed")
-            comfort_result = await comfort_model.train()
-            if comfort_result.get("status") in {"training_in_progress", "training_skipped"}:
-                logger.info("comfort_model_initial_training_deferred", **comfort_result)
-            else:
-                logger.info("comfort_model_initial_training_finished", **comfort_result)
+            comfort_result = await enqueue_maintenance_request(
+                "comfort",
+                "optimizer_startup",
+                automatic=True,
+                dedup_key="startup:" + utc_now().strftime("%Y-%m-%dT%H"),
+            )
+            logger.info("comfort_model_initial_maintenance_requested", request=comfort_result)
 
     wrapper = AquareaWrapper()
     await wrapper.start()

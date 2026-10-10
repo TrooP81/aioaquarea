@@ -293,8 +293,6 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             return None
         learning_mode_active = learning_mode_state is LearningModeState.ACTIVE
 
-        thermal_model.load_latest()
-
         async with get_session() as session:
             prices = await self._get_prices(session, horizon_start, horizon_end)
             weather = await self._get_weather(session, horizon_start, horizon_end)
@@ -350,11 +348,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 "note": "holiday_mode_active_optimization_suspended",
             }
 
-        if (
-            thermal_model.params.last_calibrated is None
-            or (now - thermal_model.params.last_calibrated).total_seconds() > 6 * 3600
-        ):
-            await thermal_model.calibrate()
+        await thermal_model.arefresh_if_changed()
 
         current_tank_temp = (
             last_status.tank_temp if last_status and last_status.tank_temp is not None else 48.0

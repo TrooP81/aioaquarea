@@ -20,6 +20,7 @@ def _make_action(action_type: str, payload: dict | None = None):
     action.payload_json = json.dumps(payload or {})
     action.scheduled_ts = dt.datetime.now(dt.timezone.utc)
     action.status = "pending"
+    action.reverts_action_id = None
     action.device_id = "device-a"
     return action
 
@@ -35,11 +36,12 @@ def _extract_stmt_values(stmt) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> None:
+async def test_legacy_inflight_cancel_reconciles_without_new_ordinary_dispatch() -> None:
     wrapper = AsyncMock()
     wrapper.get_selected_device_id = AsyncMock(return_value="device-a")
     executor = PlanExecutor(wrapper)
     action = _make_action(str(ActionType.FORCE_DHW_ON))
+    action.status = "dispatched"
     fake_handler = MagicMock()
     fake_handler.dispatch = AsyncMock(return_value={"force_dhw": "ON"})
 
@@ -54,10 +56,13 @@ async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> No
         mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
         mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(PermissionError, match="observe-only build"):
             await executor._execute_action(action)
+        assert action.status == "dispatched"
+        await executor._mark_cancelled(action)
 
-    fake_handler.dispatch.assert_awaited_once_with(wrapper, {})
+    fake_handler.dispatch.assert_not_awaited()
+    wrapper.force_dhw.assert_not_awaited()
 
     status_updates: list[str] = []
     cancelled_payload: dict[str, object] | None = None
@@ -69,8 +74,7 @@ async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> No
         if status == "cancelled" and isinstance(values.get("result_json"), str):
             cancelled_payload = json.loads(values["result_json"])
 
-    assert "dispatched" in status_updates
-    assert "cancelled" in status_updates
+    assert status_updates == ["cancelled"]
     assert cancelled_payload == {
         "reason": "shutdown_cancelled",
         "detail": "Executor shutdown interrupted action verification",
@@ -83,7 +87,7 @@ async def test_inflight_cancel_reconciles_dispatched_action_to_cancelled() -> No
 
 
 @pytest.mark.asyncio
-async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actions() -> None:
+async def test_legacy_claimed_batch_cancellation_reconciles_without_new_dispatch() -> None:
     wrapper = AsyncMock()
     executor = PlanExecutor(wrapper)
 
@@ -91,6 +95,8 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
     first_action.id = 101
     second_action = _make_action(str(ActionType.QUIET_MODE_ON), {"level": 2})
     second_action.id = 102
+    first_action.status = "executing"
+    second_action.status = "executing"
 
     with (
         patch("packages.optimizer.executor.get_session") as mock_gs,
@@ -109,35 +115,28 @@ async def test_execute_due_actions_cancel_reconciles_all_claimed_executing_actio
         mock_gs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
         mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        override_result = MagicMock()
-        override_result.scalars.return_value.all.return_value = []
-        actions_result = MagicMock()
-        actions_result.scalars.return_value.all.return_value = [first_action, second_action]
-        status_result = MagicMock()
-        status_result.scalar_one_or_none.return_value = dt.datetime.now(dt.timezone.utc)
         executing_result = MagicMock()
         executing_result.scalars.return_value.all.return_value = [101, 102]
         safety_result = MagicMock()
         safety_result.scalar_one_or_none.return_value = None
 
-        # Safety recovery, safety claim, override query, action query, claim
-        # update, executing reconciliation query, then cancellation update.
         mock_session.execute = AsyncMock(
             side_effect=[
                 None,
                 safety_result,
-                override_result,
-                actions_result,
-                None,
                 executing_result,
                 None,
             ]
         )
 
-        with pytest.raises(asyncio.CancelledError):
-            await executor.execute_due_actions()
+        await executor.execute_due_actions()
+        assert mock_session.execute.await_count == 2
+        assert first_action.status == second_action.status == "executing"
+        await executor._reconcile_claimed_batch_cancelled([first_action, second_action])
 
-    mock_execute_action.assert_awaited_once_with(first_action)
+    mock_execute_action.assert_not_awaited()
+    wrapper.force_dhw.assert_not_awaited()
+    wrapper.set_quiet_mode.assert_not_awaited()
 
     cancelled_payload: dict[str, object] | None = None
     cancelled_updates = 0

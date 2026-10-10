@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import structlog
 
 from packages.core.config import settings as app_settings
@@ -355,6 +356,73 @@ def iter_counter_change_intervals(
         yield CounterInterval(device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
 
 
+def chronological_fit_holdout(
+    bounds: list[tuple[dt.datetime, dt.datetime]],
+    *,
+    holdout_fraction: float,
+    embargo: dt.timedelta,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not bounds or not 0 < holdout_fraction < 1 or embargo.total_seconds() < 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    if any(
+        start.tzinfo is None or end.tzinfo is None or end <= start for start, end in bounds
+    ) or any(right[1] < left[1] for left, right in zip(bounds, bounds[1:])):
+        raise ValueError("Labels must be chronological timezone-aware intervals")
+    split = int(len(bounds) * (1 - holdout_fraction))
+    if split == 0 or split == len(bounds):
+        return np.array([], dtype=int), np.array([], dtype=int)
+    cutoff = bounds[split][0] - embargo
+    fit = np.asarray([index for index in range(split) if bounds[index][1] <= cutoff])
+    return fit.astype(int), np.arange(split, len(bounds))
+
+
+def iter_confirmed_zero_intervals(
+    rows: Iterable[_ConsumptionRowLike],
+    statuses: Iterable[object],
+    timezone: ZoneInfo,
+    *,
+    status_indexes: dict[str, tuple[list, list]] | None = None,
+) -> Iterator[CounterInterval]:
+    from packages.ml.thermal import ThermalModel
+
+    if status_indexes is None:
+        by_device: dict[str, list] = {}
+        for status in statuses:
+            device_id = getattr(status, "device_id", None)
+            if isinstance(device_id, str):
+                by_device.setdefault(device_id, []).append(status)
+        status_indexes = {}
+        for device_id, records in by_device.items():
+            ordered = sorted(records, key=lambda row: row.ts)
+            status_indexes[device_id] = (ordered, [row.ts for row in ordered])
+    previous = {}
+    for row in sorted(rows, key=lambda item: item.ts):
+        anchor = previous.get(row.device_id)
+        previous[row.device_id] = row
+        if anchor is None:
+            continue
+        start, end = _aware_utc(anchor.ts), _aware_utc(row.ts)
+        hours = (end - start).total_seconds() / 3600
+        source_day = getattr(row, "source_date", None)
+        old_value, value = getattr(anchor, "heat_kwh", None), getattr(row, "heat_kwh", None)
+        if (
+            not MIN_INTERVAL_HOURS <= hours <= 1.0
+            or source_day is None
+            or source_day != getattr(anchor, "source_date", None)
+            or source_day != start.astimezone(timezone).date()
+            or source_day != end.astimezone(timezone).date()
+            or old_value is None
+            or value is None
+            or not np.isfinite([old_value, value]).all()
+            or abs(value - old_value) > COUNTER_CONFIRMATION_EPSILON
+        ):
+            continue
+        records, times = status_indexes.get(row.device_id, ([], []))
+        active, _ = ThermalModel._continuous_indoor_state(records, start, end, status_times=times)
+        if active is False:
+            yield CounterInterval(row.device_id, start, end, hours, 0.0, row)
+
+
 def iter_confirmed_counter_changes(
     rows: Iterable[_ConsumptionRowLike],
     counter: str,
@@ -476,6 +544,24 @@ def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:
     mean_mae = statistics.fmean(maes)
     std_mae = statistics.pstdev(maes) if len(maes) > 1 else 0.0
     return float(mean_mae), float(std_mae)
+
+
+def time_series_cv_naive_mae(y, max_splits: int = 5) -> float:
+    """MAE of predicting each training fold's mean, on the same folds as ``time_series_cv_mae``."""
+    if not HAS_SKLEARN:
+        raise ImportError("scikit-learn required: pip install scikit-learn")
+
+    import numpy as np
+
+    y = np.asarray(y, dtype=float)
+    n_splits = min(max_splits, len(y) - 1)
+    if n_splits < 2:
+        return float(np.mean(np.abs(y - y.mean())))
+    maes = [
+        float(np.mean(np.abs(y[test_idx] - y[train_idx].mean())))
+        for train_idx, test_idx in TimeSeriesSplit(n_splits=n_splits).split(y)
+    ]
+    return float(statistics.fmean(maes))
 
 
 def make_monotonic_regressor(monotonic_cst, **overrides):

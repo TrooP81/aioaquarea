@@ -10,7 +10,37 @@ from packages.core.models import DeviceStatusRecord
 from packages.core.panasonic_special_status import optimizer_special_status_supported
 
 
-def build_device_status_record(device: Any) -> DeviceStatusRecord:
+def native_policy_settings(status: Any) -> dict[str, Any]:
+    return {
+        key: getattr(status, key, None)
+        for key in (
+            "mode",
+            "operation_status",
+            "zone1_operation_status",
+            "zone2_operation_status",
+            "zone1_target_temp",
+            "zone2_target_temp",
+            "zone1_heat_min",
+            "zone1_heat_max",
+            "zone2_heat_min",
+            "zone2_heat_max",
+            "tank_operation_status",
+            "tank_target_temp",
+            "tank_heat_min",
+            "tank_heat_max",
+            "quiet_mode",
+            "powerful_mode",
+            "special_status",
+            "force_dhw",
+            "force_heater",
+            "holiday_mode",
+        )
+    }
+
+
+def build_device_status_record(
+    device: Any, *, timer_provenance: dict[str, Any] | None = None
+) -> DeviceStatusRecord:
     """Build a status record without using global action as heating evidence."""
     zones = device.zones
     zone1 = zones.get(1)
@@ -31,7 +61,7 @@ def build_device_status_record(device: Any) -> DeviceStatusRecord:
         zone1_operation_status=zone1_status,
         zone2_operation_status=zone2_status,
     )
-    return DeviceStatusRecord(
+    record = DeviceStatusRecord(
         ts=dt.datetime.now(dt.timezone.utc),
         device_id=device.long_id,
         mode=str(device.mode),
@@ -70,3 +100,10 @@ def build_device_status_record(device: Any) -> DeviceStatusRecord:
         tank_heat_max=device.tank.heat_max if device.tank else None,
         tank_heat_min=device.tank.heat_min if device.tank else None,
     )
+    record.native_policy_provenance = {
+        "schema": "native_unchanged_v1",
+        "captured_at": record.ts.isoformat(),
+        "settings": native_policy_settings(record),
+        "timer": timer_provenance if isinstance(timer_provenance, dict) else {"status": "unknown"},
+    }
+    return record

@@ -132,9 +132,18 @@ test.describe("Dashboard", () => {
     const quotaRequestsAfterLoad = quotaRequests;
     await page.getByRole("button", { name: "Refresh from heat pump" }).click();
 
-    await expect(page.locator(".banner--warning")).toContainText(/allowance used up.*~3 min/i);
+    const quotaBanner = page.getByRole("status", { name: "Heat pump refresh result" });
+    const buildNotice = page.getByRole("status", { name: "Optimizer build and control state" });
+    await expect(quotaBanner).toContainText(/allowance used up.*~3 min/i);
+    await expect(quotaBanner).toHaveClass(/banner--warning/);
+    await expect(buildNotice).toContainText("Ordinary writes are prohibited");
+    await expect(buildNotice).toHaveClass(/banner--info/);
+    await expect(buildNotice.getByRole("button", { name: "Dismiss" })).toHaveCount(0);
     await expect.poll(() => quotaRequests).toBeGreaterThan(quotaRequestsAfterLoad);
     await expect(page.locator("body")).not.toContainText("Partial success");
+    await quotaBanner.getByRole("button", { name: "Dismiss" }).click();
+    await expect(quotaBanner).toHaveCount(0);
+    await expect(buildNotice).toBeVisible();
   });
 
   test("shows a temporary-unavailable message for a 503 poll-now response", async ({ page }) => {

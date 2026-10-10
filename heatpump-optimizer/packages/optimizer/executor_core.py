@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-from dataclasses import replace
 from enum import StrEnum
 
 import structlog
@@ -30,7 +29,7 @@ from packages.core.models import (
     ExecutorVerificationReadRecord,
     SpaceHeatingGateRecord,
 )
-from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS
+from packages.core.plan_lifecycle import ACTIVE_PLAN_STATUS, DIAGNOSTIC_PLAN_STATUS
 from packages.core.safety_reverts import (
     dhw_embargoed,
     due_revert_predicate,
@@ -38,6 +37,8 @@ from packages.core.safety_reverts import (
     normalize_zone_id,
     restore_baseline_target,
     unresolved_revert_predicate,
+    validate_action_pair,
+    validate_restore_baseline,
     zone_embargoed,
     zone_matches_baseline,
 )
@@ -129,8 +130,7 @@ class PlanExecutor:
         self._device_quality_check = device_quality_check
 
     async def execute_due_actions(self) -> None:
-        """Find and execute all actions whose scheduled time has passed."""
-        actions: list[PlanActionRecord] = []
+        """Execute only existing linked restores outside positive observation."""
         now = dt.datetime.now(dt.timezone.utc)
 
         try:
@@ -166,89 +166,11 @@ class PlanExecutor:
                 raise
             return
 
-        if learning_state is LearningModeState.UNKNOWN:
-            logger.info("executor_learning_mode_unknown_skipping_ordinary_actions")
-            return
-
-        async with self._session_factory() as session:
-            override_result = await session.execute(
-                select(OverrideRecord).where(
-                    and_(
-                        OverrideRecord.active,
-                        OverrideRecord.ts_from <= now,
-                        OverrideRecord.ts_to >= now,
-                    )
-                )
-            )
-            active_overrides = override_result.scalars().all()
-
-            result = await session.execute(
-                select(PlanActionRecord)
-                .join(PlanRecord, PlanActionRecord.plan_id == PlanRecord.id)
-                .where(
-                    and_(
-                        PlanActionRecord.status == "pending",
-                        PlanActionRecord.scheduled_ts <= now,
-                        ~unresolved_revert_predicate(),
-                        PlanRecord.status == ACTIVE_PLAN_STATUS,
-                    )
-                )
-                .order_by(PlanActionRecord.scheduled_ts)
-                .limit(MAX_ACTIONS_PER_CYCLE)
-                # Lock both the action and its active plan so replacement plans
-                # cannot race a due command in another executor cycle.
-                .with_for_update()
-            )
-            actions = result.scalars().all()
-
-            if actions:
-                await session.execute(
-                    update(PlanActionRecord)
-                    .where(
-                        and_(
-                            PlanActionRecord.id.in_([action.id for action in actions]),
-                            PlanActionRecord.status == "pending",
-                        )
-                    )
-                    .values(status="executing")
-                )
-
-            if active_overrides and actions:
-                override_reason = active_overrides[0].reason or "manual override"
-                logger.info(
-                    "executor_overrides_active",
-                    count=len(active_overrides),
-                    reason=override_reason,
-                    skipping=len(actions),
-                )
-                for action in actions:
-                    await session.execute(
-                        update(PlanActionRecord)
-                        .where(PlanActionRecord.id == action.id)
-                        .values(
-                            status="skipped",
-                            executed_at=now,
-                            result_json=json.dumps(
-                                {"reason": "override_active", "override": override_reason}
-                            ),
-                        )
-                    )
-                return
-
-            if active_overrides:
-                logger.info(
-                    "executor_overrides_active",
-                    count=len(active_overrides),
-                    reason=active_overrides[0].reason,
-                )
-                return
-
-        try:
-            for action in actions:
-                await self._execute_action(action)
-        except asyncio.CancelledError:
-            await self._reconcile_claimed_batch_cancelled(actions)
-            raise
+        logger.info(
+            "executor_ordinary_writes_prohibited",
+            learning_state=learning_state,
+            reason="observe_only_build",
+        )
 
     async def _claim_due_safety_action(self, now: dt.datetime) -> PlanActionRecord | None:
         """Claim one oldest linked restore without depending on its parent plan."""
@@ -296,7 +218,22 @@ class PlanExecutor:
     async def _execute_safety_action(self, action: PlanActionRecord) -> None:
         """Dispatch one safety restore with priority capacity and no redispatch."""
 
+        if not is_restorative_action(action):
+            raise PermissionError("Only existing linked restores may enter the safety lane")
         try:
+            try:
+                learning_state = await self._learning_check()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "safety_restore_learning_state_unknown", error_type=type(exc).__name__
+                )
+                learning_state = LearningModeState.UNKNOWN
+            if learning_state is LearningModeState.ACTIVE or learning_state is True:
+                await self._requeue_safety_action(action, "learning_mode_active")
+                return
+            action, source = await self._load_claimed_restore(action)
             payload = json.loads(action.payload_json) if action.payload_json else {}
             action_type = ActionType(action.action_type)
             precondition = await self._dispatch_precondition(action, action_type, payload)
@@ -319,8 +256,7 @@ class PlanExecutor:
                 )
                 return
             handler = get_action_handler(action_type)
-            with self._wrapper.safety_write():
-                expected_state = await handler.dispatch(self._wrapper, payload) or {}
+            expected_state = await self._wrapper._dispatch_linked_restore(action, source)
             if expected_state.get("skip"):
                 await self._requeue_safety_action(
                     action, str(expected_state.get("reason", "live_precondition"))
@@ -363,6 +299,33 @@ class PlanExecutor:
             await self._requeue_safety_action(action, type(exc).__name__)
         except Exception as exc:  # safety failures are retried, never terminal
             await self._requeue_safety_action(action, type(exc).__name__)
+
+    async def _load_claimed_restore(
+        self, action: PlanActionRecord
+    ) -> tuple[PlanActionRecord, PlanActionRecord]:
+        """Reload the persisted claim and linked source before admitting a restore."""
+        if action.reverts_action_id is None or action.safety_claimed_at is None:
+            raise PermissionError("Restore is not linked and claimed")
+        async with self._session_factory() as session:
+            stored = (
+                await session.execute(
+                    select(PlanActionRecord).where(
+                        PlanActionRecord.id == action.id,
+                        PlanActionRecord.status == "executing",
+                        PlanActionRecord.reverts_action_id == action.reverts_action_id,
+                        PlanActionRecord.safety_claimed_at == action.safety_claimed_at,
+                        PlanActionRecord.scheduled_ts <= dt.datetime.now(dt.timezone.utc),
+                    )
+                )
+            ).scalar_one_or_none()
+            if stored is None:
+                raise PermissionError("Restore claim is no longer current")
+            source = await session.get(PlanActionRecord, stored.reverts_action_id)
+        if source is None:
+            raise PermissionError("Linked restore source is missing")
+        validate_action_pair(source, stored)
+        validate_restore_baseline(source, stored)
+        return stored, source
 
     async def _safety_already_safe(
         self, action: PlanActionRecord, action_type: ActionType, payload: dict
@@ -483,102 +446,8 @@ class PlanExecutor:
                 )
 
     async def _execute_action(self, action: PlanActionRecord) -> None:
-        """Execute a single action, then synchronously verify it."""
-        try:
-            payload = json.loads(action.payload_json) if action.payload_json else {}
-            action_type = ActionType(action.action_type)
-            precondition = await self._dispatch_precondition(action, action_type, payload)
-            if precondition is not None:
-                if precondition["reason"] in {
-                    "credentials_missing",
-                    "device_status_missing",
-                    "device_status_stale",
-                    "quality_check_failed",
-                }:
-                    await self._defer_action(action, precondition)
-                    return
-                await self._skip_action(action, precondition)
-                return
-            handler = get_action_handler(action_type)
-
-            expected_state = await handler.dispatch(self._wrapper, payload) or {}
-            now = dt.datetime.now(dt.timezone.utc)
-            if expected_state.get("skip"):
-                result = {
-                    "reason": expected_state.get("reason", "action_precondition_not_met"),
-                    "detail": "Automatic command was not sent after its final live-device safety check",
-                    "observed": {
-                        key: value
-                        for key, value in expected_state.items()
-                        if key not in {"skip", "reason"}
-                    },
-                }
-                async with self._session_factory() as session:
-                    await session.execute(
-                        update(PlanActionRecord)
-                        .where(PlanActionRecord.id == action.id)
-                        .values(
-                            status="skipped",
-                            executed_at=now,
-                            expected_state_json=json.dumps(expected_state),
-                            result_json=json.dumps(result),
-                        )
-                    )
-                logger.info(
-                    "action_skipped_live_precondition",
-                    action_type=action.action_type,
-                    action_id=action.id,
-                    reason=result["reason"],
-                )
-                return
-
-            async with self._session_factory() as session:
-                await session.execute(
-                    update(PlanActionRecord)
-                    .where(PlanActionRecord.id == action.id)
-                    .values(
-                        status="dispatched",
-                        executed_at=now,
-                        expected_state_json=json.dumps(expected_state),
-                        verify_attempts=0,
-                        last_observed_json=None,
-                        result_json=json.dumps({"dispatched": True}),
-                    )
-                )
-
-            logger.info(
-                "action_dispatched",
-                action_type=action.action_type,
-                action_id=action.id,
-                expected_state=expected_state,
-            )
-
-            await self._verify_with_retry(action, payload, expected_state, now)
-
-        except asyncio.CancelledError:
-            logger.warning(
-                "action_cancelled",
-                action_type=action.action_type,
-                action_id=action.id,
-            )
-            await self._mark_cancelled(action)
-            raise
-        except ValueError:
-            logger.warning("executor_unknown_action", action_type=action.action_type)
-        except Exception as exc:
-            logger.error(
-                "action_failed", action_type=action.action_type, action_id=action.id, error=str(exc)
-            )
-            async with self._session_factory() as session:
-                await session.execute(
-                    update(PlanActionRecord)
-                    .where(PlanActionRecord.id == action.id)
-                    .values(
-                        status="failed",
-                        executed_at=dt.datetime.now(dt.timezone.utc),
-                        result_json=json.dumps({"error": str(exc)}),
-                    )
-                )
+        """Refuse ordinary dispatch, including direct and legacy entry points."""
+        raise PermissionError("Ordinary writes are prohibited in this observe-only build")
 
     async def _skip_action(self, action: PlanActionRecord, result: dict[str, object]) -> None:
         async with self._session_factory() as session:
@@ -783,41 +652,7 @@ class PlanExecutor:
         if initial.ok:
             await self._mark_verified(action, attempts, initial)
             return
-        expected_state = (
-            await handler.redispatch_expected(self._wrapper, payload, expected_state)
-            or expected_state
-        )
-        redispatched_at = dt.datetime.now(dt.timezone.utc)
-        try:
-            final, attempts = await self._poll_until_verified(
-                action=action,
-                handler=handler,
-                payload=payload,
-                expected_state=expected_state,
-                attempts=attempts,
-                lane="ordinary",
-                phase="redispatch",
-                checkpoints=REDISPATCH_VERIFY_CHECKPOINTS_S,
-                live_checkpoints=REDISPATCH_LIVE_CHECKPOINTS_S,
-                evidence_after=redispatched_at,
-            )
-        except asyncio.CancelledError:
-            raise
-        except _VerificationQuotaExhausted:
-            await self._mark_executed_unverified(action, "verification_quota_exhausted")
-            return
-        except _VerificationLedgerUnavailable:
-            await self._mark_executed_unverified(action, "verification_ledger_unavailable")
-            return
-        except _VerificationEvidenceUnavailable:
-            await self._mark_executed_unverified(action, "verification_evidence_unavailable")
-            return
-        if final.ok:
-            await self._mark_verified(action, attempts, final)
-        else:
-            await self._mark_failed(
-                action, attempts, replace(final, reason="verification_mismatch_after_redispatch")
-            )
+        await self._mark_executed_unverified(action, "ordinary_write_prohibited")
 
     async def _poll_until_verified(
         self,
@@ -1157,7 +992,10 @@ class PlanExecutor:
                 return
 
             latest_plan_result = await session.execute(
-                select(PlanRecord.id).order_by(PlanRecord.created_at.desc()).limit(1)
+                select(PlanRecord.id)
+                .where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
+                .order_by(PlanRecord.created_at.desc())
+                .limit(1)
             )
             latest_plan_id = latest_plan_result.scalar_one_or_none()
 
@@ -1230,6 +1068,7 @@ class PlanExecutor:
                 and_(
                     PlanRecord.created_at >= plan_window_start,
                     PlanRecord.created_at <= plan_window_end,
+                    PlanRecord.status != DIAGNOSTIC_PLAN_STATUS,
                 )
             )
             .order_by(PlanRecord.created_at.desc())

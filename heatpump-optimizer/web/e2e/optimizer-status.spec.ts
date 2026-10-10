@@ -1,4 +1,4 @@
-import { defaultBody, demandDataQuality, expect, manualCOPObservation, manualCOPResponse, retiredCopModel, test, type Page } from "./fixtures";
+import { controlState, defaultBody, demandDataQuality, expect, manualCOPObservation, manualCOPResponse, modelLifecycleStatus, retiredCopModel, test, type Page } from "./fixtures";
 
 interface ManualLedgerState {
     rows: ReturnType<typeof manualCOPObservation>[];
@@ -447,37 +447,35 @@ const statusWithFreshData = {
 
 const controlStates = {
     paused_by_user: {
+        ...controlState,
         state: "paused_by_user",
-        headline: "Paused by operator",
-        detail: "Operator control is holding the pump off.",
+        headline: "User override is active",
+        detail: "Ordinary writes are prohibited in this build; existing linked restores may still run outside positive observation.",
+        reason_code: "active_override",
+        override_id: 7,
+        active_override_count: 1,
+        primary_action: { kind: "request", label: "Clear override", endpoint: "/api/overrides/7", method: "DELETE" },
     },
     observing: {
+        ...controlState,
         state: "observing",
-        headline: "Learning in observation",
-        detail: "Commands remain paused while evidence is collected.",
+        headline: "Observation mode is active",
+        detail: "No actions are dispatched, including linked restores. Optimization requires a new reviewed, approved build.",
+        reason_code: "learning_mode_active",
     },
     holding: {
+        ...controlState,
         state: "holding",
-        headline: "Holding for comfort",
-        detail: "The optimizer is holding the current state.",
+        headline: "Control evidence is unavailable",
+        detail: "Ordinary writes are prohibited in this build; linked restores still require their existing checks.",
+        reason_code: "learning_state_unavailable",
     },
-    automatic: {
-        state: "automatic",
-        headline: "Automatic schedule active",
-        detail: "The optimizer may dispatch the next safe action.",
-    },
+    observe_only_build: controlState,
 } as const;
 
 function controlStateResponse(state: keyof typeof controlStates) {
     return {
         ...controlStates[state],
-        reason_code: state,
-        since: null,
-        until: null,
-        override_id: null,
-        active_override_count: 0,
-        primary_action: null,
-        notices: [],
         resolved_at: "2026-01-01T00:00:00+00:00",
     };
 }
@@ -567,7 +565,7 @@ test.describe("Models status split", () => {
             return route.fulfill({
                 status: 200,
                 contentType: "application/json",
-                body: JSON.stringify(controlStateResponse(controlStates[state] ? state : "automatic")),
+                body: JSON.stringify(controlStateResponse(controlStates[state] ? state : "observe_only_build")),
             });
         });
 
@@ -583,9 +581,9 @@ test.describe("Models status split", () => {
                 (paragraphs, headline) => paragraphs.filter((paragraph) => !paragraph.textContent?.includes(headline as string)).map((paragraph) => paragraph.textContent ?? "").join(" "),
                 controlStates[state].headline,
             );
-            const contradictoryText = state === "automatic"
-                ? /paused by operator|commands remain paused|holding the pump off/i
-                : /automatic schedule active|may dispatch the next safe action/i;
+            const contradictoryText = state === "observe_only_build"
+                ? /user override is active|no actions are dispatched|control evidence is unavailable|automatic dispatch|scheduled control remains active/i
+                : /automatic schedule active|automatic dispatch|may dispatch the next safe action/i;
             expect(plainLanguage).not.toMatch(contradictoryText);
         }
     });
@@ -754,6 +752,10 @@ test.describe("Models status split", () => {
             body: JSON.stringify({
                 ...statusWithFreshData,
                 demand_model: { ...statusWithFreshData.demand_model, trained },
+                model_lifecycle: {
+                    demand: modelLifecycleStatus(trained ? "candidate" : "unqualified"),
+                    comfort: modelLifecycleStatus(), thermal: modelLifecycleStatus(),
+                },
             }),
         }));
         await page.route("**/api/ml/train", (route) => {
@@ -773,7 +775,9 @@ test.describe("Models status split", () => {
         await page.getByRole("button", { name: "Train Demand", exact: true }).click();
         await expect(page.locator(".train-msg--success")).toHaveText("Demand model trained.");
         const demandCard = page.locator(".model-card").filter({ has: page.getByRole("heading", { name: "Demand Model" }) });
-        await expect(demandCard.getByText("Validated", { exact: true })).toBeVisible();
+        await expect(demandCard.locator(".model-card-badge")).toHaveText("Candidate");
+        await expect(demandCard).toContainText("Incumbent: Unqualified");
+        await expect(demandCard).toContainText("Ordinary writes are prohibited in this build.");
         await expect(page.getByRole("heading", { name: "COP retired" })).toBeVisible();
         await expect(page.getByRole("button", { name: /COP/ })).toHaveCount(0);
         expect(requests).toEqual([{ path: "/api/ml/train", query: "", body: null }]);

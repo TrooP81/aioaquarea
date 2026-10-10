@@ -81,7 +81,11 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
 
         direction = device.current_direction.name
         device_action = device.current_action.name
-        record = build_device_status_record(device)
+        if await get_bool_setting("ml_maintenance_enabled"):
+            await wrapper.get_active_weekly_timer_slots()
+        record = build_device_status_record(
+            device, timer_provenance=wrapper.cached_native_timer_provenance()
+        )
         raw_outdoor_temp = device.temperature_outdoor
 
         async with get_session() as session:
@@ -441,39 +445,14 @@ async def poll_indoor_temp() -> None:
 
 
 async def retrain_comfort_model() -> None:
-    """Periodically retrain the comfort model from accumulated SmartThings data."""
+    """Compatibility entrypoint: queue automatic comfort maintenance only."""
     try:
-        enabled = await get_bool_setting("use_comfort_model")
-        if not enabled:
-            return
+        from packages.ml.lifecycle import enqueue_maintenance_request
 
-        from packages.ml.comfort_model import comfort_model
-        from packages.core.device_data_quality import get_device_data_quality
-
-        await comfort_model.arefresh_if_changed()
-        try:
-            device_quality = await get_device_data_quality()
-        except Exception as exc:  # noqa: BLE001 - training requires verified device readiness
-            logger.error(
-                "comfort_model_retrain_quality_check_failed",
-                reason="quality_check_failed",
-                error_type=type(exc).__name__,
-            )
-            return
-        if not device_quality["ready"]:
-            logger.warning("comfort_model_retrain_paused", reasons=device_quality["reasons"])
-            return
-
-        lag_str = await get_string_setting("thermal_lag_minutes")
-        lag = int(lag_str) if lag_str else None
-
-        result = await comfort_model.train(thermal_lag_minutes=lag)
-        if result.get("status") in {"training_in_progress", "training_skipped"}:
-            logger.info("comfort_model_retrain_deferred", **result)
-        else:
-            logger.info("comfort_model_retrain", **result)
+        result = await enqueue_maintenance_request("comfort", "poller_request", automatic=True)
+        logger.info("comfort_maintenance_requested", request=result)
     except Exception as e:
-        logger.error("comfort_model_retrain_failed", error=str(e))
+        logger.error("comfort_maintenance_request_failed", error_type=type(e).__name__)
 
 
 async def run_seasonal_calibration() -> None:
@@ -486,6 +465,15 @@ async def run_seasonal_calibration() -> None:
         logger.info("seasonal_calibration_cycle", **result)
     except Exception as exc:  # noqa: BLE001 - background diagnostics must not stop polling
         logger.error("seasonal_calibration_cycle_failed", error=str(exc))
+
+
+async def run_ml_maintenance(owner) -> dict:
+    if not await get_bool_setting("ml_maintenance_enabled"):
+        return {"status": "disabled", "reason": "maintenance_disabled"}
+    await run_seasonal_calibration()
+    result = await owner.run()
+    logger.info("ml_maintenance_cycle", **result)
+    return result
 
 
 async def deliver_operational_alerts() -> None:
@@ -503,13 +491,24 @@ async def deliver_operational_alerts() -> None:
 async def main() -> None:
     """Main entry point for the poller service."""
     from packages.core.logging import configure_logging
+    from packages.ml.lifecycle import MaintenanceRunner, enqueue_maintenance_request
 
     configure_logging("poller")
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
     wrapper = AquareaWrapper(read_only=True)
+    maintenance = MaintenanceRunner(timer_reader=wrapper)
     await wrapper.start()
+
+    startup_slot = int(utc_now().timestamp() // (6 * 3600))
+    for component in ("demand", "comfort", "thermal"):
+        await enqueue_maintenance_request(
+            component,
+            "poller_startup",
+            automatic=True,
+            dedup_key=f"startup:{startup_slot}",
+        )
 
     scheduler = create_scheduler()
     await record_service_heartbeat("poller", poll_interval_seconds=settings.poll_interval_seconds)
@@ -574,23 +573,17 @@ async def main() -> None:
         next_run_time=utc_after(seconds=20),
     )
 
-    # Comfort model retraining every 6 hours
     scheduler.add_job(
-        retrain_comfort_model,
-        "interval",
-        hours=6,
-        id="comfort_model_retrain",
+        run_ml_maintenance,
+        "cron",
+        hour="0,6,12,18",
+        minute=0,
+        args=[maintenance],
+        timezone="UTC",
+        coalesce=True,
+        max_instances=1,
+        id="ml_maintenance",
         next_run_time=utc_after(minutes=5),
-    )
-
-    # Seasonal learning is opt-in and may only train after the data-quality
-    # checks pass.  A six-hour cadence avoids repeated heavy calibration.
-    scheduler.add_job(
-        run_seasonal_calibration,
-        "interval",
-        hours=6,
-        id="seasonal_calibration",
-        next_run_time=utc_after(minutes=7),
     )
 
     scheduler.add_job(
@@ -624,6 +617,7 @@ async def main() -> None:
         pass
     finally:
         scheduler.shutdown(wait=True)
+        await maintenance.close()
         await wrapper.stop()
         logger.info("poller_stopped")
 

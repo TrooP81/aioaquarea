@@ -183,12 +183,7 @@ class MILPOptimizer:
                 "No fresh trusted indoor temperature is available for ML comfort planning"
             )
 
-        # Calibrate thermal model if stale
-        if (
-            thermal_model.params.last_calibrated is None
-            or (now - thermal_model.params.last_calibrated).total_seconds() > 6 * 3600
-        ):
-            await thermal_model.calibrate()
+        await thermal_model.arefresh_if_changed()
 
         current_tank_temp = (
             last_status.tank_temp if last_status and last_status.tank_temp is not None else 48.0

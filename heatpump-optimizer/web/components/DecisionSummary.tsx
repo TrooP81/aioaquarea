@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ACTION_LABELS, forecastDisplayStatusLabel, formatTime } from "@/lib/constants";
+import { forecastDisplayStatusLabel, formatTime } from "@/lib/constants";
 import { Banner } from "./Banner";
 import { DataAge } from "./DataAge";
-import { usePlanActions } from "./usePlanActions";
 import { useTimeFormat } from "./useTimeFormat";
 import type { ControlState } from "@/lib/api-types";
 
@@ -34,27 +33,7 @@ interface ForecastBrief {
   };
 }
 
-function explainReason(payload: Record<string, unknown> | undefined): string {
-  const summary = payload?.user_summary;
-  if (typeof summary === "string" && summary.trim()) return summary;
-  const reason = payload?.reason;
-  if (typeof reason !== "string" || !reason.trim()) return "Scheduled from the latest plan inputs.";
-  const satisfied = reason.match(/^(comfort|setback)_satisfied_forecast_([\d.]+)_target_([\d.]+)$/);
-  if (satisfied) {
-    return `Indoor forecast ${Number(satisfied[2]).toFixed(1)}°C already covers the ${Number(satisfied[3]).toFixed(1)}°C ${satisfied[1] === "comfort" ? "comfort" : "setback"} target.`;
-  }
-  const peak = reason.match(/^comfort_hour_but_peak_price_([\d.]+)$/);
-  if (peak) return `Comfort window, but electricity is expensive at ${Number(peak[1]).toFixed(2)} per kWh.`;
-  const mild = reason.match(/^comfort_hour_but_mild_outdoor_([\d.]+)C$/);
-  if (mild) return `Comfort window with mild outdoor temperature (${Number(mild[1]).toFixed(1)}°C).`;
-  return reason
-    .replace(/_eur_kwh/g, "")
-    .replace(/_/g, " ")
-    .replace(/\b\d+\.\d{3,}\b/g, (value) => Number(value).toFixed(2));
-}
-
 export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale, controlState, onRetry }: DecisionSummaryProps) {
-  const { actions, loading: actionsLoading } = usePlanActions(plan?.id);
   const [forecast, setForecast] = useState<ForecastBrief | null>(null);
   const [forecastLoading, setForecastLoading] = useState(true);
   const [forecastError, setForecastError] = useState<string | null>(null);
@@ -84,13 +63,7 @@ export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale
     return cleanup;
   }, [plan?.id]);
 
-  const nextAction = useMemo(
-    () => actions.find((action) => action.status === "pending" && new Date(action.scheduled_ts) > new Date()) ?? null,
-    [actions],
-  );
-  const actionInfo = nextAction ? ACTION_LABELS[nextAction.action_type] : null;
   const assessment = forecast?.comfort_assessment;
-  const modeOnly = assessment?.controllability?.status === "mode_only_no_space_heat";
   const atRisk = assessment?.state === "at_risk";
   const missTime = assessment?.first_miss?.ts
     ? formatTime(assessment.first_miss.ts, timeFormat.hour12)
@@ -119,18 +92,12 @@ export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale
         </div>
         <div>
           <span>Next</span>
-          <strong>
-            {actionsLoading
-              ? "Checking plan…"
-              : nextAction
-                ? `${actionInfo?.label ?? nextAction.action_type} at ${formatTime(nextAction.scheduled_ts, timeFormat.hour12)}`
-                : "No pending command"}
-          </strong>
-          {modeOnly && <small>Mode change only — it does not request room heat</small>}
+          <strong>No ordinary command</strong>
+          <small>Ordinary writes are prohibited in this build.</small>
         </div>
         <div>
           <span>Why</span>
-          <strong>{nextAction ? explainReason(nextAction.payload) : assessment?.summary ?? "No immediate optimizer action is needed."}</strong>
+          <strong>{assessment?.summary ?? (plan ? "Legacy ordinary actions will not be dispatched." : "No immediate optimizer action is needed.")}</strong>
         </div>
         <div>
           <span>Expected impact</span>

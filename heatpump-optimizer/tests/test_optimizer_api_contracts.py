@@ -26,6 +26,16 @@ from packages.api.routers.optimizer import (
 )
 from packages.ml.model_status import clear_artifact_status_cache
 from packages.ml.safe_persistence import safe_dump
+from packages.ml.thermal import ThermalModel
+
+
+def _thermal_model(**params) -> ThermalModel:
+    model = ThermalModel()
+    model.arefresh_if_changed = AsyncMock(return_value=False)
+    model.params.tank_heating_rate = 2.5
+    for name, value in params.items():
+        setattr(model.params, name, value)
+    return model
 
 
 _RETIRED_COP_STATUS = {
@@ -55,12 +65,244 @@ def _session_context(session):
     return _AsyncContextManager(session)
 
 
+@pytest.mark.parametrize("planner", ["rules", "milp", "fallback"])
+@pytest.mark.parametrize("force_replace", [False, True])
+@pytest.mark.parametrize("learning_state", ["active", "inactive"])
+async def test_diagnostic_has_zero_actions_and_is_never_active(
+    planner, force_replace, learning_state
+):
+    from packages.core.models import PlanActionRecord, PlanRecord
+    from packages.optimizer import InfeasibleError
+    from packages.optimizer.executor_core import LearningModeState
+    from packages.optimizer.main import run_optimization
+
+    now = dt.datetime.now(dt.timezone.utc)
+    plan = {
+        "horizon_start": now,
+        "horizon_end": now + dt.timedelta(hours=24),
+        "version": "rules_v7" if planner == "rules" else "milp_v1",
+        "actions": [{"type": "force_dhw_on", "ts": now.isoformat(), "payload": {}}],
+        "forecast_snapshot": {"device_id": "device-a", "price_forecast": []},
+    }
+    optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
+    fallback = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
+    if planner == "fallback":
+        optimizer.generate_plan.side_effect = InfeasibleError("isolated fallback")
+    session = AsyncMock()
+    records = []
+
+    def add(record):
+        record.id = 321
+        records.append(record)
+
+    session.add = MagicMock(side_effect=add)
+    with (
+        patch("packages.optimizer.main.get_session", return_value=_session_context(session)),
+        patch("packages.optimizer.main.get_setting", new=AsyncMock(return_value=planner)),
+        patch(
+            "packages.optimizer.main._select_optimizer",
+            new=AsyncMock(return_value=("rules" if planner == "rules" else "milp", optimizer)),
+        ),
+        patch("packages.optimizer.main._new_rules_optimizer", return_value=fallback),
+        patch(
+            "packages.optimizer.main.resolve_learning_mode_state",
+            new=AsyncMock(return_value=LearningModeState(learning_state)),
+        ),
+        patch(
+            "packages.optimizer.main.get_device_data_quality",
+            new=AsyncMock(return_value={"ready": True}),
+        ),
+        patch(
+            "packages.optimizer.main.get_planning_data_quality",
+            new=AsyncMock(return_value={"control_allowed": True}),
+        ),
+        patch("packages.optimizer.main.comfort_model.arefresh_if_changed", new=AsyncMock()),
+        patch(
+            "packages.optimizer.main.get_active_price_context",
+            new=AsyncMock(
+                return_value=SimpleNamespace(area="SE3", source="manual", currency="SEK")
+            ),
+        ),
+        patch(
+            "packages.optimizer.main._has_material_near_term_change",
+            new=AsyncMock(return_value=(False, 42)),
+        ) as reuse,
+        patch("packages.core.plan_lifecycle.activate_plan", new=AsyncMock()) as activate,
+    ):
+        assert await run_optimization(force_replace=force_replace) == 321
+
+    assert len(records) == 1
+    assert isinstance(records[0], PlanRecord)
+    assert not any(isinstance(record, PlanActionRecord) for record in records)
+    assert records[0].status == "diagnostic"
+    assert json.loads(records[0].plan_json)["actions"] == []
+    session.execute.assert_not_awaited()
+    reuse.assert_not_awaited()
+    activate.assert_not_awaited()
+    if planner == "fallback":
+        fallback.generate_plan.assert_awaited_once()
+
+
+async def test_activate_plan_refuses_diagnostic_before_supersession():
+    from packages.core.models import PlanRecord
+    from packages.core.plan_lifecycle import activate_plan
+
+    session = AsyncMock()
+    session.add = MagicMock()
+    plan = PlanRecord(status="diagnostic", plan_json='{"actions": []}')
+
+    with pytest.raises(ValueError, match="Diagnostic plans cannot be activated"):
+        await activate_plan(session, plan)
+
+    session.execute.assert_not_awaited()
+    session.flush.assert_not_awaited()
+    session.add.assert_not_called()
+    assert plan.status == "diagnostic"
+
+
+def test_public_forecast_quality_is_reporting_only_without_changing_prediction_evidence():
+    from packages.api.routers.models_router import _reporting_forecast_quality
+
+    quality = {"status": "passed", "control_allowed": True, "reason": "validated", "samples": 60}
+
+    reported = _reporting_forecast_quality(quality)
+
+    assert reported == {
+        "status": "passed",
+        "control_allowed": False,
+        "control_reason": "observe_only_build",
+        "reason": "validated",
+        "samples": 60,
+    }
+    assert quality == {
+        "status": "passed",
+        "control_allowed": True,
+        "reason": "validated",
+        "samples": 60,
+    }
+    assert reported is not quality
+
+
+@pytest.mark.parametrize("scopes", [["plans"], ["prices", "plans"]])
+async def test_reset_refuses_open_restore_11763(scopes):
+    from fastapi import HTTPException
+    from packages.api.routers.admin import ResetRequest, reset_data
+
+    session = AsyncMock()
+    session.add = MagicMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = 11763
+    session.execute.return_value = result
+    with (
+        patch("packages.api.routers.admin.get_session", return_value=_session_context(session)),
+        patch("packages.api.routers.admin.reset_ml_models") as reset_models,
+        pytest.raises(HTTPException) as error,
+    ):
+        await reset_data(ResetRequest(scopes=scopes))
+
+    assert error.value.status_code == 409
+    assert error.value.detail == {"code": "unresolved_safety_reverts", "action_id": 11763}
+    session.scalar.assert_not_awaited()
+    session.add.assert_not_called()
+    reset_models.assert_not_called()
+    assert session.execute.await_count == 1
+    statement = session.execute.await_args.args[0]
+    assert statement.__visit_name__ == "select"
+    assert "reverts_action_id IS NOT NULL" in str(statement)
+    assert statement._for_update_arg is not None
+
+
+@pytest.mark.parametrize("learning_state", ["active", "inactive", "unknown"])
+async def test_restart_and_rollback_preserve_restore_and_embargo(learning_state):
+    from packages.core.models import PlanActionRecord, PlanRecord
+    from packages.core.plan_lifecycle import supersede_active_plan
+    from packages.core.safety_reverts import dhw_embargoed
+    from packages.core.services.aquarea import AquareaWrapper
+    from packages.optimizer.executor_core import LearningModeState, PlanExecutor
+
+    now = dt.datetime.now(dt.timezone.utc)
+    restore = PlanActionRecord(
+        id=11763,
+        plan_id=1,
+        device_id="device-a",
+        action_type="force_dhw_off",
+        payload_json="{}",
+        reverts_action_id=11762,
+        status="pending",
+        scheduled_ts=now + dt.timedelta(hours=1),
+    )
+    session = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [PlanRecord(id=1, status="active")]
+    session.execute.return_value = result
+    await supersede_active_plan(session)
+    cancellation = session.execute.await_args_list[1].args[0]
+    assert "reverts_action_id IS NULL" in str(cancellation)
+    assert restore.status == "pending"
+    assert dhw_embargoed([restore], "device-a") is True
+    for _restart in range(2):
+        wrapper = AquareaWrapper(read_only=False)
+        executor = PlanExecutor(
+            wrapper, learning_check=AsyncMock(return_value=LearningModeState(learning_state))
+        )
+        executor._claim_due_safety_action = AsyncMock(return_value=None)
+        await executor.execute_due_actions()
+        with pytest.raises(PermissionError, match="observe-only build"):
+            await wrapper.force_dhw(True)
+        assert restore.reverts_action_id == 11762
+        assert restore.status == "pending"
+        assert dhw_embargoed([restore], "device-a") is True
+
+
+async def test_default_history_excludes_diagnostics_and_explicit_detail_has_no_outcome():
+    from fastapi import HTTPException
+    from packages.api.routers.optimizer import get_plan_activity
+    from packages.core.models import PlanRecord
+
+    now = dt.datetime.now(dt.timezone.utc)
+    diagnostic = PlanRecord(
+        id=999,
+        created_at=now,
+        horizon_start=now,
+        horizon_end=now + dt.timedelta(hours=24),
+        optimizer_version="rules_v7",
+        price_currency="SEK",
+        price_source="manual",
+        plan_json='{"actions": []}',
+        status="diagnostic",
+    )
+    session = AsyncMock()
+    result = MagicMock()
+    result.all.return_value = [(diagnostic, 0)]
+    result.scalar_one_or_none.return_value = diagnostic
+    session.execute.return_value = result
+    with (
+        patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
+        patch("packages.api.routers.optimizer.plan_measurement", new=AsyncMock()) as measurement,
+    ):
+        assert await get_plans(limit=10) == []
+        assert "diagnostic" in session.execute.await_args.args[0].compile().params.values()
+        with pytest.raises(HTTPException) as error:
+            await get_plan_detail(999)
+        assert error.value.status_code == 404
+        detail = await get_plan_detail(999, include_diagnostics=True)
+        assert detail.status == "diagnostic"
+        assert detail.actions_count == 0
+        assert detail.actions == []
+        assert detail.outcome["execution_allowed"] is False
+        assert "measurement" not in detail.outcome
+        measurement.assert_not_awaited()
+        result.all.return_value = []
+        assert await get_plan_activity(limit=100, status=None) == []
+        assert "diagnostic" in session.execute.await_args.args[0].compile().params.values()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("learning_state", "expected_learning_mode", "expected_reliable", "expected_plan_driven"),
     [
         ("active", True, True, False),
-        ("inactive", False, True, True),
+        ("inactive", False, True, False),
         ("unknown", False, False, False),
     ],
 )
@@ -84,6 +326,7 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
     )
     thermal_model = SimpleNamespace(
         load_latest=MagicMock(),
+        arefresh_if_changed=AsyncMock(return_value=False),
         predict_temperature_curve=MagicMock(return_value=[]),
         predict_planned_tank_curve=MagicMock(return_value=[]),
         predict_managed_tank_curve=MagicMock(return_value=[]),
@@ -121,6 +364,130 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
 
 
 @pytest.mark.asyncio
+async def test_api_thermal_process_refreshes_committed_rates(monkeypatch):
+    from packages.api.routers import models_router
+    from tests.test_ml_lifecycle import qualified_reference
+
+    now = dt.datetime.now(dt.timezone.utc)
+    status = SimpleNamespace(
+        tank_temp=48.0, tank_target_temp=52, outdoor_temp=10.0, zone1_temp=20.0, ts=now
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: status))
+    )
+    model = ThermalModel()
+
+    async def refresh():
+        model.params.tank_heating_rate = 8.0
+        model.params.tank_heating_outdoor_factor = 0.0
+        model.params.last_calibrated = now
+        model.params.calibration_status["tank_heating"] = "validated"
+        model._qualified_reference = qualified_reference("thermal", ("tank_heating",))
+        return True
+
+    refresh_reader = AsyncMock(side_effect=refresh)
+    model.arefresh_if_changed = refresh_reader
+    monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    monkeypatch.setattr(
+        "packages.core.control_temperature.get_control_temperature",
+        AsyncMock(return_value=SimpleNamespace(is_usable=False, value=None, reason="missing")),
+    )
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_status",
+        AsyncMock(return_value={"status": "qualified-for-reporting"}),
+    )
+    response = await models_router.get_thermal_status()
+    assert response["reporting_state"] == "qualified-for-reporting"
+    assert response["predictions"]["tank_heating"]["heating_rate_per_hour"] == 8.0
+    assert response["predictions"]["tank_heating"]["confidence"] == "learned"
+    assert response["control_ready"] is False and response["ordinary_writes_allowed"] is False
+    refresh_reader.assert_awaited_once()
+
+
+async def test_optimizer_status_refreshes_thermal_even_if_seasonal_reporting_fails(monkeypatch):
+    from packages.api.routers import optimizer
+    from tests.test_ml_lifecycle import qualified_reference
+
+    model = ThermalModel()
+    now = dt.datetime.now(dt.timezone.utc)
+
+    async def refresh():
+        model.params.tank_heating_rate = 8.0
+        model.params.last_calibrated = now
+        model.params.calibration_status["tank_heating"] = "validated"
+        model._qualified_reference = qualified_reference("thermal", ("tank_heating",))
+        return True
+
+    refresh_reader = AsyncMock(side_effect=refresh)
+    model.arefresh_if_changed = refresh_reader
+    monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_setting", AsyncMock(return_value="rules_only")
+    )
+    monkeypatch.setattr(
+        "packages.optimizer.main.get_optimizer_status_snapshot",
+        AsyncMock(return_value={"active_layer": "rules_v7"}),
+    )
+    monkeypatch.setattr(
+        optimizer, "_learning_mode_status", AsyncMock(return_value={"enabled": False})
+    )
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_status", AsyncMock(return_value={"status": "retired"})
+    )
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_reporting_statuses",
+        AsyncMock(
+            return_value={
+                component: {"status": "qualified-for-reporting"}
+                for component in ("demand", "comfort", "thermal")
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "packages.ml.models.DemandModel.training_data_quality",
+        AsyncMock(return_value={"usable_samples": 0}),
+    )
+    monkeypatch.setattr(
+        "packages.ml.seasonal_learning.get_seasonal_calibration_progress",
+        AsyncMock(side_effect=RuntimeError("seasonal lookup unavailable")),
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar=lambda: 0)))
+    monkeypatch.setattr(optimizer, "get_session", lambda: _session_context(session))
+    response = await optimizer.get_optimizer_status()
+    assert response["thermal_model"]["tank_heating_rate"] == 8.0
+    assert response["thermal_model"]["confidence"] == "learned"
+    assert response["seasonal_calibration"]["reason"] == "seasonal_reporting_unavailable"
+    assert response["control_ready"] is False and response["ordinary_writes_allowed"] is False
+    refresh_reader.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "reader", ["get_thermal_status", "get_thermal_curve", "get_indoor_forecast"]
+)
+async def test_every_api_thermal_reader_refreshes_before_reading_inputs(monkeypatch, reader):
+    from packages.api.routers import models_router
+
+    model = ThermalModel()
+    refresh_reader = AsyncMock(return_value=False)
+    model.arefresh_if_changed = refresh_reader
+    monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
+    monkeypatch.setattr(models_router, "_read_live_forecast_quality", AsyncMock(return_value={}))
+    monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_status",
+        AsyncMock(return_value={"status": "unqualified"}),
+    )
+
+    def stop_after_refresh():
+        refresh_reader.assert_awaited_once()
+        raise RuntimeError("stop before fixture input reads")
+
+    monkeypatch.setattr(models_router, "get_session", stop_after_refresh)
+    with pytest.raises(RuntimeError, match="stop before fixture input reads"):
+        await getattr(models_router, reader)()
+
+
 async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
     status = SimpleNamespace(
         id=1,
@@ -133,6 +500,7 @@ async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
     session = SimpleNamespace(execute=AsyncMock(return_value=status_result))
     thermal_model = SimpleNamespace(
         load_latest=MagicMock(),
+        arefresh_if_changed=AsyncMock(return_value=False),
         predict_temperature_curve=MagicMock(return_value=[]),
         predict_managed_tank_curve=MagicMock(return_value=[]),
     )
@@ -279,9 +647,7 @@ async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) 
     count_result = MagicMock()
     count_result.scalar.return_value = 188
     session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
-    thermal_model = SimpleNamespace(
-        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
-    )
+    thermal_model = _thermal_model()
 
     with (
         patch(
@@ -332,6 +698,18 @@ async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) 
     }
     assert response["cop_trained"] is False
     assert response["fallback_layer"] == "rules_v7"
+    assert response["thermal_model"] == {
+        "lifecycle": response["model_lifecycle"]["thermal"],
+        "status": "unavailable",
+        "control_ready": False,
+        "calibrated": False,
+        "tank_heating_rate": 2.5,
+        "confidence": "default",
+        "indoor_heating_confidence": "default",
+        "indoor_heating_samples": 0,
+        "calibration_status": {},
+        "last_calibrated": None,
+    }
 
 
 class TestManualCOPAPI:
@@ -966,18 +1344,15 @@ class TestManualCOPAPI:
 
 class TestCOPRetirementAPI:
     @pytest.mark.parametrize(
-        "demand_result",
-        [
-            {"version": "fixture", "samples": 168},
-            {"error": "Insufficient data", "samples": 167},
-            RuntimeError("fixture failure"),
-        ],
+        "maintenance_enabled",
+        [False, True, None],
     )
-    async def test_no_selector_training_only_calls_demand(self, demand_result, tmp_path):
+    async def test_no_selector_training_only_enqueues_demand(self, maintenance_enabled, tmp_path):
         import httpx
 
         from packages.api.main import app
         from packages.api.routers.models_router import trigger_ml_training
+        from packages.ml.lifecycle import LifecycleUnavailable
 
         import inspect
 
@@ -988,16 +1363,23 @@ class TestCOPRetirementAPI:
         artifact = tmp_path / "cop_model_weather_dhw_v6_archived.pkl"
         artifact.write_bytes(b"archived COP bytes")
         demand = MagicMock()
-        demand.train = AsyncMock()
-        if isinstance(demand_result, Exception):
-            demand.train.side_effect = demand_result
+        demand.train = AsyncMock(side_effect=AssertionError("Demand fit"))
+        enqueue = AsyncMock()
+        demand_result = {
+            "request_id": "fixture-request",
+            "status": "queued",
+            "maintenance_enabled": maintenance_enabled,
+        }
+        if maintenance_enabled is None:
+            enqueue.side_effect = LifecycleUnavailable("fixture storage failure")
         else:
-            demand.train.return_value = demand_result
+            enqueue.return_value = demand_result
         session = MagicMock()
         with (
-            patch("packages.ml.models.DemandModel", return_value=demand),
+            patch("packages.ml.models.DemandModel", side_effect=AssertionError("Demand instance")),
             patch("packages.ml.models.COPModel", side_effect=AssertionError("COP instance")),
             patch("packages.ml.safe_persistence.safe_load", side_effect=AssertionError("COP load")),
+            patch("packages.api.routers.models_router.enqueue_maintenance_request", enqueue),
             patch(
                 "packages.api.routers.models_router.get_session",
                 return_value=_session_context(session),
@@ -1010,7 +1392,15 @@ class TestCOPRetirementAPI:
             ) as client:
                 response = await client.post("/api/ml/train")
 
-        assert response.status_code == 200
+        enqueue.assert_awaited_once_with("demand", "api")
+        demand.train.assert_not_awaited()
+        assert artifact.read_bytes() == b"archived COP bytes"
+        if maintenance_enabled is None:
+            assert response.status_code == 503
+            assert response.json()["detail"] == {"code": "ml_maintenance_unavailable"}
+            session.add.assert_not_called()
+            return
+        assert response.status_code == 202
         body = response.json()
         assert body["cop"] == {
             "status": "retired",
@@ -1018,13 +1408,12 @@ class TestCOPRetirementAPI:
             "error": "cop_model_retired",
             "reason": "unverified_thermal_output",
         }
-        if isinstance(demand_result, Exception):
-            assert body["demand"] == {"error": "Training failed: fixture failure"}
-        else:
-            assert body["demand"] == demand_result
-        demand.train.assert_awaited_once_with()
+        assert body["demand"] == {
+            **demand_result,
+            "control_ready": False,
+            "control_readiness": {"ready": False, "reason": "observe_only_build"},
+        }
         session.add.assert_called_once()
-        assert artifact.read_bytes() == b"archived COP bytes"
 
     @pytest.mark.parametrize(("hours", "expected_status"), [(24, 410), (168, 410), (0, 422)])
     async def test_compute_is_gone_without_sessions_or_computation(self, hours, expected_status):
@@ -1196,9 +1585,7 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
     count_result = MagicMock()
     count_result.scalar.return_value = 42
     session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
-    thermal_model = SimpleNamespace(
-        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
-    )
+    thermal_model = _thermal_model()
     artifact_status = {
         "trained": True,
         "last_trained": "2026-10-01T12:00:00+00:00",
@@ -1220,9 +1607,25 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
             new=AsyncMock(return_value={"enabled": False}),
         ),
         patch(
-            "packages.ml.model_status._inspect_model_artifact",
-            side_effect=lambda kind, directory: (
-                dict(_RETIRED_COP_STATUS) if kind == "cop" else dict(artifact_status)
+            "packages.ml.model_status.get_model_status",
+            new=AsyncMock(
+                side_effect=lambda kind, directory: (
+                    dict(_RETIRED_COP_STATUS) if kind == "cop" else dict(artifact_status)
+                )
+            ),
+        ),
+        patch(
+            "packages.ml.model_status.get_model_reporting_statuses",
+            new=AsyncMock(
+                return_value={
+                    component: {
+                        **(artifact_status if component == "demand" else {"trained": False}),
+                        "status": "unqualified",
+                        "control_ready": False,
+                        "ordinary_writes_allowed": False,
+                    }
+                    for component in ("demand", "comfort", "thermal")
+                }
             ),
         ),
         patch(
@@ -1239,8 +1642,61 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
     assert response["demand_model"]["trained"] is True
     assert response["demand_model"]["last_trained"] == "2026-10-01T12:00:00+00:00"
     assert response["demand_model"]["metrics"] == {"mae": 0.123, "samples": 36}
+    assert response["demand_model"]["control_ready"] is False
+    assert response["demand_model"]["ordinary_writes_allowed"] is False
     count_statement = session.execute.await_args.args[0]
     assert "consumption" in str(count_statement)
+
+
+@pytest.mark.asyncio
+async def test_optimizer_status_reports_indoor_heating_evidence_for_calibrated_model(
+    tmp_path,
+) -> None:
+    count_result = MagicMock()
+    count_result.scalar.return_value = 0
+    session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
+    calibrated_at = dt.datetime(2026, 10, 8, 16, 48, tzinfo=dt.timezone.utc)
+    thermal_model = _thermal_model(
+        last_calibrated=calibrated_at,
+        tank_heating_rate=22.334,
+        indoor_heating_samples=3,
+        calibration_status={"tank_heating": "validated", "zone_cooling": "insufficient_samples"},
+    )
+
+    with (
+        patch(
+            "packages.core.settings_service.get_setting", new=AsyncMock(return_value="rules_only")
+        ),
+        patch(
+            "packages.optimizer.main.get_optimizer_status_snapshot",
+            new=AsyncMock(return_value={"active_layer": "rules_v7"}),
+        ),
+        patch(
+            "packages.api.routers.optimizer._learning_mode_status",
+            new=AsyncMock(return_value={"enabled": False}),
+        ),
+        patch("packages.ml.models.MODEL_DIR", tmp_path),
+        patch(
+            "packages.ml.models.DemandModel.training_data_quality",
+            new=AsyncMock(return_value={"usable_samples": 0}),
+        ),
+        patch("packages.ml.thermal.thermal_model", thermal_model),
+        patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
+    ):
+        response = await get_optimizer_status()
+
+    assert response["thermal_model"] == {
+        "lifecycle": response["model_lifecycle"]["thermal"],
+        "status": "unavailable",
+        "control_ready": False,
+        "calibrated": True,
+        "tank_heating_rate": 22.33,
+        "confidence": "default",
+        "indoor_heating_confidence": "default",
+        "indoor_heating_samples": 3,
+        "calibration_status": {"tank_heating": "validated", "zone_cooling": "insufficient_samples"},
+        "last_calibrated": calibrated_at.isoformat(),
+    }
 
 
 @pytest.mark.parametrize(
@@ -1258,7 +1714,9 @@ async def test_optimizer_status_returns_consumption_evidence_and_artifact_metric
         ),
     ],
 )
-def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload, tmp_path) -> None:
+def test_model_status_never_adopts_uncommitted_signed_directory_artifact(
+    model_kind, filename, payload, tmp_path
+) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
     _write_signed_artifact(tmp_path / filename, payload)
@@ -1272,14 +1730,14 @@ def test_model_status_reads_newest_signed_artifact(model_kind, filename, payload
     ):
         status = _inspect_model_artifact(model_kind, tmp_path)
 
-    expected = {
-        "trained": True,
-        "last_trained": "2026-10-01T12:00:00+00:00",
-        "samples": payload["metrics"]["samples"],
-        "metrics": payload["metrics"],
-        "unavailable_reason": None,
-    }
-    assert status == (_RETIRED_COP_STATUS if model_kind == "cop" else expected)
+    if model_kind == "cop":
+        assert status == _RETIRED_COP_STATUS
+    else:
+        assert status["trained"] is False
+        assert status["metrics"] is None
+        assert status["committed_hash"] is None
+        assert status["unavailable_reason"] == "lifecycle_unavailable"
+        assert status["control_ready"] is False
     assert (tmp_path / filename).read_bytes() == archive_bytes
 
 
@@ -1302,7 +1760,7 @@ def test_model_status_reports_signature_failure_without_details(
 
     assert status["trained"] is False
     assert status["unavailable_reason"] == (
-        "retired" if model_kind == "cop" else "integrity_check_failed"
+        "retired" if model_kind == "cop" else "lifecycle_unavailable"
     )
     assert str(tmp_path) not in str(status)
 
@@ -1323,9 +1781,7 @@ async def test_optimizer_status_contains_safe_failure_for_bad_artifact(
     count_result = MagicMock()
     count_result.scalar.return_value = 42
     session = SimpleNamespace(execute=AsyncMock(return_value=count_result))
-    thermal_model = SimpleNamespace(
-        params=SimpleNamespace(last_calibrated=None, tank_heating_rate=2.5)
-    )
+    thermal_model = _thermal_model()
 
     with (
         patch(
@@ -1352,7 +1808,7 @@ async def test_optimizer_status_contains_safe_failure_for_bad_artifact(
     model_status = response[f"{model_kind}_model"]
     assert model_status["trained"] is False
     assert model_status["unavailable_reason"] == (
-        "retired" if model_kind == "cop" else "integrity_check_failed"
+        "retired" if model_kind == "cop" else "lifecycle_unavailable"
     )
     assert response["cop_model"] == _RETIRED_COP_STATUS
     assert str(tmp_path) not in json.dumps(response)
@@ -1374,7 +1830,9 @@ def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename
     status = _inspect_model_artifact(model_kind, tmp_path)
 
     assert status["trained"] is False
-    assert status["unavailable_reason"] == ("retired" if model_kind == "cop" else "not_found")
+    assert status["unavailable_reason"] == (
+        "retired" if model_kind == "cop" else "lifecycle_unavailable"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1396,7 +1854,7 @@ def test_model_status_ignores_pre_current_version_artifacts(model_kind, filename
         ),
     ],
 )
-def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
+def test_model_status_refuses_older_directory_fallback_when_newer_is_incompatible(
     model_kind, older_filename, newer_filename, older_payload, newer_payload, tmp_path
 ) -> None:
     from packages.ml.model_status import _inspect_model_artifact
@@ -1412,14 +1870,14 @@ def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
     ):
         status = _inspect_model_artifact(model_kind, tmp_path)
 
-    expected = {
-        "trained": True,
-        "last_trained": "2026-10-01T12:00:00+00:00",
-        "samples": older_payload["metrics"]["samples"],
-        "metrics": older_payload["metrics"],
-        "unavailable_reason": None,
-    }
-    assert status == (_RETIRED_COP_STATUS if model_kind == "cop" else expected)
+    if model_kind == "cop":
+        assert status == _RETIRED_COP_STATUS
+    else:
+        assert status["trained"] is False
+        assert status["metrics"] is None
+        assert status["committed_hash"] is None
+        assert status["unavailable_reason"] == "lifecycle_unavailable"
+    assert (tmp_path / older_filename).exists() and (tmp_path / newer_filename).exists()
 
 
 @pytest.mark.parametrize(
@@ -1439,7 +1897,7 @@ def test_model_status_uses_older_compatible_artifact_when_newer_is_incompatible(
         ),
     ],
 )
-def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
+def test_model_status_refuses_older_directory_fallback_when_newer_fails_integrity(
     model_kind, older_filename, newer_filename, older_payload, tmp_path
 ) -> None:
     from packages.ml.model_status import _inspect_model_artifact
@@ -1458,10 +1916,11 @@ def test_model_status_uses_older_valid_artifact_when_newer_fails_integrity(
     if model_kind == "cop":
         assert status == _RETIRED_COP_STATUS
     else:
-        assert status["trained"] is True
-        assert status["last_trained"] == "2026-10-01T12:00:00+00:00"
-        assert status["metrics"] == older_payload["metrics"]
-        assert status["unavailable_reason"] is None
+        assert status["trained"] is False
+        assert status["last_trained"] is None
+        assert status["metrics"] is None
+        assert status["unavailable_reason"] == "lifecycle_unavailable"
+    assert (tmp_path / older_filename).exists() and (tmp_path / newer_filename).exists()
 
 
 @pytest.mark.parametrize(
@@ -1496,57 +1955,483 @@ def test_model_status_reports_only_incompatible_artifact(
 
     assert status["trained"] is False
     assert status["unavailable_reason"] == (
-        "retired" if model_kind == "cop" else "incompatible_artifact"
+        "retired" if model_kind == "cop" else "lifecycle_unavailable"
     )
 
 
-def test_model_status_cache_reuses_snapshot_until_artifact_changes(tmp_path) -> None:
+def test_model_status_cache_never_grants_permission_without_committed_state(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
     path = tmp_path / "demand_model_weather_v3_20261001_1200.pkl"
     path.write_bytes(b"first")
     clear_artifact_status_cache()
-    loaded_metrics = iter(({"samples": 4}, {"samples": 9}))
-    load_latest = MagicMock(return_value=True)
-    fake_model = SimpleNamespace(
-        load_latest=load_latest, version="20261001_1200", metrics={"samples": 0}
-    )
-
-    def load_changed_metrics():
-        fake_model.metrics = next(loaded_metrics)
-        return True
-
-    load_latest.side_effect = load_changed_metrics
-    with patch("packages.ml.models.DemandModel", return_value=fake_model):
+    with patch("packages.ml.models.DemandModel", side_effect=AssertionError("Legacy loader")):
         first = _inspect_model_artifact("demand", tmp_path)
         second = _inspect_model_artifact("demand", tmp_path)
         os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
         third = _inspect_model_artifact("demand", tmp_path)
 
-    assert first["metrics"] == {"samples": 4}
-    assert second == first
-    assert third["metrics"] == {"samples": 9}
-    assert load_latest.call_count == 2
+    assert first == second == third
+    assert first["metrics"] is None
+    assert first["trained"] is False
+    assert first["control_ready"] is False
+    assert first["status"] == "unavailable"
 
 
-def test_model_status_cache_invalidates_when_an_artifact_is_added(tmp_path) -> None:
+def test_model_status_never_adopts_new_uncommitted_directory_files(tmp_path) -> None:
     from packages.ml.model_status import _inspect_model_artifact
 
     first_path = tmp_path / "demand_model_weather_v3_20261001_1200.pkl"
     first_path.write_bytes(b"first")
     clear_artifact_status_cache()
-    fake_model = SimpleNamespace(version="20261001_1200", metrics={"samples": 4})
-    fake_model.load_latest = MagicMock(return_value=True)
-
-    with patch("packages.ml.models.DemandModel", return_value=fake_model):
+    with patch("packages.ml.models.DemandModel", side_effect=AssertionError("Legacy loader")):
         first = _inspect_model_artifact("demand", tmp_path)
         (tmp_path / "demand_model_weather_v3_20261002_1200.pkl").write_bytes(b"second")
-        fake_model.metrics = {"samples": 9}
         second = _inspect_model_artifact("demand", tmp_path)
 
-    assert first["metrics"] == {"samples": 4}
-    assert second["metrics"] == {"samples": 9}
-    assert fake_model.load_latest.call_count == 2
+    assert first == second
+    assert first["trained"] is False
+    assert first["committed_hash"] is None
+    assert first["ordinary_writes_allowed"] is False
+
+
+@pytest.fixture
+def lifecycle_status_api(tmp_path, monkeypatch):
+    from packages.core.config import settings
+    from packages.ml.lifecycle import ArtifactReference, LifecycleSnapshot
+    from packages.ml.safe_persistence import publish_signed_artifact
+
+    now = dt.datetime.now(dt.timezone.utc)
+    monkeypatch.setattr(settings, "model_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "secret_key", "test-only-status-signing-key")
+    monkeypatch.setattr("packages.ml.safe_persistence._fsync_directory", lambda directory: None)
+    monkeypatch.setattr("packages.ml.models.MODEL_DIR", tmp_path)
+    manifest = {
+        "fit_id": "api-fit-1",
+        "data_cutoff": (now - dt.timedelta(days=15)).isoformat(),
+        "frozen_at": (now - dt.timedelta(days=15)).isoformat(),
+        "device_id": "device-a",
+        "horizons": [60],
+        "capabilities": ["space_heating_demand"],
+        "scope": {"policy": "native_unchanged_v1"},
+        "input_schema": "native_inputs_v1",
+        "output_schema": "demand_v1",
+        "runtime_versions": {"python": "3.11"},
+        "evidence_hashes": [],
+        "metrics": {"mae": 0.3, "samples": 23},
+    }
+    artifact = publish_signed_artifact(
+        {"weights": [2.0]},
+        component="demand",
+        schema_version="demand_lifecycle_v1",
+        manifest=manifest,
+    )
+    expiry = now + dt.timedelta(seconds=30)
+    reference = ArtifactReference(
+        artifact.artifact_hash,
+        "epoch-1",
+        "demand",
+        "demand_lifecycle_v1",
+        manifest,
+        "incumbent",
+        7,
+        now - dt.timedelta(hours=1),
+        expiry,
+        expiry - dt.timedelta(hours=72),
+        {"policy": "native_unchanged_v1"},
+    )
+    state = LifecycleSnapshot("epoch-1", 7, 5, False, None, None, (reference,))
+    reader = SimpleNamespace(
+        read=AsyncMock(return_value=state),
+        reporting_evidence=AsyncMock(
+            return_value={
+                "counts": {
+                    "pairs": 48,
+                    "device_day_clusters": 12,
+                    "issue_cohorts": 18,
+                    "horizons": {"60": 48},
+                    "outdoor_bins": {"0": 24, "2": 24},
+                },
+                "exclusions": {"unknown_execution": 3},
+                "pending_outcomes": 2,
+                "last_valid_outcome_at": (now - dt.timedelta(hours=1)).isoformat(),
+                "as_of": now.isoformat(),
+            }
+        ),
+    )
+    monkeypatch.setattr("packages.ml.model_status.Lifecycle", lambda: reader)
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_setting", AsyncMock(return_value="rules_only")
+    )
+    monkeypatch.setattr(
+        "packages.optimizer.main.get_optimizer_status_snapshot",
+        AsyncMock(return_value={"active_layer": "rules_v7"}),
+    )
+    monkeypatch.setattr(
+        "packages.api.routers.optimizer._learning_mode_status",
+        AsyncMock(return_value={"enabled": False}),
+    )
+    monkeypatch.setattr(
+        "packages.ml.seasonal_learning.get_seasonal_calibration_progress",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "observe_only_active": True,
+                "auto_exit": False,
+                "next_step": "await_prospective_reporting_qualification",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "packages.ml.models.DemandModel.training_data_quality",
+        AsyncMock(return_value={"usable_samples": 0}),
+    )
+    monkeypatch.setattr("packages.ml.thermal.thermal_model", _thermal_model())
+    rows = MagicMock()
+    rows.scalar.return_value = 42
+    session = SimpleNamespace(execute=AsyncMock(return_value=rows))
+    monkeypatch.setattr(
+        "packages.api.routers.optimizer.get_session", lambda: _session_context(session)
+    )
+    clear_artifact_status_cache()
+    return SimpleNamespace(state=state, reader=reader, artifact=artifact, now=now)
+
+
+@pytest.mark.parametrize(
+    "reporting_state",
+    ["unqualified", "candidate", "qualified-for-reporting", "expired", "unavailable"],
+)
+async def test_five_reporting_states_never_offer_control(
+    lifecycle_status_api, monkeypatch, reporting_state
+):
+    from dataclasses import replace
+
+    fixture = lifecycle_status_api
+    now = fixture.now
+    if reporting_state == "unqualified":
+        fixture.reader.read.return_value = replace(fixture.state, references=())
+    elif reporting_state == "candidate":
+        candidate = replace(
+            fixture.state.references[0],
+            role="candidate",
+            qualified_at=None,
+            qualification_expires_at=None,
+            last_valid_outcome_at=None,
+            qualification_scope={},
+        )
+        fixture.reader.read.return_value = replace(fixture.state, references=(candidate,))
+    elif reporting_state == "expired":
+        now += dt.timedelta(seconds=30)
+    elif reporting_state == "unavailable":
+        fixture.reader.read.side_effect = OSError("private unavailable dependency")
+    monkeypatch.setattr("packages.ml.model_status._now", lambda: now)
+    response = await get_optimizer_status()
+    status = response["model_lifecycle"]["demand"]
+    assert response["demand_model"]["status"] == reporting_state
+    assert {
+        "configured_layer",
+        "active_layer",
+        "fallback_layer",
+        "learning_mode",
+        "cop_model",
+        "demand_model",
+        "thermal_model",
+    } <= response.keys()
+    assert response["control_ready"] is response["ordinary_writes_allowed"] is False
+    assert response["optimization_requires_new_build"] is True
+    assert response["seasonal_calibration"]["observe_only_active"] is True
+    assert response["seasonal_calibration"]["auto_exit"] is False
+    assert all(
+        component["control_ready"] is component["ordinary_writes_allowed"] is False
+        for component in response["model_lifecycle"].values()
+    )
+    assert status["status"] == reporting_state
+    assert status["control_ready"] is status["ordinary_writes_allowed"] is False
+    assert status["control_readiness"] == {"ready": False, "reason": "observe_only_build"}
+    assert {
+        "missing_counts",
+        "missing_diversity",
+        "exclusion_counts",
+        "next_cadence_at",
+        "last_valid_outcome_at",
+        "next_decision_checkpoint",
+        "candidate_progress",
+    } <= status.keys()
+    if reporting_state in {"candidate", "qualified-for-reporting", "expired"}:
+        assert status["missing_counts"]["paired_outcomes"] == 12
+        assert status["missing_diversity"]["populated_outdoor_bins"] == 1
+        assert status["exclusion_counts"] == {"unknown_execution": 3}
+        assert status["next_decision_checkpoint"]["index"] == 0
+        assert status["next_decision_checkpoint"]["due"] is True
+        assert status["next_cadence_at"] is None
+        assert status["cadence_reason"] == "maintenance_disabled"
+    if reporting_state == "candidate":
+        assert status["incumbent_status"] == "unqualified"
+        assert status["candidate_progress"]["status"] == "candidate"
+        assert status["candidate_progress"]["control_ready"] is False
+    encoded = json.dumps(status).lower()
+    assert "resume automatic control" not in encoded
+    assert "approved for control" not in encoded
+    assert "private unavailable dependency" not in encoded
+
+
+async def test_reporting_evidence_is_a_single_read_only_scoped_snapshot(lifecycle_status_api):
+    from packages.ml.lifecycle import Lifecycle
+
+    session = AsyncMock()
+    session.execute.return_value = SimpleNamespace(
+        mappings=lambda: SimpleNamespace(
+            one=lambda: {
+                "pairs": 48,
+                "device_day_clusters": 12,
+                "issue_cohorts": 18,
+                "horizons": {"60": 48},
+                "outdoor_bins": {"0": 24, "2": 24},
+                "exclusions": {"unknown_execution": 3},
+                "pending_outcomes": 2,
+                "last_valid_outcome_at": lifecycle_status_api.now,
+            }
+        )
+    )
+    lifecycle = Lifecycle()
+    lifecycle._sessions = lambda: _session_context(session)
+    reference = lifecycle_status_api.state.references[0]
+    result = await lifecycle.reporting_evidence(reference, now=lifecycle_status_api.now)
+    assert result["counts"]["pairs"] == 48
+    assert result["exclusions"] == {"unknown_execution": 3}
+    assert result["pending_outcomes"] == 2
+    session.execute.assert_awaited_once()
+    statement = session.execute.await_args.args[0]
+    assert statement.is_select is True
+    sql = str(statement)
+    assert "UPDATE " not in sql and "INSERT " not in sql and "DELETE " not in sql
+    assert "LIMIT " not in sql
+    assert {"epoch-1", "device-a", "demand", reference.artifact_hash} <= set(
+        value for value in statement.compile().params.values() if isinstance(value, str)
+    )
+
+
+async def test_qualified_incumbent_and_candidate_progress_are_separate(
+    lifecycle_status_api, monkeypatch
+):
+    from dataclasses import replace
+    from packages.ml.lifecycle import ArtifactReference
+    from packages.ml.safe_persistence import publish_signed_artifact
+
+    fixture = lifecycle_status_api
+    manifest = {**fixture.state.references[0].manifest, "fit_id": "api-fit-2"}
+    artifact = publish_signed_artifact(
+        {"weights": [3.0]},
+        component="demand",
+        schema_version="demand_lifecycle_v1",
+        manifest=manifest,
+    )
+    candidate = ArtifactReference(
+        artifact.artifact_hash, "epoch-1", "demand", "demand_lifecycle_v1", manifest, "candidate", 8
+    )
+    fixture.reader.read.return_value = replace(
+        fixture.state,
+        references=(*fixture.state.references, candidate),
+        maintenance_enabled=True,
+        next_maintenance_at=fixture.now + dt.timedelta(hours=6),
+        last_demand_attempt_at=fixture.now - dt.timedelta(hours=1),
+        checkpoints={
+            f"decision:{candidate.artifact_hash}:0": {
+                "status": "evaluated",
+                "result": {"reason": "insufficient_evidence"},
+            }
+        },
+    )
+    monkeypatch.setattr("packages.ml.model_status._now", lambda: fixture.now)
+    response = await get_optimizer_status()
+    status = response["demand_model"]
+    assert status["status"] == status["incumbent_status"] == "qualified-for-reporting"
+    assert status["candidate_progress"]["status"] == "candidate"
+    assert status["candidate_progress"]["missing_counts"]["paired_outcomes"] == 12
+    assert status["candidate_progress"]["last_valid_outcome_at"] != status["last_valid_outcome_at"]
+    assert status["next_cadence_at"] == (fixture.now + dt.timedelta(hours=23)).isoformat()
+    assert status["next_decision_checkpoint"]["index"] == 1
+    assert status["next_decision_checkpoint"]["due"] is False
+    assert status["last_decision"]["reason"] == "insufficient_evidence"
+    assert response["seasonal_calibration"]["observe_only_active"] is True
+    assert response["seasonal_calibration"]["auto_exit"] is False
+    assert response["ordinary_writes_allowed"] is response["control_ready"] is False
+
+
+@pytest.mark.parametrize("reason", ["outcomes_expired", "incompatible_sensor_policy_scope"])
+async def test_invalidated_incumbent_retains_expired_reporting_history(
+    lifecycle_status_api, monkeypatch, reason
+):
+    from dataclasses import replace
+    from packages.ml.lifecycle import Lease, Lifecycle
+    from packages.ml.model_status import _inspect_model_artifact
+
+    fixture = lifecycle_status_api
+    now = fixture.now + dt.timedelta(hours=1)
+    monkeypatch.setattr("packages.ml.lifecycle._now", lambda: now)
+    monkeypatch.setattr("packages.ml.model_status._now", lambda: now)
+    session = AsyncMock()
+    session.execute.return_value.scalar_one = MagicMock(return_value=8)
+    lifecycle = Lifecycle()
+    lifecycle._sessions = lambda: _session_context(session)
+    lifecycle._lock = AsyncMock()
+    lifecycle._read = AsyncMock(return_value=fixture.state)
+    lease = Lease("epoch-1", "fixture-owner", 5, 7, now + dt.timedelta(hours=1))
+    reference = fixture.state.references[0]
+    with patch("packages.ml.safe_persistence._require_publication_owner") as require_owner:
+        await lifecycle.invalidate_component(lease, reference, reason)
+    require_owner.assert_called_once_with()
+    lifecycle._lock.assert_awaited_once_with(session, lease)
+    updates = session.execute.await_args_list[1].args[0].compile().params
+    assert updates["qualified_at"] == reference.qualified_at
+    assert updates["qualification_expires_at"] <= now
+    assert updates["last_valid_outcome_at"] == reference.last_valid_outcome_at
+    expired = replace(reference, qualification_expires_at=updates["qualification_expires_at"])
+    status = _inspect_model_artifact(
+        "demand", fixture.artifact.path.parent, replace(fixture.state, references=(expired,))
+    )
+    assert status["status"] == "expired"
+    assert status["control_ready"] is status["ordinary_writes_allowed"] is False
+
+
+@pytest.mark.parametrize("component", ["comfort", "thermal"])
+@pytest.mark.parametrize(
+    "reporting_state",
+    ["unqualified", "candidate", "qualified-for-reporting", "expired", "unavailable"],
+)
+async def test_model_status_routes_expose_reporting_only_lifecycle(
+    monkeypatch, component, reporting_state
+):
+    from packages.api.routers import models_router
+    from packages.ml.model_status import _empty_status
+
+    report = {**_empty_status("fixture"), "status": reporting_state}
+    read_report = AsyncMock(return_value=report)
+    monkeypatch.setattr("packages.ml.model_status.get_model_status", read_report)
+    monkeypatch.setattr("packages.ml.comfort_model.comfort_model.arefresh_if_changed", AsyncMock())
+    monkeypatch.setattr("packages.ml.thermal.thermal_model.load_latest", MagicMock())
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None))
+    )
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    result = await (
+        models_router.get_comfort_model_status()
+        if component == "comfort"
+        else models_router.get_thermal_status()
+    )
+    assert result["lifecycle"] == report
+    assert result["reporting_state"] == reporting_state
+    assert result["control_ready"] is result["ordinary_writes_allowed"] is False
+    assert result["control_readiness"] == {"ready": False, "reason": "observe_only_build"}
+    assert read_report.await_args is not None
+    assert read_report.await_args.args[0] == component
+
+
+@pytest.mark.parametrize("invalid_counts", [None, [], {"pairs": "unknown"}])
+async def test_invalid_reporting_counts_fail_unavailable(lifecycle_status_api, invalid_counts):
+    from packages.ml.model_status import get_model_status
+
+    lifecycle_status_api.reader.reporting_evidence.return_value = {"counts": invalid_counts}
+    status = await get_model_status("demand", lifecycle_status_api.artifact.path.parent)
+    assert status["status"] == "unavailable"
+    assert status["counts"] is status["missing_counts"] is None
+    assert status["control_ready"] is status["ordinary_writes_allowed"] is False
+
+
+async def test_qualification_success_reports_readiness_without_exiting_observation(
+    lifecycle_status_api, monkeypatch
+):
+    from packages.ml.model_status import _empty_status
+
+    reports = {
+        component: {**_empty_status("fixture"), "status": "qualified-for-reporting"}
+        for component in ("demand", "comfort", "thermal")
+    }
+    monkeypatch.setattr(
+        "packages.ml.model_status.get_model_reporting_statuses", AsyncMock(return_value=reports)
+    )
+    learning = {"enabled": True, "effective_active": True, "sources": ["manual", "seasonal"]}
+    monkeypatch.setattr(
+        "packages.api.routers.optimizer._learning_mode_status", AsyncMock(return_value=learning)
+    )
+    with (
+        patch("packages.core.settings_service.set_setting", new=AsyncMock()) as single_write,
+        patch("packages.core.settings_service.set_settings_bulk", new=AsyncMock()) as bulk_write,
+    ):
+        response = await get_optimizer_status()
+    assert response["seasonal_calibration"]["reporting_ready"] is True
+    assert response["seasonal_calibration"]["next_step"] == "ready_for_reporting"
+    assert response["seasonal_calibration"]["enabled"] is True
+    assert response["seasonal_calibration"]["observe_only_active"] is True
+    assert response["seasonal_calibration"]["auto_exit"] is False
+    assert response["learning_mode"] == learning
+    assert response["control_ready"] is response["ordinary_writes_allowed"] is False
+    single_write.assert_not_awaited()
+    bulk_write.assert_not_awaited()
+
+
+async def test_cache_expiry_refuses_stale_state(lifecycle_status_api, monkeypatch):
+    monkeypatch.setattr("packages.ml.model_status._now", lambda: lifecycle_status_api.now)
+    first = await get_optimizer_status()
+    assert first["demand_model"]["status"] == "qualified-for-reporting"
+    assert first["demand_model"]["committed_hash"] == lifecycle_status_api.artifact.artifact_hash
+    monkeypatch.setattr(
+        "packages.ml.model_status._now", lambda: lifecycle_status_api.now + dt.timedelta(seconds=30)
+    )
+    expired = await get_optimizer_status()
+    assert expired["demand_model"]["status"] == "expired"
+    assert expired["demand_model"]["control_ready"] is False
+    assert expired["ordinary_writes_allowed"] is False
+    assert expired["cop_model"] == _RETIRED_COP_STATUS
+    assert lifecycle_status_api.reader.read.await_count == 2
+
+
+async def test_uncommitted_artifact_is_never_loaded(lifecycle_status_api):
+    from dataclasses import replace
+
+    lifecycle_status_api.reader.read.return_value = replace(
+        lifecycle_status_api.state, references=()
+    )
+    with patch(
+        "packages.ml.safe_persistence.pickle.loads", side_effect=AssertionError("Uncommitted load")
+    ):
+        response = await get_optimizer_status()
+    assert response["demand_model"]["trained"] is False
+    assert response["demand_model"]["committed_hash"] is None
+    assert response["control_ready"] is False
+    assert lifecycle_status_api.artifact.path.exists()
+
+
+@pytest.mark.parametrize("tampering", ["hash", "hmac", "schema", "db"])
+async def test_hash_hmac_schema_tampering_refuses_load(
+    lifecycle_status_api, monkeypatch, tampering
+):
+    from dataclasses import replace
+    from packages.core.config import settings
+
+    first = await get_optimizer_status()
+    assert first["demand_model"]["trained"] is True
+    if tampering == "hash":
+        lifecycle_status_api.artifact.path.write_bytes(b"tampered")
+    elif tampering == "hmac":
+        monkeypatch.setattr(settings, "secret_key", "different-test-signing-key")
+    elif tampering == "schema":
+        reference = replace(lifecycle_status_api.state.references[0], schema_version="legacy")
+        lifecycle_status_api.reader.read.return_value = replace(
+            lifecycle_status_api.state, references=(reference,)
+        )
+    else:
+        lifecycle_status_api.reader.read.side_effect = OSError("private DB failure")
+    with patch(
+        "packages.ml.safe_persistence.pickle.loads", side_effect=AssertionError("Untrusted load")
+    ):
+        response = await get_optimizer_status()
+    assert response["demand_model"]["status"] == "unavailable"
+    assert response["demand_model"]["trained"] is False
+    assert response["demand_model"]["control_ready"] is False
+    assert response["ordinary_writes_allowed"] is False
+    assert response["cop_model"] == _RETIRED_COP_STATUS
+    assert "private" not in json.dumps(response)
 
 
 @pytest.mark.asyncio

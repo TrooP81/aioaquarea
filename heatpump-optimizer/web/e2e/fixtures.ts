@@ -1,4 +1,5 @@
 import { expect, test as base, type Page } from "@playwright/test";
+import type { ControlState, ModelLifecycleStatus, ModelReportingProgress, ModelReportingState } from "../lib/api-types";
 
 const jsonResponse = (body: unknown) => ({
     status: 200,
@@ -17,6 +18,44 @@ export const retiredCopModel = {
     unavailable_reason: "retired",
     reason: "unverified_thermal_output",
 };
+
+export function modelLifecycleStatus(state: ModelReportingState = "unqualified"): ModelLifecycleStatus {
+    const available = state !== "unavailable";
+    const hasFit = available && state !== "unqualified";
+    const counts: NonNullable<ModelLifecycleStatus["counts"]> = hasFit ? {
+        pairs: 48, device_day_clusters: 12, issue_cohorts: 18,
+        horizons: { "60": 48 }, outdoor_bins: { "0": 24, "2": 24 },
+    } : { pairs: 0, device_day_clusters: 0, issue_cohorts: 0, horizons: {}, outdoor_bins: {} };
+    const progress: ModelReportingProgress = {
+        maintenance_enabled: false, cadence_hours: 6, cadence_reason: "maintenance_disabled",
+        next_cadence_at: null, evidence_for: hasFit ? state === "candidate" ? "candidate" : "incumbent" : null,
+        evidence_as_of: available ? "2026-10-09T12:00:00Z" : null,
+        counts: available ? counts : null,
+        missing_counts: available ? {
+            paired_outcomes: 60 - counts.pairs, device_day_clusters: 14 - counts.device_day_clusters,
+            issue_cohorts: 20 - counts.issue_cohorts, elapsed_days: hasFit ? 0 : null,
+        } : null,
+        missing_diversity: available ? {
+            populated_outdoor_bins: hasFit ? 1 : 3,
+            pairs_per_horizon: hasFit ? { "60": 0 } : {}, pairs_per_outdoor_bin: {},
+        } : null,
+        exclusion_counts: hasFit ? { unknown_execution: 3 } : {},
+        pending_outcomes: available ? 2 : null,
+        next_decision_checkpoint: hasFit ? {
+            index: 0, at: "2026-10-10T12:00:00Z", due: false, policy: "prospective_native_fixed_daily_v1",
+        } : null,
+    };
+    return {
+        ...progress, status: state,
+        incumbent_status: state === "candidate" ? "unqualified" : state,
+        candidate_status: state === "candidate" ? "candidate" : null,
+        candidate_progress: state === "candidate" ? { ...progress, status: "candidate", control_ready: false } : null,
+        last_valid_outcome_at: hasFit ? "2026-10-09T11:00:00Z" : null,
+        qualification_expires_at: state === "qualified-for-reporting" || state === "expired" ? "2026-10-12T11:00:00Z" : null,
+        control_ready: false, ordinary_writes_allowed: false,
+        control_readiness: { ready: false, reason: "observe_only_build" },
+    };
+}
 
 export const demandDataQuality = {
     raw_records: 0,
@@ -67,9 +106,15 @@ export function manualCOPObservation(periodDate = "2026-10-04", value = 9.7, rev
 
 const optimizerStatus = {
     configured_layer: "rules_only",
+    build_policy: "observe_only",
+    ordinary_writes_allowed: false,
+    control_ready: false,
     active_layer: "rules_v7",
     fallback_layer: "rules_v7",
     last_plan: null,
+    model_lifecycle: {
+        demand: modelLifecycleStatus(), comfort: modelLifecycleStatus(), thermal: modelLifecycleStatus(),
+    },
     cop_model: retiredCopModel,
     demand_model: { trained: false, last_trained: null, data_quality: demandDataQuality },
     thermal_model: {
@@ -82,16 +127,20 @@ const optimizerStatus = {
     },
 };
 
-const controlState = {
-    state: "automatic",
-    headline: "Scheduled control remains active",
-    detail: "Automatic dispatch remains active.",
-    reason_code: "automatic",
+export const controlState: ControlState = {
+    state: "observing",
+    headline: "Observe-only build",
+    detail: "Ordinary writes are prohibited in this build. Optimization requires a new reviewed, approved build; only existing linked restores may run outside positive observation.",
+    reason_code: "observe_only_build",
+    build_policy: "observe_only",
+    control_ready: false,
+    ordinary_writes_allowed: false,
+    optimization_requires_new_build: true,
     since: null,
     until: null,
     override_id: null,
     active_override_count: 0,
-    primary_action: null,
+    primary_action: { kind: "link", label: "View plan", href: "/?view=timeline" },
     notices: [],
     resolved_at: "2026-01-01T00:00:00+00:00",
 };

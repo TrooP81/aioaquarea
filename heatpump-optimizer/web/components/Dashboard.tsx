@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import { useCurrency, formatPricePerKwh, formatCostInCurrency } from "./useCurrency";
 import { DataAge } from "./DataAge";
 import { Banner } from "./Banner";
-import { LAYER_LABELS, LAYER_TOOLTIPS, outdoorFallbackReasonLabel, gateStateLabel } from "@/lib/constants";
+import { LAYER_LABELS, LAYER_TOOLTIPS, MODEL_REPORTING_LABELS, outdoorFallbackReasonLabel, gateStateLabel } from "@/lib/constants";
+import type { ModelComponent, ModelReportingState } from "@/lib/api-types";
 
 interface DashboardProps {
   data: {
@@ -48,8 +49,7 @@ interface DashboardProps {
 
 interface OptimizerBrief {
   active_layer: string;
-  demand_trained: boolean;
-  thermal_calibrated: boolean;
+  model_states: Record<ModelComponent, ModelReportingState>;
   planningData: { control_allowed: boolean; reasons: string[] } | null;
 }
 
@@ -113,8 +113,11 @@ export function Dashboard({ data }: DashboardProps) {
         if (!d) return;
         setOptBrief({
           active_layer: d.active_layer,
-          demand_trained: d.demand_model?.trained ?? false,
-          thermal_calibrated: d.thermal_model?.calibrated ?? false,
+          model_states: {
+            demand: d.model_lifecycle?.demand?.status ?? "unavailable",
+            comfort: d.model_lifecycle?.comfort?.status ?? "unavailable",
+            thermal: d.model_lifecycle?.thermal?.status ?? "unavailable",
+          },
           planningData: d.planning_data_quality ?? null,
         });
       })
@@ -270,10 +273,12 @@ export function Dashboard({ data }: DashboardProps) {
                 <button className="btn btn-sm" onClick={loadOptimizerBrief}>Retry</button>
               ) : optBrief ? (
                 <span className="ml-status-dots">
-                  <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} aria-label={`Demand heating model ${optBrief.demand_trained ? "ready" : "not ready"}`} title="Demand (electrical heating) model" />
-                  <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} aria-label={`Thermal heat-up model ${optBrief.thermal_calibrated ? "ready" : "not ready"}`} title="Thermal (heat-up rate) model" />
+                  {Object.entries(optBrief.model_states).map(([component, state]) => (
+                    <span key={component} className={`status-dot ${state === "qualified-for-reporting" ? "status-dot--ok" : state === "candidate" ? "status-dot--observing" : ""}`} aria-label={`${component === "demand" ? "Demand heating model" : component === "thermal" ? "Thermal heat-up model" : "Comfort forecast model"} ${MODEL_REPORTING_LABELS[state] ?? "Unavailable"}; reporting only`} title={`${component}: ${MODEL_REPORTING_LABELS[state] ?? "Unavailable"}`} />
+                  ))}
                   <span className="ml-status-label">
-                    {[optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/2 learning models ready
+                    {Object.values(optBrief.model_states).filter((state) => state === "qualified-for-reporting").length}/3 qualified for reporting
+                    {Object.values(optBrief.model_states).includes("unavailable") && "; some states unavailable"}
                   </span>
                 </span>
               ) : "No optimizer status is available yet."}

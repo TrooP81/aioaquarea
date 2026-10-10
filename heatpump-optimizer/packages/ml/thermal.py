@@ -17,26 +17,68 @@ Phase 3 improvements:
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
+from bisect import bisect_right
 import math
-from dataclasses import asdict, dataclass, field, fields
-from typing import Optional
+import time
+from dataclasses import asdict, dataclass, field, fields, replace
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import structlog
 from sqlalchemy import select
 
 from packages.core.database import get_session
-from packages.core.heating_evidence import has_confirmed_space_heating
-from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+from packages.core.heating_evidence import classify_space_heating
+from packages.core.models import (
+    DeviceStatusRecord,
+    IndoorTempReading,
+    SettingRecord,
+    WeatherRecord,
+)
 from packages.ml.models_common import MODEL_DIR
+
+if TYPE_CHECKING:
+    from packages.ml.lifecycle import Lifecycle
 
 logger = structlog.get_logger(__name__)
 
 # A successful tank calibration is not evidence that the separate indoor-air
 # fallback has been learned. Keep confidence tied to each sub-model's samples.
-MIN_LEARNED_RATE_SAMPLES = 5
+MIN_LEARNED_RATE_SAMPLES = 20
 THERMAL_MODEL_ARTIFACT = "thermal_params_v1.pkl"
-THERMAL_MODEL_SCHEMA_VERSION = 3
+THERMAL_MODEL_SCHEMA_VERSION = 5
+THERMAL_LABEL_EMBARGO = dt.timedelta(hours=6)
+RATE_VALIDATION_HOLDOUT_FRACTION = 0.3
+RATE_MIN_HOLDOUT_SAMPLES = 3
+RATE_MIN_RELATIVE_SKILL = 0.05
+RATE_MIN_OUTDOOR_SPAN_FOR_SLOPE_C = 15.0
+RATE_OUTDOOR_EXTRAPOLATION_MARGIN_C = 3.0
+SEGMENT_MAX_GAP_S = 1200
+HEATING_SEGMENT_HOURS = (0.25, 3.0)
+STANDBY_SEGMENT_HOURS = (0.5, 6.0)
+INDOOR_HEATING_RATE_MIN_C_PER_H = 0.1
+INDOOR_HEATING_RATE_MAX_C_PER_H = 3.0
+INDOOR_COOLING_RATE_MIN_C_PER_H = -1.0
+
+# component -> (base parameter, outdoor-factor parameter, runtime rate method)
+_RATE_COMPONENTS = {
+    "tank_heating": ("tank_heating_rate", "tank_heating_outdoor_factor", "_tank_heating_rate"),
+    "tank_cooling": ("tank_standby_loss", "tank_loss_outdoor_factor", "_tank_loss_rate"),
+    "zone_heating": ("zone_heating_rate", "zone_heating_outdoor_factor", "_zone_heating_rate"),
+    "zone_cooling": ("zone_standby_loss", "zone_loss_outdoor_factor", "_zone_loss_rate"),
+    "indoor_heating": (
+        "indoor_heating_rate",
+        "indoor_heating_outdoor_factor",
+        "_indoor_heating_rate",
+    ),
+    "indoor_cooling": (
+        "indoor_cooling_rate",
+        "indoor_cooling_outdoor_factor",
+        "_indoor_cooling_rate",
+    ),
+}
 
 
 def assumed_heating_efficiency(outdoor_temp: float) -> float:
@@ -58,6 +100,7 @@ class ThermalParams:
     tank_loss_outdoor_factor: float = 0.01  # reduced loss per °C warmer outdoor
     # Zone heating rate: °C/hour
     zone_heating_rate: float = 1.5
+    zone_heating_outdoor_factor: float = 0.03
     # Zone cooling rate (standby): °C/hour
     zone_standby_loss: float = -0.3
     # Zone loss sensitivity to outdoor temp
@@ -83,6 +126,8 @@ class ThermalParams:
     # Per-component validation result from the latest calibration. Persisted so
     # the API process can explain a rejected candidate calibrated by optimizer.
     calibration_status: dict[str, str] = field(default_factory=dict)
+    # Outdoor range (°C) each validated rate was observed in; defaults apply outside it.
+    rate_outdoor_ranges: dict[str, list[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,55 +179,183 @@ class ThermalModel:
 
     def __init__(self):
         self.params = ThermalParams()
+        self.validation: dict[str, dict] = {}
+        self._qualified_reference = None
+        self._committed_checked_at: float | None = None
+        self._committed_refresh_lock = asyncio.Lock()
 
     def reset(self) -> None:
         """Discard learned calibration and return to default thermal parameters."""
         self.params = ThermalParams()
-
-    def _sanitize_zone_cooling_params(self) -> None:
-        """Reset impossible persisted zone-loss values before they reach control."""
-        if not (-3.0 <= self.params.zone_standby_loss <= 0.0):
-            self.params.zone_standby_loss = ThermalParams().zone_standby_loss
-            self.params.calibration_status["zone_cooling"] = (
-                "rejected_previous_base_outside_safe_range"
-            )
-        if abs(self.params.zone_loss_outdoor_factor) > 0.2:
-            self.params.zone_loss_outdoor_factor = ThermalParams().zone_loss_outdoor_factor
-            self.params.calibration_status["zone_cooling"] = (
-                "rejected_previous_slope_outside_safe_range"
-            )
+        self.validation = {}
+        self._qualified_reference = None
+        self._committed_checked_at = None
 
     @staticmethod
-    def _robust_zone_cooling_fit(
-        samples: list[tuple[float, float]],
-    ) -> tuple[float, float] | None:
-        """Fit zone standby loss only when its raw parameters are plausible.
-
-        The old direct regression could extrapolate a sparse warm-weather
-        sample into a very large negative intercept (for example -49°C/h at
-        0°C). Runtime clamping hid that value but forecasts still became
-        pessimistic. Trim MAD outliers and reject, rather than clamp, an
-        implausible candidate so the last validated/default parameters remain.
-        """
-        deltas = np.array([sample[0] for sample in samples], dtype=float)
+    def _fit_rate(samples: list[tuple[float, float, float]]) -> tuple[float, float]:
+        """MAD-trimmed rate fit; an outdoor slope only when outdoor temperatures vary widely."""
+        rates = np.array([sample[0] for sample in samples], dtype=float)
         outdoors = np.array([sample[1] for sample in samples], dtype=float)
-        median = float(np.median(deltas))
-        mad = float(np.median(np.abs(deltas - median)))
-        spread = max(0.1, mad * 1.4826)
-        keep = np.abs(deltas - median) <= 3.0 * spread
-        deltas = deltas[keep]
-        outdoors = outdoors[keep]
-        if len(deltas) < MIN_LEARNED_RATE_SAMPLES:
-            return None
+        median = float(np.median(rates))
+        spread = max(0.1, float(np.median(np.abs(rates - median))) * 1.4826)
+        keep = np.abs(rates - median) <= 3.0 * spread
+        rates, outdoors = rates[keep], outdoors[keep]
+        if np.ptp(outdoors) >= RATE_MIN_OUTDOOR_SPAN_FOR_SLOPE_C:
+            factor, base = np.polyfit(outdoors, rates, 1)
+            return float(base), float(factor)
+        return float(np.mean(rates)), 0.0
 
-        if np.std(outdoors) > 0.1:
-            slope, base = np.polyfit(outdoors, deltas, 1)
+    def _validate_rate_component(
+        self, component: str, samples: list[tuple[float, float, float]]
+    ) -> None:
+        """Adopt a fitted rate only if it beats both persistence and the default on later data.
+
+        Samples are chronological ``(rate_c_per_h, outdoor_c, hours)``. The candidate is
+        fitted on the earliest 70% and scored on the rest through the same clamped runtime
+        rate used for control; otherwise the safe default is kept.
+        """
+        base_name, factor_name, runtime = _RATE_COMPONENTS[component]
+        defaults = ThermalParams()
+        setattr(self.params, base_name, getattr(defaults, base_name))
+        setattr(self.params, factor_name, getattr(defaults, factor_name))
+        self.params.rate_outdoor_ranges.pop(component, None)
+        split = int(len(samples) * (1.0 - RATE_VALIDATION_HOLDOUT_FRACTION))
+        train, holdout = samples[:split], samples[split:]
+        if holdout and len(holdout[0]) == 5:
+            embargo_cutoff = holdout[0][3] - THERMAL_LABEL_EMBARGO
+            train = [sample for sample in train if sample[4] <= embargo_cutoff]
+        if len(train) < MIN_LEARNED_RATE_SAMPLES or len(holdout) < RATE_MIN_HOLDOUT_SAMPLES:
+            self.params.calibration_status[component] = "insufficient_samples"
+            self.validation[component] = {
+                "samples": len(samples),
+                "train_samples": len(train),
+                "holdout_samples": len(holdout),
+                "minimum_fit_segments": MIN_LEARNED_RATE_SAMPLES,
+            }
+            return
+
+        def holdout_mae(params: ThermalParams) -> float:
+            probe = ThermalModel()
+            probe.params = params
+            rate = getattr(probe, runtime)
+            return float(
+                np.mean(
+                    [
+                        abs(rate(outdoor) * hours - actual * hours)
+                        for actual, outdoor, hours in (sample[:3] for sample in holdout)
+                    ]
+                )
+            )
+
+        base, factor = self._fit_rate(train)
+        outdoors = [sample[1] for sample in train]
+        evaluated_params = replace(
+            defaults,
+            **{base_name: base, factor_name: factor},
+            rate_outdoor_ranges={component: [min(outdoors), max(outdoors)]},
+        )
+        candidate_mae = holdout_mae(evaluated_params)
+        default_mae = holdout_mae(defaults)
+        persistence_mae = float(np.mean([abs(sample[0] * sample[2]) for sample in holdout]))
+        self.validation[component] = {
+            "train_samples": len(train),
+            "holdout_samples": len(holdout),
+            "candidate_mae_c": round(candidate_mae, 4),
+            "default_mae_c": round(default_mae, 4),
+            "persistence_mae_c": round(persistence_mae, 4),
+            "evaluated_parameters": [base, factor],
+            "embargo_hours": THERMAL_LABEL_EMBARGO.total_seconds() / 3600,
+            "holdout_features": [[sample[1], sample[2]] for sample in holdout],
+            "holdout_targets": [sample[0] * sample[2] for sample in holdout],
+            "fit_label_end": train[-1][4].isoformat() if len(train[-1]) == 5 else None,
+            "holdout_issue_start": holdout[0][3].isoformat() if len(holdout[0]) == 5 else None,
+        }
+        probe = ThermalModel()
+        probe.params = evaluated_params
+        self.validation[component]["holdout_predictions"] = [
+            getattr(probe, runtime)(sample[1]) * sample[2] for sample in holdout
+        ]
+        if candidate_mae < min(default_mae, persistence_mae) * (1.0 - RATE_MIN_RELATIVE_SKILL):
+            setattr(self.params, base_name, base)
+            setattr(self.params, factor_name, factor)
+            self.params.rate_outdoor_ranges[component] = [min(outdoors), max(outdoors)]
+            self.params.calibration_status[component] = "validated"
         else:
-            slope, base = 0.0, float(np.mean(deltas))
+            self.params.calibration_status[component] = "rejected_no_skill_over_baseline"
 
-        if not (-3.0 <= base <= 0.0) or abs(slope) > 0.2:
-            return None
-        return float(base), float(slope)
+    @staticmethod
+    def _dhw_heating_active(record) -> bool:
+        action = getattr(record, "device_action", None)
+        if isinstance(action, str):
+            return action == "HEATING_WATER"
+        return getattr(record, "direction", None) == "WATER"
+
+    @staticmethod
+    def _zone_heating_active(record) -> bool:
+        action = getattr(record, "device_action", None)
+        if isinstance(action, str):
+            return action == "HEATING"
+        return getattr(record, "direction", None) == "PUMP"
+
+    @staticmethod
+    def _rate_segments(records, field_name: str, active, heating: bool, outdoor_at) -> list:
+        """Whole heating or standby runs as ``(rate, outdoor, hours)`` samples.
+
+        Rates over a complete run average out whole-degree sensor quantisation and do not
+        depend on the sign of the change, unlike consecutive-step deltas.  A heating run is
+        measured to its peak because the controller stops at the target.
+        """
+        low, high = HEATING_SEGMENT_HOURS if heating else STANDBY_SEGMENT_HOURS
+        segments: list[tuple[float, float, float]] = []
+
+        def flush(run: list) -> None:
+            if len(run) < 2:
+                return
+            hours = (run[-1].ts - run[0].ts).total_seconds() / 3600.0
+            if not low <= hours <= high:
+                return
+            start = float(getattr(run[0], field_name))
+            if heating:
+                peak = max(run, key=lambda record: float(getattr(record, field_name)))
+                rise_hours = (peak.ts - run[0].ts).total_seconds() / 3600.0
+                if rise_hours >= low:
+                    hours = rise_hours
+                    rate = (float(getattr(peak, field_name)) - start) / hours
+                else:
+                    rate = 0.0
+            else:
+                rate = (float(getattr(run[-1], field_name)) - start) / hours
+            fallback = run[0].outdoor_temp if run[0].outdoor_temp is not None else 10.0
+            segments.append(
+                (rate, float(outdoor_at(run[0].ts, fallback)), hours, run[0].ts, run[-1].ts)
+            )
+
+        run: list = []
+        for record in records:
+            value = getattr(record, field_name, None)
+            usable = (
+                value is not None
+                and value > 0
+                and not getattr(record, "defrost_active", None)
+                and active(record) == heating
+            )
+            device_id = getattr(record, "device_id", None)
+            previous_device = getattr(run[-1], "device_id", None) if run else None
+            if run and (
+                not usable
+                or (record.ts - run[-1].ts).total_seconds() > SEGMENT_MAX_GAP_S
+                or (
+                    isinstance(device_id, str)
+                    and isinstance(previous_device, str)
+                    and device_id != previous_device
+                )
+            ):
+                flush(run)
+                run = []
+            if usable:
+                run.append(record)
+        flush(run)
+        return segments
 
     @staticmethod
     def _artifact_path():
@@ -196,73 +369,118 @@ class ThermalModel:
             {
                 "schema_version": THERMAL_MODEL_SCHEMA_VERSION,
                 "params": asdict(self.params),
+                "validation": self.validation,
             },
             self._artifact_path(),
         )
 
-    def load_latest(self) -> bool:
-        """Load the shared calibrated parameters, returning whether one was valid."""
-        from packages.ml.safe_persistence import safe_load
+    @staticmethod
+    def _decode_params(params: object) -> ThermalParams:
+        if not isinstance(params, dict):
+            raise ValueError("missing thermal parameter payload")
+        allowed = {field.name for field in fields(ThermalParams)}
+        values = {key: value for key, value in params.items() if key in allowed}
+        calibrated = values.get("last_calibrated")
+        if isinstance(calibrated, str):
+            calibrated_at = dt.datetime.fromisoformat(calibrated)
+            values["last_calibrated"] = (
+                calibrated_at.replace(tzinfo=dt.timezone.utc)
+                if calibrated_at.tzinfo is None
+                else calibrated_at
+            )
+        elif calibrated is not None and not isinstance(calibrated, dt.datetime):
+            raise ValueError("invalid thermal calibration timestamp")
+        return ThermalParams(**values)
 
-        path = self._artifact_path()
-        if not path.exists():
-            return False
-        try:
-            payload = safe_load(path)
-            if (
-                not isinstance(payload, dict)
-                or payload.get("schema_version") != THERMAL_MODEL_SCHEMA_VERSION
-            ):
-                raise ValueError("obsolete thermal outdoor-temperature schema")
-            params = payload.get("params") if isinstance(payload, dict) else None
-            if not isinstance(params, dict):
-                raise ValueError("missing thermal parameter payload")
-
-            allowed = {field.name for field in fields(ThermalParams)}
-            values = {key: value for key, value in params.items() if key in allowed}
-            calibrated = values.get("last_calibrated")
-            if isinstance(calibrated, str):
-                calibrated_at = dt.datetime.fromisoformat(calibrated)
-                values["last_calibrated"] = (
-                    calibrated_at.replace(tzinfo=dt.timezone.utc)
-                    if calibrated_at.tzinfo is None
-                    else calibrated_at
-                )
-            elif calibrated is not None and not isinstance(calibrated, dt.datetime):
-                raise ValueError("invalid thermal calibration timestamp")
-
-            loaded = ThermalParams(**values)
-        except (OSError, TypeError, ValueError) as exc:
-            logger.warning("thermal_model_load_failed", path=str(path), error=str(exc))
-            return False
-
-        if (
-            self.params.last_calibrated is not None
-            and loaded.last_calibrated is not None
-            and self.params.last_calibrated >= loaded.last_calibrated
-        ):
-            return True
-        self.params = loaded
-        logger.info(
-            "thermal_model_loaded",
-            path=str(path),
-            last_calibrated=loaded.last_calibrated.isoformat() if loaded.last_calibrated else None,
+    async def arefresh_committed(
+        self, *, lifecycle: "Lifecycle | None" = None, scope: dict | None = None
+    ) -> bool:
+        """Read lifecycle authority only; unavailable authority means default rates."""
+        from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+        from packages.ml.forecast_quality import (
+            check_exact_fit,
+            materialize_native_inputs,
+            native_scope,
         )
+
+        lifecycle = lifecycle if lifecycle is not None else Lifecycle()
+        try:
+            reference = (await lifecycle.read()).reference("thermal")
+            if not reference_is_qualified(reference):
+                raise ValueError("thermal_not_qualified")
+            if scope is None:
+                inputs = await materialize_native_inputs(
+                    "thermal",
+                    now=dt.datetime.now(dt.timezone.utc),
+                    device_id=reference.manifest["device_id"],
+                    capabilities=tuple(reference.manifest["capabilities"]),
+                )
+                if inputs is None:
+                    raise ValueError("current_thermal_scope_unavailable")
+                scope = native_scope(inputs)
+            if not reference_is_qualified(reference, scope=scope):
+                raise ValueError("thermal_scope_mismatch")
+            payload = await lifecycle.load_committed(
+                "thermal", expected_hash=reference.artifact_hash
+            )
+            if not isinstance(payload, dict) or payload.get("schema_version") != 5:
+                raise ValueError("invalid committed thermal schema")
+            await asyncio.to_thread(check_exact_fit, "thermal", payload)
+            if (await lifecycle.read()).reference("thermal") != reference:
+                raise ValueError("thermal_authority_changed")
+            loaded = self._decode_params(payload.get("params"))
+            defaults = ThermalParams()
+            for component, (base_key, factor_key, _) in _RATE_COMPONENTS.items():
+                if (
+                    loaded.last_calibrated is None
+                    or loaded.calibration_status.get(component) != "validated"
+                    or component not in reference.qualification_scope["capabilities"]
+                ):
+                    setattr(loaded, base_key, getattr(defaults, base_key))
+                    setattr(loaded, factor_key, getattr(defaults, factor_key))
+        except Exception as error:
+            self.reset()
+            logger.warning("thermal_committed_unavailable", error_type=type(error).__name__)
+            return False
+        self.params = loaded
+        self.validation = {}
+        self._qualified_reference = reference
+        return True
+
+    async def arefresh_if_changed(self, *, force: bool = False) -> bool:
+        async with self._committed_refresh_lock:
+            checked = self._committed_checked_at
+            if not force and checked is not None and 0 <= time.monotonic() - checked < 60:
+                available = self.load_latest()
+                self._committed_checked_at = checked
+                return available
+            available = await self.arefresh_committed()
+            self._committed_checked_at = time.monotonic()
+            return available
+
+    def load_latest(self) -> bool:
+        from packages.ml.lifecycle import reference_is_qualified
+
+        if not reference_is_qualified(self._qualified_reference):
+            self.reset()
+            return False
         return True
 
     def confidence_for(self, component: str) -> str:
         """Return evidence-based confidence for one thermal sub-model."""
+        from packages.ml.lifecycle import reference_is_qualified
+
+        reference = self._qualified_reference
+        if (
+            not reference_is_qualified(reference)
+            or component not in reference.manifest.get("capabilities", ())
+            or component not in (reference.qualification_scope or {}).get("capabilities", ())
+        ):
+            return "default"
         if self.params.last_calibrated is None:
             return "default"
-        samples = {
-            "tank_heating": self.params.dhw_heating_samples,
-            "zone_heating": self.params.zone_compressor_samples,
-            "indoor_heating": self.params.indoor_heating_samples,
-            "indoor_cooling": self.params.indoor_cooling_samples,
-        }.get(component)
-        if samples is None:
-            return "learned"
-        return "learned" if samples >= MIN_LEARNED_RATE_SAMPLES else "default"
+        validated = self.params.calibration_status.get(component) == "validated"
+        return "learned" if validated else "default"
 
     @staticmethod
     def _nearest_prior_index_in_gap(
@@ -314,6 +532,9 @@ class ThermalModel:
             weather_rows = weather_result.scalars().all()
 
         if len(records) < self.params.min_samples:
+            minimum = self.params.min_samples
+            self.reset()
+            self.params.min_samples = minimum
             logger.warning(
                 f"Insufficient data for calibration: {len(records)} records "
                 f"(need {self.params.min_samples})"
@@ -324,21 +545,6 @@ class ThermalModel:
                 "min_required": self.params.min_samples,
             }
 
-        # Compute deltas between consecutive records
-        tank_heating_deltas = []  # (delta_deg_per_hour, outdoor_temp)
-        tank_cooling_deltas = []
-        zone_heating_deltas = []
-        zone_cooling_deltas = []
-        defrost_filtered = 0
-
-        # Pair each record with the closest earlier sample at least 10 minutes
-        # away to avoid amplifying sensor noise into extreme hourly rates.
-        # amplifying short-interval temperature noise into extreme hourly
-        # rates (e.g. 1°C / 5 min → 12°C/h when it's really ~2°C/h).
-        MIN_GAP_S_DEVICE = 600  # 10 min
-        MAX_GAP_S_DEVICE = 7200  # 2 h
-
-        record_times = np.array([r.ts.timestamp() for r in records])
         weather_by_hour = {
             row.ts.replace(minute=0, second=0, microsecond=0): float(row.temperature)
             for row in weather_rows
@@ -354,133 +560,28 @@ class ThermalModel:
             available = [(gap, value) for gap, value in candidates if value is not None]
             return min(available, key=lambda item: item[0])[1] if available else fallback
 
-        for i in range(1, len(records)):
-            curr = records[i]
-
-            prev_index = self._nearest_prior_index_in_gap(
-                record_times, i, MIN_GAP_S_DEVICE, MAX_GAP_S_DEVICE
+        defrost_filtered = sum(1 for record in records if getattr(record, "defrost_active", None))
+        segments = {
+            "tank_heating": (self._dhw_heating_active, "tank_temp", True),
+            "tank_cooling": (self._dhw_heating_active, "tank_temp", False),
+            "zone_heating": (self._zone_heating_active, "zone1_temp", True),
+            "zone_cooling": (self._zone_heating_active, "zone1_temp", False),
+        }
+        samples = {
+            component: self._rate_segments(
+                records, field_name, active, heating, weather_temperature_at
             )
-            if prev_index is None:
-                continue
-            prev = records[prev_index]
-            gap_s = (curr.ts - prev.ts).total_seconds()
+            for component, (active, field_name, heating) in segments.items()
+        }
 
-            dt_hours = gap_s / 3600.0
-
-            # FILTER: Skip defrost intervals — temperature readings are unreliable
-            if getattr(curr, "defrost_active", None) or getattr(prev, "defrost_active", None):
-                defrost_filtered += 1
-                continue
-
-            outdoor = weather_temperature_at(
-                curr.ts,
-                curr.outdoor_temp if curr.outdoor_temp is not None else 10.0,
-            )
-            curr_direction = getattr(curr, "direction", None)
-            prev_direction = getattr(prev, "direction", None)
-
-            # Tank temperature delta
-            if (
-                prev.tank_temp is not None
-                and curr.tank_temp is not None
-                and prev.tank_temp > 0
-                and curr.tank_temp > 0
-            ):
-                tank_delta = (curr.tank_temp - prev.tank_temp) / dt_hours
-
-                # With sliding-window gaps, direction may change mid-interval.
-                # Accept heating samples when EITHER endpoint was in WATER mode.
-                either_water = "WATER" in (curr_direction, prev_direction)
-                either_idle = curr_direction in (None, "IDLE", "PUMP") and prev_direction in (
-                    None,
-                    "IDLE",
-                    "PUMP",
-                )
-
-                if tank_delta > 0.5:
-                    if curr_direction is None or either_water:
-                        tank_heating_deltas.append((tank_delta, outdoor))
-                elif tank_delta < -0.1:
-                    if curr_direction is None or either_idle:
-                        tank_cooling_deltas.append((tank_delta, outdoor))
-
-            # Zone 1 temperature delta
-            if (
-                prev.zone1_temp is not None
-                and curr.zone1_temp is not None
-                and prev.zone1_temp > 0
-                and curr.zone1_temp > 0
-            ):
-                zone_delta = (curr.zone1_temp - prev.zone1_temp) / dt_hours
-
-                # Accept zone heating when EITHER endpoint was in PUMP mode
-                either_pump = "PUMP" in (curr_direction, prev_direction)
-                either_not_pump = curr_direction in (None, "IDLE", "WATER") and prev_direction in (
-                    None,
-                    "IDLE",
-                    "WATER",
-                )
-
-                if zone_delta > 0.2:
-                    if curr_direction is None or either_pump:
-                        zone_heating_deltas.append((zone_delta, outdoor))
-                elif zone_delta < -0.1:
-                    if curr_direction is None or either_not_pump:
-                        zone_cooling_deltas.append((zone_delta, outdoor))
-
-        # --- Fit linear relationships ---
         self.params.calibration_status = {}
-        self._sanitize_zone_cooling_params()
-
-        # Tank heating rate: base_rate + factor * outdoor_temp
-        if len(tank_heating_deltas) >= 5:
-            deltas = np.array([d[0] for d in tank_heating_deltas])
-            outdoors = np.array([d[1] for d in tank_heating_deltas])
-
-            # Simple linear regression: rate = a + b * outdoor_temp
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.tank_heating_outdoor_factor = float(coeffs[0])
-                self.params.tank_heating_rate = float(coeffs[1])  # intercept (at outdoor=0)
-            else:
-                self.params.tank_heating_rate = float(np.mean(deltas))
-
-        # Tank standby loss (clamped: a 200L tank rarely loses more than 3°C/h)
-        if len(tank_cooling_deltas) >= 5:
-            deltas = np.array([d[0] for d in tank_cooling_deltas])
-            outdoors = np.array([d[1] for d in tank_cooling_deltas])
-
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.tank_loss_outdoor_factor = float(coeffs[0])
-                self.params.tank_standby_loss = max(-3.0, float(coeffs[1]))
-            else:
-                self.params.tank_standby_loss = max(-3.0, float(np.mean(deltas)))
-
-        # Zone heating rate (clamped: water supply typically heats at 2-15°C/h)
-        if len(zone_heating_deltas) >= 5:
-            deltas = np.array([d[0] for d in zone_heating_deltas])
-            outdoors = np.array([d[1] for d in zone_heating_deltas])
-
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.zone_heating_rate = min(15.0, float(coeffs[1]))
-            else:
-                self.params.zone_heating_rate = min(15.0, float(np.mean(deltas)))
-
-        # Zone standby loss. Unlike the old direct fit, retain a validated
-        # parameter set when sparse data produces an unsafe extrapolation.
-        if len(zone_cooling_deltas) >= 5:
-            fitted = self._robust_zone_cooling_fit(zone_cooling_deltas)
-            if fitted is not None:
-                self.params.zone_standby_loss, self.params.zone_loss_outdoor_factor = fitted
-                self.params.calibration_status["zone_cooling"] = "validated"
-            else:
-                self.params.calibration_status["zone_cooling"] = (
-                    "rejected_candidate_outside_safe_range"
-                )
-        else:
-            self.params.calibration_status["zone_cooling"] = "insufficient_samples"
+        self.validation = {}
+        for component, component_samples in samples.items():
+            self._validate_rate_component(component, component_samples)
+        tank_heating_deltas = samples["tank_heating"]
+        tank_cooling_deltas = samples["tank_cooling"]
+        zone_heating_deltas = samples["zone_heating"]
+        zone_cooling_deltas = samples["zone_cooling"]
 
         # --- Indoor air temperature rates (from SmartThings data) ---
         indoor_heating_deltas, indoor_cooling_deltas = await self._calibrate_indoor_rates(
@@ -517,6 +618,8 @@ class ThermalModel:
             "zone_cooling_samples": len(zone_cooling_deltas),
             "indoor_heating_samples": len(indoor_heating_deltas),
             "indoor_cooling_samples": len(indoor_cooling_deltas),
+            "validation": self.validation,
+            "calibration_status": dict(self.params.calibration_status),
             "defrost_intervals_filtered": defrost_filtered,
             "params": {
                 "tank_heating_rate": self.params.tank_heating_rate,
@@ -538,14 +641,20 @@ class ThermalModel:
         since: dt.datetime,
         device_records: list,
     ) -> tuple[list, list]:
-        """
-        Learn indoor air temperature heating/cooling rates from SmartThings data.
+        """Learn indoor heating/standby rates, keeping only those that beat persistence.
 
-        Joins IndoorTempReading with the nearest DeviceStatusRecord to determine
-        whether the zone was actively heating (direction=PUMP/HEATING) or idle.
+        Rates come from one consistent indoor series (the comfort reference sensor
+        or a five-minute cross-room median): pairing readings from different rooms
+        turns fixed sensor offsets into fictitious rates.  Every interval is kept
+        whatever its sign, because classifying rises as heating and falls as
+        cooling manufactures rates out of sensor noise.  Each component must then
+        predict a chronological hold-out better than "no change" or it is rejected
+        and the safe default is kept.
 
-        Returns (indoor_heating_deltas, indoor_cooling_deltas) for calibration stats.
+        Returns (heating_samples, standby_samples) for calibration stats.
         """
+        from packages.ml.comfort_model import ComfortModel
+
         async with get_session() as session:
             result = await session.execute(
                 select(IndoorTempReading)
@@ -553,7 +662,13 @@ class ThermalModel:
                 .where(IndoorTempReading.is_stale == False)  # noqa: E712
                 .order_by(IndoorTempReading.timestamp)
             )
-            readings = result.scalars().all()
+            raw_readings = result.scalars().all()
+            reference_result = await session.execute(
+                select(SettingRecord.value).where(
+                    SettingRecord.key == "comfort_reference_sensor_id"
+                )
+            )
+            reference_sensor_id = str(reference_result.scalar_one_or_none() or "").strip()
             weather_result = await session.execute(
                 select(WeatherRecord)
                 .where(WeatherRecord.ts >= since - dt.timedelta(hours=2))
@@ -561,59 +676,45 @@ class ThermalModel:
             )
             weather_rows = weather_result.scalars().all()
 
-        if len(readings) < 2:
-            return [], []
+        readings, _, _ = ComfortModel._select_indoor_observations(raw_readings, reference_sensor_id)
+        return self._fit_indoor_rates(readings, device_records, weather_rows)
 
-        # Build lookup for device status → nearest-neighbor matching
-        status_times = (
-            np.array([(r.ts - since).total_seconds() for r in device_records])
-            if device_records
-            else np.array([])
-        )
+    def _fit_indoor_rates(self, readings, device_records, weather_rows) -> tuple[list, list]:
+        heating_samples: list[tuple[float, float, float]] = []  # (rate, outdoor, hours)
+        standby_samples: list[tuple[float, float, float]] = []
+        if len(readings) < 2 or not device_records:
+            self._record_indoor_validation(heating_samples, standby_samples)
+            return heating_samples, standby_samples
+        device_records = sorted(device_records, key=lambda row: row.ts)
+        status_times = [row.ts for row in device_records]
+
         weather_by_hour = {
             row.ts.replace(minute=0, second=0, microsecond=0): float(row.temperature)
             for row in weather_rows
             if row.temperature is not None
         }
 
-        indoor_heating_deltas: list[tuple[float, float]] = []  # (delta_per_hour, outdoor)
-        indoor_cooling_deltas: list[tuple[float, float]] = []
-
-        # Pair each reading with the closest earlier reading at least 15
-        # minutes away rather than the oldest row still inside two hours. This
-        # avoids both sensor-noise amplification and rate estimates blurred by
-        # intervening mode changes.
         MIN_GAP_S = 900  # 15 min minimum between paired readings
         MAX_GAP_S = 7200  # 2 h maximum
 
         reading_times = np.array([r.timestamp.timestamp() for r in readings])
         for i in range(1, len(readings)):
-            curr_reading = readings[i]
-
             prev_index = self._nearest_prior_index_in_gap(reading_times, i, MIN_GAP_S, MAX_GAP_S)
             if prev_index is None:
                 continue
+            curr_reading = readings[i]
             prev_reading = readings[prev_index]
-            gap_s = (curr_reading.timestamp - prev_reading.timestamp).total_seconds()
-
-            dt_hours = gap_s / 3600.0
-            abs_delta = abs(curr_reading.temperature - prev_reading.temperature)
-            # Skip deltas within sensor noise (±0.15°C)
-            if abs_delta < 0.15:
+            heating_now, status = self._continuous_indoor_state(
+                device_records,
+                prev_reading.timestamp,
+                curr_reading.timestamp,
+                status_times=status_times,
+            )
+            if heating_now is None:
                 continue
 
-            indoor_delta = (curr_reading.temperature - prev_reading.temperature) / dt_hours
-
-            # Find nearest device status to determine heating state
-            if len(status_times) == 0:
-                continue
-            t_sec = (curr_reading.timestamp - since).total_seconds()
-            idx = int(np.argmin(np.abs(status_times - t_sec)))
-            status = device_records[idx]
-            gap = abs((status.ts - curr_reading.timestamp).total_seconds())
-            if gap > 900:  # > 15 min gap — skip
-                continue
-
+            dt_hours = (reading_times[i] - reading_times[prev_index]) / 3600.0
+            rate = (curr_reading.temperature - prev_reading.temperature) / dt_hours
             weather_hour = curr_reading.timestamp.replace(minute=0, second=0, microsecond=0)
             weather_candidates = [
                 (abs(offset), weather_by_hour.get(weather_hour + dt.timedelta(hours=offset)))
@@ -629,48 +730,89 @@ class ThermalModel:
                 if status.outdoor_temp is not None
                 else 10.0
             )
-            zone_active = has_confirmed_space_heating(status)
-
-            if indoor_delta > 0.1 and zone_active:
-                indoor_heating_deltas.append((indoor_delta, outdoor))
-            elif indoor_delta < -0.05:
-                indoor_cooling_deltas.append((indoor_delta, outdoor))
-
-        # Fit indoor heating rate
-        if len(indoor_heating_deltas) >= MIN_LEARNED_RATE_SAMPLES:
-            deltas = np.array([d[0] for d in indoor_heating_deltas])
-            outdoors = np.array([d[1] for d in indoor_heating_deltas])
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.indoor_heating_outdoor_factor = float(coeffs[0])
-                self.params.indoor_heating_rate = float(coeffs[1])
-            else:
-                self.params.indoor_heating_rate = float(np.mean(deltas))
-
-        # Fit indoor cooling rate (clamped: a house rarely cools faster than 1°C/h)
-        if len(indoor_cooling_deltas) >= MIN_LEARNED_RATE_SAMPLES:
-            deltas = np.array([d[0] for d in indoor_cooling_deltas])
-            outdoors = np.array([d[1] for d in indoor_cooling_deltas])
-            if np.std(outdoors) > 0:
-                coeffs = np.polyfit(outdoors, deltas, 1)
-                self.params.indoor_cooling_outdoor_factor = float(coeffs[0])
-                self.params.indoor_cooling_rate = max(-1.0, float(coeffs[1]))
-            else:
-                self.params.indoor_cooling_rate = max(-1.0, float(np.mean(deltas)))
-
-        self.params.indoor_heating_samples = len(indoor_heating_deltas)
-        self.params.indoor_cooling_samples = len(indoor_cooling_deltas)
-
-        if indoor_heating_deltas or indoor_cooling_deltas:
-            logger.info(
-                "indoor_rates_calibrated",
-                heating_samples=len(indoor_heating_deltas),
-                cooling_samples=len(indoor_cooling_deltas),
-                heating_rate=self.params.indoor_heating_rate,
-                cooling_rate=self.params.indoor_cooling_rate,
+            (heating_samples if heating_now else standby_samples).append(
+                (
+                    float(rate),
+                    float(outdoor),
+                    float(dt_hours),
+                    prev_reading.timestamp,
+                    curr_reading.timestamp,
+                )
             )
 
-        return indoor_heating_deltas, indoor_cooling_deltas
+        self._record_indoor_validation(heating_samples, standby_samples)
+        logger.info(
+            "indoor_rates_calibrated",
+            heating_samples=len(heating_samples),
+            standby_samples=len(standby_samples),
+            heating_status=self.params.calibration_status.get("indoor_heating"),
+            standby_status=self.params.calibration_status.get("indoor_cooling"),
+            heating_rate=self.params.indoor_heating_rate,
+            cooling_rate=self.params.indoor_cooling_rate,
+        )
+        return heating_samples, standby_samples
+
+    @staticmethod
+    def _continuous_indoor_state(
+        records, start: dt.datetime, end: dt.datetime, *, status_times=None
+    ):
+        ordered = sorted(records, key=lambda row: row.ts) if status_times is None else records
+        status_times = [row.ts for row in ordered] if status_times is None else status_times
+        first = bisect_right(status_times, start) - 1
+        last = bisect_right(status_times, end)
+        if first < 0 or (start - ordered[first].ts).total_seconds() > 900:
+            return None, None
+        interval = ordered[first:last]
+        if (end - interval[-1].ts).total_seconds() > 900:
+            return None, None
+        devices = {
+            row.device_id for row in interval if isinstance(getattr(row, "device_id", None), str)
+        }
+        if len(devices) > 1 or any(
+            (right.ts - left.ts).total_seconds() > 900
+            for left, right in zip(interval, interval[1:])
+        ):
+            return None, None
+        states = []
+        for row in interval:
+            persisted = getattr(row, "space_heating_active", None)
+            reason = getattr(row, "space_heating_evidence", None)
+            if reason == "not_confirmed" or getattr(row, "defrost_active", False) is True:
+                return None, None
+            if isinstance(persisted, bool):
+                states.append(persisted)
+            else:
+                evidence = classify_space_heating(
+                    **{
+                        key: getattr(row, key, None)
+                        for key in (
+                            "operation_status",
+                            "mode",
+                            "direction",
+                            "pump_duty",
+                            "device_action",
+                            "defrost_active",
+                            "zone1_operation_status",
+                            "zone2_operation_status",
+                        )
+                    }
+                )
+                if evidence.code == "not_confirmed":
+                    return None, None
+                states.append(evidence.active)
+        if len(set(states)) != 1:
+            return None, None
+        return states[0], interval[-1]
+
+    def _record_indoor_validation(
+        self,
+        heating_samples: list[tuple[float, float, float]],
+        standby_samples: list[tuple[float, float, float]],
+    ) -> None:
+        self._validate_rate_component("indoor_heating", heating_samples)
+        self._validate_rate_component("indoor_cooling", standby_samples)
+        self.params.indoor_heating_samples = len(heating_samples)
+        self.params.indoor_cooling_samples = len(standby_samples)
 
     def predict_tank_heating_time(
         self, current_temp: float, target_temp: float, outdoor_temp: float
@@ -682,6 +824,7 @@ class ThermalModel:
         - Warmer outdoor → better COP → faster heating
         """
         rate = self._tank_heating_rate(outdoor_temp)
+        confidence = self.confidence_for("tank_heating")
 
         if rate <= 0:
             # Safety: if we somehow get a negative rate, use default
@@ -695,7 +838,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=0.0,
                 heating_rate_per_hour=rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=confidence,
             )
 
         hours_needed = delta_needed / rate
@@ -705,7 +848,7 @@ class ThermalModel:
             outdoor_temp=outdoor_temp,
             estimated_minutes=hours_needed * 60.0,
             heating_rate_per_hour=rate,
-            confidence="learned" if self.params.last_calibrated else "default",
+            confidence=confidence,
         )
 
     def predict_tank_cooling_time(
@@ -717,6 +860,7 @@ class ThermalModel:
         This tells us "how long can we delay heating before the tank gets too cold?"
         """
         loss_rate = self._tank_loss_rate(outdoor_temp)
+        confidence = self.confidence_for("tank_cooling")
 
         if loss_rate >= 0:
             # Not cooling — infinite time
@@ -726,7 +870,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=float("inf"),
                 heating_rate_per_hour=loss_rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=confidence,
             )
 
         # Can't cool below outdoor temperature
@@ -740,7 +884,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=0.0 if current_temp <= min_temp else float("inf"),
                 heating_rate_per_hour=loss_rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=confidence,
             )
 
         hours_until_cold = delta_until_min / abs(loss_rate)
@@ -750,7 +894,7 @@ class ThermalModel:
             outdoor_temp=outdoor_temp,
             estimated_minutes=hours_until_cold * 60.0,
             heating_rate_per_hour=loss_rate,
-            confidence="learned" if self.params.last_calibrated else "default",
+            confidence=confidence,
         )
 
     def predict_zone_heating_time(
@@ -758,6 +902,7 @@ class ThermalModel:
     ) -> ThermalPrediction:
         """Predict how long to heat a zone to target temperature."""
         rate = self._zone_heating_rate(outdoor_temp)
+        confidence = self.confidence_for("zone_heating")
 
         if rate <= 0:
             rate = 1.0
@@ -770,7 +915,7 @@ class ThermalModel:
                 outdoor_temp=outdoor_temp,
                 estimated_minutes=0.0,
                 heating_rate_per_hour=rate,
-                confidence="learned" if self.params.last_calibrated else "default",
+                confidence=confidence,
             )
 
         hours_needed = delta_needed / rate
@@ -780,7 +925,7 @@ class ThermalModel:
             outdoor_temp=outdoor_temp,
             estimated_minutes=hours_needed * 60.0,
             heating_rate_per_hour=rate,
-            confidence="learned" if self.params.last_calibrated else "default",
+            confidence=confidence,
         )
 
     def predict_indoor_heating_time(
@@ -1722,36 +1867,52 @@ class ThermalModel:
 
     # --- Internal rate calculations ---
 
+    def _rate_params(self, component: str, outdoor_temp: float) -> ThermalParams:
+        """Learned parameters inside their observed outdoor range, defaults outside it."""
+        from packages.ml.lifecycle import reference_is_qualified
+
+        if self._qualified_reference is not None and not reference_is_qualified(
+            self._qualified_reference
+        ):
+            return _DEFAULT_PARAMS
+        observed = self.params.rate_outdoor_ranges.get(component)
+        if observed and not (
+            observed[0] - RATE_OUTDOOR_EXTRAPOLATION_MARGIN_C
+            <= outdoor_temp
+            <= observed[1] + RATE_OUTDOOR_EXTRAPOLATION_MARGIN_C
+        ):
+            return _DEFAULT_PARAMS
+        return self.params
+
     def _tank_heating_rate(self, outdoor_temp: float) -> float:
         """Tank heating rate (°C/hour) adjusted for outdoor temp."""
-        rate = (
-            self.params.tank_heating_rate + self.params.tank_heating_outdoor_factor * outdoor_temp
-        )
+        p = self._rate_params("tank_heating", outdoor_temp)
+        rate = p.tank_heating_rate + p.tank_heating_outdoor_factor * outdoor_temp
         return max(1.0, min(30.0, rate))
 
     def _tank_loss_rate(self, outdoor_temp: float) -> float:
         """Tank standby loss rate (°C/hour, negative)."""
-        loss = self.params.tank_standby_loss + self.params.tank_loss_outdoor_factor * outdoor_temp
+        p = self._rate_params("tank_cooling", outdoor_temp)
+        loss = p.tank_standby_loss + p.tank_loss_outdoor_factor * outdoor_temp
         return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
     def _zone_heating_rate(self, outdoor_temp: float) -> float:
         """Zone heating rate (°C/hour)."""
-        # Zones heat slower when it's very cold outside
-        rate = self.params.zone_heating_rate + 0.03 * outdoor_temp
+        p = self._rate_params("zone_heating", outdoor_temp)
+        rate = p.zone_heating_rate + p.zone_heating_outdoor_factor * outdoor_temp
         return max(0.5, min(15.0, rate))
 
     def _zone_loss_rate(self, outdoor_temp: float) -> float:
         """Zone standby loss rate (°C/hour, negative)."""
-        loss = self.params.zone_standby_loss + self.params.zone_loss_outdoor_factor * outdoor_temp
+        p = self._rate_params("zone_cooling", outdoor_temp)
+        loss = p.zone_standby_loss + p.zone_loss_outdoor_factor * outdoor_temp
         return max(-3.0, min(0.0, loss))  # Capped to physically plausible range
 
     def _indoor_heating_rate(self, outdoor_temp: float) -> float:
         """Indoor air heating rate (°C/hour) when zone is actively heating."""
-        rate = (
-            self.params.indoor_heating_rate
-            + self.params.indoor_heating_outdoor_factor * outdoor_temp
-        )
-        return max(0.1, min(3.0, rate))
+        p = self._rate_params("indoor_heating", outdoor_temp)
+        rate = p.indoor_heating_rate + p.indoor_heating_outdoor_factor * outdoor_temp
+        return max(INDOOR_HEATING_RATE_MIN_C_PER_H, min(INDOOR_HEATING_RATE_MAX_C_PER_H, rate))
 
     def _indoor_cooling_rate(self, outdoor_temp: float) -> float:
         """Indoor air cooling rate (°C/hour, negative) during standby.
@@ -1760,12 +1921,141 @@ class ThermalModel:
         a poorly insulated one up to ~0.8°C/h.  Values beyond -1.0 are
         usually calibration noise, not real thermal behaviour.
         """
-        loss = (
-            self.params.indoor_cooling_rate
-            + self.params.indoor_cooling_outdoor_factor * outdoor_temp
-        )
-        return max(-1.0, min(0.0, loss))
+        p = self._rate_params("indoor_cooling", outdoor_temp)
+        loss = p.indoor_cooling_rate + p.indoor_cooling_outdoor_factor * outdoor_temp
+        return max(INDOOR_COOLING_RATE_MIN_C_PER_H, min(0.0, loss))
 
+
+async def materialize_thermal_inputs(
+    device_id: str,
+    reference_sensor_id: str,
+    weather_provider: str,
+    cutoff: dt.datetime,
+) -> dict:
+    from packages.ml.comfort_model import ComfortModel
+
+    since = cutoff - dt.timedelta(days=90)
+    async with get_session() as session:
+        records = (
+            (
+                await session.execute(
+                    select(DeviceStatusRecord)
+                    .where(
+                        DeviceStatusRecord.device_id == device_id,
+                        DeviceStatusRecord.ts >= since,
+                        DeviceStatusRecord.ts <= cutoff,
+                    )
+                    .order_by(DeviceStatusRecord.ts)
+                    .limit(50_001)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        weather = (
+            (
+                await session.execute(
+                    select(WeatherRecord)
+                    .where(
+                        WeatherRecord.source == weather_provider,
+                        WeatherRecord.ts >= since - dt.timedelta(hours=2),
+                        WeatherRecord.ts <= cutoff,
+                    )
+                    .order_by(WeatherRecord.ts)
+                    .limit(50_001)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        raw_readings = (
+            (
+                await session.execute(
+                    select(IndoorTempReading)
+                    .where(
+                        IndoorTempReading.timestamp >= since,
+                        IndoorTempReading.timestamp <= cutoff,
+                        IndoorTempReading.is_stale.is_(False),
+                    )
+                    .order_by(IndoorTempReading.timestamp)
+                    .limit(50_001)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if max(len(records), len(weather), len(raw_readings)) > 50_000:
+            raise ValueError("Thermal materialization overflow")
+        records = [
+            SimpleNamespace(
+                **{
+                    column.name: getattr(row, column.name)
+                    for column in DeviceStatusRecord.__table__.columns
+                }
+            )
+            for row in records
+        ]
+        weather = [
+            SimpleNamespace(
+                **{
+                    column.name: getattr(row, column.name)
+                    for column in WeatherRecord.__table__.columns
+                }
+            )
+            for row in weather
+        ]
+        readings, _, _ = ComfortModel._select_indoor_observations(raw_readings, reference_sensor_id)
+    return {
+        "records": records,
+        "weather": weather,
+        "readings": readings,
+        "device_id": device_id,
+        "data_cutoff": cutoff,
+    }
+
+
+def build_thermal_candidate(data: dict) -> dict | None:
+    model = ThermalModel()
+    records, weather = data["records"], data["weather"]
+    if len(records) < model.params.min_samples:
+        return None
+
+    def outdoor_at(timestamp, fallback):
+        matches = [
+            row
+            for row in weather
+            if row.temperature is not None and 0 <= (timestamp - row.ts).total_seconds() <= 7200
+        ]
+        return float(matches[-1].temperature) if matches else fallback
+
+    for component, active, field_name, heating in (
+        ("tank_heating", model._dhw_heating_active, "tank_temp", True),
+        ("tank_cooling", model._dhw_heating_active, "tank_temp", False),
+        ("zone_heating", model._zone_heating_active, "zone1_temp", True),
+        ("zone_cooling", model._zone_heating_active, "zone1_temp", False),
+    ):
+        samples = model._rate_segments(records, field_name, active, heating, outdoor_at)
+        model._validate_rate_component(component, samples)
+    model._fit_indoor_rates(data["readings"], records, weather)
+    declared = [
+        name
+        for name, status in model.params.calibration_status.items()
+        if status == "validated" and name.startswith(("tank_", "indoor_"))
+    ]
+    if not declared:
+        return None
+    model.params.last_calibrated = data["data_cutoff"]
+    model.params.sample_count = len(records)
+    return {
+        "schema_version": THERMAL_MODEL_SCHEMA_VERSION,
+        "params": asdict(model.params),
+        "validation": model.validation,
+        "declared_components": declared,
+        "device_id": data["device_id"],
+    }
+
+
+_DEFAULT_PARAMS = ThermalParams()
 
 # Singleton instance
 thermal_model = ThermalModel()

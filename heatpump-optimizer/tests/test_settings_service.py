@@ -115,6 +115,87 @@ class TestDhwDeadlines:
 
 
 class TestLearningModeSettings:
+    def test_maintenance_defaults_off(self):
+        spec = SETTING_SPECS["ml_maintenance_enabled"]
+        assert spec.value_type == "bool"
+        assert spec.default_env is None
+        assert spec.parse(spec.default) is False
+        assert validate_setting_value("ml_maintenance_enabled", "true") is None
+
+    @pytest.mark.asyncio
+    async def test_maintenance_defaults_off_and_auto_exit_is_ineffective(self):
+        from packages.core import settings_service
+
+        assert SETTING_SPECS["ml_maintenance_enabled"].parse("false") is False
+        assert SETTING_SPECS["seasonal_calibration_enabled"].parse("false") is False
+        assert SETTING_SPECS["seasonal_calibration_auto_exit"].default == "false"
+        assert SETTINGS_SCHEMA["seasonal_calibration_auto_exit"]["read_only"] is True
+        stored = SimpleNamespace(key="seasonal_calibration_auto_exit", value="true")
+        session = AsyncMock()
+        session.execute.return_value = SimpleNamespace(
+            scalar_one_or_none=lambda: stored,
+            scalars=lambda: SimpleNamespace(all=lambda: [stored]),
+        )
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(settings_service, "get_session", return_value=context):
+            assert await settings_service.get_setting("seasonal_calibration_auto_exit") == "false"
+            assert (
+                await settings_service.get_bool_setting("seasonal_calibration_auto_exit") is False
+            )
+            assert (await settings_service.get_all_settings())[
+                "seasonal_calibration_auto_exit"
+            ] == "false"
+            with pytest.raises(ValueError, match="read-only"):
+                await settings_service.set_setting("seasonal_calibration_auto_exit", "true")
+            with pytest.raises(ValueError, match="read-only"):
+                await settings_service.set_settings_bulk({"seasonal_calibration_auto_exit": "true"})
+        for value in ("true", "1", "yes", "on", ""):
+            with pytest.raises(ValueError, match="read-only"):
+                validate_setting_value("seasonal_calibration_auto_exit", value)
+        validate_setting_value("seasonal_calibration_auto_exit", "false")
+
+    @pytest.mark.asyncio
+    async def test_explicit_seasonal_exit_clears_campaign_atomically(self):
+        from packages.core import settings_service
+
+        session = AsyncMock()
+        session.execute.return_value = SimpleNamespace(scalars=lambda: [])
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(settings_service, "get_session", return_value=context):
+            await settings_service.set_settings_bulk({"seasonal_calibration_enabled": "false"})
+        writes = {
+            params["key"]: params["value"]
+            for call in session.execute.await_args_list
+            if getattr(call.args[0], "is_insert", False)
+            and "key" in (params := call.args[0].compile().params)
+        }
+        assert writes == {
+            "seasonal_calibration_enabled": "false",
+            "_seasonal_calibration_campaign_since": "",
+            "_seasonal_calibration_safety_deferred_since": "",
+        }
+        context.__aenter__.assert_awaited_once()
+        context.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_late_seasonal_activation_cannot_recreate_exited_campaign(self):
+        from packages.core import settings_service
+
+        session = AsyncMock()
+        session.execute.return_value = SimpleNamespace(scalars=lambda: [])
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(settings_service, "get_session", return_value=context):
+            await settings_service.set_settings_bulk(
+                {"_seasonal_calibration_campaign_since": "2026-10-09T12:00:00+00:00"}
+            )
+        assert session.execute.await_count == 2
+
     def test_learning_mode_settings_registered(self):
         assert "learning_mode_enabled" in SETTINGS_SCHEMA
         assert "learning_mode_since" in SETTINGS_SCHEMA
@@ -143,6 +224,9 @@ class TestBoolSettings:
             ("use_comfort_model", "garbage", False),
             ("learning_mode_enabled", "false", False),
             ("learning_mode_enabled", "true", True),
+            ("ml_maintenance_enabled", None, False),
+            ("ml_maintenance_enabled", "false", False),
+            ("ml_maintenance_enabled", "true", True),
         ],
     )
     async def test_get_bool_setting_parses_stored_and_default_values(

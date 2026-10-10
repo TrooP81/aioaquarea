@@ -243,6 +243,27 @@ def zone_matches_baseline(baseline: Any, current_target: Any) -> bool:
     )
 
 
+def validate_restore_baseline(source: Any, restore: Any) -> int | None:
+    """Require an explicit whole-degree zone restore and compatible source baseline."""
+    if str(_action_value(restore, "action_type")) != "zone_temp_restore":
+        return None
+    baseline = restore_baseline_target(restore)
+    source_payload = _action_value(source, "payload", None)
+    if not isinstance(source_payload, dict):
+        raw = _action_value(source, "payload_json", None)
+        source_payload = json.loads(raw) if raw else {}
+    if not isinstance(source_payload, dict):
+        raise ValueError("safety_restore_baseline_mismatch")
+    source_baseline = source_payload.get("baseline_temperature")
+    if (
+        baseline is None
+        or not baseline.is_integer()
+        or (source_baseline is not None and not zone_matches_baseline(source_baseline, baseline))
+    ):
+        raise ValueError("safety_restore_baseline_mismatch")
+    return int(baseline)
+
+
 def dhw_embargoed(actions: Iterable[Any], device_id: str | None) -> bool:
     """Return whether an unresolved DHW restore blocks a device's new DHW ON."""
 

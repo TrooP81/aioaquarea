@@ -30,6 +30,7 @@ from packages.core.safety_reverts import (
     zone_matches_baseline,
 )
 from packages.core.plan_outcome import measured_window_outcome, plan_measurement
+from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
 
 router = APIRouter()
 logger = structlog.get_logger()
@@ -53,7 +54,7 @@ def _json_object(value: str | None) -> dict[str, object]:
 
 
 @router.get("/api/plans", response_model=list[PlanResponse])
-async def get_plans(limit: int = Query(10, ge=1, le=50)):
+async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bool = False):
     """Get recent optimizer plans."""
     async with get_session() as session:
         count_subq = (
@@ -65,15 +66,20 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
             .subquery()
         )
 
-        result = await session.execute(
+        query = (
             select(PlanRecord, count_subq.c.cnt)
             .outerjoin(count_subq, PlanRecord.id == count_subq.c.plan_id)
             .order_by(desc(PlanRecord.created_at))
             .limit(limit)
         )
+        if not include_diagnostics:
+            query = query.where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
+        result = await session.execute(query)
 
         responses = []
         for p, count in result.all():
+            if not include_diagnostics and p.status == DIAGNOSTIC_PLAN_STATUS:
+                continue
             responses.append(
                 PlanResponse(
                     id=p.id,
@@ -84,7 +90,7 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
                     cost_estimate_eur=p.cost_estimate_eur,
                     price_currency=p.price_currency,
                     price_source=p.price_source,
-                    actions_count=count or 0,
+                    actions_count=0 if p.status == DIAGNOSTIC_PLAN_STATUS else count or 0,
                     status=p.status,
                     status_reason=p.status_reason,
                     superseded_at=p.superseded_at,
@@ -95,31 +101,38 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
 
 
 @router.get("/api/plans/{plan_id}", response_model=PlanDetailResponse)
-async def get_plan_detail(plan_id: int):
+async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
     """Get plan details with actions."""
     async with get_session() as session:
-        plan_result = await session.execute(select(PlanRecord).where(PlanRecord.id == plan_id))
+        query = select(PlanRecord).where(PlanRecord.id == plan_id)
+        if not include_diagnostics:
+            query = query.where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
+        plan_result = await session.execute(query)
         plan = plan_result.scalar_one_or_none()
-        if not plan:
+        if not plan or (plan.status == DIAGNOSTIC_PLAN_STATUS and not include_diagnostics):
             raise HTTPException(status_code=404, detail="Plan not found")
 
-        actions_result = await session.execute(
-            select(PlanActionRecord)
-            .where(PlanActionRecord.plan_id == plan_id)
-            .order_by(PlanActionRecord.scheduled_ts)
-        )
-        actions = actions_result.scalars().all()
-        from packages.api._helpers import get_price_area
-        from packages.core.settings_service import get_float_setting, get_user_tz
+        if plan.status == DIAGNOSTIC_PLAN_STATUS:
+            actions = []
+            outcome = {"status": "diagnostic", "execution_allowed": False}
+        else:
+            actions_result = await session.execute(
+                select(PlanActionRecord)
+                .where(PlanActionRecord.plan_id == plan_id)
+                .order_by(PlanActionRecord.scheduled_ts)
+            )
+            actions = actions_result.scalars().all()
+            from packages.api._helpers import get_price_area
+            from packages.core.settings_service import get_float_setting, get_user_tz
 
-        outcome = await plan_measurement(
-            session,
-            plan=plan,
-            price_area=await get_price_area(),
-            comfort_min_c=await get_float_setting("comfort_temp_min"),
-            comfort_max_c=await get_float_setting("comfort_temp_max"),
-            timezone_name=await get_user_tz(),
-        )
+            outcome = await plan_measurement(
+                session,
+                plan=plan,
+                price_area=await get_price_area(),
+                comfort_min_c=await get_float_setting("comfort_temp_min"),
+                comfort_max_c=await get_float_setting("comfort_temp_max"),
+                timezone_name=await get_user_tz(),
+            )
 
     plan_data = _json_object(plan.plan_json)
     provenance = _json_object(plan.input_provenance_json)
@@ -199,7 +212,10 @@ async def get_plan_activity(
         result = await session.execute(
             select(PlanActionRecord, PlanRecord.created_at, PlanRecord.optimizer_version)
             .join(PlanRecord, PlanRecord.id == PlanActionRecord.plan_id)
-            .where(PlanActionRecord.status.in_(statuses))
+            .where(
+                PlanActionRecord.status.in_(statuses),
+                PlanRecord.status != DIAGNOSTIC_PLAN_STATUS,
+            )
             .order_by(
                 desc(func.coalesce(PlanActionRecord.executed_at, PlanActionRecord.scheduled_ts))
             )
@@ -431,6 +447,10 @@ async def _learning_mode_status() -> dict[str, object]:
         sources.append("seasonal")
     return {
         "enabled": enabled,
+        "build_policy": "observe_only",
+        "ordinary_writes_allowed": False,
+        "optimization_requires_new_build": True,
+        "linked_restores_eligible": not (learning.reliable and learning.active),
         "since": since_iso,
         "days_elapsed": days_elapsed,
         "effective_active": bool(sources),
@@ -506,7 +526,8 @@ async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
     from packages.core.settings_service import get_setting
     from packages.ml.models import DemandModel, MODEL_DIR
-    from packages.ml.model_status import _inspect_model_artifact
+    from packages.ml.model_status import get_model_reporting_statuses, get_model_status
+    from packages.ml.seasonal_learning import get_seasonal_calibration_progress
     from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
     from packages.optimizer.rules import RulesOptimizer
@@ -515,21 +536,46 @@ async def get_optimizer_status():
     optimizer_status = await get_optimizer_status_snapshot(layer)
     learning_mode = await _learning_mode_status()
 
+    await thermal_model.arefresh_if_changed()
     async with get_session() as session:
         consumption_count = await session.execute(
             select(func.count()).select_from(ConsumptionRecord)
         )
         total_consumption = consumption_count.scalar() or 0
 
-    cop_model, demand_model, demand_quality = await asyncio.gather(
-        asyncio.to_thread(_inspect_model_artifact, "cop", MODEL_DIR),
-        asyncio.to_thread(_inspect_model_artifact, "demand", MODEL_DIR),
+    cop_model, model_lifecycle, demand_quality = await asyncio.gather(
+        get_model_status("cop", MODEL_DIR),
+        get_model_reporting_statuses(MODEL_DIR),
         DemandModel().training_data_quality(),
     )
+    demand_model = model_lifecycle["demand"]
     demand_model["source_records"] = total_consumption
+    try:
+        seasonal = await get_seasonal_calibration_progress()
+    except Exception as error:
+        logger.warning("seasonal_reporting_unavailable", error_type=type(error).__name__)
+        seasonal = {
+            "enabled": None,
+            "observe_only_active": None,
+            "reason": "seasonal_reporting_unavailable",
+            "auto_exit": False,
+        }
+    seasonal["reporting_ready"] = all(
+        model_lifecycle[component]["status"] == "qualified-for-reporting"
+        for component in ("demand", "thermal")
+    )
+    seasonal["control_ready"] = False
+    seasonal["auto_exit"] = False
+    if seasonal["reporting_ready"]:
+        seasonal["next_step"] = "ready_for_reporting"
 
     return {
         "configured_layer": layer,
+        "build_policy": "observe_only",
+        "ordinary_writes_allowed": False,
+        "control_ready": False,
+        "optimization_requires_new_build": True,
+        "control_message": "Ordinary writes are prohibited in this build; optimization requires a new reviewed, approved build.",
         "active_layer": optimizer_status["active_layer"],
         "effective_layer": optimizer_status.get("effective_layer", "rules"),
         "selection_reason": optimizer_status.get(
@@ -541,12 +587,21 @@ async def get_optimizer_status():
         "cop_source": "assumed",
         "cop_measured": False,
         "learning_mode": learning_mode,
+        "model_lifecycle": model_lifecycle,
+        "seasonal_calibration": seasonal,
         "cop_model": cop_model,
         "demand_model": {**demand_model, "data_quality": demand_quality},
+        "comfort_model": model_lifecycle["comfort"],
         "thermal_model": {
+            "lifecycle": model_lifecycle["thermal"],
+            "status": model_lifecycle["thermal"]["status"],
+            "control_ready": False,
             "calibrated": thermal_model.params.last_calibrated is not None,
             "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),
-            "confidence": "learned" if thermal_model.params.last_calibrated else "default",
+            "confidence": thermal_model.confidence_for("tank_heating"),
+            "indoor_heating_confidence": thermal_model.confidence_for("indoor_heating"),
+            "indoor_heating_samples": thermal_model.params.indoor_heating_samples,
+            "calibration_status": dict(thermal_model.params.calibration_status),
             "last_calibrated": thermal_model.params.last_calibrated.isoformat()
             if thermal_model.params.last_calibrated
             else None,

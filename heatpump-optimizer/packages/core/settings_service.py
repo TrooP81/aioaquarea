@@ -58,6 +58,11 @@ def _parse_bool(value: str) -> bool:
 
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
+    "ml_maintenance_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": "Enable poller-owned model maintenance for reporting only; never permits device writes",
+    },
     "manual_cop_monitoring_enabled": {
         "type": "bool",
         "default": "false",
@@ -68,7 +73,7 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "str",
         "default": "rules_only",
         "description": (
-            "rules_only and auto use rules with assumed heating efficiency while COP is retired. "
+            "Selects the diagnostic planner. rules_only and auto use rules with assumed heating efficiency while COP is retired. "
             "milp_preferred explicitly selects MILP with the retained demand model."
         ),
         "options": ["rules_only", "milp_preferred", "auto"],
@@ -78,9 +83,9 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": "false",
         "description": (
-            "Observe-only training mode: the optimizer still plans but the executor "
-            "dispatches no device commands, so the heat pump runs naturally while data "
-            "is collected for ML training. Toggle off to let the optimizer act."
+            "This build prohibits ordinary writes and generates diagnostic plans only. "
+            "Learning mode also suppresses existing linked safety restores. Turning it off "
+            "does not enable optimization; that requires a new reviewed, approved build."
         ),
     },
     "learning_mode_since": {
@@ -92,9 +97,9 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": "false",
         "description": (
-            "Opt-in, observe-only seasonal calibration. During detected cold weather, "
-            "plans are recorded but no heat-pump commands are sent so natural heating "
-            "data can improve the demand and indoor thermal models."
+            "Opt-in seasonal observation starts during detected cold weather and persists "
+            "until explicit human exit, including after warming or successful maintenance. "
+            "Exiting never enables ordinary writes in this build."
         ),
     },
     "seasonal_calibration_max_outdoor_c": {
@@ -114,8 +119,14 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "seasonal_calibration_auto_exit": {
         "type": "bool",
-        "default": "true",
-        "description": "End seasonal observe-only mode after demand and indoor-heating evidence have both trained successfully",
+        "default": "false",
+        "read_only": True,
+        "description": "Read-only and always false; stored legacy values cannot end observation automatically",
+    },
+    "_seasonal_calibration_campaign_since": {
+        "type": "str",
+        "default": "",
+        "description": "Persisted seasonal observation activation timestamp; cleared only by explicit human exit (internal)",
     },
     "_seasonal_calibration_safety_deferred_since": {
         "type": "str",
@@ -577,6 +588,8 @@ def validate_setting_value(key: str, value: str) -> None:
     at the API boundary instead of crashing later in the optimizer/poller).
     """
     spec = get_setting_spec(key)
+    if SETTINGS_SCHEMA[key].get("read_only") and value != spec.serialize_default():
+        raise ValueError(f"{key} is read-only and always {spec.serialize_default()}")
 
     if spec.options is not None:
         if value not in spec.options:
@@ -633,11 +646,14 @@ async def get_all_settings() -> dict[str, str]:
             if row.key in SETTINGS_SCHEMA:
                 result[row.key] = row.value
 
+    result["seasonal_calibration_auto_exit"] = "false"
     return result
 
 
 async def get_setting(key: str) -> str:
     """Get a single setting value (DB first, then env fallback)."""
+    if key == "seasonal_calibration_auto_exit":
+        return "false"
     async with get_session() as session:
         row = await session.execute(select(SettingRecord).where(SettingRecord.key == key))
         record = row.scalar_one_or_none()
@@ -712,6 +728,11 @@ async def get_string_setting(key: str) -> str:
 
 async def set_setting(key: str, value: str) -> None:
     """Upsert a setting in the DB."""
+    if key == "seasonal_calibration_enabled":
+        await set_settings_bulk({key: value})
+        return
+    if SETTINGS_SCHEMA.get(key, {}).get("read_only"):
+        validate_setting_value(key, value)
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with get_session() as session:
@@ -721,6 +742,10 @@ async def set_setting(key: str, value: str) -> None:
             set_={"value": value},
         )
         await session.execute(stmt)
+        if key == "ml_maintenance_enabled":
+            from packages.ml.lifecycle import update_maintenance_gate
+
+            await update_maintenance_gate(session, _parse_bool(value))
 
 
 async def set_settings_bulk(updates: dict[str, str]) -> None:
@@ -730,6 +755,15 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
     writer may persist a valid individual value that makes the combined
     thresholds invalid.
     """
+    updates = dict(updates)
+    for key, value in updates.items():
+        if SETTINGS_SCHEMA.get(key, {}).get("read_only"):
+            validate_setting_value(key, value)
+    if "seasonal_calibration_enabled" in updates and not _parse_bool(
+        updates["seasonal_calibration_enabled"]
+    ):
+        updates["_seasonal_calibration_campaign_since"] = ""
+        updates["_seasonal_calibration_safety_deferred_since"] = ""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with get_session() as session:
@@ -745,6 +779,10 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
         rows = await session.execute(select(SettingRecord))
         values.update({row.key: row.value for row in rows.scalars() if row.key in values})
         values.update(updates)
+        if updates.get("_seasonal_calibration_campaign_since") and not _parse_bool(
+            values["seasonal_calibration_enabled"]
+        ):
+            updates.pop("_seasonal_calibration_campaign_since")
         if any(
             key in HEAT_CURVE_SETTING_KEYS
             or key.startswith("space_heating_gate_")
@@ -767,6 +805,10 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
                 set_={"value": value},
             )
             await session.execute(stmt)
+            if key == "ml_maintenance_enabled":
+                from packages.ml.lifecycle import update_maintenance_gate
+
+                await update_maintenance_gate(session, _parse_bool(value))
 
 
 async def get_comfort_schedule() -> dict[str, list[int]]:

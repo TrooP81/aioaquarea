@@ -291,6 +291,11 @@ class ControlStateResponse(BaseModel):
     primary_action: ControlStateActionResponse | None = None
     notices: list[ControlStateNoticeResponse] = Field(default_factory=list)
     resolved_at: dt.datetime
+    model_lifecycle: dict[str, dict[str, object]] = Field(default_factory=dict)
+    build_policy: Literal["observe_only"] = "observe_only"
+    control_ready: Literal[False] = False
+    ordinary_writes_allowed: Literal[False] = False
+    optimization_requires_new_build: Literal[True] = True
 
 
 class SettingsUpdate(BaseModel):

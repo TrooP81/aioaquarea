@@ -5,6 +5,7 @@ const now = new Date();
 const plans = [
   {
     id: 101,
+    status: "active",
     created_at: now.toISOString(),
     horizon_start: now.toISOString(),
     horizon_end: new Date(now.getTime() + 86_400_000).toISOString(),
@@ -14,6 +15,7 @@ const plans = [
   },
   {
     id: 202,
+    status: "superseded",
     created_at: new Date(now.getTime() - 86_400_000).toISOString(),
     horizon_start: now.toISOString(),
     horizon_end: new Date(now.getTime() + 86_400_000).toISOString(),
@@ -128,4 +130,39 @@ test("plan history stays visible while a shared-clock refresh is pending", async
 
   releaseRefresh();
   await expect(firstRow).toBeVisible();
+});
+
+test("diagnostics are hidden and active identity does not follow list position", async ({ page }) => {
+  const diagnostic = { ...plans[0], id: 999, status: "diagnostic", optimizer_version: "diagnostic_only", actions_count: 0 };
+  const active = { ...plans[1], status: "active" };
+  await page.route(/\/api\/plans\?limit=\d+$/, (route) => route.fulfill({
+    contentType: "application/json", body: JSON.stringify([diagnostic, { ...plans[0], status: "superseded" }, active]),
+  }));
+  await page.route("**/api/plans/202", (route) => route.fulfill({
+    contentType: "application/json", body: JSON.stringify({ ...active, actions: [{ ...action("active_history"), scheduled_ts: new Date(now.getTime() - 60_000).toISOString() }] }),
+  }));
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Timeline" }).click();
+  const rows = page.locator(".plan-history-row");
+  await expect(rows).toHaveCount(2);
+  await expect(page.getByText("diagnostic_only", { exact: true })).toHaveCount(0);
+  await rows.nth(1).click();
+  await expect(page.locator(".plan-action-explanation")).toHaveText("ℹ Scheduled time passed — waiting for diagnostic sweep");
+  await expect(page.getByText("Superseded by a newer plan before this action's scheduled time", { exact: true })).toHaveCount(0);
+});
+
+test("dashboard refuses a diagnostic active-plan payload", async ({ page }) => {
+  let diagnosticDetailRequests = 0;
+  await page.route("**/api/dashboard", (route) => route.fulfill({
+    contentType: "application/json", body: JSON.stringify({ current_status: null, active_plan: { ...plans[0], id: 999, status: "diagnostic" } }),
+  }));
+  await page.route("**/api/plans/999", (route) => {
+    diagnosticDetailRequests += 1;
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...plans[0], id: 999, actions: [] }) });
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Timeline" }).click();
+  await expect(page.getByText("No past plans yet.", { exact: true })).toBeVisible();
+  await expect(page.getByText("No active plan. This build generates diagnostics only; optimization requires a new reviewed, approved build.", { exact: true })).toBeVisible();
+  expect(diagnosticDetailRequests).toBe(0);
 });
