@@ -16,6 +16,18 @@ export interface ReleaseNote {
  */
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
+    version: "0.15.0",
+    released: "2026-10-10",
+    title: "Self-checking models in observe-only mode",
+    changes: [
+      "This build never sends ordinary heat-pump commands; only existing safety restores can run. Turning optimization back on needs a new reviewed release.",
+      "Models maintain themselves when enabled (off by default) and are only trusted after their forecasts beat simple baselines on real outcomes recorded in advance.",
+      "Each model shows whether it is unqualified, a candidate, qualified for reporting, expired, or unavailable; observe-only mode is never ended automatically.",
+      "Thermal, comfort and demand learning no longer mix room sensors, pick samples by direction, or keep models that predict worse than \"no change\".",
+      "The learned COP model is retired, and approximate controller COP readings can be recorded manually without affecting planning.",
+    ],
+  },
+  {
     version: "0.14.0",
     released: "2026-10-03",
     title: "Explainable timelines and safer learning",

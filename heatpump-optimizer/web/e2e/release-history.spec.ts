@@ -54,9 +54,9 @@ test("shows the live release and its change history on Settings", async ({ page 
   await expect(page.getByTestId("app-version")).toContainText(`v${packageInfo.version}`);
   await expect(page.getByRole("heading", { name: "Release History" })).toBeVisible();
   const newestRelease = page.locator(".release-list-item").first();
-  await expect(newestRelease).toContainText("v0.14.0");
-  await expect(newestRelease).toContainText("2026-10-03");
-  await expect(newestRelease).toContainText("Explainable timelines and safer learning");
+  await expect(newestRelease).toContainText("v0.15.0");
+  await expect(newestRelease).toContainText("2026-10-10");
+  await expect(newestRelease).toContainText("Self-checking models in observe-only mode");
   await expect(page.getByTestId("dashboard-version")).toHaveText(`v${packageInfo.version}`);
   await expect(page.getByTestId("api-version")).toHaveText("v0.12.0");
   await expect(page.getByTestId("api-contract")).toHaveText("2026-07-28.3");
