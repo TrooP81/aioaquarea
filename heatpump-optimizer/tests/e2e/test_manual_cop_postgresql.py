@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import http.client
 import importlib.metadata
+import ipaddress
 import json
 import os
 import re
@@ -1818,43 +1819,425 @@ async def _release_retained_blockers(workers, retained):
             await retained.pop().aclose()
 
 
-async def _drop_migration_child(parent, child, workers, parent_before):
+MIGRATION_CHILD_POLLS = 100
+MIGRATION_CHILD_POLL_SECONDS = 0.1
+MIGRATION_CHILD_DIAGNOSTICS_VERSION = 1
+MIGRATION_CHILD_DIAGNOSTIC_ROWS = 64
+MIGRATION_CHILD_DIAGNOSTIC_IDENTITY_SQL = (
+    "SELECT current_database(), current_user, inet_server_port(), d.oid::bigint, "
+    "d.datdba::bigint, pg_get_userbyid(d.datdba)::text, "
+    "shobj_description(d.oid, 'pg_database'), current_setting('server_version'), "
+    "current_setting('server_version_num')::integer, "
+    "(SELECT COALESCE(json_agg(json_build_array(e.extname, e.extversion) "
+    "ORDER BY e.extname), '[]'::json)::text FROM pg_extension e) "
+    "FROM pg_database d WHERE d.datname = :name"
+)
+# Allowlisted columns of the child's sessions only: never query text, credentials or
+# sessions of any other database.
+MIGRATION_CHILD_ACTIVITY_SQL = (
+    "SELECT count(*) OVER (), a.pid, a.datid::bigint, a.datname::text, a.usesysid::bigint, "
+    "a.usename::text, a.backend_type, a.application_name, host(a.client_addr), "
+    "a.client_port, a.backend_start, a.xact_start, a.query_start, a.state_change, "
+    "a.state, a.wait_event_type, a.wait_event FROM pg_stat_activity a "
+    "WHERE a.datid = CAST(:child_oid AS oid) ORDER BY a.pid "
+    f"LIMIT {MIGRATION_CHILD_DIAGNOSTIC_ROWS}"
+)
+MIGRATION_CHILD_ACTIVITY_FIELDS = (
+    ("pid", "int"),
+    ("datid", "int"),
+    ("datname", "label"),
+    ("usesysid", "int"),
+    ("usename", "label"),
+    ("backend_type", "label"),
+    ("application_name", "label"),
+    ("client_addr", "address"),
+    ("client_port", "int"),
+    ("backend_start", "time"),
+    ("xact_start", "time"),
+    ("query_start", "time"),
+    ("state_change", "time"),
+    ("state", "label"),
+    ("wait_event_type", "event_type"),
+    ("wait_event", "event"),
+)
+MIGRATION_CHILD_KNOWN_LABELS = frozenset(
+    {
+        "",
+        "heatpump",
+        "postgres",
+        "client backend",
+        "autovacuum launcher",
+        "autovacuum worker",
+        "background worker",
+        "logical replication launcher",
+        "logical replication worker",
+        "parallel worker",
+        "walsender",
+        "TimescaleDB Background Worker Launcher",
+        "TimescaleDB Background Worker Scheduler",
+        "active",
+        "idle",
+        "idle in transaction",
+        "idle in transaction (aborted)",
+        "fastpath function call",
+        "disabled",
+    }
+)
+# Structured SQLSTATEs that mean the statement or session was cancelled or timed out:
+# connection exceptions, operator intervention (57014 query_canceled, shutdowns) and timeouts.
+MIGRATION_CHILD_TERMINAL_SQLSTATE_CLASSES = frozenset({"08", "57"})
+MIGRATION_CHILD_TERMINAL_SQLSTATES = frozenset({"25P03", "55P03"})
+# Exact recognized names only; anything else, including a known name with extra text, is hashed.
+MIGRATION_CHILD_KNOWN_EXTENSIONS = frozenset({"plpgsql", "timescaledb"})
+MIGRATION_CHILD_WAIT_EVENT_TYPES = frozenset(
+    {"Activity", "BufferPin", "Client", "Extension", "IO", "IPC", "LWLock", "Lock", "Timeout"}
+)
+MIGRATION_CHILD_WAIT_EVENTS = frozenset(
+    {
+        # Client
+        "ClientRead",
+        "ClientWrite",
+        "SSLOpenServer",
+        # Activity (including the main loops of background workers)
+        "AutoVacuumMain",
+        "BgWriterHibernate",
+        "BgWriterMain",
+        "CheckpointerMain",
+        "LogicalLauncherMain",
+        "WalWriterMain",
+        # Lock
+        "advisory",
+        "extend",
+        "object",
+        "page",
+        "relation",
+        "transactionid",
+        "tuple",
+        "userlock",
+        "virtualxid",
+        # LWLock / IO / IPC / Timeout commonly seen around DROP DATABASE
+        "BufferContent",
+        "BufferMapping",
+        "LockManager",
+        "ProcArray",
+        "DataFileRead",
+        "DataFileWrite",
+        "WALSync",
+        "WALWrite",
+        "BgWorkerShutdown",
+        "BgWorkerStartup",
+        "CheckpointDone",
+        "CheckpointStart",
+        "ProcSignalBarrier",
+        "PgSleep",
+        "SpinDelay",
+        "VacuumDelay",
+        # Extensions such as TimescaleDB background workers report this generic event.
+        "Extension",
+    }
+)
+
+
+def _diagnostic_digest(value):
+    return "redacted:sha256:" + hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _diagnostic_value(kind, value, known=MIGRATION_CHILD_KNOWN_LABELS):
+    """Allowlisted serialization: unknown free-form text becomes a stable digest."""
+    if value is None:
+        return "unknown"
+    if kind == "int":
+        return value if type(value) is int else _diagnostic_digest(value)
+    if kind == "time":
+        return value.isoformat() if isinstance(value, dt.datetime) else _diagnostic_digest(value)
+    if kind == "address":
+        try:
+            address = ipaddress.ip_address(str(value))
+        except ValueError:
+            return _diagnostic_digest(value)
+        return (
+            str(address) if address.is_loopback or address.is_private else _diagnostic_digest(value)
+        )
+    if kind == "release":
+        # Only the leading numeric release is parsed out; the remaining text is never reported.
+        match = isinstance(value, str) and re.match(
+            r"[0-9]+(?:\.[0-9]+){0,2}(?![0-9A-Za-z.])", value
+        )
+        return match.group(0) if match else "unknown"
+    if kind == "version":
+        allowed = isinstance(value, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", value)
+    else:
+        allowlist = {
+            "extension": MIGRATION_CHILD_KNOWN_EXTENSIONS,
+            "event_type": MIGRATION_CHILD_WAIT_EVENT_TYPES,
+            "event": MIGRATION_CHILD_WAIT_EVENTS,
+        }.get(kind, known)
+        allowed = isinstance(value, str) and value in allowlist
+    return value if allowed else _diagnostic_digest(value)
+
+
+def _diagnostic_identity(row, child):
+    """Parent-scoped identity facts; the binding comment is reported only as match and hash."""
+    if row is None:
+        return {"owned": False, "child": "missing"}
+    parent_sql = (
+        "heatpump_test",
+        "heatpump",
+        5432 if child["parent"]["provider"] == "github" else 5433,
+    )
     try:
+        pairs = json.loads(row[9])
+    except (TypeError, ValueError):
+        pairs = None
+    extensions = "unknown"
+    if isinstance(pairs, list) and all(isinstance(p, list) and len(p) == 2 for p in pairs):
+        extensions = [
+            [_diagnostic_value("extension", name), _diagnostic_value("version", version)]
+            for name, version in pairs
+        ]
+    return {
+        "owned": tuple(row[:3]) == parent_sql
+        and row[3] == child["oid"]
+        and row[6] == child["binding"],
+        "parent_sql_matches": tuple(row[:3]) == parent_sql,
+        "child_oid": _diagnostic_value("int", row[3]),
+        "owner_oid": _diagnostic_value("int", row[4]),
+        "owner": _diagnostic_value("label", row[5]),
+        "comment_matches": row[6] == child["binding"],
+        "comment_sha256": (
+            "unknown" if row[6] is None else hashlib.sha256(row[6].encode("utf-8")).hexdigest()
+        ),
+        "parent_server_version": _diagnostic_value("release", row[7]),
+        "parent_server_version_text": _diagnostic_value("version", row[7]),
+        "parent_server_version_num": _diagnostic_value("int", row[8]),
+        "parent_extensions": extensions,
+        "child_extensions": "unknown",
+    }
+
+
+def _diagnostic_activity(row, child):
+    known = MIGRATION_CHILD_KNOWN_LABELS | {child["database"]}
+    return {
+        name: _diagnostic_value(kind, value, known)
+        for (name, kind), value in zip(MIGRATION_CHILD_ACTIVITY_FIELDS, row, strict=True)
+    }
+
+
+def _diagnostic_connection_probe(connection):
+    """Capture the healthy raw references now; never revalidate (reconnect) after an error."""
+    fairy = connection.sync_connection._dbapi_connection
+    driver = fairy.driver_connection
+
+    def usable():
+        return (
+            not connection.invalidated
+            and not connection.closed
+            and connection.sync_connection._dbapi_connection is fairy
+            and fairy.driver_connection is driver
+            and not driver.is_closed()
+            and not driver.is_in_transaction()
+        )
+
+    return usable
+
+
+async def _capture_migration_child_diagnostics(
+    connection, child, diagnostics, stage, poll, count, usable
+):
+    """At most three child-scoped SELECTs of evidence; never authorizes DROP or termination.
+
+    A server-returned SELECT error on a still usable AUTOCOMMIT connection is recorded and
+    polling continues; any other failure, including cancellation, is terminal.
+    """
+    snapshot = {
+        "stage": stage,
+        "poll": poll,
+        "count": count,
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "queries": 0,
+        "status": "incomplete",
+    }
+    diagnostics["snapshots"].append(snapshot)
+    parameters = {"name": child["database"]}
+    try:
+        _require_original_parent(child)
+        snapshot["queries"] += 1
+        before = (
+            await connection.execute(text(MIGRATION_CHILD_DIAGNOSTIC_IDENTITY_SQL), parameters)
+        ).one_or_none()
+        snapshot["identity"] = _diagnostic_identity(before, child)
+        if not snapshot["identity"]["owned"]:
+            snapshot["status"] = "identity_drift"
+            raise AssertionError("migration child ownership uncertain")
+        snapshot["queries"] += 1
+        rows = (
+            await connection.execute(
+                text(MIGRATION_CHILD_ACTIVITY_SQL), {"child_oid": child["oid"]}
+            )
+        ).all()
+        snapshot["queries"] += 1
+        after = (
+            await connection.execute(text(MIGRATION_CHILD_DIAGNOSTIC_IDENTITY_SQL), parameters)
+        ).one_or_none()
+        _require_original_parent(child)
+        if after != before:
+            snapshot["status"] = "identity_drift"
+            raise AssertionError("migration child ownership uncertain")
+        rows = rows[:MIGRATION_CHILD_DIAGNOSTIC_ROWS]
+        snapshot["total"] = _diagnostic_value("int", rows[0][0]) if rows else 0
+        snapshot["truncated"] = not isinstance(snapshot["total"], int) or snapshot["total"] > len(
+            rows
+        )
+        snapshot["activity"] = [_diagnostic_activity(row[1:], child) for row in rows]
+        snapshot["status"] = "captured"
+    except BaseException as error:
+        snapshot["error"] = type(error).__name__
+        if snapshot["status"] == "incomplete":
+            snapshot["status"] = "failed"
+        sqlstate = getattr(getattr(error, "orig", None), "sqlstate", None)
+        if not (isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate)):
+            sqlstate = None
+        snapshot["sqlstate"] = sqlstate or "unknown"
+        # Only a structured, ordinary server error on a still usable connection is recoverable;
+        # unstructured, cancellation and timeout outcomes are terminal.
+        if (
+            isinstance(error, DBAPIError)
+            and not error.connection_invalidated
+            and sqlstate is not None
+            and sqlstate[:2] not in MIGRATION_CHILD_TERMINAL_SQLSTATE_CLASSES
+            and sqlstate not in MIGRATION_CHILD_TERMINAL_SQLSTATES
+            and snapshot["status"] == "failed"
+            and usable()
+        ):
+            snapshot["terminal"] = False
+            return
+        snapshot["terminal"] = True
+        raise
+
+
+async def _exit_migration_child_connection(context, primary, diagnostics):
+    """Run the connection's own context exit exactly once and drain it to completion.
+
+    No new deadline: the existing process phase deadline stays authoritative. Caller
+    cancellations are remembered, never forwarded to the exit, and never end the drain.
+    """
+    arguments = (None, None, None)
+    if primary is not None:
+        arguments = (type(primary), primary, primary.__traceback__)
+    exiting = asyncio.ensure_future(context.__aexit__(*arguments))
+    cancelled = None
+    while not exiting.done():
+        try:
+            # asyncio.wait shields the exit: cancelling this wait never cancels the exit task.
+            await asyncio.wait({exiting})
+        except asyncio.CancelledError as error:
+            cancelled = cancelled or error
+    state = {"cancelled": cancelled is not None}
+    if exiting.cancelled() or exiting.exception() is not None:
+        failure = asyncio.CancelledError() if exiting.cancelled() else exiting.exception()
+        state["status"] = "failed"
+        state["error"] = type(failure).__name__
+    else:
+        state["status"] = "closed"
+        failure = cancelled
+    diagnostics["connection_exit"] = state
+    if failure is None:
+        return
+    if primary is not None:
+        # The primary cause stays primary; the exit outcome is recorded alongside it.
+        primary.add_note(f"migration child connection exit: {state}")
+        return
+    if cancelled is not None and failure is not cancelled:
+        # The caller's cancellation arrived first and stays primary; the later exit failure
+        # keeps its exact identity as the explicit cause.
+        cancelled.add_note(f"migration child connection exit then failed: {state}")
+        raise cancelled from failure
+    raise failure
+
+
+async def _drain_and_drop_migration_child(connection, child, parent_before, diagnostics):
+    usable = None
+    for attempt in range(MIGRATION_CHILD_POLLS):
+        current = (
+            await connection.execute(
+                text(
+                    "SELECT d.oid::bigint, shobj_description(d.oid, 'pg_database'), "
+                    "(SELECT count(*) FROM pg_stat_activity a WHERE a.datid = d.oid) "
+                    "FROM pg_database d WHERE d.datname = :name"
+                ),
+                {"name": child["database"]},
+            )
+        ).one_or_none()
+        assert current is not None, "migration child disappeared"
+        assert (current[0], current[1]) == (child["oid"], child["binding"]), (
+            "migration child ownership uncertain"
+        )
+        if current[2] == 0:
+            break
+        if usable is None:
+            usable = _diagnostic_connection_probe(connection)
+            await _capture_migration_child_diagnostics(
+                connection, child, diagnostics, "first_nonzero", attempt, current[2], usable
+            )
+        await asyncio.sleep(MIGRATION_CHILD_POLL_SECONDS)
+    else:
+        # Created before collection: no collector, exit or receipt failure replaces it.
+        refusal = AssertionError("migration child still has sessions")
+        try:
+            await _capture_migration_child_diagnostics(
+                connection, child, diagnostics, "final_refusal", attempt, current[2], usable
+            )
+        except BaseException as failure:
+            raise refusal from failure
+        raise refusal
+    await connection.execute(text(f'DROP DATABASE "{child["database"]}"'))
+    assert await _parent_relations(connection) == parent_before, "parent state changed"
+
+
+async def _drop_migration_child(parent, child, workers, parent_before, retained_count):
+    diagnostics = {
+        "version": MIGRATION_CHILD_DIAGNOSTICS_VERSION,
+        "workers": [],
+        "retained_resources": retained_count,
+        "snapshots": [],
+    }
+    try:
+        diagnostics["workers"] = [
+            {
+                "index": index,
+                "done": worker.done(),
+                "cancelled": worker.done() and worker.cancelled(),
+            }
+            for index, worker in enumerate(workers)
+        ]
         assert child["oid"] is not None, "migration child OID was not recorded"
         assert all(worker.done() for worker in workers), "migration worker did not settle"
         _require_original_parent(child)
-        async with parent.connect() as connection:
+        context = parent.connect()
+        connection = await context.__aenter__()
+        primary = None
+        try:
             connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
             await guard_owned_database(connection)
             _require_original_parent(child)
-            for _attempt in range(100):
-                current = (
-                    await connection.execute(
-                        text(
-                            "SELECT d.oid::bigint, shobj_description(d.oid, 'pg_database'), "
-                            "(SELECT count(*) FROM pg_stat_activity a WHERE a.datid = d.oid) "
-                            "FROM pg_database d WHERE d.datname = :name"
-                        ),
-                        {"name": child["database"]},
-                    )
-                ).one_or_none()
-                assert current is not None, "migration child disappeared"
-                assert (current[0], current[1]) == (child["oid"], child["binding"]), (
-                    "migration child ownership uncertain"
-                )
-                if current[2] == 0:
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                raise AssertionError("migration child still has sessions")
-            await connection.execute(text(f'DROP DATABASE "{child["database"]}"'))
-            assert await _parent_relations(connection) == parent_before, "parent state changed"
+            await _drain_and_drop_migration_child(connection, child, parent_before, diagnostics)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            await _exit_migration_child_connection(context, primary, diagnostics)
     except BaseException as error:
-        receipt = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) / (
-            "migration-child-cleanup-" + child["database"] + ".json"
-        )
-        receipt.write_text(json.dumps(child | {"error": type(error).__name__}), encoding="utf-8")
-        raise AssertionError(f"migration child cleanup refused; receipt {receipt.name}") from error
+        receipt = "migration-child-cleanup-" + child["database"] + ".json"
+        try:
+            (Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) / receipt).write_text(
+                json.dumps(child | {"error": type(error).__name__, "diagnostics": diagnostics}),
+                encoding="utf-8",
+            )
+        except Exception as failure:
+            # The receipt is evidence only; its failure never replaces the refusal's cause.
+            error.add_note(f"migration child cleanup receipt not written: {type(failure).__name__}")
+            receipt += " (unwritten)"
+        raise AssertionError(f"migration child cleanup refused; receipt {receipt}") from error
 
 
 @asynccontextmanager
@@ -1969,7 +2352,7 @@ async def owned_migration_child(purpose):
             if child_engine is not None:
                 await child_engine.dispose()
             if created:
-                await _drop_migration_child(parent, record, workers, parent_before)
+                await _drop_migration_child(parent, record, workers, parent_before, len(retained))
         finally:
             await parent.dispose()
 
@@ -2234,6 +2617,234 @@ async def seed_forward_records(connection):
         )
         await insert_legacy_observation(connection, values)
     return SimpleNamespace(devices=devices, links=links, manual=len(manual))
+
+
+class _DiagnosticDriver:
+    def __init__(self):
+        self.closed = False
+        self.in_transaction = False
+
+    def is_closed(self):
+        return self.closed
+
+    def is_in_transaction(self):
+        return self.in_transaction
+
+
+def _diagnostic_statement_kind(sql):
+    if sql.startswith("DROP DATABASE"):
+        return "drop"
+    if "FROM pg_class" in sql:
+        return "relations"
+    if "server_version_num" in sql:
+        return "identity"
+    if "count(*) OVER ()" in sql:
+        return "activity"
+    if "count(*) FROM pg_stat_activity" in sql:
+        return "poll"
+    raise AssertionError(f"unexpected cleanup SQL: {sql}")
+
+
+class _DiagnosticParent:
+    """Scripted parent engine and connection for cleanup diagnostics; no network at all."""
+
+    def __init__(
+        self,
+        child,
+        counts,
+        *,
+        rows=(),
+        total=None,
+        failures=None,
+        blocks=None,
+        exit_gate=None,
+        exit_error=None,
+    ):
+        self.child = child
+        self.counts = list(counts)
+        self.rows = list(rows)
+        self.total = len(self.rows) if total is None else total
+        self.identities = []
+        self.failures = dict(failures or {})
+        self.blocks = dict(blocks or {})
+        self.exit_gate = exit_gate
+        self.exit_error = exit_error
+        self.statements = []
+        self.connects = 0
+        self.exits = []
+        self.driver = _DiagnosticDriver()
+        self.fairy = SimpleNamespace(driver_connection=self.driver)
+        self.sync_connection = SimpleNamespace(_dbapi_connection=self.fairy)
+        self.invalidated = False
+        self.closed = False
+
+    def connect(self):
+        self.connects += 1
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self.exits.append(exc_info[0])
+        if self.exit_gate is not None:
+            await self.exit_gate.wait()
+        self.closed = True
+        if self.exit_error is not None:
+            raise self.exit_error
+
+    async def execution_options(self, **options):
+        assert options == {"isolation_level": "AUTOCOMMIT"}
+        return self
+
+    def kinds(self):
+        return [kind for kind, _sql, _parameters in self.statements]
+
+    def owned_identity(self):
+        return (
+            "heatpump_test",
+            "heatpump",
+            5432,
+            self.child["oid"],
+            10,
+            "heatpump",
+            self.child["binding"],
+            "16.4 (Debian 16.4-1.pgdg120+2)",
+            160004,
+            '[["plpgsql", "1.0"], ["timescaledb", "2.17.2"]]',
+        )
+
+    async def execute(self, statement, parameters=None):
+        assert not self.closed and not self.invalidated, "SQL on a closed or invalidated connection"
+        sql = str(statement)
+        kind = _diagnostic_statement_kind(sql)
+        self.statements.append((kind, sql, parameters))
+        key = (kind, self.kinds().count(kind))
+        if key in self.blocks:
+            await self.blocks.pop(key).wait()
+        if key in self.failures:
+            raise self.failures.pop(key)(self)
+        if kind == "poll":
+            count = self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+            rows = [(self.child["oid"], self.child["binding"], count)]
+        elif kind == "identity":
+            rows = [self.identities.pop(0) if self.identities else self.owned_identity()]
+        elif kind == "activity":
+            rows = [(self.total, *row) for row in self.rows]
+        else:
+            rows = []
+        return SimpleNamespace(one_or_none=lambda: rows[0] if rows else None, all=lambda: rows)
+
+
+def _diagnostic_child():
+    name = MIGRATION_CHILD_PREFIX + "diag_" + "0" * 32
+    return {
+        "database": name,
+        "oid": 4242,
+        "binding": json.dumps({"database": name, "marker": "binding-text-never-reported"}),
+        "parent": {"provider": "github"},
+    }
+
+
+def _diagnostic_rows(child, count):
+    start = dt.datetime(2026, 10, 12, 21, 0, tzinfo=dt.timezone.utc)
+    return [
+        (1000 + index, child["oid"], child["database"], 10, "heatpump", "client backend", "")
+        + ("127.0.0.1", 50000 + index, start, None, start, start, "idle", "Client", "ClientRead")
+        for index in range(count)
+    ]
+
+
+def _diagnostic_guards(monkeypatch, tmp_path, *, polls, parent_failure_at=None):
+    """Replace the receipt/SQL guards with counted fakes; bound the poll loop for speed."""
+    monkeypatch.setenv("COP_MANUAL_TEST_EVIDENCE", str(tmp_path))
+    monkeypatch.setitem(globals(), "MIGRATION_CHILD_POLLS", polls)
+    monkeypatch.setitem(globals(), "MIGRATION_CHILD_POLL_SECONDS", 0)
+    calls = []
+
+    async def guard(connection):
+        calls.append("guard")
+
+    def parent_check(child):
+        calls.append("parent")
+        if calls.count("parent") == parent_failure_at:
+            raise AssertionError("migration child parent identity changed")
+
+    monkeypatch.setitem(globals(), "guard_owned_database", guard)
+    monkeypatch.setitem(globals(), "_require_original_parent", parent_check)
+    return calls
+
+
+def _diagnostic_receipt(tmp_path, child):
+    receipt = tmp_path / f"migration-child-cleanup-{child['database']}.json"
+    return json.loads(receipt.read_text(encoding="utf-8"))["diagnostics"]
+
+
+DIAGNOSTIC_CAPTURE = ["identity", "activity", "identity"]
+
+
+def _adapted_asyncpg_error(name, *, invalidated=False):
+    """The DBAPIError SQLAlchemy's asyncpg dialect actually builds for an asyncpg error class."""
+    import asyncpg
+    from sqlalchemy.dialects.postgresql.asyncpg import (
+        AsyncAdapt_asyncpg_connection,
+        AsyncAdapt_asyncpg_dbapi,
+    )
+
+    dbapi = AsyncAdapt_asyncpg_dbapi(asyncpg)
+    adapter = AsyncAdapt_asyncpg_connection.__new__(AsyncAdapt_asyncpg_connection)
+    adapter.dbapi = dbapi
+    adapter._connection = SimpleNamespace(is_closed=lambda: False)
+    try:
+        adapter._handle_exception(getattr(asyncpg.exceptions, name)("synthetic"))
+    except dbapi.Error as adapted:
+        return DBAPIError.instance(
+            "SELECT", {}, adapted, dbapi.Error, connection_invalidated=invalidated
+        )
+    raise AssertionError(f"{name} was not adapted")
+
+
+class _DiagnosticSuspend:
+    def __await__(self):
+        yield
+
+
+class _DiagnosticPendingExit:
+    """Scripted connection exit task: pending until settled, every interaction counted."""
+
+    def __init__(self):
+        self.settled = False
+        self.error = None
+        self.cancels = 0
+        self.calls = []
+        self.waits = 0
+
+    def exit(self, *exc_info):
+        self.calls.append(exc_info)
+        return "exit-coroutine"
+
+    def ensure_future(self, awaitable):
+        assert awaitable == "exit-coroutine"
+        return self
+
+    def done(self):
+        return self.settled
+
+    def cancelled(self):
+        return False
+
+    def exception(self):
+        assert self.settled
+        return self.error
+
+    def cancel(self):
+        self.cancels += 1
+
+    async def wait(self, tasks, timeout=None):
+        assert tasks == {self} and timeout is None, "a new exit deadline was introduced"
+        self.waits += 1
+        await _DiagnosticSuspend()
+        return set(), set(tasks)
 
 
 class TestManualCOPPostgreSQLMigration:
@@ -3036,7 +3647,7 @@ class TestManualCOPPostgreSQLMigration:
         assert closed == [] and len(retained) == 1
         child = {"database": "manual_cop_child_x", "oid": 1, "binding": "{}", "parent": {}}
         with pytest.raises(AssertionError, match="cleanup refused") as refused:
-            await _drop_migration_child(Parent(), child, [pending], None)
+            await _drop_migration_child(Parent(), child, [pending], None, 1)
         assert "did not settle" in str(refused.value.__cause__)
         receipt = json.loads(
             (tmp_path / "migration-child-cleanup-manual_cop_child_x.json").read_text()
@@ -3045,6 +3656,481 @@ class TestManualCOPPostgreSQLMigration:
         pending.cancel()
         await _release_retained_blockers([pending], retained)
         assert closed == [True] and retained == []
+
+    async def test_diag_capture_is_child_scoped_and_bounded(self, tmp_path, monkeypatch):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        # More rows than the bound: the client-side bound holds even if the server's does not.
+        parent = _DiagnosticParent(child, [2], rows=_diagnostic_rows(child, 70), total=70)
+        loop = asyncio.get_running_loop()
+        finished, cancelled = loop.create_future(), loop.create_future()
+        finished.set_result(None)
+        cancelled.cancel()
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [finished, cancelled], (), 2)
+        assert str(refused.value.__cause__) == "migration child still has sessions"
+        assert parent.kinds() == ["poll", *DIAGNOSTIC_CAPTURE, "poll", "poll", *DIAGNOSTIC_CAPTURE]
+        assert parent.connects == 1 and parent.exits == [AssertionError]
+        for kind, sql, parameters in parent.statements:
+            assert not re.search(r"\b(query|password|passwd|client_hostname)\b", sql)
+            if kind == "activity":
+                assert parameters == {"child_oid": child["oid"]}
+                assert "WHERE a.datid = CAST(:child_oid AS oid) ORDER BY a.pid LIMIT 64" in sql
+        diagnostics = _diagnostic_receipt(tmp_path, child)
+        assert diagnostics["version"] == 1 and diagnostics["retained_resources"] == 2
+        assert diagnostics["workers"] == [
+            {"index": 0, "done": True, "cancelled": False},
+            {"index": 1, "done": True, "cancelled": True},
+        ]
+        snapshots = diagnostics["snapshots"]
+        assert [(s["stage"], s["poll"], s["count"]) for s in snapshots] == [
+            ("first_nonzero", 0, 2),
+            ("final_refusal", 2, 2),
+        ]
+        for snapshot in snapshots:
+            assert snapshot["status"] == "captured" and snapshot["queries"] == 3
+            assert snapshot["total"] == 70 and snapshot["truncated"] is True
+            assert len(snapshot["activity"]) == MIGRATION_CHILD_DIAGNOSTIC_ROWS
+            assert {row["datid"] for row in snapshot["activity"]} == {child["oid"]}
+            identity = snapshot["identity"]
+            assert identity["owned"] and identity["comment_matches"]
+            assert identity["child_extensions"] == "unknown"
+            assert identity["parent_extensions"] == [["plpgsql", "1.0"], ["timescaledb", "2.17.2"]]
+        assert diagnostics["connection_exit"] == {"cancelled": False, "status": "closed"}
+        assert "binding-text-never-reported" not in json.dumps(diagnostics)
+
+    @pytest.mark.parametrize(
+        "drift", ["oid_swap", "comment", "parent_sql", "parent_receipt", "after_activity"]
+    )
+    async def test_diag_identity_drift_refuses_before_activity(self, tmp_path, monkeypatch, drift):
+        _diagnostic_guards(
+            monkeypatch,
+            tmp_path,
+            polls=3,
+            parent_failure_at=3 if drift == "parent_receipt" else None,
+        )
+        child = _diagnostic_child()
+        parent = _DiagnosticParent(child, [1], rows=_diagnostic_rows(child, 1))
+        owned = parent.owned_identity()
+        swapped = {
+            "oid_swap": owned[:3] + (9999,) + owned[4:],
+            "comment": owned[:6] + ("another binding",) + owned[7:],
+            "parent_sql": ("postgres",) + owned[1:],
+            "after_activity": owned[:3] + (9999,) + owned[4:],
+        }.get(drift)
+        if drift == "after_activity":
+            parent.identities = [owned, swapped]
+        elif swapped is not None:
+            parent.identities = [swapped]
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        # The first capture's actual terminal error is primary; no final refusal is invented.
+        expected = (
+            "migration child parent identity changed"
+            if drift == "parent_receipt"
+            else "migration child ownership uncertain"
+        )
+        assert str(refused.value.__cause__) == expected
+        assert parent.kinds() == {
+            "parent_receipt": ["poll"],
+            "after_activity": ["poll", *DIAGNOSTIC_CAPTURE],
+        }.get(drift, ["poll", "identity"])
+        assert parent.connects == 1 and len(parent.exits) == 1
+        [snapshot] = _diagnostic_receipt(tmp_path, child)["snapshots"]
+        assert snapshot["terminal"] is True and "activity" not in snapshot
+        assert snapshot["status"] == ("failed" if drift == "parent_receipt" else "identity_drift")
+
+    @pytest.mark.parametrize("stage", ["first", "final"])
+    async def test_diag_usable_autocommit_select_failure_preserves_polling(
+        self, tmp_path, monkeypatch, stage
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+
+        def server_error(fake):
+            return _adapted_asyncpg_error("InsufficientPrivilegeError")
+
+        rows = _diagnostic_rows(child, 1)
+        if stage == "first":
+            parent = _DiagnosticParent(
+                child, [1, 1, 0], rows=rows, failures={("activity", 1): server_error}
+            )
+            await _drop_migration_child(parent, child, [], (), 0)
+            assert parent.kinds() == ["poll", "identity", "activity", "poll", "poll", "drop"] + [
+                "relations"
+            ]
+            assert list(tmp_path.iterdir()) == []
+        else:
+            parent = _DiagnosticParent(
+                child, [1], rows=rows, failures={("activity", 2): server_error}
+            )
+            with pytest.raises(AssertionError, match="cleanup refused") as refused:
+                await _drop_migration_child(parent, child, [], (), 0)
+            refusal = refused.value.__cause__
+            assert str(refusal) == "migration child still has sessions"
+            assert refusal.__cause__ is None
+            assert parent.kinds() == ["poll", *DIAGNOSTIC_CAPTURE, "poll", "poll"] + [
+                "identity",
+                "activity",
+            ]
+            snapshots = _diagnostic_receipt(tmp_path, child)["snapshots"]
+            assert [s["status"] for s in snapshots] == ["captured", "failed"]
+            assert snapshots[1]["terminal"] is False and snapshots[1]["sqlstate"] == "42501"
+            assert snapshots[1]["error"] == "ProgrammingError"
+        assert parent.connects == 1 and len(parent.exits) == 1
+
+    @pytest.mark.parametrize("stage", ["first", "final"])
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "timeout",
+            "error_invalidated",
+            "sqlalchemy_invalidated",
+            "driver_closed",
+            "in_transaction",
+            "replaced_connection",
+            "unstructured",
+        ],
+    )
+    async def test_diag_timeout_or_invalidation_is_terminal(
+        self, tmp_path, monkeypatch, mode, stage
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        raised = []
+
+        def fail(fake):
+            if mode == "timeout":
+                error = TimeoutError("synthetic command timeout")
+            elif mode == "unstructured":
+                # No structured SQLSTATE: the outcome is uncertain, hence terminal.
+                error = DBAPIError("SELECT", {}, Exception("synthetic"))
+            else:
+                # An otherwise recoverable SQLSTATE; only the connection state makes it terminal.
+                error = _adapted_asyncpg_error(
+                    "InsufficientPrivilegeError", invalidated=mode == "error_invalidated"
+                )
+            if mode == "sqlalchemy_invalidated":
+                fake.invalidated = True
+            elif mode == "driver_closed":
+                fake.driver.closed = True
+            elif mode == "in_transaction":
+                fake.driver.in_transaction = True
+            elif mode == "replaced_connection":
+                fake.sync_connection._dbapi_connection = SimpleNamespace()
+            raised.append(error)
+            return error
+
+        nth = 1 if stage == "first" else 2
+        parent = _DiagnosticParent(
+            child, [1], rows=_diagnostic_rows(child, 1), failures={("activity", nth): fail}
+        )
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        # Terminal: nothing more is sent, nothing reconnects, nothing is dropped.
+        prefix = [] if stage == "first" else ["poll", *DIAGNOSTIC_CAPTURE, "poll"]
+        assert parent.kinds() == prefix + ["poll", "identity", "activity"]
+        assert parent.connects == 1 and len(parent.exits) == 1
+        cause = refused.value.__cause__
+        if stage == "final":
+            assert str(cause) == "migration child still has sessions"
+            cause = cause.__cause__
+        assert cause is raised[0]
+        snapshot = _diagnostic_receipt(tmp_path, child)["snapshots"][-1]
+        assert snapshot["terminal"] is True and snapshot["status"] == "failed"
+
+    @pytest.mark.parametrize("moment", ["capture", "exit"])
+    async def test_diag_external_cancellation_drains_exit_without_reconnect(
+        self, tmp_path, monkeypatch, moment
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        blocked, gate = asyncio.Event(), asyncio.Event()
+        if moment == "capture":
+            expected = ["poll", "identity", "activity"]
+            parent = _DiagnosticParent(
+                child,
+                [1],
+                rows=_diagnostic_rows(child, 1),
+                blocks={("activity", 1): blocked},
+                exit_gate=gate,
+            )
+        else:
+            expected = ["poll", "drop", "relations"]
+            parent = _DiagnosticParent(child, [0], exit_gate=gate)
+        before = asyncio.all_tasks()
+        runner = asyncio.ensure_future(_drop_migration_child(parent, child, [], (), 0))
+        while parent.kinds() != expected:
+            await asyncio.sleep(0)
+        if moment == "capture":
+            for _ in range(5):
+                await asyncio.sleep(0)
+            runner.cancel()
+        while not parent.exits:
+            await asyncio.sleep(0)
+        if moment == "exit":
+            runner.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+        # A further cancellation while the exit drains neither abandons nor repeats it.
+        runner.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not runner.done() and len(parent.exits) == 1
+        gate.set()
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await runner
+        assert isinstance(refused.value.__cause__, asyncio.CancelledError)
+        assert parent.kinds() == expected and not blocked.is_set()
+        assert parent.connects == 1 and len(parent.exits) == 1
+        assert asyncio.all_tasks() - before == set(), "a cleanup task was abandoned"
+        diagnostics = _diagnostic_receipt(tmp_path, child)
+        assert diagnostics["connection_exit"] == {"cancelled": True, "status": "closed"}
+        if moment == "capture":
+            [snapshot] = diagnostics["snapshots"]
+            assert snapshot["terminal"] is True and snapshot["error"] == "CancelledError"
+
+    @pytest.mark.parametrize(
+        "failing", [("capture",), ("exit",), ("receipt",), ("capture", "exit", "receipt")]
+    )
+    async def test_diag_final_refusal_survives_capture_exit_and_receipt_failure(
+        self, tmp_path, monkeypatch, failing
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=2)
+        if "receipt" in failing:
+            monkeypatch.setenv("COP_MANUAL_TEST_EVIDENCE", str(tmp_path / "missing"))
+        child = _diagnostic_child()
+        timeout = TimeoutError("synthetic capture timeout")
+        parent = _DiagnosticParent(
+            child,
+            [1],
+            rows=_diagnostic_rows(child, 1),
+            failures={("activity", 2): lambda fake: timeout} if "capture" in failing else None,
+            exit_error=OSError("synthetic exit failure") if "exit" in failing else None,
+        )
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        refusal = refused.value.__cause__
+        assert str(refusal) == "migration child still has sessions"
+        assert refusal.__cause__ is (timeout if "capture" in failing else None)
+        notes = getattr(refusal, "__notes__", [])
+        assert any("connection exit" in note for note in notes) == ("exit" in failing)
+        assert any("receipt not written" in note for note in notes) == ("receipt" in failing)
+        assert str(refused.value).endswith("(unwritten)") == ("receipt" in failing)
+        assert parent.exits == [AssertionError] and "drop" not in parent.kinds()
+        if "receipt" not in failing:
+            diagnostics = _diagnostic_receipt(tmp_path, child)
+            exit_status = "failed" if "exit" in failing else "closed"
+            assert diagnostics["connection_exit"]["status"] == exit_status
+            final_status = "failed" if "capture" in failing else "captured"
+            assert diagnostics["snapshots"][-1]["status"] == final_status
+
+    async def test_diag_zero_session_path_and_redaction_contract(self, tmp_path, monkeypatch):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        parent = _DiagnosticParent(child, [0])
+        # The zero-session path never probes the raw connection nor issues a new query.
+        parent.sync_connection = None
+        await _drop_migration_child(parent, child, [], (), 0)
+        assert parent.kinds() == ["poll", "drop", "relations"]
+        assert parent.connects == 1 and parent.exits == [None]
+        assert list(tmp_path.iterdir()) == []
+        secret = "postgresql://heatpump:hunter2@db.example/heatpump"
+        start = dt.datetime(2026, 10, 12, 21, 0, tzinfo=dt.timezone.utc)
+        serialized = _diagnostic_activity(
+            (77, 4242, child["database"], 10, "heatpump", "TimescaleDB Background Worker Scheduler")
+            + (secret, "8.8.8.8", None, start, None, None, start, "idle in transaction")
+            + ("Lock", "transactionid"),
+            child,
+        )
+        assert serialized["datname"] == child["database"]
+        assert serialized["backend_type"] == "TimescaleDB Background Worker Scheduler"
+        assert serialized["application_name"] == _diagnostic_digest(secret)
+        assert serialized["client_addr"] == _diagnostic_digest("8.8.8.8")
+        assert serialized["client_port"] == "unknown" and serialized["xact_start"] == "unknown"
+        assert serialized["backend_start"] == start.isoformat()
+        assert serialized["wait_event"] == "transactionid"
+        assert "hunter2" not in json.dumps(serialized)
+        for address in ("127.0.0.1", "::1", "10.1.2.3", "192.168.0.4"):
+            assert _diagnostic_value("address", address) == address
+        assert _diagnostic_value("label", "someone else").startswith("redacted:sha256:")
+        assert _diagnostic_value("event", "two words").startswith("redacted:sha256:")
+        assert _diagnostic_value("int", "12") == _diagnostic_digest("12")
+        identity = _diagnostic_identity(parent.owned_identity(), child)
+        assert identity["owned"] and identity["comment_matches"]
+        assert identity["comment_sha256"] == hashlib.sha256(child["binding"].encode()).hexdigest()
+        assert "binding-text-never-reported" not in json.dumps(identity)
+        assert _diagnostic_identity(None, child) == {"owned": False, "child": "missing"}
+
+    @pytest.mark.parametrize("primary", [False, True])
+    @pytest.mark.parametrize("outcome", ["closed", "failed"])
+    async def test_diag_pending_exit_drains_without_deadline_or_reconnect(
+        self, monkeypatch, primary, outcome
+    ):
+        real = asyncio
+        exiting = _DiagnosticPendingExit()
+        cancellations = []
+
+        async def wait(tasks, timeout=None):
+            if exiting.waits in (1, 3, 250) and len(cancellations) < 3:
+                cancellations.append(real.CancelledError())
+                exiting.waits += 1
+                raise cancellations[-1]
+            return await exiting.wait(tasks, timeout)
+
+        # Scripted, loop-free asyncio: no clock exists, so no budget can end the drain early.
+        fake = SimpleNamespace(CancelledError=real.CancelledError, wait=wait)
+        fake.ensure_future = exiting.ensure_future
+        monkeypatch.setitem(globals(), "asyncio", fake)
+        refusal = AssertionError("migration child still has sessions") if primary else None
+        diagnostics = {}
+        draining = _exit_migration_child_connection(
+            SimpleNamespace(__aexit__=exiting.exit), refusal, diagnostics
+        )
+        for _ in range(1000):
+            assert draining.send(None) is None, "the drain ended while the exit was pending"
+        assert len(cancellations) == 3 and exiting.waits >= 1000
+        assert exiting.calls == [(type(refusal), refusal, None) if primary else (None, None, None)]
+        assert exiting.cancels == 0 and "connection_exit" not in diagnostics
+        exiting.settled = True
+        if outcome == "failed":
+            exiting.error = OSError("synthetic exit failure")
+        if primary:
+            with pytest.raises(StopIteration):
+                draining.send(None)
+            assert refusal.__notes__ == [
+                f"migration child connection exit: {diagnostics['connection_exit']}"
+            ]
+        else:
+            with pytest.raises(BaseException) as raised:
+                draining.send(None)
+            if outcome == "closed":
+                assert raised.value is cancellations[0]
+            else:
+                # The first terminal event, the caller's cancellation, stays primary; the
+                # later exit failure keeps its exact identity as the explicit cause.
+                assert raised.value is cancellations[0]
+                assert raised.value.__cause__ is exiting.error
+                assert raised.value.__notes__ == [
+                    f"migration child connection exit then failed: {diagnostics['connection_exit']}"
+                ]
+            assert exiting.error is None or not hasattr(exiting.error, "__notes__")
+            assert all(c.__cause__ is None for c in cancellations[1:])
+        expected = {"cancelled": True, "status": outcome}
+        if outcome == "failed":
+            expected["error"] = "OSError"
+        assert diagnostics["connection_exit"] == expected
+        assert len(exiting.calls) == 1 and exiting.cancels == 0
+
+    @pytest.mark.parametrize("stage", ["first", "final"])
+    @pytest.mark.parametrize(
+        ("name", "sqlstate"),
+        [
+            ("QueryCanceledError", "57014"),
+            ("AdminShutdownError", "57P01"),
+            ("LockNotAvailableError", "55P03"),
+            ("IdleInTransactionSessionTimeoutError", "25P03"),
+        ],
+    )
+    async def test_diag_cancel_or_timeout_sqlstate_is_terminal(
+        self, tmp_path, monkeypatch, name, sqlstate, stage
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        error = _adapted_asyncpg_error(name)
+        # The SQLAlchemy-adapted error is not an invalidation; its SQLSTATE alone decides.
+        assert error.orig.sqlstate == sqlstate and not error.connection_invalidated
+        nth = 1 if stage == "first" else 2
+        # A first-stage session count that would otherwise reach zero and DROP.
+        counts = [1, 0] if stage == "first" else [1]
+        parent = _DiagnosticParent(
+            child,
+            counts,
+            rows=_diagnostic_rows(child, 1),
+            failures={("activity", nth): lambda fake: error},
+        )
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        # Terminal: no further poll, diagnostic SQL or DROP; nothing reconnects.
+        prefix = [] if stage == "first" else ["poll", *DIAGNOSTIC_CAPTURE, "poll"]
+        assert parent.kinds() == prefix + ["poll", "identity", "activity"]
+        assert parent.connects == 1
+        cause = refused.value.__cause__
+        if stage == "final":
+            # The existing count refusal stays primary, the cancellation is its attached cause.
+            assert str(cause) == "migration child still has sessions"
+            assert parent.exits == [AssertionError]
+            cause = cause.__cause__
+        else:
+            # The first actual error is primary and is what the connection exit receives.
+            assert parent.exits == [type(error)]
+        assert cause is error
+        snapshot = _diagnostic_receipt(tmp_path, child)["snapshots"][-1]
+        assert snapshot["terminal"] is True and snapshot["status"] == "failed"
+        assert snapshot["sqlstate"] == sqlstate
+
+    @pytest.mark.parametrize("placement", ["exact", "embedded"])
+    async def test_diag_free_form_canaries_are_never_serialized(self, placement):
+        child = _diagnostic_child()
+
+        def canary(legitimate, name):
+            token = f"CANARY_{name}_SECRET_TOKEN"
+            return token if placement == "exact" else f"{legitimate} {token}"
+
+        parent = _DiagnosticParent(child, [1])
+        owned = parent.owned_identity()
+        extensions = [
+            [canary("timescaledb", "EXTENSION"), canary("2.17.2", "EXTENSION_VERSION")],
+            ["timescaledb", canary("2.17.2", "PASSWORD_VALUE")],
+            [canary("plpgsql", "PRIVATE_EXTENSION"), "1.0"],
+        ]
+        identities = [
+            owned[:5] + (canary("heatpump", "OWNER"),) + owned[6:7],
+            owned[:7] + (canary("16.4", "SERVER_VERSION"),),
+        ]
+        identities = [
+            identities[0] + owned[7:],
+            identities[1] + (owned[8], json.dumps(extensions)),
+            owned[:9] + (json.dumps({"CANARY_MAPPING_SECRET_TOKEN": "1.0"}),),
+            owned[:9] + (json.dumps(["CANARY_FLAT_SECRET_TOKEN"]),),
+        ]
+        start = dt.datetime(2026, 10, 12, 21, 0, tzinfo=dt.timezone.utc)
+        activity = (77, 4242, canary(child["database"], "DATNAME"), 10)
+        activity += (canary("heatpump", "USER"), canary("client backend", "BACKEND_TYPE"))
+        activity += (canary("", "APPLICATION"), canary("127.0.0.1", "ADDRESS"), 5000)
+        activity += (start, None, start, start, canary("idle", "STATE"))
+        activity += (canary("Client", "WAIT_EVENT_TYPE"), canary("ClientRead", "WAIT_EVENT"))
+        serialized = [_diagnostic_identity(row, child) for row in identities]
+        serialized.append(_diagnostic_activity(activity, child))
+        serialized += [
+            _diagnostic_value(kind, canary(legitimate, "VALUE"))
+            for kind, legitimate in [
+                ("event", "ClientRead"),
+                ("event_type", "Lock"),
+                ("extension", "timescaledb"),
+                ("version", "2.17.2"),
+                ("release", "16.4"),
+                ("label", "idle"),
+            ]
+        ]
+        assert "CANARY" not in json.dumps(serialized)
+        assert serialized[1]["parent_server_version"] == (
+            "unknown" if placement == "exact" else "16.4"
+        )
+        assert serialized[1]["parent_server_version_text"].startswith("redacted:sha256:")
+        assert serialized[1]["parent_extensions"][1][0] == "timescaledb"
+        assert serialized[2]["parent_extensions"] == "unknown"
+        assert serialized[3]["parent_extensions"] == "unknown"
+        # Legitimate evidence stays exact.
+        legitimate = _diagnostic_identity(owned, child)
+        assert legitimate["parent_server_version"] == "16.4"
+        assert legitimate["parent_server_version_num"] == 160004
+        assert legitimate["parent_extensions"] == [["plpgsql", "1.0"], ["timescaledb", "2.17.2"]]
+        assert _diagnostic_value("version", "16.4") == "16.4"
+        assert _diagnostic_value("release", "16.4.CANARY") == "unknown"
+        assert _diagnostic_value("event_type", "Lock") == "Lock"
+        assert _diagnostic_value("event", "Extension") == "Extension"
+        assert _diagnostic_value("event", "transactionid") == "transactionid"
 
     async def test_manual_reset_recreate_rejects_stale_pre_reset_revision(
         self, forward_manual_database, monkeypatch
