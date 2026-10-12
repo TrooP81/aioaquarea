@@ -492,9 +492,9 @@ esac
         )
         assert "restore-db-production-test-*" in script
         assert "restore_production_test_*" in script
-        assert 'project_backups_dir=$(CDPATH= cd -- "$PROJECT_DIR/backups" && pwd -P)' in script
+        assert "project_backups_dir=$(CDPATH='' cd -- \"$PROJECT_DIR/backups\" && pwd -P)" in script
         assert (
-            'production_test_backup_dir=$(CDPATH= cd -- "$RESTORE_PRODUCTION_TEST_BACKUP_DIR" && pwd -P)'
+            "production_test_backup_dir=$(CDPATH='' cd -- \"$RESTORE_PRODUCTION_TEST_BACKUP_DIR\" && pwd -P)"
             in script
         )
         assert "RESTORE_PRODUCTION_TEST_BACKUP_DIR=$production_test_backup_dir" in script

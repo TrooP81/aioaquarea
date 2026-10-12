@@ -30,7 +30,7 @@ fi
 temporary_archive=""
 verification_log=$(mktemp)
 candidate_verified=false
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 cleanup() {
   if [ "$candidate_verified" = "true" ]; then

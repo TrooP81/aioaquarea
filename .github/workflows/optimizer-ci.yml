@@ -32,11 +32,12 @@ jobs:
       ENTSOE_AREA: 10Y1001A1001A46L
       AQUAREA_USERNAME: test@test.com
       AQUAREA_PASSWORD: testpass
-      MODEL_DIR: ${{ runner.temp }}/hpo-unit-${{ github.run_id }}-${{ github.run_attempt }}/models
       PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/heatpump-optimizer
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Export owned unit model directory
+        run: echo "MODEL_DIR=$RUNNER_TEMP/hpo-unit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/models" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12.13"
@@ -82,7 +83,6 @@ jobs:
       LATITUDE: "59.3293"
       LONGITUDE: "18.0686"
       COP_MANUAL_TEST_OWNED: cop-manual-mon-${{ github.run_id }}-${{ github.run_attempt }}
-      MODEL_DIR: ${{ runner.temp }}/cop-manual-mon-${{ github.run_id }}-${{ github.run_attempt }}/models
       PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/heatpump-optimizer
       PYTHONDONTWRITEBYTECODE: "1"
     services:
@@ -110,6 +110,8 @@ jobs:
           --health-retries 12
     steps:
       - uses: actions/checkout@v4
+      - name: Export owned e2e model directory
+        run: echo "MODEL_DIR=$RUNNER_TEMP/cop-manual-mon-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/models" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12.13"

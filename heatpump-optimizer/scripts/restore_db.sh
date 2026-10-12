@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
 PRODUCTION_TEST_COMPOSE_FILE="$PROJECT_DIR/docker-compose.restore-production.test.yml"
 PINNED_IMAGE=timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
@@ -34,7 +34,7 @@ configure_production_test_mode() {
     [ -n "${RESTORE_PRODUCTION_TEST_COMPOSE_FILE:-}" ] || {
         echo "RESTORE_PRODUCTION_TEST_COMPOSE_FILE must name the canonical disposable compose file" >&2; exit 2;
     }
-    production_test_compose_dir=$(CDPATH= cd -- "$(dirname -- "$RESTORE_PRODUCTION_TEST_COMPOSE_FILE")" && pwd -P)
+    production_test_compose_dir=$(CDPATH='' cd -- "$(dirname -- "$RESTORE_PRODUCTION_TEST_COMPOSE_FILE")" && pwd -P)
     [ "$production_test_compose_dir/$(basename -- "$RESTORE_PRODUCTION_TEST_COMPOSE_FILE")" = "$PRODUCTION_TEST_COMPOSE_FILE" ] || {
         echo "RESTORE_PRODUCTION_TEST_COMPOSE_FILE must name the canonical disposable compose file" >&2
         exit 2
@@ -57,9 +57,9 @@ configure_production_test_mode() {
     }
     project_backups_dir="$PROJECT_DIR/backups"
     if [ -d "$project_backups_dir" ]; then
-        project_backups_dir=$(CDPATH= cd -- "$PROJECT_DIR/backups" && pwd -P)
+        project_backups_dir=$(CDPATH='' cd -- "$PROJECT_DIR/backups" && pwd -P)
     fi
-    production_test_backup_dir=$(CDPATH= cd -- "$RESTORE_PRODUCTION_TEST_BACKUP_DIR" && pwd -P)
+    production_test_backup_dir=$(CDPATH='' cd -- "$RESTORE_PRODUCTION_TEST_BACKUP_DIR" && pwd -P)
     case $production_test_backup_dir in
         "$project_backups_dir"|"$project_backups_dir"/*)
             echo "RESTORE_PRODUCTION_TEST_BACKUP_DIR must be an external disposable directory" >&2
@@ -135,6 +135,8 @@ run_production_restore() {
         exit 2
     }
 
+    # $RESTORE_ARCHIVE is intentionally expanded by the restore-tool container shell.
+    # shellcheck disable=SC2016
     production_compose run --rm --no-deps -T -e RESTORE_ARCHIVE="$archive_name" \
         restore-tool sh -ceu 'pg_restore --list "/backups/$RESTORE_ARCHIVE" >/dev/null' </dev/null
 
@@ -155,6 +157,8 @@ run_production_restore() {
         production_status=$?
         trap - EXIT HUP INT TERM
         if [ "$production_status" -ne 0 ] && [ "$candidate_started" = "true" ]; then
+            # $RESTORE_CANDIDATE is intentionally expanded by the restore-tool container shell.
+            # shellcheck disable=SC2016
             production_compose run --rm --no-deps -T -e RESTORE_CANDIDATE="$candidate_database" \
                 restore-tool sh -ceu 'dropdb --maintenance-db=postgres --if-exists --force "$RESTORE_CANDIDATE"' >/dev/null 2>&1 || true
         fi
@@ -221,7 +225,7 @@ run_test_restore() {
         *) echo "POSTGRES_DB must start with restore_production_test_ in --test mode" >&2; exit 2 ;;
     esac
     database_name "$POSTGRES_DB"
-    RESTORE_PRODUCTION_TEST_BACKUP_DIR=$(CDPATH= cd -- "$(dirname -- "$archive")" && pwd -P)
+    RESTORE_PRODUCTION_TEST_BACKUP_DIR=$(CDPATH='' cd -- "$(dirname -- "$archive")" && pwd -P)
     RESTORE_DISPOSABLE=true
     RESTORE_ISOLATED_PROJECT=$test_project
     export POSTGRES_DB RESTORE_PRODUCTION_TEST_BACKUP_DIR RESTORE_DISPOSABLE RESTORE_ISOLATED_PROJECT
@@ -249,7 +253,9 @@ run_test_restore() {
     echo "Restored isolated test database: $test_database"
 }
 
-[ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
+if ! { [ "$#" -ge 2 ] && [ "$#" -le 3 ]; }; then
+    usage
+fi
 mode=$1
 shift
 allow_live_restore=false

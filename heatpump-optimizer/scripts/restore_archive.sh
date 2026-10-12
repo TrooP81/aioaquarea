@@ -92,7 +92,9 @@ restore_archive() {
     case ${RESTORE_EXPECTED_REVISION:-} in
         ""|*[!0-9]*) fail "A trusted numeric RESTORE_EXPECTED_REVISION is required for legacy archives" ;;
     esac
-    [ -f "$archive" ] && [ ! -L "$archive" ] || fail "Archive must be a regular, non-symlink file"
+    if ! { [ -f "$archive" ] && [ ! -L "$archive" ]; }; then
+        fail "Archive must be a regular, non-symlink file"
+    fi
     work_dir=$(mktemp -d)
     candidate_created=false
     pre_restore_succeeded=false
@@ -199,9 +201,11 @@ swap_databases() {
     for swap_database in "$live_database" "$replacement_database" "$retained_database"; do
         database_identifier "$swap_database"
     done
-    [ "$live_database" != "$replacement_database" ] &&
+    if ! { [ "$live_database" != "$replacement_database" ] &&
         [ "$live_database" != "$retained_database" ] &&
-        [ "$replacement_database" != "$retained_database" ] || fail "Cutover database names must be distinct"
+        [ "$replacement_database" != "$retained_database" ]; }; then
+        fail "Cutover database names must be distinct"
+    fi
     server_compatibility
     worker_gate "$live_database"
     worker_gate "$replacement_database"
