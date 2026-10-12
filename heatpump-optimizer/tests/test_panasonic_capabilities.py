@@ -3,7 +3,24 @@
 import datetime as dt
 from types import SimpleNamespace
 
+import pytest
+
 from packages.core.panasonic_capabilities import build_panasonic_capabilities
+
+_MANUAL_ONLY_COMMANDS = (
+    "set_powerful_time",
+    "set_force_heater",
+    "set_holiday_timer",
+    "request_defrost",
+)
+_OBSERVE_ONLY_COMMANDS = (
+    "set_operation_mode",
+    "set_zone_heat_temperature",
+    "set_tank_temperature",
+    "set_quiet_mode",
+    "force_dhw",
+    "set_special_status",
+)
 
 
 def _status(now: dt.datetime, **overrides):
@@ -55,7 +72,12 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         "has_tank": True,
         "zones": [1],
     }
-    assert result["commands"]["force_dhw"]["available"] is True
+    force_dhw = result["commands"]["force_dhw"]
+    assert force_dhw["device_supported"] is True
+    assert force_dhw["policy"] == "observe_only_build"
+    assert force_dhw["available"] is False
+    assert force_dhw["ordinary_automation_allowed"] is False
+    assert force_dhw["values"] == ["off", "on"]
     assert result["commands"]["set_tank_temperature"]["constraints"] == {
         "observed_range": {"minimum_celsius": 40, "maximum_celsius": 65},
         "whole_degrees_only": True,
@@ -64,10 +86,50 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         "observed_ranges": {"1": {"minimum": 18, "maximum": 45}},
         "whole_degrees_only": True,
     }
-    assert result["commands"]["set_zone_heat_temperature"]["available"] is True
+    for name in _OBSERVE_ONLY_COMMANDS:
+        command = result["commands"][name]
+        assert command["device_supported"] is True, name
+        assert command["policy"] == "observe_only_build", name
+        assert command["available"] is False, name
+        assert command["ordinary_automation_allowed"] is False, name
+    for name in _MANUAL_ONLY_COMMANDS:
+        command = result["commands"][name]
+        assert command["device_supported"] is True, name
+        assert command["policy"] == "manual_only", name
+        assert command["available"] is True, name
+        assert command["ordinary_automation_allowed"] is False, name
     assert result["commands"]["request_defrost"]["policy"] == "manual_only"
     assert result["commands"]["set_special_status"]["device_supported"] is True
-    assert result["commands"]["set_special_status"]["available"] is True
+    assert result["commands"]["set_special_status"]["available"] is False
+    assert result["api"]["live_probe_performed"] is False
+
+
+@pytest.mark.parametrize(
+    ("status_age", "heartbeat_age", "latest", "reason"),
+    [
+        (dt.timedelta(seconds=901), dt.timedelta(seconds=20), True, "live_status_stale"),
+        (dt.timedelta(seconds=30), dt.timedelta(minutes=4), True, "poller_heartbeat_stale"),
+        (None, dt.timedelta(seconds=20), False, "no_live_status"),
+    ],
+    ids=["stale_status", "stale_heartbeat", "unavailable_status"],
+)
+def test_stale_or_unavailable_observation_blocks_manual_and_observe_only_commands(
+    status_age, heartbeat_age, latest, reason
+) -> None:
+    now = dt.datetime(2026, 8, 13, 12, tzinfo=dt.timezone.utc)
+    result = build_panasonic_capabilities(
+        latest_status=_status(now, ts=now - status_age) if latest else None,
+        poller_heartbeat=SimpleNamespace(updated_at=now - heartbeat_age),
+        device_status_threshold_seconds=900,
+        now=now,
+    )
+
+    assert result["availability"]["reason"] == reason
+    assert result["availability"]["commands_allowed"] is False
+    assert result["commands"]["force_dhw"]["policy"] == "observe_only_build"
+    for name in (*_MANUAL_ONLY_COMMANDS, *_OBSERVE_ONLY_COMMANDS):
+        assert result["commands"][name]["available"] is False, name
+    assert result["commands"]["set_tank_temperature"]["constraints"]["whole_degrees_only"] is True
 
 
 def test_stale_status_blocks_every_command_without_hiding_capabilities() -> None:

@@ -716,7 +716,7 @@ class MILPOptimizer:
         if current_indoor_temp is None:
             return {
                 "actions": [],
-                "version": self.VERSION,
+                "version": self._plan_version(),
                 "cost_estimate": None,
                 "diagnostic_status": "unproven",
                 "reason": "actual_initial_indoor_state_missing",
@@ -728,7 +728,7 @@ class MILPOptimizer:
             }
         if gate_states is None or observation_context is None:
             raise DataIncompleteError("Complete gate and observed DHW context required")
-        return build_represented_plan(
+        plan = build_represented_plan(
             prices=prices,
             weather=weather,
             cop_fn=cop_fn,
@@ -748,8 +748,100 @@ class MILPOptimizer:
             reported_indoor_targets=reported_indoor_targets,
             serialized_actions=serialized_actions,
             timeout_seconds=self.SOLVER_TIMEOUT_SECONDS,
-            version=self.VERSION,
+            version=self._plan_version(),
         )
+        return self._with_compatibility_metadata(
+            plan,
+            prices=prices,
+            weather=weather,
+            cop_fn=cop_fn,
+            demand_per_hour=demand_per_hour,
+            reported_indoor_targets=reported_indoor_targets,
+        )
+
+    def _plan_version(self) -> str:
+        # Only the retained trained demand model tags a plan; the retired COP model never does.
+        demand_trained = getattr(self._demand_model, "is_trained", False) is True
+        return f"{self.VERSION}+ml" if demand_trained else self.VERSION
+
+    @staticmethod
+    def _with_compatibility_metadata(
+        plan: dict[str, Any],
+        *,
+        prices,
+        weather,
+        cop_fn,
+        demand_per_hour,
+        reported_indoor_targets=None,
+    ) -> dict[str, Any]:
+        """Add legacy-compatible fields derived only from the declared trace and its replay.
+
+        Solved actions, monetary cost, deadlines and solver calls are unchanged. The
+        native SH fraction is the declared unchanged load; the delivered fraction is
+        duration weighted and zero while DHW diverts the heat pump.
+        """
+        from packages.optimizer.represented_strategy import _instant
+
+        trace = plan["represented_strategy"]
+        replay = plan["serialized_replay"]
+        rows = trace["hours"]
+        horizon_start = _instant(rows[0]["ts"])
+        hours = len(rows)
+        delivered = [0.0] * hours
+        previous = horizon_start
+        for state in replay["states"][1:]:
+            instant = _instant(state["ts"])
+            duration = (instant - previous).total_seconds() / 3600
+            index = math.floor((previous - horizon_start).total_seconds() / 3600)
+            if 0 <= index < hours:
+                delivered[index] += duration * state["space_heating_fraction"]
+            previous = instant
+
+        plan["space_heating_demand_kwh"] = round(sum(float(value) for value in demand_per_hour), 6)
+        row_by_start = {_instant(row["ts"]): (index, row) for index, row in enumerate(rows)}
+        for action in plan["actions"]:
+            if action["type"] != "force_dhw_on":
+                continue
+            index, row = row_by_start[_instant(action["ts"])]
+            minutes = action["payload"]["dhw_minutes"]
+            action["payload"].update(
+                {
+                    "price": row["price_per_kwh"],
+                    "cop": float(cop_fn(weather[index][1], prices[index][0].hour)),
+                    "cop_source": "assumed",
+                    "cop_measured": False,
+                    "dhw_power_kw": row["dhw_power_kw"],
+                    "dhw_fraction": minutes / 60,
+                }
+            )
+
+        snapshot = plan["forecast_snapshot"]
+        indoor_forecast = []
+        shortfall = 0.0
+        for index, point in enumerate(snapshot["forecast_with_plan"]):
+            point["native_space_heating_fraction"] = rows[index]["native_sh_fraction"]
+            point["space_heating_fraction"] = delivered[index]
+            target = (
+                reported_indoor_targets[index]
+                if reported_indoor_targets is not None
+                else rows[index]["indoor_floor_c"]
+            )
+            gap = float(target) - point["predicted_indoor_temp"]
+            if gap > 1e-5:
+                shortfall += gap
+            indoor_forecast.append(
+                {
+                    "hour": point["hour"],
+                    "ts": point["ts"],
+                    "predicted_indoor_temp": point["predicted_indoor_temp"],
+                    "target": target,
+                    "space_heating_fraction": delivered[index],
+                }
+            )
+        plan["indoor_forecast"] = indoor_forecast
+        plan["comfort_shortfall"] = round(shortfall, 6)
+        plan["initial_violations"] = dict(replay["initial_violations"])
+        return plan
 
     def _solve_unrepresented_legacy(
         self,

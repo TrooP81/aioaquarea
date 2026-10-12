@@ -53,7 +53,10 @@ async def lifespan(application: FastAPI):
                 await wrapper.start()
             except Exception:
                 logger.exception("Panasonic quota wrapper startup failed")
-                await finish_owned_cleanup(wrapper.stop)
+                # Transfer disposal ownership before awaiting so final cleanup cannot
+                # stop the failed wrapper a second time, including after cancellation.
+                failed_wrapper, wrapper = wrapper, None
+                await finish_owned_cleanup(failed_wrapper.stop)
             else:
                 application.state.aquarea_wrapper = wrapper
         yield

@@ -891,6 +891,48 @@ async def test_starved_verification_failures_do_not_reset_starvation_state(monke
         wrapper._read_limiter.acquire.assert_awaited_once()
 
 
+def _event_clock(monkeypatch, start: float = 100.0) -> AsyncMock:
+    """Install a monotonic clock that only advances when the fake sleep is awaited."""
+    clock = {"now": start}
+
+    async def advance(seconds):
+        clock["now"] += seconds
+
+    sleep = AsyncMock(side_effect=advance)
+    monkeypatch.setattr("packages.core.services.aquarea.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("packages.core.services.aquarea.asyncio.sleep", sleep)
+    return sleep
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("retry_after_seconds", "starved"), ((59, False), (60, True), (61, True)))
+async def test_executor_starvation_threshold_uses_actual_waited_seconds(
+    monkeypatch, caplog, retry_after_seconds, starved
+):
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    wrapper = _wrapper()
+    wrapper._account_key = "account-key"
+    wrapper._device = _live_device()
+    exhausted = DistributedReadQuotaExhausted(
+        _quota_status(0, retry_after_seconds=retry_after_seconds)
+    )
+    wrapper._read_quota = SimpleNamespace(reserve=AsyncMock(side_effect=[exhausted, None]))
+    sleep = _event_clock(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="packages.core.services.aquarea"):
+        await wrapper.refresh_device(quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION)
+
+    state = wrapper._quota_starvation[ReadQuotaContext.EXECUTOR_VERIFICATION]
+    messages = [record.message for record in caplog.records]
+    assert sleep.await_args_list == [((retry_after_seconds,), {})]
+    assert messages.count("executor_verification_quota_starved") == int(starved)
+    assert messages.count("executor_verification_quota_recovered") == 0
+    assert state.active is starved
+    assert state.consecutive_starved_verifications == int(starved)
+    assert state.accumulated_wait_seconds_since_recovery == float(retry_after_seconds)
+    assert state.verification_wait_started_at is None
+
+
 @pytest.mark.asyncio
 async def test_starved_then_distributed_success_recovers_once_and_relapse_emits_new_edge(
     monkeypatch, caplog
@@ -899,16 +941,11 @@ async def test_starved_then_distributed_success_recovers_once_and_relapse_emits_
     wrapper = _wrapper()
     wrapper._account_key = "account-key"
     wrapper._device = _live_device()
-    exhausted = DistributedReadQuotaExhausted(_quota_status(0))
+    exhausted = DistributedReadQuotaExhausted(_quota_status(0, retry_after_seconds=61))
     wrapper._read_quota = SimpleNamespace(
         reserve=AsyncMock(side_effect=[exhausted, None, None, exhausted, None])
     )
-    monkeypatch.setattr("packages.core.services.aquarea.asyncio.sleep", AsyncMock())
-    monotonic_values = iter([100.0, 161.0, 200.0, 300.0, 361.0, 422.0, 500.0])
-    monkeypatch.setattr(
-        "packages.core.services.aquarea.time.monotonic",
-        lambda: next(monotonic_values, 500.0),
-    )
+    sleep = _event_clock(monkeypatch)
 
     with caplog.at_level(logging.INFO, logger="packages.core.services.aquarea"):
         await wrapper.refresh_device(quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION)
@@ -921,29 +958,29 @@ async def test_starved_then_distributed_success_recovers_once_and_relapse_emits_
     state = wrapper._quota_starvation[ReadQuotaContext.EXECUTOR_VERIFICATION]
     assert state.active is True
     assert state.consecutive_starved_verifications == 1
+    assert state.ledger_slots_committed_since_recovery == 1
+    assert state.accumulated_wait_seconds_since_recovery == 61.0
     assert state.verification_wait_started_at is None
+    assert sleep.await_args_list == [((61,), {}), ((61,), {})]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("retry_after_seconds", "accumulated"), ((120, 240.0), (61, 122.0)))
 async def test_consecutive_long_waits_do_not_recover_until_fast_distributed_success(
-    monkeypatch, caplog
+    monkeypatch, caplog, retry_after_seconds, accumulated
 ):
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     wrapper = _wrapper()
     wrapper._account_key = "account-key"
     wrapper._device = _live_device()
     wrapper._record_live_status = MagicMock()
-    exhausted = DistributedReadQuotaExhausted(_quota_status(0, retry_after_seconds=120))
+    exhausted = DistributedReadQuotaExhausted(
+        _quota_status(0, retry_after_seconds=retry_after_seconds)
+    )
     wrapper._read_quota = SimpleNamespace(
         reserve=AsyncMock(side_effect=[exhausted, None, exhausted, None, None, exhausted, None])
     )
-    sleep = AsyncMock()
-    monkeypatch.setattr("packages.core.services.aquarea.asyncio.sleep", sleep)
-    monotonic_values = iter([100.0, 161.0, 200.0, 261.0, 300.0, 361.0])
-    monkeypatch.setattr(
-        "packages.core.services.aquarea.time.monotonic",
-        lambda: next(monotonic_values, 361.0),
-    )
+    sleep = _event_clock(monkeypatch)
 
     with caplog.at_level(logging.INFO, logger="packages.core.services.aquarea"):
         await wrapper.refresh_device(quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION)
@@ -952,7 +989,7 @@ async def test_consecutive_long_waits_do_not_recover_until_fast_distributed_succ
         assert state.active is True
         assert state.consecutive_starved_verifications == 2
         assert state.ledger_slots_committed_since_recovery == 2
-        assert state.accumulated_wait_seconds_since_recovery == 122.0
+        assert state.accumulated_wait_seconds_since_recovery == accumulated
 
         await wrapper.refresh_device(quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION)
         assert state.active is False
@@ -965,7 +1002,7 @@ async def test_consecutive_long_waits_do_not_recover_until_fast_distributed_succ
     messages = [record.message for record in caplog.records]
     assert messages.count("executor_verification_quota_starved") == 2
     assert messages.count("executor_verification_quota_recovered") == 1
-    assert sleep.await_args_list == [((120,), {}), ((120,), {}), ((120,), {})]
+    assert sleep.await_args_list == [((retry_after_seconds,), {})] * 3
 
 
 @pytest.mark.asyncio
@@ -1250,6 +1287,151 @@ async def test_lifespan_start_failure_leaves_other_routes_available(monkeypatch)
         assert not hasattr(application.state, "aquarea_wrapper")
 
     wrapper.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_disabled_quota_creates_no_wrapper_and_still_drains_logs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", False)
+    constructor = MagicMock()
+    drain = AsyncMock()
+    monkeypatch.setattr(api_main, "AquareaWrapper", constructor)
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
+    application = SimpleNamespace(state=SimpleNamespace())
+
+    async with api_main.lifespan(application):
+        assert not hasattr(application.state, "aquarea_wrapper")
+
+    constructor.assert_not_called()
+    drain.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_failed_start_disposes_once_before_final_log_drain(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    events = []
+    wrapper = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("startup failed")),
+        stop=AsyncMock(side_effect=lambda: events.append("wrapper_stop")),
+    )
+    monkeypatch.setattr(api_main, "AquareaWrapper", MagicMock(return_value=wrapper))
+    monkeypatch.setattr(
+        "packages.core.log_sink.shutdown_log_sink",
+        AsyncMock(side_effect=lambda: events.append("log_drain")),
+    )
+    application = SimpleNamespace(state=SimpleNamespace())
+
+    async with api_main.lifespan(application):
+        assert events == ["wrapper_stop"]
+
+    assert events == ["wrapper_stop", "log_drain"]
+    wrapper.stop.assert_awaited_once()
+    assert not hasattr(application.state, "aquarea_wrapper")
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_stop(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    wrapper = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("startup failed")),
+        stop=AsyncMock(side_effect=OSError("stop failed")),
+    )
+    drain = AsyncMock()
+    monkeypatch.setattr(api_main, "AquareaWrapper", MagicMock(return_value=wrapper))
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
+    application = SimpleNamespace(state=SimpleNamespace())
+
+    with pytest.raises(OSError, match="stop failed"):
+        async with api_main.lifespan(application):
+            pytest.fail("startup must not yield after failed disposal")
+
+    wrapper.stop.assert_awaited_once()
+    drain.assert_awaited_once()
+    assert not hasattr(application.state, "aquarea_wrapper")
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_stops_once(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    stopping = asyncio.Event()
+    release = asyncio.Event()
+    events = []
+
+    async def stop():
+        events.append("wrapper_stop_started")
+        stopping.set()
+        await release.wait()
+        events.append("wrapper_stop_finished")
+
+    wrapper = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("startup failed")),
+        stop=AsyncMock(side_effect=stop),
+    )
+    monkeypatch.setattr(api_main, "AquareaWrapper", MagicMock(return_value=wrapper))
+    monkeypatch.setattr(
+        "packages.core.log_sink.shutdown_log_sink",
+        AsyncMock(side_effect=lambda: events.append("log_drain")),
+    )
+    application = SimpleNamespace(state=SimpleNamespace())
+
+    async def run_lifespan():
+        async with api_main.lifespan(application):
+            events.append("yielded")
+
+    task = asyncio.create_task(run_lifespan())
+    await stopping.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert events == ["wrapper_stop_started"]
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["wrapper_stop_started", "wrapper_stop_finished", "log_drain"]
+    wrapper.stop.assert_awaited_once()
+    assert not hasattr(application.state, "aquarea_wrapper")
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_cancellation_during_start_disposes_partial_wrapper_once(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    starting = asyncio.Event()
+
+    async def start():
+        starting.set()
+        await asyncio.Event().wait()
+
+    wrapper = SimpleNamespace(start=AsyncMock(side_effect=start), stop=AsyncMock())
+    drain = AsyncMock()
+    monkeypatch.setattr(api_main, "AquareaWrapper", MagicMock(return_value=wrapper))
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
+    application = SimpleNamespace(state=SimpleNamespace())
+
+    async def run_lifespan():
+        async with api_main.lifespan(application):
+            pytest.fail("cancelled startup must not yield")
+
+    task = asyncio.create_task(run_lifespan())
+    await starting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    wrapper.stop.assert_awaited_once()
+    drain.assert_awaited_once()
+    assert not hasattr(application.state, "aquarea_wrapper")
 
 
 @pytest.mark.asyncio

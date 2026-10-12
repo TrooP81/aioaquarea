@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import math
 from typing import Any
 
 import structlog
@@ -679,6 +680,129 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         actions = [
             action for action in actions if action["type"] in {"force_dhw_on", "force_dhw_off"}
         ]
+
+        def build_forecast_snapshot(snapshot_actions: list[dict[str, Any]]) -> dict[str, Any]:
+            return self._build_forecast_snapshot(
+                prices=prices,
+                weather=weather,
+                weather_full=weather_full,
+                actions=snapshot_actions,
+                horizon_start=horizon_start,
+                current_indoor=current_indoor_temp,
+                current_water_temp=current_water_temp,
+                heat_curve=heat_curve,
+                comfort_schedule=comfort_schedule,
+                comfort_temp_target=comfort_temp_target,
+                comfort_temp_min=comfort_temp_min,
+                tz_name=tz_name,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                gate_projections=gate_projections,
+                quality_gate=quality_gate,
+                control_temperature=control_temperature,
+                control_input={
+                    "available": control_temperature.is_usable,
+                    "confidence": control_temperature.confidence,
+                    "reason": control_temperature.reason,
+                    "reference_sensor_id": control_temperature.reference_sensor_id,
+                    "reference_sensor_label": control_temperature.reference_sensor_label,
+                    "reference_room": control_temperature.reference_room,
+                    "sensor_ids": [sensor.device_id for sensor in control_temperature.sensors],
+                    "sensor_count": control_temperature.sensor_count,
+                    "sample_count": control_temperature.sample_count,
+                    "observed_at": (
+                        control_temperature.latest_reading.isoformat()
+                        if control_temperature.latest_reading is not None
+                        else None
+                    ),
+                    "outdoor_temperature": {
+                        "effective_c": outdoor_reading.effective_c,
+                        "heat_pump_c": outdoor_reading.heat_pump_c,
+                        "weather_c": outdoor_reading.weather_c,
+                        "source": outdoor_reading.source,
+                        "weather_provider": outdoor_reading.weather_provider,
+                        "compensation_c": outdoor_reading.compensation_c,
+                        "fallback_reason": outdoor_reading.fallback_reason,
+                    },
+                    "room_comfort": {
+                        "basis_temperature": room_envelope.basis_temperature
+                        if room_envelope
+                        else None,
+                        "fresh_inlier_min": room_envelope.fresh_inlier_min
+                        if room_envelope
+                        else None,
+                        "fresh_inlier_max": room_envelope.fresh_inlier_max
+                        if room_envelope
+                        else None,
+                        "affected_rooms": list(room_envelope.rooms_above_max)
+                        if room_envelope
+                        else [],
+                    },
+                },
+                baseline_profile=baseline_profile,
+                configured_baseline_mode=configured_baseline_mode,
+                effective_baseline_mode=effective_baseline_mode,
+                live_baseline_fractions=live_baseline_fractions,
+                learning_mode_active=learning_mode_active,
+            )
+
+        plan_control_input = {
+            "indoor_temp": latest_indoor_temp,
+            "confidence": control_temperature.confidence,
+            "sensor_count": control_temperature.sensor_count,
+            "sample_count": control_temperature.sample_count,
+            "reason": control_temperature.reason,
+            "outdoor_temperature": {
+                "effective_c": outdoor_reading.effective_c,
+                "heat_pump_c": outdoor_reading.heat_pump_c,
+                "weather_c": outdoor_reading.weather_c,
+                "source": outdoor_reading.source,
+                "weather_provider": outdoor_reading.weather_provider,
+                "compensation_c": outdoor_reading.compensation_c,
+                "fallback_reason": outdoor_reading.fallback_reason,
+            },
+        }
+        plan_space_heating_gate = {
+            "state": effective_gate.state,
+            "reason": effective_gate.reason_code,
+            "profile_id": effective_gate.profile_id,
+            "base_c": effective_gate.base_c,
+            "on_threshold_c": effective_gate.on_threshold_c,
+            "off_threshold_c": effective_gate.off_threshold_c,
+            "last_raw_outdoor_c": effective_gate.last_raw_outdoor_c,
+            "fingerprint_matches": effective_gate.fingerprint_matches,
+            "projected_states": [evidence.state for evidence in gate_projections],
+        }
+        if current_indoor_temp is None:
+            # Without an actual initial room state nothing can be certified; candidates
+            # remain diagnostic metadata that the orchestrator refuses to persist.
+            logger.info(
+                "rules_strategy_unproven",
+                reason="actual_initial_indoor_state_missing",
+                diagnostic_status="unproven",
+            )
+            return {
+                "device_id": last_status.device_id if last_status is not None else None,
+                "horizon_start": horizon_start,
+                "horizon_end": horizon_end,
+                "actions": [],
+                "version": self.VERSION,
+                "cop_source": "assumed",
+                "cop_measured": False,
+                "heating_efficiency": {"source": "assumed", "measured": False},
+                "cost_estimate": None,
+                "diagnostic_status": "unproven",
+                "reason": "actual_initial_indoor_state_missing",
+                "diagnostic_strategy_actions": [],
+                "unproven_strategies": {
+                    "schema": SCHEMA,
+                    "status": "unproven",
+                    "actions": unproven_actions + actions,
+                },
+                "planning_data_quality": input_quality,
+                "forecast_snapshot": build_forecast_snapshot([]),
+                "control_input": plan_control_input,
+                "space_heating_gate": plan_space_heating_gate,
+            }
         try:
             actions = represented_rules_commands(actions)
             native_gates = [evidence.state for evidence in gate_projections]
@@ -699,6 +823,15 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     if 0 < (deadline - horizon_start).total_seconds() // 3600 <= len(prices)
                 ],
                 indoor_targets=[comfort_temp_min] * len(prices),
+                indoor_rates=self._represented_indoor_rates(
+                    prices=prices,
+                    weather=weather,
+                    weather_full=weather_full,
+                    current_indoor=current_indoor_temp,
+                    heat_curve=heat_curve,
+                    use_learned_forecast=learned_forecast_allowed,
+                    max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                ),
                 tank_min_per_hour=[
                     await get_float_setting(
                         "tank_min_temp"
@@ -728,60 +861,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         cost_accounting = await self._estimate_unshifted_baseline(
             prices, device_id=last_status.device_id if last_status is not None else None, now=now
         )
-        forecast_snapshot = self._build_forecast_snapshot(
-            prices=prices,
-            weather=weather,
-            weather_full=weather_full,
-            actions=actions,
-            horizon_start=horizon_start,
-            current_indoor=current_indoor_temp,
-            current_water_temp=current_water_temp,
-            heat_curve=heat_curve,
-            comfort_schedule=comfort_schedule,
-            comfort_temp_target=comfort_temp_target,
-            comfort_temp_min=comfort_temp_min,
-            tz_name=tz_name,
-            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
-            gate_projections=gate_projections,
-            quality_gate=quality_gate,
-            control_temperature=control_temperature,
-            control_input={
-                "available": control_temperature.is_usable,
-                "confidence": control_temperature.confidence,
-                "reason": control_temperature.reason,
-                "reference_sensor_id": control_temperature.reference_sensor_id,
-                "reference_sensor_label": control_temperature.reference_sensor_label,
-                "reference_room": control_temperature.reference_room,
-                "sensor_ids": [sensor.device_id for sensor in control_temperature.sensors],
-                "sensor_count": control_temperature.sensor_count,
-                "sample_count": control_temperature.sample_count,
-                "observed_at": (
-                    control_temperature.latest_reading.isoformat()
-                    if control_temperature.latest_reading is not None
-                    else None
-                ),
-                "outdoor_temperature": {
-                    "effective_c": outdoor_reading.effective_c,
-                    "heat_pump_c": outdoor_reading.heat_pump_c,
-                    "weather_c": outdoor_reading.weather_c,
-                    "source": outdoor_reading.source,
-                    "weather_provider": outdoor_reading.weather_provider,
-                    "compensation_c": outdoor_reading.compensation_c,
-                    "fallback_reason": outdoor_reading.fallback_reason,
-                },
-                "room_comfort": {
-                    "basis_temperature": room_envelope.basis_temperature if room_envelope else None,
-                    "fresh_inlier_min": room_envelope.fresh_inlier_min if room_envelope else None,
-                    "fresh_inlier_max": room_envelope.fresh_inlier_max if room_envelope else None,
-                    "affected_rooms": list(room_envelope.rooms_above_max) if room_envelope else [],
-                },
-            },
-            baseline_profile=baseline_profile,
-            configured_baseline_mode=configured_baseline_mode,
-            effective_baseline_mode=effective_baseline_mode,
-            live_baseline_fractions=live_baseline_fractions,
-            learning_mode_active=learning_mode_active,
-        )
+        forecast_snapshot = build_forecast_snapshot(actions)
         forecast_snapshot["forecast_with_plan"] = represented["forecast_snapshot"][
             "forecast_with_plan"
         ]
@@ -814,33 +894,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             },
             "planning_data_quality": input_quality,
             "forecast_snapshot": forecast_snapshot,
-            "control_input": {
-                "indoor_temp": latest_indoor_temp,
-                "confidence": control_temperature.confidence,
-                "sensor_count": control_temperature.sensor_count,
-                "sample_count": control_temperature.sample_count,
-                "reason": control_temperature.reason,
-                "outdoor_temperature": {
-                    "effective_c": outdoor_reading.effective_c,
-                    "heat_pump_c": outdoor_reading.heat_pump_c,
-                    "weather_c": outdoor_reading.weather_c,
-                    "source": outdoor_reading.source,
-                    "weather_provider": outdoor_reading.weather_provider,
-                    "compensation_c": outdoor_reading.compensation_c,
-                    "fallback_reason": outdoor_reading.fallback_reason,
-                },
-            },
-            "space_heating_gate": {
-                "state": effective_gate.state,
-                "reason": effective_gate.reason_code,
-                "profile_id": effective_gate.profile_id,
-                "base_c": effective_gate.base_c,
-                "on_threshold_c": effective_gate.on_threshold_c,
-                "off_threshold_c": effective_gate.off_threshold_c,
-                "last_raw_outdoor_c": effective_gate.last_raw_outdoor_c,
-                "fingerprint_matches": effective_gate.fingerprint_matches,
-                "projected_states": [evidence.state for evidence in gate_projections],
-            },
+            "control_input": plan_control_input,
+            "space_heating_gate": plan_space_heating_gate,
         }
 
     async def _estimate_cost(
@@ -905,6 +960,111 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         return await get_weather_full(session, start, end)
 
     @staticmethod
+    def _forecast_weather_slot(
+        weather_full: list[dict[str, Any]], slot_ts: dt.datetime, fallback_temperature: float
+    ) -> dict[str, Any]:
+        candidates = [row for row in weather_full if isinstance(row.get("ts"), dt.datetime)]
+        if candidates:
+            closest = min(candidates, key=lambda row: abs((row["ts"] - slot_ts).total_seconds()))
+            if abs((closest["ts"] - slot_ts).total_seconds()) <= 90 * 60:
+
+                def value(key: str, default: float, *, non_negative: bool = False) -> float:
+                    try:
+                        number = float(closest.get(key))
+                    except (TypeError, ValueError):
+                        return default
+                    return max(0.0, number) if non_negative else number
+
+                return {
+                    "outdoor_temp": value("temperature", fallback_temperature),
+                    "wind_speed": value("wind_speed", 3.0, non_negative=True),
+                    "irradiance": value("irradiance", 0.0, non_negative=True),
+                    "precipitation": value("precipitation", 0.0, non_negative=True),
+                    "weather_source": closest.get("source"),
+                    "forecast_issued_at": (
+                        closest["forecast_issued_at"].isoformat()
+                        if isinstance(closest.get("forecast_issued_at"), dt.datetime)
+                        else None
+                    ),
+                }
+        return {
+            "outdoor_temp": float(fallback_temperature),
+            "wind_speed": 3.0,
+            "irradiance": 0.0,
+            "precipitation": 0.0,
+            "weather_source": "fallback",
+            "forecast_issued_at": None,
+        }
+
+    @staticmethod
+    def _represented_indoor_rates(
+        *,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        weather_full: list[dict[str, Any]],
+        current_indoor: float,
+        heat_curve: HeatCurveConfig,
+        use_learned_forecast: bool,
+        max_passive_change_c_per_hour: float,
+    ) -> list[tuple[float, float]]:
+        """Hourly (full-heat, passive) room deltas for the represented native SH trace.
+
+        Both scenarios use the policy-aware controlled curve from the same observed
+        origin and supply/weather horizon, so the resolved passive-change policy reaches
+        the authoritative represented forecast. The policy governs the passive
+        scenario's learned predictions; it is not a cap on full-heat or mixed changes.
+        """
+        from packages.optimizer import DataIncompleteError
+
+        weather_forecast = []
+        for hour, (slot_ts, _price) in enumerate(prices):
+            target_ts = slot_ts + dt.timedelta(hours=1)
+            fallback_temperature = (
+                weather[hour][1] if hour < len(weather) and weather[hour][1] is not None else 5.0
+            )
+            weather_forecast.append(
+                {
+                    "ts": target_ts.isoformat(),
+                    "hour": target_ts.hour,
+                    **RulesOptimizer._forecast_weather_slot(
+                        weather_full, target_ts, float(fallback_temperature)
+                    ),
+                }
+            )
+        hours = len(weather_forecast)
+        try:
+            zone_water_temps = [
+                heat_curve.planned_supply_temperature(row["outdoor_temp"])
+                for row in weather_forecast
+            ]
+            curves = [
+                thermal_model.predict_indoor_controlled_curve(
+                    current_indoor=current_indoor,
+                    zone_water_temps=zone_water_temps,
+                    heating_fractions=[fraction] * hours,
+                    weather_forecast=weather_forecast,
+                    hours=hours,
+                    use_learned_forecast=use_learned_forecast,
+                    max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                )
+                for fraction in (1.0, 0.0)
+            ]
+            rates = []
+            previous = [float(current_indoor), float(current_indoor)]
+            for hour in range(hours):
+                deltas = []
+                for index, curve in enumerate(curves):
+                    value = float(curve[hour]["predicted_indoor_temp"])
+                    if not math.isfinite(value):
+                        raise ValueError("nonfinite_indoor_prediction")
+                    deltas.append(value - previous[index])
+                    previous[index] = value
+                rates.append((deltas[0], deltas[1]))
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise DataIncompleteError("Policy-aware indoor rates unavailable") from error
+        return rates
+
+    @staticmethod
     def _build_forecast_snapshot(
         *,
         prices: list[tuple[dt.datetime, float]],
@@ -951,40 +1111,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         ordered_actions.sort(key=lambda item: item[0])
 
         def weather_for_slot(slot_ts: dt.datetime, fallback_temperature: float) -> dict[str, Any]:
-            candidates = [row for row in weather_full if isinstance(row.get("ts"), dt.datetime)]
-            if candidates:
-                closest = min(
-                    candidates, key=lambda row: abs((row["ts"] - slot_ts).total_seconds())
-                )
-                if abs((closest["ts"] - slot_ts).total_seconds()) <= 90 * 60:
-
-                    def value(key: str, default: float, *, non_negative: bool = False) -> float:
-                        try:
-                            number = float(closest.get(key))
-                        except (TypeError, ValueError):
-                            return default
-                        return max(0.0, number) if non_negative else number
-
-                    return {
-                        "outdoor_temp": value("temperature", fallback_temperature),
-                        "wind_speed": value("wind_speed", 3.0, non_negative=True),
-                        "irradiance": value("irradiance", 0.0, non_negative=True),
-                        "precipitation": value("precipitation", 0.0, non_negative=True),
-                        "weather_source": closest.get("source"),
-                        "forecast_issued_at": (
-                            closest["forecast_issued_at"].isoformat()
-                            if isinstance(closest.get("forecast_issued_at"), dt.datetime)
-                            else None
-                        ),
-                    }
-            return {
-                "outdoor_temp": float(fallback_temperature),
-                "wind_speed": 3.0,
-                "irradiance": 0.0,
-                "precipitation": 0.0,
-                "weather_source": "fallback",
-                "forecast_issued_at": None,
-            }
+            return RulesOptimizer._forecast_weather_slot(
+                weather_full, slot_ts, fallback_temperature
+            )
 
         weather_forecast: list[dict[str, Any]] = []
         price_forecast: list[dict[str, Any]] = []

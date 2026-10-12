@@ -493,6 +493,30 @@ def represented_rules_commands(actions):
     return result
 
 
+def _represented_objective(cost, minutes, active):
+    """Return the solver objective while ``cost`` stays the monetary accounting expression.
+
+    Only when every runtime-minute coefficient of the constructed monetary expression is
+    exactly equal are activation counts used as a tie-break: one integer minute of primary
+    objective is weighted ``M + 1`` and outranks every possible activation-count difference
+    (at most ``M``), so monetary optimality is never traded for fewer pulses.
+    """
+    import pulp
+
+    coefficients = [
+        cost.get(variable, 0) if isinstance(cost, pulp.LpAffineExpression) else 0
+        for variable in minutes
+    ]
+    if not coefficients or any(value != coefficients[0] for value in coefficients):
+        return cost
+    common = coefficients[0]
+    if common == 0:
+        return pulp.lpSum(active)
+    bound = min(20, len(active))
+    sign = 1 if common > 0 else -1
+    return sign * (bound + 1) * pulp.lpSum(minutes) + pulp.lpSum(active)
+
+
 def solve_represented_trace(trace, *, timeout_seconds):
     import pulp
 
@@ -572,7 +596,7 @@ def solve_represented_trace(trace, *, timeout_seconds):
         tank_ends.append(tank_end)
         room_ends.append(room_end)
     problem += pulp.lpSum(active) <= 20
-    problem += cost
+    problem += _represented_objective(cost, minutes, active)
     problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=timeout_seconds))
     if problem.status == pulp.LpStatusNotSolved:
         raise SolverTimeoutError("Represented DHW solver timeout")

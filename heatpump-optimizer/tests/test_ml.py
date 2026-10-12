@@ -931,7 +931,10 @@ class TestCOPRetirementLifecycle:
         thermal.params.last_calibrated = None
         wrapper = MagicMock()
         wrapper.start = AsyncMock(side_effect=RuntimeError("fixture startup stop"))
+        wrapper.stop = AsyncMock()
+        drain = AsyncMock()
         with (
+            patch("packages.core.log_sink.shutdown_log_sink", new=drain),
             patch.object(optimizer_main, "_demand_model", demand),
             patch.object(optimizer_main, "comfort_model", comfort),
             patch.object(optimizer_main, "thermal_model", thermal),
@@ -951,6 +954,8 @@ class TestCOPRetirementLifecycle:
             with pytest.raises(RuntimeError, match="fixture startup stop"):
                 await optimizer_main.main()
 
+        drain.assert_awaited_once_with()
+        wrapper.stop.assert_awaited_once_with()
         demand.load_latest.assert_called_once_with()
         comfort.load_latest.assert_called_once_with()
         thermal.load_latest.assert_called_once_with()
@@ -2936,40 +2941,54 @@ class TestOrchestratorFallback:
     @pytest.mark.asyncio
     async def test_run_optimization_with_rules_only(self):
         """End-to-end: rules_only setting should produce a rules plan."""
+        from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
+        from tests.test_optimizer_api_contracts import (
+            _INACTIVE,
+            _admissible_plan,
+            _refused_plan_session,
+            _session_context,
+        )
 
+        session, records = _refused_plan_session()
         with patch(
             "packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="rules_only"
         ):
             with patch("packages.optimizer.main.RulesOptimizer") as MockRules:
-                mock_plan = {
-                    "horizon_start": dt.datetime.now(dt.timezone.utc),
-                    "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
-                    "actions": [],
-                    "version": "rules_v3",
-                    "cost_estimate": 0.0,
-                }
+                mock_plan = _admissible_plan(version="rules_v3")
                 MockRules.return_value.generate_plan = AsyncMock(return_value=mock_plan)
 
                 with (
                     patch(
                         "packages.optimizer.main.get_session",
-                        _mock_get_session([_FakeResult([]), _FakeResult([]), _FakeResult([])]),
+                        MagicMock(side_effect=lambda *a, **k: _session_context(session)),
                     ),
+                    patch.object(
+                        optimizer_main,
+                        "resolve_learning_mode_state",
+                        new=AsyncMock(return_value=_INACTIVE()),
+                    ),
+                    patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
                     patch(
-                        "packages.optimizer.main.get_active_price_context",
-                        AsyncMock(
-                            return_value=SimpleNamespace(area="NL", currency="EUR", source="test")
-                        ),
+                        "packages.core.pricing.get_active_price_context",
+                        AsyncMock(side_effect=AssertionError("newest price-context lookup")),
                     ),
                     patch(
                         "packages.optimizer.main.get_device_data_quality",
                         AsyncMock(return_value={"ready": True, "reasons": []}),
                     ),
+                    patch.object(
+                        optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()
+                    ),
+                    patch.object(optimizer_main.comfort_model, "arefresh_if_changed", AsyncMock()),
                 ):
-                    await run_optimization()
+                    assert await run_optimization() == 321
 
                 MockRules.return_value.generate_plan.assert_awaited_once()
+        [record] = records
+        assert record.status == "diagnostic"
+        assert record.optimizer_version == "rules_v3"
+        assert record.price_source == "manual"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2977,15 +2996,17 @@ class TestOrchestratorFallback:
     )
     async def test_milp_failure_falls_back_to_rules(self, failure):
         """When MILP raises, the orchestrator should fall back to rules."""
+        from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
+        from tests.test_optimizer_api_contracts import (
+            _INACTIVE,
+            _admissible_plan,
+            _refused_plan_session,
+            _session_context,
+        )
 
-        mock_plan = {
-            "horizon_start": dt.datetime.now(dt.timezone.utc),
-            "horizon_end": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24),
-            "actions": [],
-            "version": "rules_v3",
-            "cost_estimate": 0.0,
-        }
+        mock_plan = _admissible_plan(version="rules_v3")
+        session, records = _refused_plan_session()
 
         with patch(
             "packages.optimizer.main.get_setting",
@@ -3005,44 +3026,56 @@ class TestOrchestratorFallback:
                     with (
                         patch(
                             "packages.optimizer.main.get_session",
-                            _mock_get_session([_FakeResult([]), _FakeResult([])]),
+                            MagicMock(side_effect=lambda *a, **k: _session_context(session)),
                         ),
                         patch(
                             "packages.optimizer.main.get_planning_data_quality",
-                            AsyncMock(
-                                return_value={
-                                    "control_allowed": True,
-                                    "status": "ready",
-                                    "reasons": [],
-                                    "price": {},
-                                    "weather": {},
-                                }
-                            ),
+                            AsyncMock(side_effect=AssertionError("newest planning quality")),
                         ),
                         patch(
-                            "packages.optimizer.main.get_active_price_context",
-                            AsyncMock(
-                                return_value=SimpleNamespace(
-                                    area="NL", currency="EUR", source="test"
-                                )
-                            ),
+                            "packages.core.pricing.get_active_price_context",
+                            AsyncMock(side_effect=AssertionError("newest price context")),
                         ),
                         patch(
                             "packages.optimizer.main.get_device_data_quality",
                             AsyncMock(return_value={"ready": True, "reasons": []}),
                         ),
+                        patch.object(
+                            optimizer_main,
+                            "resolve_learning_mode_state",
+                            new=AsyncMock(return_value=_INACTIVE()),
+                        ),
+                        patch.object(
+                            optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()
+                        ),
+                        patch.object(
+                            optimizer_main.comfort_model, "arefresh_if_changed", AsyncMock()
+                        ),
+                        patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
                     ):
-                        await run_optimization()
+                        assert await run_optimization() == 321
 
                     # MILP failed, so rules should have been called
                     MockRules.return_value.generate_plan.assert_awaited_once()
+        [record] = records
+        assert record.optimizer_version == "rules_v3"
+        assert record.status == "diagnostic"
 
     @pytest.mark.asyncio
     async def test_planning_quality_check_failure_blocks_plan(self):
         """An unavailable planning-quality gate must not permit a rules fallback."""
+        from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
+        from tests.test_optimizer_api_contracts import _INACTIVE, _admissible_plan
 
-        optimizer = AsyncMock()
+        plan = _admissible_plan(version="milp_v1")
+        plan["planning_data_quality"] = {
+            "control_allowed": False,
+            "status": "unavailable",
+            "reasons": ["Planning input quality could not be checked."],
+        }
+        optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
+        session_factory = MagicMock(side_effect=AssertionError("persistence session"))
         with (
             patch(
                 "packages.optimizer.main.get_setting",
@@ -3062,17 +3095,29 @@ class TestOrchestratorFallback:
             ),
             patch(
                 "packages.optimizer.main.get_planning_data_quality",
-                new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+                new=AsyncMock(side_effect=AssertionError("newest planning quality")),
             ),
+            patch.object(
+                optimizer_main,
+                "resolve_learning_mode_state",
+                new=AsyncMock(return_value=_INACTIVE()),
+            ),
+            patch.object(optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()),
+            patch.object(optimizer_main, "get_session", new=session_factory),
+            patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
+            patch("packages.optimizer.main.RulesOptimizer") as rules,
             patch("packages.optimizer.main.logger") as logger,
         ):
             assert await run_optimization() is None
+            assert optimizer_main._last_plan_generated_at == 0.0
 
-        optimizer.generate_plan.assert_not_awaited()
-        logger.error.assert_called_once_with(
-            "optimization_paused_planning_data_quality_check_failed",
-            reason="quality_check_failed",
-            error_type="RuntimeError",
+        optimizer.generate_plan.assert_awaited_once()
+        rules.return_value.generate_plan.assert_not_called()
+        session_factory.assert_not_called()
+        logger.info.assert_any_call(
+            "optimizer_no_plan",
+            reason="unvalidated_frozen_input_batch",
+            refusal="control_not_allowed",
         )
 
     @pytest.mark.asyncio

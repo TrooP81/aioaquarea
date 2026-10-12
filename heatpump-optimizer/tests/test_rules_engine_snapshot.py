@@ -2,10 +2,10 @@
 
 import datetime as dt
 import json
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -205,22 +205,63 @@ def test_under_min_and_over_max_treats_floor_protection_as_a_soft_cap():
         comfort_temp_min=18.0,
         indoor_rates=[(1.0, -0.5)],
     )
+    from packages.core.config import settings
+    from packages.core.space_heating_gate import SpaceHeatingGateState
+    from packages.optimizer import InfeasibleError
     from packages.optimizer.milp import MILPOptimizer
 
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
-    plan = MILPOptimizer()._solve(
-        [(start, 0.1)],
-        [(start, 5.0)],
-        cop_fn=lambda temperature, hour=12: 3.0,
-        demand_per_hour=[4.0],
-        current_tank_temp=48.0,
-        room_overheat_active=[True],
-        floor_protection_duty=duties,
-    )
-    retained_heat = plan["forecast_snapshot"]["forecast_with_plan"][0]["space_heating_fraction"]
+
+    def solve(*, demand, rates, room):
+        # Declared native SH: demand over the 12 kW declared electrical power.
+        with patch.object(settings, "sh_max_power_kw", 12.0):
+            return MILPOptimizer()._solve(
+                [(start, 0.1)],
+                [(start, 5.0)],
+                cop_fn=lambda temperature, hour=12: 3.0,
+                demand_per_hour=[demand],
+                current_tank_temp=48.0,
+                current_indoor_temp=room,
+                indoor_targets=[18.0],
+                tank_min_per_hour=[43.0],
+                tank_max_temp_setting=55.0,
+                indoor_rates=[rates],
+                gate_states=[SpaceHeatingGateState.ALLOWED],
+                room_overheat_active=[True],
+                floor_protection_duty=duties,
+                indoor_max_temp_setting=24.0,
+                # A 48.2 C hardware ceiling admits no 5-minute pulse (+0.42 C), isolating
+                # the native SH duty from any cost-driven DHW diversion.
+                hardware_tank_ceiling=48.2,
+                observation_context={
+                    "device_id": "synthetic-floor-device",
+                    "observed_at": start,
+                    "captured_at": start,
+                    "max_age_seconds": 900,
+                    "tank_target_c": 60.0,
+                    "force_dhw": 0,
+                },
+            )
 
     assert duties == pytest.approx([1.0])
-    assert 0.0 < retained_heat <= duties[0]
+    # Floor protection is soft: the declared 1/3 native duty cannot lift 17 C to the 18 C
+    # floor (17 - 0.5 + 1/3 * 1.5 = 17.0), so the represented plan is refused.
+    with pytest.raises(InfeasibleError):
+        solve(demand=4.0, rates=(1.0, -0.5), room=17.0)
+
+    retained = solve(demand=4.0, rates=(1.0, -0.5), room=18.5)
+    retained_point = retained["forecast_snapshot"]["forecast_with_plan"][0]
+    assert retained["actions"] == []
+    assert retained_point["native_space_heating_fraction"] == pytest.approx(1 / 3)
+    assert 0.0 < retained_point["space_heating_fraction"] <= duties[0]
+    assert retained_point["space_heating_fraction"] == pytest.approx(1 / 3)
+    assert retained_point["predicted_indoor_temp"] == pytest.approx(18.5)
+
+    recovered = solve(demand=12.0, rates=(1.2, -0.1), room=17.0)
+    recovered_point = recovered["forecast_snapshot"]["forecast_with_plan"][0]
+    assert recovered["actions"] == []
+    assert recovered_point["space_heating_fraction"] == pytest.approx(1.0)
+    assert recovered_point["predicted_indoor_temp"] == pytest.approx(18.2)
 
 
 def test_room_overheat_suppresses_discretionary_heat():
@@ -1127,6 +1168,53 @@ async def test_rules_gate_error_falls_back():
     assert gate["control_allowed"] is False
 
 
+async def _represented_policy_setting(name):
+    """Only the freshness policy keys the represented observation context reads."""
+    return {"device_status_max_age_minutes": "15", "poll_interval_seconds": "300"}[name]
+
+
+def _no_database(*_args, **_kwargs):
+    raise AssertionError("unexpected database session")
+
+
+def _isolated_represented_inputs(stack, optimizer, horizon):
+    """Price/weather rows aligned to the generator's own horizon; no real DB sessions."""
+
+    async def prices(_session, start, _end):
+        horizon["start"] = start
+        return [(start, 0.1)]
+
+    async def weather(_session, start, _end):
+        return [(start, 5.0)]
+
+    stack.enter_context(patch.object(optimizer, "_get_prices", new=AsyncMock(side_effect=prices)))
+    stack.enter_context(patch.object(optimizer, "_get_weather", new=AsyncMock(side_effect=weather)))
+    stack.enter_context(
+        patch(
+            "packages.core.settings_service.get_setting",
+            new=AsyncMock(side_effect=_represented_policy_setting),
+        )
+    )
+    # Committed thermal authority lives in the DB; keep the uncalibrated defaults instead.
+    stack.enter_context(
+        patch.object(
+            rules_engine.thermal_model, "arefresh_if_changed", new=AsyncMock(return_value=False)
+        )
+    )
+    return [
+        stack.enter_context(
+            patch("packages.core.settings_service.get_session", side_effect=_no_database)
+        ),
+        stack.enter_context(patch("packages.core.database.get_session", side_effect=_no_database)),
+    ]
+
+
+def _peak_candidate(horizon):
+    return lambda *_args, **_kwargs: [
+        {"type": "peak_avoidance", "ts": horizon["start"].isoformat(), "payload": {}}
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_target", ["control_temperature", "room_envelope"])
 async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private_logs(
@@ -1134,8 +1222,12 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
 ):
     from packages.optimizer.executor_core import LearningModeState
 
-    start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)
+    horizon = {}
     status = SimpleNamespace(
+        ts=observed_at,
+        force_dhw=0,
+        tank_heat_max=65.0,
         device_id="device-1",
         holiday_mode=0,
         tank_temp=48.0,
@@ -1173,11 +1265,6 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         fingerprint_matches=True,
     )
     projection = SimpleNamespace(state="ALLOWED")
-    action = {
-        "type": "peak_avoidance",
-        "ts": start.isoformat(),
-        "payload": {},
-    }
     optimizer = RulesOptimizer()
 
     async def setting_float(name):
@@ -1186,6 +1273,9 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
             "comfort_temp_target": 20.0,
             "comfort_temp_min": 18.0,
             "comfort_temp_max": 25.0,
+            "tank_min_temp": 45.0,
+            "tank_min_temp_offpeak": 40.0,
+            "tank_max_temp": 55.0,
         }[name]
 
     async def setting_int(name):
@@ -1202,12 +1292,7 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         stack.enter_context(
             patch.object(rules_engine, "get_session", return_value=SessionContext())
         )
-        stack.enter_context(
-            patch.object(optimizer, "_get_prices", new=AsyncMock(return_value=[(start, 0.1)]))
-        )
-        stack.enter_context(
-            patch.object(optimizer, "_get_weather", new=AsyncMock(return_value=[(start, 5.0)]))
-        )
+        database_sentinels = _isolated_represented_inputs(stack, optimizer, horizon)
         stack.enter_context(
             patch.object(optimizer, "_get_weather_full", new=AsyncMock(return_value=[]))
         )
@@ -1253,7 +1338,7 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
                             confidence="high",
                             sensor_count=1,
                             sample_count=1,
-                            latest_reading=start,
+                            latest_reading=observed_at,
                         )
                     ),
                 )
@@ -1304,7 +1389,9 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         stack.enter_context(
             patch.object(rules_engine, "panasonic_zone_heating_available", return_value=False)
         )
-        stack.enter_context(patch.object(optimizer, "_plan_peak_avoidance", return_value=[action]))
+        stack.enter_context(
+            patch.object(optimizer, "_plan_peak_avoidance", side_effect=_peak_candidate(horizon))
+        )
         stack.enter_context(
             patch.object(optimizer, "_estimate_cost", new=AsyncMock(return_value=0.0))
         )
@@ -1327,8 +1414,25 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         warning = stack.enter_context(patch.object(rules_engine.logger, "warning"))
         plan = await optimizer.generate_plan()
 
+    assert all(not sentinel.called for sentinel in database_sentinels)
     assert plan is not None
-    assert any(item["type"] == "peak_avoidance" for item in plan["actions"])
+    # The unsupported candidate is retained only as unproven metadata, never certified.
+    certified = plan["actions"] + plan["diagnostic_strategy_actions"]
+    assert all(item["type"] in {"force_dhw_on", "force_dhw_off"} for item in certified)
+    assert plan["unproven_strategies"]["schema"] == "native_sh_trace_v1"
+    assert plan["unproven_strategies"]["status"] == "unproven"
+    unproven_types = [item["type"] for item in plan["unproven_strategies"]["actions"]]
+    assert unproven_types.count("peak_avoidance") == 1
+    if failure_target == "control_temperature":
+        assert plan["diagnostic_status"] == "unproven"
+        assert plan["reason"] == "actual_initial_indoor_state_missing"
+        assert plan["actions"] == plan["diagnostic_strategy_actions"] == []
+        assert plan["cost_estimate"] is None
+        assert plan["control_input"]["indoor_temp"] is None
+        assert plan["forecast_snapshot"]["forecast_with_plan"] == []
+        assert "represented_strategy" not in plan
+    else:
+        assert plan["diagnostic_status"] == "conditional_feasible"
     assert plan["forecast_snapshot"]["control_input"]["room_comfort"]["affected_rooms"] == []
     assert plan["forecast_snapshot"]["forecast_status"] == (
         "unavailable" if failure_target == "control_temperature" else "fallback"
@@ -1342,11 +1446,15 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
     assert "26.1" not in warning_text
 
 
-@pytest.mark.asyncio
-async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_snapshot():
-    start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+async def _generate_with_passive_policy(limit, curve, *, gate=None):
+    """Run the rules generator; ``curve=None`` keeps the real controlled curve."""
+    observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)
+    horizon = {}
     optimizer = RulesOptimizer()
     status = SimpleNamespace(
+        ts=observed_at,
+        force_dhw=0,
+        tank_heat_max=65.0,
         device_id="device-1",
         holiday_mode=0,
         tank_temp=48.0,
@@ -1379,10 +1487,12 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
             "comfort_temp_target": 20.5,
             "comfort_temp_min": 18.0,
             "comfort_temp_max": 22.0,
-            "indoor_forecast_max_passive_change_c_per_hour": 0.2,
+            "indoor_forecast_max_passive_change_c_per_hour": limit,
+            "tank_min_temp": 45.0,
+            "tank_min_temp_offpeak": 40.0,
+            "tank_max_temp": 55.0,
         }[name]
 
-    curve = MagicMock(return_value=[{"hour": 1, "predicted_indoor_temp": 20.0, "source": "linear"}])
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(rules_engine, "get_session", return_value=SessionContext())
@@ -1396,12 +1506,7 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
                 new=AsyncMock(return_value=LearningModeState.INACTIVE),
             )
         )
-        stack.enter_context(
-            patch.object(optimizer, "_get_prices", new=AsyncMock(return_value=[(start, 0.1)]))
-        )
-        stack.enter_context(
-            patch.object(optimizer, "_get_weather", new=AsyncMock(return_value=[(start, 5.0)]))
-        )
+        database_sentinels = _isolated_represented_inputs(stack, optimizer, horizon)
         stack.enter_context(
             patch.object(optimizer, "_get_weather_full", new=AsyncMock(return_value=[]))
         )
@@ -1439,7 +1544,7 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
                         confidence="high",
                         sensor_count=1,
                         sample_count=1,
-                        latest_reading=start,
+                        latest_reading=observed_at,
                     )
                 ),
             )
@@ -1520,7 +1625,7 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
             patch.object(
                 optimizer,
                 "_plan_peak_avoidance",
-                return_value=[{"ts": start.isoformat(), "type": "peak_avoidance", "payload": {}}],
+                side_effect=_peak_candidate(horizon),
             )
         )
         stack.enter_context(
@@ -1528,17 +1633,320 @@ async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_
         )
         stack.enter_context(
             patch.object(
-                rules_engine, "evaluate_live_control_gate", new=AsyncMock(return_value=None)
+                rules_engine, "evaluate_live_control_gate", new=AsyncMock(return_value=gate)
             )
         )
-        stack.enter_context(
-            patch.object(rules_engine.thermal_model, "predict_indoor_controlled_curve", curve)
-        )
+        if curve is not None:
+            stack.enter_context(
+                patch.object(rules_engine.thermal_model, "predict_indoor_controlled_curve", curve)
+            )
         plan = await optimizer.generate_plan()
+    assert all(not sentinel.called for sentinel in database_sentinels)
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_rules_plan_passes_resolved_passive_change_limit_to_decisions_and_snapshot():
+    curve = MagicMock(return_value=[{"hour": 1, "predicted_indoor_temp": 20.0, "source": "linear"}])
+    plan = await _generate_with_passive_policy(0.2, curve)
 
     assert plan is not None
     assert len(curve.call_args_list) >= 4
     assert all(call.kwargs["max_passive_change_c_per_hour"] == 0.2 for call in curve.call_args_list)
+    certified = plan["actions"] + plan["diagnostic_strategy_actions"]
+    assert all(item["type"] != "peak_avoidance" for item in certified)
+    unproven_types = [item["type"] for item in plan["unproven_strategies"]["actions"]]
+    assert unproven_types.count("peak_avoidance") == 1
+
+
+@pytest.mark.asyncio
+async def test_rules_refuses_certification_when_policy_aware_rates_are_nonfinite():
+    curve = MagicMock(
+        return_value=[{"hour": 1, "predicted_indoor_temp": float("nan"), "source": "linear"}]
+    )
+    with patch.object(rules_engine.logger, "info") as info:
+        plan = await _generate_with_passive_policy(0.2, curve)
+
+    assert plan is None
+    assert any(
+        call.args == ("rules_strategy_unproven",) and call.kwargs["reason"] == "DataIncompleteError"
+        for call in info.call_args_list
+    )
+
+
+def _policy_curve(**kwargs):
+    """Synthetic controlled curve: passive drift follows the resolved policy, full heat 1.5 C/h."""
+    limit = kwargs["max_passive_change_c_per_hour"]
+    fractions = kwargs["heating_fractions"]
+    value = kwargs["current_indoor"]
+    rows = []
+    for hour in range(kwargs["hours"]):
+        fraction = fractions[hour] if hour < len(fractions) else 0.0
+        value += -limit + fraction * (1.5 + limit)
+        rows.append(
+            {"hour": hour + 1, "predicted_indoor_temp": round(value, 1), "source": "linear"}
+        )
+    return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0.2, 0.6])
+async def test_rules_represented_forecast_consumes_resolved_passive_policy(limit):
+    curve = MagicMock(side_effect=_policy_curve)
+    plan = await _generate_with_passive_policy(limit, curve)
+
+    assert plan is not None
+    assert plan["diagnostic_status"] == "conditional_feasible"
+    row = plan["represented_strategy"]["hours"][0]
+    # The passive rate follows the resolved policy; full heat is not capped by it.
+    assert row["indoor_passive_c_per_h"] == pytest.approx(-limit)
+    assert row["indoor_full_heat_c_per_h"] == pytest.approx(1.5)
+    replay = plan["serialized_replay"]
+    expected = 20.0
+    previous = dt.datetime.fromisoformat(replay["states"][0]["ts"])
+    for state in replay["states"][1:]:
+        instant = dt.datetime.fromisoformat(state["ts"])
+        duration = (instant - previous).total_seconds() / 3600
+        expected += duration * (-limit + state["space_heating_fraction"] * (1.5 + limit))
+        previous = instant
+    assert replay["states"][-1]["indoor_c"] == pytest.approx(expected)
+    final = plan["forecast_snapshot"]["forecast_with_plan"][-1]["predicted_indoor_temp"]
+    assert final == pytest.approx(expected, abs=0.05)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("limit", "learned_change"), [(0.2, -0.2), (0.6, -0.3)])
+async def test_rules_plan_real_curve_admitted_gate_publishes_policy_capped_passive_rate(
+    limit, learned_change
+):
+    gate = {"status": "available", "control_allowed": True, "reason": "synthetic_admitted"}
+    with _synthetic_passive_predictor(-0.3) as models:
+        plan = await _generate_with_passive_policy(limit, None, gate=gate)
+
+    assert plan is not None
+    assert plan["diagnostic_status"] == "conditional_feasible"
+    assert models[60].calls > 0
+    row = plan["represented_strategy"]["hours"][0]
+    assert row["indoor_passive_c_per_h"] == pytest.approx(learned_change)
+    assert row["indoor_full_heat_c_per_h"] == pytest.approx(
+        _curve_oracle(20.0, 1, outdoor=5.0, heated=True)[0] - 20.0
+    )
+    assert plan["forecast_snapshot"]["forecast_quality"]["control_allowed"] is True
+
+
+class _SyntheticPassiveDirect:
+    """Constant raw passive delta; the real projection, readiness and policy clamp still run."""
+
+    def __init__(self, delta_c):
+        self.delta_c = delta_c
+        self.calls = 0
+
+    def predict(self, rows):
+        import numpy as np
+
+        self.calls += 1
+        return np.full(len(rows), self.delta_c)
+
+
+@contextmanager
+def _synthetic_passive_predictor(raw_change_c_per_hour):
+    """Admit synthetic validated passive direct models on the real comfort-model singleton.
+
+    The control model stays observation-only, so heated scenarios exercise the
+    unqualified linear fallback inside the same real controlled curve.
+    """
+    from packages.ml.comfort_model import ComfortModel, comfort_model
+
+    models = {
+        horizon: _SyntheticPassiveDirect(raw_change_c_per_hour * horizon / 60)
+        for horizon in (60, 180, 360, 720)
+    }
+    metrics = {
+        "passive_horizons": {
+            str(horizon): {"status": "trained", "mae": 0.1, "persistence_mae": 0.3}
+            for horizon in models
+        }
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(comfort_model, "_model", object()))
+        stack.enter_context(patch.object(comfort_model, "_qualified_reference", None))
+        stack.enter_context(patch.object(comfort_model, "_passive_direct_models", models))
+        stack.enter_context(patch.object(comfort_model, "_metrics", metrics))
+        stack.enter_context(
+            patch.object(
+                ComfortModel, "is_ready_for_control", new_callable=PropertyMock, return_value=False
+            )
+        )
+        yield models
+
+
+def _curve_oracle(start, hours, *, outdoor, heated, direct=None):
+    """Independent hourly oracle: unrounded internal state, 0.1 C published values.
+
+    ``direct`` maps an hour to the validated direct passive change from ``start``;
+    other hours continue with linear physics from the previous internal state.
+    """
+    from packages.ml.thermal import _solar_gain_c, thermal_model
+
+    supply = HeatCurveConfig().planned_supply_temperature(outdoor)
+    values, indoor = [], start
+    for hour in range(1, hours + 1):
+        if direct is not None and hour in direct:
+            indoor = start + direct[hour]
+        else:
+            rate = thermal_model._free_float_step(indoor, outdoor) - indoor
+            if heated and supply > indoor + 5.0:
+                rate = thermal_model._indoor_heating_rate(outdoor) + _solar_gain_c(0.0)
+            indoor += rate
+        values.append(round(indoor, 1))
+    return values
+
+
+def _published(rates, index, start=20.0):
+    values, value = [], start
+    for rate in rates:
+        value = round(value + rate[index], 1)
+        values.append(value)
+    return values
+
+
+def _passive_policy_inputs(hours, *, outdoor=5.0):
+    start = dt.datetime(2026, 1, 5, 6, tzinfo=dt.timezone.utc)
+    prices = [
+        (start + dt.timedelta(hours=hour), price)
+        for hour, price in zip(range(hours), [0.30, 0.05, 0.40, 0.08, 0.35, 0.25])
+    ]
+    weather = [(timestamp, outdoor) for timestamp, _price in prices]
+    return start, prices, weather
+
+
+def _policy_rates(limit, *, learned, hours=6, current_indoor=20.0):
+    _start, prices, weather = _passive_policy_inputs(hours)
+    return RulesOptimizer._represented_indoor_rates(
+        prices=prices,
+        weather=weather,
+        weather_full=[],
+        current_indoor=current_indoor,
+        heat_curve=HeatCurveConfig(),
+        use_learned_forecast=learned,
+        max_passive_change_c_per_hour=limit,
+    )
+
+
+@pytest.mark.parametrize(
+    ("limit", "anchors"),
+    # Raw synthetic passive drift is -0.3 C/h; 0.2 binds, 0.6 does not cap it.
+    [(0.2, {1: 19.8, 3: 19.4, 6: 18.8}), (0.6, {1: 19.7, 3: 19.1, 6: 18.2})],
+)
+def test_real_controlled_curve_admitted_learned_gate_applies_passive_policy(limit, anchors):
+    with _synthetic_passive_predictor(-0.3) as models:
+        rates = _policy_rates(limit, learned=True)
+
+    assert {horizon: model.calls > 0 for horizon, model in models.items()} == {
+        60: True,
+        180: True,
+        360: True,
+        720: False,
+    }
+    passive_curve = _published(rates, 1)
+    for hour, expected in anchors.items():
+        assert passive_curve[hour - 1] == pytest.approx(expected)
+    # Validated direct horizons apply the resolved policy as a cap on the learned
+    # change; hours without one continue with linear physics, never a guessed rate.
+    direct = {hour: max(-limit * hour, -0.3 * hour) for hour in (1, 3, 6)}
+    assert passive_curve == pytest.approx(
+        _curve_oracle(20.0, 6, outdoor=5.0, heated=False, direct=direct)
+    )
+    # The heated scenario is the unqualified linear fallback, not capped by the policy.
+    assert _published(rates, 0) == pytest.approx(_curve_oracle(20.0, 6, outdoor=5.0, heated=True))
+    assert all(full > passive for full, passive in rates)
+
+
+def test_real_controlled_curve_unqualified_fallback_ignores_passive_policy():
+    with _synthetic_passive_predictor(-0.3) as models:
+        tight = _policy_rates(0.2, learned=False)
+        loose = _policy_rates(0.6, learned=False)
+
+    assert all(model.calls == 0 for model in models.values())
+    assert tight == pytest.approx(loose)
+    assert _published(tight, 1) == pytest.approx(_curve_oracle(20.0, 6, outdoor=5.0, heated=False))
+    assert _published(tight, 0) == pytest.approx(_curve_oracle(20.0, 6, outdoor=5.0, heated=True))
+
+
+@pytest.mark.parametrize("limit", [0.2, 0.6])
+def test_represented_plan_replays_real_policy_rates_with_native_mix_and_dhw_diversion(limit):
+    from packages.core.config import settings
+    from packages.optimizer.represented_strategy import (
+        assumed_native_demand,
+        build_represented_plan,
+    )
+
+    start, prices, weather = _passive_policy_inputs(6)
+    with _synthetic_passive_predictor(-0.3):
+        rates = _policy_rates(limit, learned=True)
+    gates = ["ALLOWED"] * 6
+    demand = assumed_native_demand(weather, gates)
+    captured = start - dt.timedelta(minutes=1)
+    plan = build_represented_plan(
+        prices=prices,
+        weather=weather,
+        cop_fn=lambda _outdoor, _hour=12: 3.0,
+        demand_per_hour=demand,
+        current_tank_temp=46.0,
+        current_indoor_temp=20.0,
+        gate_states=gates,
+        hardware_tank_ceiling=65.0,
+        context={
+            "device_id": "synthetic-device",
+            "observed_at": captured - dt.timedelta(minutes=2),
+            "captured_at": captured,
+            "max_age_seconds": 900,
+            "tank_target_c": 55.0,
+            "force_dhw": 0,
+        },
+        dhw_deadlines=[6],
+        indoor_targets=[18.0] * 6,
+        tank_min_per_hour=[45.0] * 6,
+        tank_max_temp_setting=55.0,
+        indoor_rates=rates,
+        indoor_max_temp_setting=23.0,
+        timeout_seconds=20,
+    )
+
+    rows = plan["represented_strategy"]["hours"]
+    assert [(row["indoor_full_heat_c_per_h"], row["indoor_passive_c_per_h"]) for row in rows] == (
+        pytest.approx(rates)
+    )
+    assert all(0 < row["native_sh_fraction"] < 1 for row in rows)
+    replay = plan["serialized_replay"]
+    diverted = [state for state in replay["states"][1:] if state["dhw_active"]]
+    assert diverted and all(state["space_heating_fraction"] == 0.0 for state in diverted)
+    assert [action["type"] for action in plan["actions"]].count("force_dhw_on") >= 1
+
+    indoor, cost, upper = 20.0, 0.0, 0.0
+    previous = start
+    for state in replay["states"][1:]:
+        instant = dt.datetime.fromisoformat(state["ts"])
+        row = rows[int((previous - start).total_seconds() // 3600)]
+        duration = (instant - previous).total_seconds() / 3600
+        fraction = 0.0 if state["dhw_active"] else row["native_sh_fraction"]
+        assert state["space_heating_fraction"] == pytest.approx(fraction)
+        indoor += duration * (
+            row["indoor_passive_c_per_h"]
+            + fraction * (row["indoor_full_heat_c_per_h"] - row["indoor_passive_c_per_h"])
+        )
+        assert state["indoor_c"] == pytest.approx(indoor)
+        power = row["dhw_power_kw"] if state["dhw_active"] else settings.sh_max_power_kw * fraction
+        cost += power * duration * row["price_per_kwh"]
+        upper += (
+            max(row["dhw_power_kw"], row["native_sh_power_kw"]) * duration * row["price_per_kwh"]
+        )
+        previous = instant
+    assert plan["cost_estimate"] == pytest.approx(cost)
+    assert 0 < plan["cost_estimate"] <= upper
+    serialized = json.dumps(plan, default=str)
+    for private in ("comfort_model", "passive_direct", "direct_horizon", "persistence_mae"):
+        assert private not in serialized
 
 
 class TestControlBasisAndForecastContract:

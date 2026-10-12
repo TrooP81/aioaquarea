@@ -390,41 +390,135 @@ async def test_S4_QR2_actual_rules_generation_without_optional_solver(monkeypatc
         assert plan["cost_estimate"] < 0
 
 
-async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatch):
-    from packages.optimizer import main, represented_strategy
-    from packages.optimizer.executor_core import LearningModeState
+def _publication_plan(monkeypatch):
+    """Six-hour represented diagnostic consuming one producer-built frozen batch."""
+    from packages.core.config import settings
+    from packages.core.planning_data_quality import (
+        MINIMUM_CONTROL_HOURS,
+        PlanningInputBatch,
+        PriceInput,
+        WeatherInput,
+        planning_batch_quality,
+    )
+    from packages.ml.thermal import thermal_model
+    from packages.optimizer import represented_strategy
 
-    value = trace(1)
-    start = dt.datetime.fromisoformat(value["hours"][0]["ts"])
+    monkeypatch.setattr(thermal_model.params, "last_calibrated", None)
+    monkeypatch.setattr(settings, "sh_max_power_kw", 12.0)
+    monkeypatch.setattr(settings, "tank_max_temp", 55)
+    monkeypatch.setattr(settings, "comfort_temp_max", 22.0)
+    hours = MINIMUM_CONTROL_HOURS
+    assert hours == 6
+    captured = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).replace(microsecond=0)
+    start = captured.replace(minute=0, second=0) + dt.timedelta(hours=1)
+    fetched, issued = captured - dt.timedelta(minutes=10), captured - dt.timedelta(hours=1)
+    price_values = [-0.2, 0.3, 0.1, -0.2, 0.3, 0.1]
+    batch = PlanningInputBatch(
+        captured,
+        start,
+        start + dt.timedelta(hours=hours),
+        "manual",
+        "manual",
+        "manual",
+        tuple(
+            PriceInput(
+                start + dt.timedelta(hours=hour),
+                price_values[hour],
+                "SEK",
+                "manual",
+                fetched,
+                "hourly_duration_weighted_v1",
+            )
+            for hour in range(hours)
+        ),
+        tuple(
+            WeatherInput(
+                start + dt.timedelta(hours=hour),
+                5.0,
+                2.0,
+                50.0,
+                0.0,
+                80.0,
+                40.0,
+                "manual",
+                issued,
+                "weather_c_mps_wm2_mm_v1",
+            )
+            for hour in range(hours)
+        ),
+    )
+    quality = planning_batch_quality(batch)
+    assert quality["control_allowed"] is True, quality["reasons"]
+    context = {
+        "device_id": "offline-device",
+        "observed_at": (captured - dt.timedelta(minutes=1)).isoformat(),
+        "captured_at": captured.isoformat(),
+        "max_age_seconds": 900,
+        "tank_target_c": 55.0,
+        "force_dhw": 0,
+    }
+    last_hour = {"hours": [{"ts": (start + dt.timedelta(hours=hours - 1)).isoformat()}]}
     plan = represented_strategy.build_represented_plan(
-        prices=[(start, -0.2)],
-        weather=[(start, 5)],
+        prices=[(row.ts, row.value) for row in batch.prices],
+        weather=[(row.ts, row.temperature) for row in batch.weather],
         cop_fn=lambda *a: 3,
-        demand_per_hour=[0],
+        demand_per_hour=[0] * hours,
         current_tank_temp=48,
         current_indoor_temp=20,
-        gate_states=["BLOCKED"],
+        gate_states=["BLOCKED"] * hours,
         hardware_tank_ceiling=55,
-        context=owner_context(value),
-        indoor_rates=[(0.2, -0.1)],
-        indoor_targets=[19],
-        tank_min_per_hour=[48],
-        serialized_actions=pulse(value, 0, 30),
+        context=context,
+        indoor_rates=[(0.2, -0.1)] * hours,
+        indoor_targets=[19] * hours,
+        tank_min_per_hour=[48] * hours,
+        # The initial pulse is retained; the linked final pulse keeps the tank floor.
+        serialized_actions=pulse({"hours": [{"ts": start.isoformat()}]}, 0, 30)
+        + pulse(last_hour, 0, 10),
     )
-    plan["planning_data_quality"] = {
-        "control_allowed": True,
-        "price": {"area": "SE3", "source": "manual", "currency": "SEK"},
-    }
-    records = []
-    session = SimpleNamespace(
-        add=lambda record: (setattr(record, "id", 321), records.append(record)), flush=AsyncMock()
-    )
+    plan["planning_data_quality"] = quality
+    return plan, batch
 
-    @asynccontextmanager
-    async def sessions(**kwargs):
-        yield session
 
-    monkeypatch.setattr(main, "get_session", sessions)
+class _PublicationSession:
+    def __init__(self, main, *, flush_error=None, commit_error=None):
+        self.main, self.flush_error, self.commit_error = main, flush_error, commit_error
+        self.records, self.committed, self.events, self.opened = [], [], [], 0
+
+    def add(self, record):
+        record.id = 321
+        self.records.append(record)
+
+    async def flush(self):
+        self.events.append(("flush", self.main._last_plan_generated_at))
+        if self.flush_error:
+            raise self.flush_error
+
+    def factory(self):
+        @asynccontextmanager
+        async def sessions(**kwargs):
+            self.opened += 1
+            try:
+                yield self
+            except BaseException:
+                self.events.append(("rollback", self.main._last_plan_generated_at))
+                raise
+            self.events.append(("commit", self.main._last_plan_generated_at))
+            if self.commit_error:
+                raise self.commit_error
+            self.committed.extend(self.records)
+
+        return sessions
+
+
+_COOLDOWN_SENTINEL = -123456.0
+
+
+def _publication_harness(monkeypatch, plan, session):
+    from packages.optimizer import main
+    from packages.optimizer.executor_core import LearningModeState
+
+    monkeypatch.setattr(main, "_last_plan_generated_at", _COOLDOWN_SENTINEL)
+    monkeypatch.setattr(main, "get_session", session.factory())
     monkeypatch.setattr(main, "get_setting", AsyncMock(return_value="rules_only"))
     monkeypatch.setattr(
         main, "resolve_learning_mode_state", AsyncMock(return_value=LearningModeState.ACTIVE)
@@ -441,7 +535,23 @@ async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatc
     monkeypatch.setattr(main.comfort_model, "arefresh_if_changed", AsyncMock())
     activate = AsyncMock(side_effect=AssertionError("Diagnostic must never activate"))
     monkeypatch.setattr("packages.core.plan_lifecycle.activate_plan", activate)
+    return main, activate
+
+
+async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatch):
+    from packages.optimizer import main as optimizer_main
+
+    plan, batch = _publication_plan(monkeypatch)
+    session = _PublicationSession(optimizer_main)
+    main, activate = _publication_harness(monkeypatch, plan, session)
     assert await main.run_optimization() == 321
+    assert session.opened == 1
+    assert session.events == [
+        ("flush", _COOLDOWN_SENTINEL),
+        ("commit", _COOLDOWN_SENTINEL),
+    ]
+    assert main._last_plan_generated_at != _COOLDOWN_SENTINEL
+    records = session.committed
     assert len(records) == 1
     record = records[0]
     saved = json.loads(record.plan_json)
@@ -449,9 +559,17 @@ async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatc
     assert record.status == "diagnostic" and record.status != "active"
     assert saved["actions"] == [] and saved["diagnostic"] is True
     assert saved["diagnostic_strategy_actions"] and record.price_currency == "SEK"
-    assert provenance["planning_horizon"]["hours"] == 1
+    assert provenance["planning_horizon"]["hours"] == 6
     assert provenance["price_risk"]["status"] == "published_prices"
-    assert provenance["price_risk"]["hours"] == 1
+    assert provenance["price_risk"]["hours"] == 6
+    assert provenance["input_quality"]["horizon_hours"] == 6
+    assert provenance["input_quality"]["effective_horizon_hours"] == 6
+    assert provenance["input_quality"]["horizon_start"] == batch.start.isoformat()
+    assert record.horizon_start == batch.start and record.horizon_end == batch.end
+    assert len(saved["represented_strategy"]["hours"]) == 6
+    assert [row["ts"] for row in saved["forecast_snapshot"]["price_forecast"]] == [
+        row.ts.isoformat() for row in batch.prices
+    ]
     assert saved["represented_strategy"]["price_currency"] == "SEK"
     assert saved["serialized_replay"]["price_currency"] == "SEK"
     assert saved["cost_accounting"]["price_currency"] == "SEK"
@@ -459,6 +577,50 @@ async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatc
     assert saved["forecast_snapshot"]["forecast_no_heating"][0][
         "predicted_indoor_temp"
     ] == pytest.approx(19.9)
+    activate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "case", ["missing_status", "nonliteral_true", "horizon_mismatch", "context_mismatch"]
+)
+async def test_S4_QR3_invalid_publication_quality_opens_no_session(monkeypatch, case):
+    from packages.optimizer import main as optimizer_main
+
+    plan, _batch = _publication_plan(monkeypatch)
+    quality = plan["planning_data_quality"]
+    if case == "missing_status":
+        del quality["status"]
+    elif case == "nonliteral_true":
+        quality["control_allowed"] = 1
+    elif case == "horizon_mismatch":
+        plan["horizon_end"] = plan["horizon_end"] + dt.timedelta(hours=1)
+    else:
+        quality["price"]["area"] = "SE3"
+    session = _PublicationSession(optimizer_main)
+    main, activate = _publication_harness(monkeypatch, plan, session)
+    assert await main.run_optimization() is None
+    assert session.opened == 0 and session.records == [] and session.committed == []
+    assert main._last_plan_generated_at == _COOLDOWN_SENTINEL
+    activate.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["flush", "commit"])
+async def test_S4_QR3_transaction_failure_never_advances_cooldown(monkeypatch, failure):
+    from packages.optimizer import main as optimizer_main
+
+    plan, _batch = _publication_plan(monkeypatch)
+    error = RuntimeError(f"offline {failure} failure")
+    session = _PublicationSession(
+        optimizer_main,
+        flush_error=error if failure == "flush" else None,
+        commit_error=error if failure == "commit" else None,
+    )
+    main, activate = _publication_harness(monkeypatch, plan, session)
+    assert await main.run_optimization() is None
+    assert session.opened == 1 and session.committed == []
+    expected = "rollback" if failure == "flush" else "commit"
+    assert session.events[-1] == (expected, _COOLDOWN_SENTINEL)
+    assert main._last_plan_generated_at == _COOLDOWN_SENTINEL
     activate.assert_not_awaited()
 
 
@@ -939,3 +1101,133 @@ def test_R23_R35_entrypoints_protect_startup_and_schedule_all_async_jobs():
         and getattr(node.value.func, "id", "") == "finish_owned_cleanup"
         for node in ast.walk(ast.Module(body=owner.finalbody, type_ignores=[]))
     )
+
+
+def _flat_dhw_trace(prices):
+    value = trace(len(prices))
+    value["deadline_hours"] = []
+    value["initial_tank_c"] = 46.0
+    for row, price in zip(value["hours"], prices):
+        row.update(
+            price_per_kwh=price,
+            gate_state="BLOCKED",
+            native_sh_fraction=0.0,
+            tank_net_heating_c_per_h=6.0,
+            tank_loss_c_per_h=-1.0,
+            tank_floor_c=45.0,
+        )
+    return value
+
+
+def _enumerate_schedules(value):
+    """Independent brute-force of every integer runtime schedule (blocked native SH)."""
+    from itertools import product
+
+    from packages.optimizer.represented_strategy import TOLERANCE
+
+    slack = 1e-9
+    rows = value["hours"]
+    target = value["observed_tank_target_c"] - 0.5 - TOLERANCE
+    feasible = []
+    for minutes in product([0, *range(5, 61)], repeat=len(rows)):
+        tank, indoor, cost, valid = value["initial_tank_c"], value["initial_indoor_c"], 0.0, True
+        for runtime, row in zip(minutes, rows):
+            fraction = runtime / 60
+            peak = tank + row["tank_net_heating_c_per_h"] * fraction
+            end = peak + row["tank_loss_c_per_h"] * (1 - fraction)
+            room = indoor + row["indoor_passive_c_per_h"]
+            pulse_room = indoor + row["indoor_passive_c_per_h"] * fraction
+            if (
+                max(peak, end) > value["tank_ceiling_c"] + slack
+                or end < row["tank_floor_c"] - slack
+                or not row["indoor_floor_c"] - slack <= room <= value["indoor_ceiling_c"] + slack
+                or (
+                    runtime
+                    and (
+                        max(tank, peak) > target + slack
+                        or not row["indoor_floor_c"] - slack
+                        <= pulse_room
+                        <= value["indoor_ceiling_c"] + slack
+                    )
+                )
+            ):
+                valid = False
+                break
+            cost += row["price_per_kwh"] * fraction * row["dhw_power_kw"]
+            tank, indoor = end, room
+        if valid:
+            feasible.append((minutes, cost))
+    assert feasible
+    return feasible
+
+
+def _recorded_solver(monkeypatch):
+    import pulp
+
+    calls, real = [], pulp.PULP_CBC_CMD
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pulp, "PULP_CBC_CMD", recording)
+    return calls
+
+
+@pytest.mark.parametrize("price", [0.1, -0.2, 0.0])
+def test_B1_equal_monetary_coefficients_prefer_fewer_pulses_without_cost(monkeypatch, price):
+    calls = _recorded_solver(monkeypatch)
+    value = _flat_dhw_trace([price] * 3)
+    actions, replay = solve_represented_trace(value, timeout_seconds=7)
+    assert len(calls) == 1 and calls[0]["timeLimit"] == 7
+    runtimes = [item["payload"]["dhw_minutes"] for item in actions if "action_key" in item]
+    feasible = _enumerate_schedules(value)
+    best_cost = min(cost for _minutes, cost in feasible)
+    cost_optimal = [minutes for minutes, cost in feasible if cost <= best_cost + 1e-9]
+    if price:
+        totals = {sum(minutes) for minutes in cost_optimal}
+        assert len(totals) == 1 and sum(runtimes) == totals.pop()
+    fewest = min(sum(1 for runtime in minutes if runtime) for minutes in cost_optimal)
+    assert len(runtimes) == fewest
+    assert replay["cost"] == pytest.approx(best_cost, abs=1e-6)
+
+
+def test_B1_unequal_coefficients_keep_monetary_optimum(monkeypatch):
+    calls = _recorded_solver(monkeypatch)
+    value = _flat_dhw_trace([0.1, 0.3, 0.2])
+    _actions, replay = solve_represented_trace(value, timeout_seconds=5)
+    assert len(calls) == 1 and calls[0]["timeLimit"] == 5
+    best_cost = min(cost for _minutes, cost in _enumerate_schedules(value))
+    assert replay["cost"] == pytest.approx(best_cost, abs=1e-6)
+
+
+def test_B1_objective_specialization_is_exact_equality_only():
+    import math
+
+    import pulp
+
+    from packages.optimizer.represented_strategy import _represented_objective
+
+    minutes = [pulp.LpVariable(f"m{hour}", 0, 60, cat="Integer") for hour in range(2)]
+    active = [pulp.LpVariable(f"a{hour}", cat="Binary") for hour in range(2)]
+
+    def monetary(prices):
+        cost = 0
+        for runtime, price in zip(minutes, prices):
+            cost += price * (runtime / 60 * 1.5)
+        return cost
+
+    for prices in ([0.1, 0.3], [0.1, 0.1 + 1e-12]):
+        cost = monetary(prices)
+        coefficients = [cost.get(item) for item in minutes]
+        assert coefficients[0] != coefficients[1]
+        assert math.isclose(*coefficients, rel_tol=1e-9) is (prices[1] != 0.3)
+        assert _represented_objective(cost, minutes, active) is cost
+    # One runtime minute weighs M + 1 = 3 and outranks any activation difference (<= M = 2).
+    for price, weight in ((0.1, 3), (-0.2, -3)):
+        objective = _represented_objective(monetary([price, price]), minutes, active)
+        assert [objective.get(item) for item in minutes] == [weight, weight]
+        assert [objective.get(item) for item in active] == [1, 1]
+    objective = _represented_objective(monetary([0.0, 0.0]), minutes, active)
+    assert [objective.get(item, 0) for item in minutes] == [0, 0]
+    assert [objective.get(item) for item in active] == [1, 1]

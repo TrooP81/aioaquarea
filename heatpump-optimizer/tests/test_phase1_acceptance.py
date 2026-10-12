@@ -813,7 +813,7 @@ class TestAC10FreshnessSafety:
         assert planner.generate_plan.await_count == int(expected_fresh)
 
         result = MagicMock()
-        result.scalar_one_or_none.return_value = SimpleNamespace()
+        result.scalar_one_or_none.return_value = SimpleNamespace(ts=timestamp)
         session = MagicMock(execute=AsyncMock(return_value=result))
         wrapper = AsyncMock()
         wrapper.get_selected_device_id.return_value = "device-a"
@@ -824,12 +824,15 @@ class TestAC10FreshnessSafety:
             device_quality_check=AsyncMock(return_value=quality),
         )
 
-        class FrozenClock:
+        class FrozenClock(dt.datetime):
             @classmethod
-            def now(cls, timezone=None):
+            def now(cls, tz=None):
                 return frozen_now
 
-        with patch("packages.optimizer.executor_core.dt.datetime", FrozenClock):
+        executor_clock = SimpleNamespace(
+            datetime=FrozenClock, timezone=dt.timezone, timedelta=dt.timedelta
+        )
+        with patch("packages.optimizer.executor_core.dt", executor_clock):
             precondition = await executor._dispatch_precondition(
                 SimpleNamespace(device_id="device-a"), ActionType.FORCE_DHW_OFF, {}
             )
@@ -893,12 +896,43 @@ class TestAC10FreshnessSafety:
     def test_AC10_2_initial_training_is_after_device_quality_gate(self):
         import importlib
 
-        source = inspect.getsource(importlib.import_module("packages.optimizer.main").main)
+        optimizer_main = importlib.import_module("packages.optimizer.main")
+        assert "await _run_service(wrapper, scheduler)" in inspect.getsource(optimizer_main.main)
+        source = inspect.getsource(optimizer_main._run_service)
         assert source.index("device_quality = await get_device_data_quality()") < source.index(
             "await enqueue_maintenance_request("
         )
+        assert source.index("await enqueue_maintenance_request(") < source.index(
+            "await wrapper.start()"
+        )
         assert 'if not device_quality["ready"]' in source
         assert "comfort_model.train(" not in source
+
+    @pytest.mark.asyncio
+    async def test_AC10_2_initial_training_not_requested_when_device_not_ready(self):
+        import importlib
+
+        optimizer_main = importlib.import_module("packages.optimizer.main")
+        comfort_model = SimpleNamespace(is_trained=False, train=AsyncMock())
+        enqueue = AsyncMock()
+        wrapper = MagicMock(start=AsyncMock(side_effect=RuntimeError("fixture stop")))
+        with (
+            patch.object(optimizer_main, "_load_ml_models"),
+            patch("packages.core.logging.configure_logging"),
+            patch.object(
+                optimizer_main,
+                "get_device_data_quality",
+                new=AsyncMock(return_value={"ready": False, "reasons": ["device_status_stale"]}),
+            ),
+            patch.object(optimizer_main, "comfort_model", comfort_model),
+            patch("packages.ml.lifecycle.enqueue_maintenance_request", new=enqueue),
+        ):
+            with pytest.raises(RuntimeError, match="fixture stop"):
+                await optimizer_main._run_service(wrapper, MagicMock())
+
+        enqueue.assert_not_awaited()
+        comfort_model.train.assert_not_awaited()
+        wrapper.start.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_AC10_3_freshness_blocked_action_returns_pending_without_rescheduling(self):
@@ -1032,6 +1066,8 @@ class TestAC10FreshnessSafety:
         comfort_model = SimpleNamespace(is_trained=False, train=AsyncMock())
         wrapper = AsyncMock()
         scheduler = MagicMock()
+        scheduler.close = AsyncMock()
+        drain = AsyncMock()
         shutdown_event = MagicMock()
         shutdown_event.wait = AsyncMock()
 
@@ -1051,7 +1087,7 @@ class TestAC10FreshnessSafety:
                 "packages.core.service_health.record_service_heartbeat",
                 new=AsyncMock(),
             ),
-            patch.object(optimizer_main, "_shutdown_runtime", new=AsyncMock()),
+            patch("packages.core.log_sink.shutdown_log_sink", new=drain),
             patch.object(optimizer_main.asyncio, "Event", return_value=shutdown_event),
         ):
             with capture_logs() as logs:
@@ -1066,6 +1102,9 @@ class TestAC10FreshnessSafety:
         assert sentinel not in repr(logs)
         wrapper.start.assert_awaited_once()
         scheduler.start.assert_called_once()
+        scheduler.close.assert_awaited_once_with()
+        drain.assert_awaited_once_with()
+        wrapper.stop.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_AC10_3_degraded_optimizer_does_not_supersede_a_plan(self):

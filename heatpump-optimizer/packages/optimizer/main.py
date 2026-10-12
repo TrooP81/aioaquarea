@@ -16,7 +16,12 @@ from packages.core.models import (
     PlanRecord,
 )
 from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
-from packages.core.planning_data_quality import get_planning_data_quality
+from packages.core.planning_data_quality import (
+    MAX_PRICE_AGE,
+    MAX_WEATHER_ISSUE_AGE,
+    MINIMUM_CONTROL_HOURS,
+    get_planning_data_quality,
+)
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.services import AquareaWrapper
 from packages.core.scheduling import create_scheduler, utc_after, utc_now
@@ -131,6 +136,154 @@ async def _has_material_near_term_change(session, plan: dict) -> tuple[bool, int
         != {_planned_action_signature(action) for action in proposed_actions},
         active.id,
     )
+
+
+_PRICE_SOURCES = frozenset({"entsoe", "tibber", "manual"})
+_WEATHER_SOURCES = frozenset({"open-meteo", "smhi", "manual"})
+_ADMISSIBLE_DIAGNOSTIC_STATUS = "conditional_feasible"
+
+
+class _PlanAdmissionRefused(ValueError):
+    """Stable refusal reason; never carries the rejected payload."""
+
+
+def _strict_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _PlanAdmissionRefused("invalid_integer_field")
+    return value
+
+
+def _strict_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise _PlanAdmissionRefused("invalid_boolean_field")
+    return value
+
+
+def _aware_instant(value: object) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        instant = value
+    elif isinstance(value, str):
+        try:
+            instant = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise _PlanAdmissionRefused("malformed_clock") from exc
+    else:
+        raise _PlanAdmissionRefused("malformed_clock")
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise _PlanAdmissionRefused("naive_clock")
+    return instant.astimezone(dt.timezone.utc)
+
+
+def _frozen_clock(value: object) -> dt.datetime:
+    """Frozen producer provenance carries ISO strings; plan horizon clocks may be datetimes."""
+    if not isinstance(value, str):
+        raise _PlanAdmissionRefused("malformed_clock")
+    return _aware_instant(value)
+
+
+def _section(quality: dict, key: str) -> dict:
+    value = quality.get(key)
+    if not isinstance(value, dict):
+        raise _PlanAdmissionRefused(f"missing_{key}_provenance")
+    return value
+
+
+def _feed_admission(
+    feed: dict, *, clock_key: str, captured_at: dt.datetime, maximum: dt.timedelta, horizon: int
+) -> int:
+    contiguous = _strict_int(feed.get("contiguous_hours"))
+    if not 0 <= contiguous <= horizon:
+        raise _PlanAdmissionRefused("inconsistent_feed_hours")
+    if _strict_bool(feed.get("complete_horizon")) is not (contiguous >= horizon):
+        raise _PlanAdmissionRefused("inconsistent_feed_completeness")
+    if feed.get("fresh") is not True:
+        raise _PlanAdmissionRefused("feed_not_fresh")
+    clock = _frozen_clock(feed.get(clock_key))
+    elapsed = captured_at - clock
+    if not dt.timedelta(0) <= elapsed <= maximum:
+        raise _PlanAdmissionRefused("feed_clock_out_of_bounds")
+    if _strict_int(feed.get("age_seconds")) != round(elapsed.total_seconds()):
+        raise _PlanAdmissionRefused("inconsistent_feed_age")
+    return contiguous
+
+
+def _validated_planning_quality(plan: object, *, now: dt.datetime) -> dict:
+    """Admit only a ready frozen-batch result whose returned provenance is self-consistent."""
+    if not isinstance(plan, dict):
+        raise _PlanAdmissionRefused("plan_not_mapping")
+    quality = plan.get("planning_data_quality")
+    if not isinstance(quality, dict):
+        raise _PlanAdmissionRefused("missing_planning_data_quality")
+    if quality.get("control_allowed") is not True:
+        raise _PlanAdmissionRefused("control_not_allowed")
+    if quality.get("status") != "ready" or quality.get("reasons") != []:
+        raise _PlanAdmissionRefused("planning_quality_not_ready")
+    status = plan.get("diagnostic_status")
+    if not isinstance(status, str) or status != _ADMISSIBLE_DIAGNOSTIC_STATUS:
+        raise _PlanAdmissionRefused("diagnostic_status_not_admissible")
+
+    captured_at = _frozen_clock(quality.get("captured_at"))
+    if captured_at > now:
+        raise _PlanAdmissionRefused("capture_after_admission")
+    horizon_start = _frozen_clock(quality.get("horizon_start"))
+    if horizon_start != horizon_start.replace(minute=0, second=0, microsecond=0):
+        raise _PlanAdmissionRefused("horizon_start_not_hour_boundary")
+    horizon = _strict_int(quality.get("horizon_hours"))
+    minimum = _strict_int(quality.get("minimum_control_hours"))
+    effective = _strict_int(quality.get("effective_horizon_hours"))
+    if horizon <= 0 or minimum != MINIMUM_CONTROL_HOURS or not minimum <= effective <= horizon:
+        raise _PlanAdmissionRefused("inconsistent_horizon_hours")
+
+    price = _section(quality, "price")
+    weather = _section(quality, "weather")
+    area, source, currency = price.get("area"), price.get("source"), price.get("currency")
+    if not isinstance(source, str) or source not in _PRICE_SOURCES:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if not isinstance(area, str) or not area.strip():
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if source in {"tibber", "manual"} and area != source:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if not isinstance(currency, str) or len(currency) != 3:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    weather_source = weather.get("source")
+    if not isinstance(weather_source, str) or weather_source not in _WEATHER_SOURCES:
+        raise _PlanAdmissionRefused("invalid_weather_source")
+    price_hours = _feed_admission(
+        price,
+        clock_key="latest_fetched_at",
+        captured_at=captured_at,
+        maximum=MAX_PRICE_AGE,
+        horizon=horizon,
+    )
+    weather_hours = _feed_admission(
+        weather,
+        clock_key="latest_issued_at",
+        captured_at=captured_at,
+        maximum=MAX_WEATHER_ISSUE_AGE,
+        horizon=horizon,
+    )
+    if effective != min(price_hours, weather_hours):
+        raise _PlanAdmissionRefused("inconsistent_effective_horizon")
+    limited = price_hours < horizon
+    if _strict_bool(quality.get("price_horizon_limited")) is not limited:
+        raise _PlanAdmissionRefused("inconsistent_price_limitation")
+    if _strict_bool(quality.get("reoptimization_when_prices_extend")) is not limited:
+        raise _PlanAdmissionRefused("inconsistent_price_limitation")
+    # The producer always emits this key: 900 when price-limited, otherwise null.
+    if "next_publication_check_seconds" not in price:
+        raise _PlanAdmissionRefused("inconsistent_publication_check")
+    publication_check = price["next_publication_check_seconds"]
+    if limited:
+        if _strict_int(publication_check) != 900:
+            raise _PlanAdmissionRefused("inconsistent_publication_check")
+    elif publication_check is not None:
+        raise _PlanAdmissionRefused("inconsistent_publication_check")
+
+    if _aware_instant(plan.get("horizon_start")) != horizon_start:
+        raise _PlanAdmissionRefused("plan_horizon_mismatch")
+    if _aware_instant(plan.get("horizon_end")) != horizon_start + dt.timedelta(hours=effective):
+        raise _PlanAdmissionRefused("plan_horizon_mismatch")
+    return quality
 
 
 _optimization_lock = asyncio.Lock()
@@ -347,9 +500,15 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
 
             from packages.core.pricing import PriceContext
 
-            input_quality = plan.get("planning_data_quality")
-            if not isinstance(input_quality, dict) or not input_quality.get("control_allowed"):
-                logger.info("optimizer_no_plan", reason="unvalidated_frozen_input_batch")
+            generated_at = dt.datetime.now(dt.timezone.utc)
+            try:
+                input_quality = _validated_planning_quality(plan, now=generated_at)
+            except _PlanAdmissionRefused as refusal:
+                logger.info(
+                    "optimizer_no_plan",
+                    reason="unvalidated_frozen_input_batch",
+                    refusal=str(refusal),
+                )
                 return None
             price_input = input_quality["price"]
             price_context = PriceContext(
@@ -357,7 +516,6 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 source=price_input["source"],
                 currency=price_input["currency"],
             )
-            generated_at = dt.datetime.now(dt.timezone.utc)
             provenance = {
                 "schema_version": 1,
                 "generated_at": generated_at.isoformat(),

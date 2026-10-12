@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from packages.api.schemas import DashboardResponse
 from packages.api.routers.dashboard import get_dashboard
@@ -1299,6 +1300,86 @@ async def test_optimizer_status_data_freshness_propagates_cancellation(optimizer
     fixture.clock.assert_called_once_with(dt.timezone.utc)
 
 
+def _admitted_planning_quality(
+    *,
+    captured_at: dt.datetime | None = None,
+    horizon_hours: int = 24,
+    price_hours: int | None = None,
+    weather_hours: int | None = None,
+    price_provider: str = "manual",
+    area: str | None = None,
+    currency: str = "SEK",
+    price_age: dt.timedelta = dt.timedelta(minutes=10),
+    weather_age: dt.timedelta = dt.timedelta(hours=1),
+) -> dict:
+    """Build quality only through the real frozen-batch producer."""
+    from packages.core.planning_data_quality import (
+        PlanningInputBatch,
+        PriceInput,
+        WeatherInput,
+        planning_batch_quality,
+    )
+
+    captured_at = captured_at or (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+    ).replace(microsecond=0)
+    start = captured_at.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    price_hours = horizon_hours if price_hours is None else price_hours
+    weather_hours = horizon_hours if weather_hours is None else weather_hours
+    batch = PlanningInputBatch(
+        captured_at,
+        start,
+        start + dt.timedelta(hours=horizon_hours),
+        area or price_provider,
+        price_provider,
+        "open-meteo",
+        tuple(
+            PriceInput(
+                start + dt.timedelta(hours=hour),
+                0.25,
+                currency,
+                price_provider,
+                captured_at - price_age,
+                "hourly_duration_weighted_v1",
+            )
+            for hour in range(price_hours)
+        ),
+        tuple(
+            WeatherInput(
+                start + dt.timedelta(hours=hour),
+                5.0,
+                2.0,
+                50.0,
+                0.0,
+                80.0,
+                40.0,
+                "open-meteo",
+                captured_at - weather_age,
+                "weather_c_mps_wm2_mm_v1",
+            )
+            for hour in range(weather_hours)
+        ),
+    )
+    quality = planning_batch_quality(batch)
+    assert quality["control_allowed"] is True, quality["reasons"]
+    return quality
+
+
+def _admissible_plan(*, version: str = "rules_v7", **quality_options) -> dict:
+    quality = _admitted_planning_quality(**quality_options)
+    start = dt.datetime.fromisoformat(quality["horizon_start"])
+    end = start + dt.timedelta(hours=quality["effective_horizon_hours"])
+    return {
+        "horizon_start": start,
+        "horizon_end": end,
+        "version": version,
+        "diagnostic_status": "conditional_feasible",
+        "actions": [{"type": "force_dhw_on", "ts": start.isoformat(), "payload": {}}],
+        "forecast_snapshot": {"device_id": "device-a", "price_forecast": []},
+        "planning_data_quality": quality,
+    }
+
+
 @pytest.mark.parametrize("planner", ["rules", "milp", "fallback"])
 @pytest.mark.parametrize("force_replace", [False, True])
 @pytest.mark.parametrize("learning_state", ["active", "inactive"])
@@ -1307,17 +1388,11 @@ async def test_diagnostic_has_zero_actions_and_is_never_active(
 ):
     from packages.core.models import PlanActionRecord, PlanRecord
     from packages.optimizer import InfeasibleError
+    from packages.optimizer import main as optimizer_main
     from packages.optimizer.executor_core import LearningModeState
     from packages.optimizer.main import run_optimization
 
-    now = dt.datetime.now(dt.timezone.utc)
-    plan = {
-        "horizon_start": now,
-        "horizon_end": now + dt.timedelta(hours=24),
-        "version": "rules_v7" if planner == "rules" else "milp_v1",
-        "actions": [{"type": "force_dhw_on", "ts": now.isoformat(), "payload": {}}],
-        "forecast_snapshot": {"device_id": "device-a", "price_forecast": []},
-    }
+    plan = _admissible_plan(version="rules_v7" if planner == "rules" else "milp_v1")
     optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     fallback = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     if planner == "fallback":
@@ -1348,33 +1423,1224 @@ async def test_diagnostic_has_zero_actions_and_is_never_active(
         ),
         patch(
             "packages.optimizer.main.get_planning_data_quality",
-            new=AsyncMock(return_value={"control_allowed": True}),
+            new=AsyncMock(side_effect=AssertionError("newest planning-quality lookup")),
         ),
         patch("packages.optimizer.main.comfort_model.arefresh_if_changed", new=AsyncMock()),
+        patch.object(optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()),
         patch(
-            "packages.optimizer.main.get_active_price_context",
-            new=AsyncMock(
-                return_value=SimpleNamespace(area="SE3", source="manual", currency="SEK")
-            ),
+            "packages.core.pricing.get_active_price_context",
+            new=AsyncMock(side_effect=AssertionError("newest price-context lookup")),
         ),
         patch(
             "packages.optimizer.main._has_material_near_term_change",
             new=AsyncMock(return_value=(False, 42)),
         ) as reuse,
         patch("packages.core.plan_lifecycle.activate_plan", new=AsyncMock()) as activate,
+        patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
     ):
         assert await run_optimization(force_replace=force_replace) == 321
+        assert optimizer_main._last_plan_generated_at > 0.0
 
     assert len(records) == 1
     assert isinstance(records[0], PlanRecord)
     assert not any(isinstance(record, PlanActionRecord) for record in records)
     assert records[0].status == "diagnostic"
     assert json.loads(records[0].plan_json)["actions"] == []
+    assert records[0].price_source == "manual"
+    assert records[0].price_currency == "SEK"
     session.execute.assert_not_awaited()
     reuse.assert_not_awaited()
     activate.assert_not_awaited()
     if planner == "fallback":
         fallback.generate_plan.assert_awaited_once()
+
+
+def _INACTIVE():
+    from packages.optimizer.executor_core import LearningModeState
+
+    return LearningModeState.INACTIVE
+
+
+def _refused_plan_session():
+    session = AsyncMock()
+    records = []
+
+    def add(record):
+        record.id = 321
+        records.append(record)
+
+    session.add = MagicMock(side_effect=add)
+    return session, records
+
+
+async def _run_admission(plan, *, layer="rules", failure=None, fallback_plan=None):
+    from packages.optimizer import main as optimizer_main
+
+    optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
+    if failure is not None:
+        optimizer.generate_plan.side_effect = failure
+    fallback = SimpleNamespace(generate_plan=AsyncMock(return_value=fallback_plan))
+    session, records = _refused_plan_session()
+    session_factory = MagicMock(side_effect=lambda *args, **kwargs: _session_context(session))
+    with (
+        patch.object(optimizer_main, "get_session", new=session_factory),
+        patch.object(optimizer_main, "get_setting", new=AsyncMock(return_value=layer)),
+        patch.object(
+            optimizer_main, "_select_optimizer", new=AsyncMock(return_value=(layer, optimizer))
+        ),
+        patch.object(optimizer_main, "_new_rules_optimizer", return_value=fallback),
+        patch.object(
+            optimizer_main,
+            "get_device_data_quality",
+            new=AsyncMock(return_value={"ready": True, "reasons": []}),
+        ),
+        patch.object(
+            optimizer_main,
+            "get_planning_data_quality",
+            new=AsyncMock(side_effect=AssertionError("newest planning-quality lookup")),
+        ),
+        patch(
+            "packages.core.pricing.get_active_price_context",
+            new=AsyncMock(side_effect=AssertionError("newest price-context lookup")),
+        ),
+        patch.object(optimizer_main.comfort_model, "arefresh_if_changed", new=AsyncMock()),
+        patch.object(optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()),
+        patch.object(optimizer_main, "AquareaWrapper", side_effect=AssertionError("device")),
+        patch.object(
+            optimizer_main, "resolve_learning_mode_state", new=AsyncMock(return_value=_INACTIVE())
+        ),
+        patch(
+            "packages.ml.lifecycle.enqueue_maintenance_request",
+            new=AsyncMock(side_effect=AssertionError("enqueue")),
+        ),
+        patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
+        capture_logs() as logs,
+    ):
+        result = await optimizer_main.run_optimization()
+        cooldown = optimizer_main._last_plan_generated_at
+    return SimpleNamespace(
+        result=result,
+        records=records,
+        session_factory=session_factory,
+        cooldown=cooldown,
+        fallback=fallback,
+        logs=logs,
+    )
+
+
+def _assert_refused(outcome, refusal):
+    assert outcome.result is None
+    assert outcome.records == []
+    outcome.session_factory.assert_not_called()
+    assert outcome.cooldown == 0.0
+    refusals = [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
+    assert refusals == [
+        {
+            "event": "optimizer_no_plan",
+            "log_level": "info",
+            "reason": "unvalidated_frozen_input_batch",
+            "refusal": refusal,
+        }
+    ]
+
+
+def _quality(plan):
+    return plan["planning_data_quality"]
+
+
+def _captured(plan):
+    return dt.datetime.fromisoformat(_quality(plan)["captured_at"])
+
+
+def _set(*path, value=None, delete=False):
+    def mutate(plan):
+        target = plan
+        for key in path[:-1]:
+            target = target[key]
+        if delete:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value(plan) if callable(value) else value
+        return plan
+
+    return mutate
+
+
+def _feed_clock(section, clock_key, offset_seconds):
+    def mutate(plan):
+        clock = _captured(plan) - dt.timedelta(seconds=offset_seconds)
+        _quality(plan)[section][clock_key] = clock.isoformat()
+        _quality(plan)[section]["age_seconds"] = offset_seconds
+        return plan
+
+    return mutate
+
+
+def _shift_horizon(hours=0, minutes=0):
+    def mutate(plan):
+        delta = dt.timedelta(hours=hours, minutes=minutes)
+        start = dt.datetime.fromisoformat(_quality(plan)["horizon_start"]) + delta
+        _quality(plan)["horizon_start"] = start.isoformat()
+        plan["horizon_start"] += delta
+        plan["horizon_end"] += delta
+        return plan
+
+    return mutate
+
+
+def _naive(section, key):
+    def mutate(plan):
+        target = _quality(plan) if section is None else _quality(plan)[section]
+        target[key] = dt.datetime.fromisoformat(target[key]).replace(tzinfo=None).isoformat()
+        return plan
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    "value",
+    [False, "false", 1, None, "missing"],
+    ids=["false", "string_false", "one", "none", "missing_flag"],
+)
+async def test_CIU2_control_allowed_must_be_literal_true(value):
+    plan = _admissible_plan()
+    if value == "missing":
+        del plan["planning_data_quality"]["control_allowed"]
+    else:
+        plan["planning_data_quality"]["control_allowed"] = value
+
+    _assert_refused(await _run_admission(plan), "control_not_allowed")
+
+
+@pytest.mark.parametrize(
+    ("section", "clock_key"),
+    [
+        (None, "captured_at"),
+        (None, "horizon_start"),
+        ("price", "latest_fetched_at"),
+        ("weather", "latest_issued_at"),
+    ],
+)
+async def test_CIU2_frozen_quality_clocks_require_producer_iso_strings(section, clock_key):
+    """Plan clocks may be datetimes; frozen producer provenance must retain ISO strings."""
+    plan = _admissible_plan()
+    target = _quality(plan) if section is None else _quality(plan)[section]
+    target[clock_key] = dt.datetime.fromisoformat(target[clock_key])
+
+    outcome = await _run_admission(plan)
+
+    assert outcome.result is None, "Non-string frozen clock must refuse publication"
+    assert outcome.records == []
+    outcome.session_factory.assert_not_called()
+    assert outcome.cooldown == 0.0
+    assert any(
+        log.get("event") == "optimizer_no_plan"
+        and log.get("reason") == "unvalidated_frozen_input_batch"
+        for log in outcome.logs
+    )
+
+
+_FROZEN_CLOCKS = [
+    (None, "captured_at"),
+    (None, "horizon_start"),
+    ("price", "latest_fetched_at"),
+    ("weather", "latest_issued_at"),
+]
+
+
+def _frozen_clock_target(plan, section):
+    return _quality(plan) if section is None else _quality(plan)[section]
+
+
+@pytest.mark.parametrize("options", [{}, {"price_hours": 12}], ids=["full", "shortened"])
+@pytest.mark.parametrize(("section", "clock_key"), _FROZEN_CLOCKS)
+@pytest.mark.parametrize("variant", ["aware_datetime", "epoch_number", "none"])
+async def test_CIU2_frozen_clock_type_mutations_refuse_exactly(
+    options, section, clock_key, variant
+):
+    plan = _admissible_plan(**options)
+    target = _frozen_clock_target(plan, section)
+    instant = dt.datetime.fromisoformat(target[clock_key])
+    target[clock_key] = {
+        "aware_datetime": instant,
+        "epoch_number": instant.timestamp(),
+        "none": None,
+    }[variant]
+
+    _assert_refused(await _run_admission(plan), "malformed_clock")
+
+
+@pytest.mark.parametrize("options", [{}, {"price_hours": 12}], ids=["full", "shortened"])
+async def test_CIU2_producer_iso_clocks_and_datetime_plan_horizon_are_admitted(options):
+    plan = _admissible_plan(**options)
+    for section, clock_key in _FROZEN_CLOCKS:
+        value = _frozen_clock_target(plan, section)[clock_key]
+        assert isinstance(value, str)
+        assert dt.datetime.fromisoformat(value).tzinfo is not None
+    assert isinstance(plan["horizon_start"], dt.datetime)
+    assert isinstance(plan["horizon_end"], dt.datetime)
+    expected_quality = json.loads(json.dumps(_quality(plan)))
+
+    outcome = await _run_admission(plan)
+
+    assert outcome.result == 321
+    outcome.session_factory.assert_called_once()
+    assert outcome.cooldown > 0.0
+    (record,) = outcome.records
+    assert json.loads(record.input_provenance_json)["input_quality"] == expected_quality
+    assert not [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "refusal"),
+    [
+        (_set("planning_data_quality", delete=True), "missing_planning_data_quality"),
+        (_set("planning_data_quality", value="ready"), "missing_planning_data_quality"),
+        (lambda plan: [plan], "plan_not_mapping"),
+        (_set("planning_data_quality", "status", value="degraded"), "planning_quality_not_ready"),
+        (_set("planning_data_quality", "status", value="Ready"), "planning_quality_not_ready"),
+        (_set("planning_data_quality", "reasons", value=["stale"]), "planning_quality_not_ready"),
+        (_set("planning_data_quality", "reasons", delete=True), "planning_quality_not_ready"),
+        (_set("diagnostic_status", value="unproven"), "diagnostic_status_not_admissible"),
+        (
+            _set("diagnostic_status", value="conditional_infeasible"),
+            "diagnostic_status_not_admissible",
+        ),
+        (_set("diagnostic_status", delete=True), "diagnostic_status_not_admissible"),
+        (_set("diagnostic_status", value=1), "diagnostic_status_not_admissible"),
+        (
+            _set("diagnostic_status", value="Conditional_Feasible"),
+            "diagnostic_status_not_admissible",
+        ),
+        (_naive(None, "captured_at"), "naive_clock"),
+        (_set("planning_data_quality", "captured_at", value="yesterday"), "malformed_clock"),
+        (_set("planning_data_quality", "captured_at", delete=True), "malformed_clock"),
+        (
+            _set(
+                "planning_data_quality",
+                "captured_at",
+                value=lambda plan: (
+                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+                ).isoformat(),
+            ),
+            "capture_after_admission",
+        ),
+        (_naive(None, "horizon_start"), "naive_clock"),
+        (_shift_horizon(minutes=30), "horizon_start_not_hour_boundary"),
+        (_set("planning_data_quality", "horizon_hours", value=True), "invalid_integer_field"),
+        (_set("planning_data_quality", "horizon_hours", value="24"), "invalid_integer_field"),
+        (_set("planning_data_quality", "horizon_hours", value=0), "inconsistent_horizon_hours"),
+        (
+            _set("planning_data_quality", "minimum_control_hours", value=5),
+            "inconsistent_horizon_hours",
+        ),
+        (
+            _set("planning_data_quality", "effective_horizon_hours", value=25),
+            "inconsistent_horizon_hours",
+        ),
+        (
+            _set("planning_data_quality", "effective_horizon_hours", value=True),
+            "invalid_integer_field",
+        ),
+        (
+            _set("planning_data_quality", "effective_horizon_hours", value=23),
+            "inconsistent_effective_horizon",
+        ),
+        (
+            _set("planning_data_quality", "price_horizon_limited", value=True),
+            "inconsistent_price_limitation",
+        ),
+        (
+            _set("planning_data_quality", "price_horizon_limited", value="false"),
+            "invalid_boolean_field",
+        ),
+        (
+            _set("planning_data_quality", "reoptimization_when_prices_extend", value=True),
+            "inconsistent_price_limitation",
+        ),
+        (_set("planning_data_quality", "price", delete=True), "missing_price_provenance"),
+        (_set("planning_data_quality", "weather", value=[]), "missing_weather_provenance"),
+        (_set("planning_data_quality", "price", "area", value=""), "invalid_price_context"),
+        (_set("planning_data_quality", "price", "area", value="  "), "invalid_price_context"),
+        (_set("planning_data_quality", "price", "area", value=None), "invalid_price_context"),
+        (
+            _set("planning_data_quality", "price", "source", value="nordpool"),
+            "invalid_price_context",
+        ),
+        (_set("planning_data_quality", "price", "area", value="SE3"), "invalid_price_context"),
+        (_set("planning_data_quality", "price", "currency", value="SEKK"), "invalid_price_context"),
+        (_set("planning_data_quality", "price", "currency", value=None), "invalid_price_context"),
+        (
+            _set("planning_data_quality", "price", "contiguous_hours", value=True),
+            "invalid_integer_field",
+        ),
+        (
+            _set("planning_data_quality", "price", "contiguous_hours", value=25),
+            "inconsistent_feed_hours",
+        ),
+        (
+            _set("planning_data_quality", "price", "complete_horizon", value=False),
+            "inconsistent_feed_completeness",
+        ),
+        (
+            _set("planning_data_quality", "price", "complete_horizon", value="true"),
+            "invalid_boolean_field",
+        ),
+        (_set("planning_data_quality", "price", "fresh", value="true"), "feed_not_fresh"),
+        (_set("planning_data_quality", "price", "fresh", value=False), "feed_not_fresh"),
+        (_naive("price", "latest_fetched_at"), "naive_clock"),
+        (
+            _set("planning_data_quality", "price", "latest_fetched_at", value="soon"),
+            "malformed_clock",
+        ),
+        (_feed_clock("price", "latest_fetched_at", -1), "feed_clock_out_of_bounds"),
+        (_feed_clock("price", "latest_fetched_at", 7201), "feed_clock_out_of_bounds"),
+        (
+            _set(
+                "planning_data_quality",
+                "price",
+                "age_seconds",
+                value=lambda plan: _quality(plan)["price"]["age_seconds"] + 1,
+            ),
+            "inconsistent_feed_age",
+        ),
+        (
+            _set("planning_data_quality", "price", "age_seconds", value=True),
+            "invalid_integer_field",
+        ),
+        (
+            _set("planning_data_quality", "price", "next_publication_check_seconds", value=900),
+            "inconsistent_publication_check",
+        ),
+        (
+            _set("planning_data_quality", "price", "next_publication_check_seconds", delete=True),
+            "inconsistent_publication_check",
+        ),
+        (
+            _set("planning_data_quality", "price", "next_publication_check_seconds", value=0),
+            "inconsistent_publication_check",
+        ),
+        (
+            _set("planning_data_quality", "price", "source", value=["manual"]),
+            "invalid_price_context",
+        ),
+        (
+            _set("planning_data_quality", "price", "source", value={"manual": True}),
+            "invalid_price_context",
+        ),
+        (_set("planning_data_quality", "price", "source", value=None), "invalid_price_context"),
+        (
+            _set("planning_data_quality", "price", "area", value=["manual"]),
+            "invalid_price_context",
+        ),
+        (
+            _set("planning_data_quality", "weather", "source", value=["open-meteo"]),
+            "invalid_weather_source",
+        ),
+        (
+            _set("planning_data_quality", "weather", "source", value={"open-meteo": 1}),
+            "invalid_weather_source",
+        ),
+        (_set("planning_data_quality", "weather", "source", value=None), "invalid_weather_source"),
+        (_set("planning_data_quality", "weather", "source", value="yr"), "invalid_weather_source"),
+        (_feed_clock("weather", "latest_issued_at", 14401), "feed_clock_out_of_bounds"),
+        (_feed_clock("weather", "latest_issued_at", -1), "feed_clock_out_of_bounds"),
+        (
+            _set(
+                "planning_data_quality",
+                "weather",
+                "age_seconds",
+                value=lambda plan: _quality(plan)["weather"]["age_seconds"] - 1,
+            ),
+            "inconsistent_feed_age",
+        ),
+        (_set("planning_data_quality", "weather", "fresh", value=False), "feed_not_fresh"),
+        (
+            _set("planning_data_quality", "weather", "contiguous_hours", value=-1),
+            "inconsistent_feed_hours",
+        ),
+        (
+            _set(
+                "horizon_start",
+                value=lambda plan: plan["horizon_start"] + dt.timedelta(hours=1),
+            ),
+            "plan_horizon_mismatch",
+        ),
+        (
+            _set("horizon_end", value=lambda plan: plan["horizon_end"] - dt.timedelta(hours=1)),
+            "plan_horizon_mismatch",
+        ),
+        (
+            _set("horizon_start", value=lambda plan: plan["horizon_start"].replace(tzinfo=None)),
+            "naive_clock",
+        ),
+        (_set("horizon_end", value=None), "malformed_clock"),
+    ],
+)
+async def test_CIU2_one_field_mutations_of_producer_quality_refuse(mutate, refusal):
+    _assert_refused(await _run_admission(mutate(_admissible_plan())), refusal)
+
+
+@pytest.mark.parametrize(
+    ("options", "mutate", "refusal"),
+    [
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "next_publication_check_seconds", value=None),
+            "invalid_integer_field",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "next_publication_check_seconds", value=600),
+            "inconsistent_publication_check",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "next_publication_check_seconds", value=True),
+            "invalid_integer_field",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "reoptimization_when_prices_extend", value=False),
+            "inconsistent_price_limitation",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "complete_horizon", value=True),
+            "inconsistent_feed_completeness",
+        ),
+        (
+            {"price_provider": "tibber"},
+            _set("planning_data_quality", "price", "area", value="SE3"),
+            "invalid_price_context",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "next_publication_check_seconds", delete=True),
+            "inconsistent_publication_check",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "price", "source", value=["manual"]),
+            "invalid_price_context",
+        ),
+        (
+            {"price_hours": 12},
+            _set("planning_data_quality", "weather", "source", value={"open-meteo": 1}),
+            "invalid_weather_source",
+        ),
+    ],
+    ids=[
+        "limited_without_publication_check",
+        "limited_wrong_publication_check",
+        "limited_bool_publication_check",
+        "limited_without_reoptimization",
+        "limited_marked_complete",
+        "tibber_area_mismatch",
+        "limited_publication_check_key_missing",
+        "limited_price_source_list",
+        "limited_weather_source_dict",
+    ],
+)
+async def test_CIU2_shortened_and_provider_mutations_refuse(options, mutate, refusal):
+    _assert_refused(await _run_admission(mutate(_admissible_plan(**options))), refusal)
+
+
+def _offset_clocks(offset):
+    def mutate(plan):
+        quality = _quality(plan)
+        zone = dt.timezone(offset)
+        for target, key in (
+            (quality, "captured_at"),
+            (quality, "horizon_start"),
+            (quality["price"], "latest_fetched_at"),
+            (quality["weather"], "latest_issued_at"),
+        ):
+            instant = dt.datetime.fromisoformat(target[key]).astimezone(zone)
+            text = instant.isoformat()
+            target[key] = text.replace("+00:00", "Z") if offset == dt.timedelta() else text
+        plan["horizon_start"] = plan["horizon_start"].astimezone(zone)
+        return plan
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    ("options", "mutate"),
+    [
+        ({}, None),
+        ({"price_hours": 12}, None),
+        ({"weather_hours": 10}, None),
+        ({"price_hours": 6, "weather_hours": 6}, None),
+        ({"horizon_hours": 6}, None),
+        ({"price_age": dt.timedelta(hours=2)}, None),
+        ({"weather_age": dt.timedelta(hours=4)}, None),
+        ({"price_age": dt.timedelta(0), "weather_age": dt.timedelta(0)}, None),
+        ({"price_provider": "tibber"}, None),
+        ({"price_provider": "entsoe", "area": "SE3"}, None),
+        ({"currency": "sek"}, None),
+        ({}, _offset_clocks(dt.timedelta(hours=2))),
+        ({}, _offset_clocks(dt.timedelta())),
+        ({}, _set("planning_data_quality", "producer_note", value="extra metadata")),
+    ],
+    ids=[
+        "full",
+        "price_shortened",
+        "weather_shortened",
+        "minimum_six",
+        "six_hour_request",
+        "price_age_exact_bound",
+        "weather_age_exact_bound",
+        "zero_ages",
+        "tibber",
+        "entsoe_area",
+        "lowercase_currency",
+        "plus_two_offset",
+        "zulu",
+        "unknown_metadata",
+    ],
+)
+async def test_CIU2_valid_full_and_shortened_horizons_are_admitted(options, mutate):
+    plan = _admissible_plan(**options)
+    expected_quality = json.loads(json.dumps(_quality(plan)))
+    if mutate is not None:
+        plan = mutate(plan)
+        expected_quality = json.loads(json.dumps(_quality(plan)))
+
+    outcome = await _run_admission(plan)
+
+    assert outcome.result == 321
+    outcome.session_factory.assert_called_once()
+    assert outcome.cooldown > 0.0
+    (record,) = outcome.records
+    assert record.status == "diagnostic"
+    stored = json.loads(record.plan_json)
+    assert stored["actions"] == []
+    assert stored["diagnostic"] is True
+    provenance = json.loads(record.input_provenance_json)
+    assert provenance["input_quality"] == expected_quality
+    assert provenance["price"] == {
+        "area": expected_quality["price"]["area"],
+        "source": expected_quality["price"]["source"],
+        "currency": expected_quality["price"]["currency"],
+    }
+    assert record.price_source == expected_quality["price"]["source"]
+    assert record.price_currency == expected_quality["price"]["currency"]
+    assert not [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
+
+
+async def test_CIU2_provenance_is_from_returned_batch_after_provider_change():
+    plan = _admissible_plan(price_provider="entsoe", area="SE3", currency="SEK")
+    with patch(
+        "packages.core.settings_service.get_all_settings",
+        new=AsyncMock(side_effect=AssertionError("post-capture settings lookup")),
+    ):
+        outcome = await _run_admission(plan)
+
+    (record,) = outcome.records
+    provenance = json.loads(record.input_provenance_json)
+    assert provenance["price"] == {"area": "SE3", "source": "entsoe", "currency": "SEK"}
+    assert provenance["input_quality"]["captured_at"] == _quality(plan)["captured_at"]
+    assert record.price_source == "entsoe"
+
+
+@pytest.mark.parametrize("failure", ["infeasible", "unexpected"])
+@pytest.mark.parametrize("fallback_valid", [True, False])
+async def test_CIU2_rules_fallback_is_admitted_independently(failure, fallback_valid):
+    from packages.optimizer import InfeasibleError
+
+    fallback_plan = _admissible_plan()
+    if not fallback_valid:
+        fallback_plan["planning_data_quality"]["control_allowed"] = False
+    error = InfeasibleError("fixture") if failure == "infeasible" else RuntimeError("fixture")
+
+    outcome = await _run_admission(None, layer="milp", failure=error, fallback_plan=fallback_plan)
+
+    outcome.fallback.generate_plan.assert_awaited_once_with()
+    if fallback_valid:
+        assert outcome.result == 321
+        assert len(outcome.records) == 1
+    else:
+        _assert_refused(outcome, "control_not_allowed")
+
+
+async def test_CIU2_cancellation_propagates_without_persistence():
+    from packages.optimizer import main as optimizer_main
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_admission(None, failure=asyncio.CancelledError())
+    assert not optimizer_main._optimization_lock.locked()
+
+
+def _read_only_select_escape(element, base):
+    """Classify one SELECT tree node; ``None`` only for allowlisted plain-read nodes."""
+    from sqlalchemy.sql import operators
+    from sqlalchemy.sql.dml import UpdateBase
+    from sqlalchemy.sql.elements import (
+        BinaryExpression,
+        BindParameter,
+        BooleanClauseList,
+        ClauseList,
+        ColumnClause,
+        Grouping,
+        Null,
+        TextClause,
+        UnaryExpression,
+    )
+    from sqlalchemy.sql.functions import FunctionElement
+    from sqlalchemy.sql.schema import Column
+    from sqlalchemy.sql.selectable import Select, TableClause
+
+    comparisons = {
+        operators.eq,
+        operators.ne,
+        operators.lt,
+        operators.le,
+        operators.gt,
+        operators.ge,
+        operators.and_,
+        operators.or_,
+        operators.in_op,
+        operators.not_in_op,
+        operators.is_,
+        operators.is_not,
+    }
+    orderings = {operators.desc_op, operators.asc_op}
+    if isinstance(element, UpdateBase):
+        return ("dml", type(element).__name__)
+    if isinstance(element, TextClause):
+        return ("text", element.text)
+    if isinstance(element, FunctionElement):
+        return ("function", getattr(element, "name", type(element).__name__))
+    if isinstance(element, Select):
+        return None if element._for_update_arg is None else ("lock", "for_update")
+    if isinstance(element, TableClause):
+        registered = base.metadata.tables.get(element.fullname)
+        return None if registered is element._deannotate() else ("table", element.fullname)
+    if isinstance(element, ColumnClause):
+        if element.is_literal:
+            return ("literal", element.name)
+        source = element._deannotate()
+        registered = base.metadata.tables.get(getattr(source.table, "fullname", None))
+        if (
+            isinstance(source, Column)
+            and registered is not None
+            and registered.c.get(source.key) is source
+        ):
+            return None
+        return ("column", element.name)
+    if isinstance(element, BindParameter):
+        # Bound literal data is sent as a parameter, never spliced in as SQL.
+        return None
+    if isinstance(element, BinaryExpression):
+        return None if element.operator in comparisons else _operator_escape(element.operator)
+    if isinstance(element, (BooleanClauseList, ClauseList)):
+        allowed = comparisons | {operators.comma_op}
+        return None if element.operator in allowed else _operator_escape(element.operator)
+    if isinstance(element, UnaryExpression):
+        if element.modifier in orderings and element.operator is None:
+            return None
+        return _operator_escape(element.modifier or element.operator)
+    if isinstance(element, Grouping):
+        return None
+    if type(element) is Null:
+        # The SQL NULL keyword operand of IS / IS NOT; carries no raw SQL or side effect.
+        return None
+    return ("node", type(element).__name__)
+
+
+def _operator_escape(operator):
+    name = getattr(operator, "opstring", None) or getattr(operator, "__name__", None)
+    return ("operator", name or type(operator).__name__)
+
+
+class _DmlSentinel:
+    """Fake transactional storage permitting only app-log inserts and 24-hour pruning."""
+
+    def __init__(self, *, fail_commits=0, block=None):
+        self.committed_logs = []
+        self.allowed_prunes = []
+        self.forbidden = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.fail_commits = fail_commits
+        self.block = block
+        self.cancellations = 0
+
+    def factory(self, *args, **kwargs):
+        sentinel = self
+
+        class _Session:
+            def __init__(self):
+                self.pending = []
+
+            def add(self, record):
+                self.pending.append(record)
+
+            def add_all(self, records):
+                self.pending.extend(records)
+
+            async def merge(self, record):
+                sentinel.forbidden.append(("merge", type(record).__name__))
+
+            async def delete(self, record):
+                sentinel.forbidden.append(("delete", type(record).__name__))
+
+            async def flush(self):
+                self._autoflush()
+
+            async def execute(self, statement, *args, **kwargs):
+                self._autoflush()
+                sentinel.statement(statement)
+                return MagicMock()
+
+            def _autoflush(self):
+                from packages.core.models import AppLogRecord
+
+                for record in self.pending:
+                    if not isinstance(record, AppLogRecord):
+                        sentinel.forbidden.append(("orm", type(record).__name__))
+                self.pending = [
+                    record for record in self.pending if isinstance(record, AppLogRecord)
+                ]
+
+        class _Context:
+            async def __aenter__(self):
+                if sentinel.block is not None:
+                    while not sentinel.block.is_set():
+                        try:
+                            await sentinel.block.wait()
+                        except asyncio.CancelledError:
+                            sentinel.cancellations += 1
+                self.session = _Session()
+                return self.session
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                self.session._autoflush()
+                if exc_type is not None:
+                    sentinel.rollbacks += 1
+                    return False
+                if sentinel.fail_commits:
+                    sentinel.fail_commits -= 1
+                    sentinel.rollbacks += 1
+                    raise OSError("fixture commit failure")
+                sentinel.commits += 1
+                sentinel.committed_logs.extend(self.session.pending)
+                return False
+
+        return _Context()
+
+    def statement(self, statement):
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.sql import visitors
+        from sqlalchemy.sql.dml import Delete
+        from sqlalchemy.sql.elements import TextClause
+        from sqlalchemy.sql.selectable import Select
+
+        from packages.core.models import Base
+
+        if isinstance(statement, str):
+            self.forbidden.append(("raw", statement))
+            return
+        if isinstance(statement, Select):
+            # A SELECT prefix proves nothing: functions (setval, nextval, pg_*), raw
+            # literal columns, textual fragments and data-modifying CTEs can mutate state.
+            # Only an explicit allowlist of plain repository-table read nodes passes;
+            # every other node (including unknown ones) is rejected.
+            escapes = []
+            for element in visitors.iterate(statement):
+                escape = _read_only_select_escape(element, Base)
+                if escape is not None:
+                    escapes.append(escape)
+            self.forbidden.extend(escapes)
+            return
+        if isinstance(statement, TextClause):
+            self.forbidden.append(("text", statement.text))
+            return
+        compiled = statement.compile(dialect=postgresql.dialect())
+        sql = " ".join(str(compiled).split())
+        params = list(compiled.params.values())
+        if (
+            isinstance(statement, Delete)
+            and sql == "DELETE FROM app_logs WHERE app_logs.ts < %(ts_1)s"
+            and len(params) == 1
+            and isinstance(params[0], dt.datetime)
+            and abs(params[0] - (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)))
+            < dt.timedelta(seconds=30)
+        ):
+            self.allowed_prunes.append(params[0])
+            return
+        self.forbidden.append(("dml", sql))
+
+
+async def test_CIU2_dml_sentinel_detects_injected_forbidden_writes():
+    from sqlalchemy import delete, insert, text, update
+
+    from packages.core.models import (
+        AppLogRecord,
+        MLLifecycleStateRecord,
+        PlanRecord,
+        SettingRecord,
+    )
+
+    sentinel = _DmlSentinel()
+    async with sentinel.factory() as session:
+        session.add(AppLogRecord(level="INFO", event="allowed", service="optimizer"))
+        await session.execute(
+            delete(AppLogRecord).where(
+                AppLogRecord.ts < dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+            )
+        )
+        session.add(PlanRecord(status="diagnostic"))
+        await session.execute(select_one())
+        await session.execute(update(SettingRecord).values(value="x"))
+        await session.execute(insert(MLLifecycleStateRecord).values(id=1))
+        await session.execute(
+            text("DELETE FROM app_logs WHERE ts < now(); UPDATE settings SET value = 'x'")
+        )
+        await session.execute(delete(AppLogRecord))
+        await session.execute(
+            delete(AppLogRecord).where(AppLogRecord.ts < dt.datetime.now(dt.timezone.utc))
+        )
+        await session.merge(SettingRecord(key="k", value="v"))
+
+    assert [kind for kind, _ in sentinel.forbidden] == [
+        "orm",
+        "dml",
+        "dml",
+        "text",
+        "dml",
+        "dml",
+        "merge",
+    ]
+    assert len(sentinel.allowed_prunes) == 1
+    assert [record.event for record in sentinel.committed_logs] == ["allowed"]
+
+
+async def test_CIU2_dml_sentinel_rejects_select_shaped_side_effects():
+    from sqlalchemy import column, func, literal_column, select, table, text
+
+    from packages.core.models import AppLogRecord
+
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    sentinel = _DmlSentinel()
+    async with sentinel.factory() as session:
+        await session.execute(select_one())
+        await session.execute(
+            select(AppLogRecord).where(AppLogRecord.ts < cutoff).order_by(AppLogRecord.id)
+        )
+        session.add(AppLogRecord(level="INFO", event="allowed", service="optimizer"))
+        await session.execute(delete_app_logs_before(cutoff))
+        await session.execute(text("SELECT setval('synthetic_review_sequence', 7)"))
+        await session.execute(select(func.setval("synthetic_review_sequence", 7)))
+        await session.execute(select(func.nextval("synthetic_review_sequence")))
+        await session.execute(select(text("pg_advisory_lock(1)")))
+        await session.execute(select(literal_column("1")).select_from(text("settings")))
+        await session.execute(select(column("value")).select_from(table("unregistered_table")))
+        await session.execute(select(column("ts")).select_from(table("app_logs")))
+        await session.execute(select(AppLogRecord.id).where(func.pg_notify("c", "x") == ""))
+
+    assert sentinel.forbidden == [
+        ("text", "SELECT setval('synthetic_review_sequence', 7)"),
+        ("function", "setval"),
+        ("function", "nextval"),
+        ("text", "pg_advisory_lock(1)"),
+        ("literal", "1"),
+        ("text", "settings"),
+        ("column", "value"),
+        ("table", "unregistered_table"),
+        ("column", "ts"),
+        ("table", "app_logs"),
+        ("function", "pg_notify"),
+    ]
+    assert sentinel.allowed_prunes and len(sentinel.allowed_prunes) == 1
+    assert [record.event for record in sentinel.committed_logs] == ["allowed"]
+    assert sentinel.rollbacks == 0
+
+
+@pytest.mark.parametrize("escape", ["raw_function", "mutating_cte"])
+def test_CIU2_dml_sentinel_rejects_hidden_effects_in_registered_select(escape):
+    """Registered tables do not make raw expressions or data-modifying CTEs read-only."""
+    from sqlalchemy import literal_column, select, update
+
+    from packages.core.models import AppLogRecord, SettingRecord
+
+    if escape == "raw_function":
+        statement = select(AppLogRecord.id, literal_column("nextval('synthetic_review_sequence')"))
+    else:
+        statement = select(AppLogRecord.id).add_cte(
+            update(SettingRecord).values(value="synthetic-review-only").cte("synthetic_mutation")
+        )
+    sentinel = _DmlSentinel()
+
+    sentinel.statement(statement)  # Classification only: never execute either statement.
+
+    assert sentinel.forbidden, "SELECT-shaped side effects must not pass the DML allowlist"
+    assert sentinel.allowed_prunes == []
+
+
+def _sentinel_escapes(statement):
+    sentinel = _DmlSentinel()
+    sentinel.statement(statement)  # Classification only: never executed or compiled to SQL.
+    assert sentinel.allowed_prunes == []
+    return sentinel.forbidden
+
+
+def test_CIU2_dml_sentinel_allowlists_only_plain_registered_reads():
+    """Raw SQL expressions, data-modifying CTEs and unknown nodes fail closed."""
+    from sqlalchemy import delete, insert, literal, literal_column, select, update
+
+    from packages.core.models import AppLogRecord, PlanActionRecord, PlanRecord, SettingRecord
+
+    now = dt.datetime.now(dt.timezone.utc)
+    reads = [
+        select(PlanRecord)
+        .where(PlanRecord.status == "active", PlanRecord.horizon_end > now)
+        .order_by(PlanRecord.created_at.desc())
+        .limit(1),
+        select(PlanActionRecord).where(
+            PlanActionRecord.plan_id == 1,
+            PlanActionRecord.status == "pending",
+            PlanActionRecord.scheduled_ts >= now,
+            PlanActionRecord.scheduled_ts < now + dt.timedelta(hours=1),
+        ),
+        select(AppLogRecord.id).where(AppLogRecord.level.in_(["INFO", "WARNING"])),
+        # Bound literal data is a parameter value, not spliced SQL.
+        select(AppLogRecord.id).where(AppLogRecord.event == literal("nextval('x')")),
+        select(PlanRecord.id).where(PlanRecord.status.is_(None)),
+        select(AppLogRecord.id).where(AppLogRecord.logger_name.is_not(None)),
+    ]
+    for statement in reads:
+        assert _sentinel_escapes(statement) == []
+
+    raw_setval = "setval('synthetic_review_sequence', 7)"
+    assert _sentinel_escapes(select(literal_column(raw_setval))) == [("literal", raw_setval)]
+    assert _sentinel_escapes(
+        select(AppLogRecord.id).where(literal_column("pg_notify('c', 'x')") == "")
+    ) == [("literal", "pg_notify('c', 'x')")]
+    for nested, kind in (
+        (update(SettingRecord).values(value="synthetic-review-only"), "Update"),
+        (insert(SettingRecord).values(key="synthetic", value="review"), "Insert"),
+        (delete(AppLogRecord), "Delete"),
+    ):
+        escapes = _sentinel_escapes(select(SettingRecord.key).add_cte(nested.cte("hidden")))
+        assert ("dml", kind) in escapes
+        assert ("node", "CTE") in escapes
+    assert _sentinel_escapes(select(AppLogRecord.id).with_for_update())[0] == (
+        "lock",
+        "for_update",
+    )
+    assert _sentinel_escapes(select(AppLogRecord.id).where(AppLogRecord.event.op("||")("x") == ""))
+    assert ("node", "CollationClause") in _sentinel_escapes(
+        select(AppLogRecord.id).order_by(AppLogRecord.event.collate("C"))
+    )
+
+
+def delete_app_logs_before(cutoff):
+    from sqlalchemy import delete
+
+    from packages.core.models import AppLogRecord
+
+    return delete(AppLogRecord).where(AppLogRecord.ts < cutoff)
+
+
+def select_one():
+    from sqlalchemy import select
+
+    from packages.core.models import AppLogRecord
+
+    return select(AppLogRecord.id).limit(1)
+
+
+@pytest.fixture
+def production_log_sink(monkeypatch):
+    """Run the real structlog â†’ DB sink, then restore all logging globals."""
+    import structlog
+
+    from packages.core import log_sink
+
+    saved_config = structlog.get_config()
+    saved = {
+        name: getattr(log_sink, name)
+        for name in (
+            "_CLOSING",
+            "_SERVICE_NAME",
+            "_FLUSH_TASK",
+            "_INFLIGHT_TASK",
+            "_INFLIGHT_BATCH",
+        )
+    }
+    saved_buffer = list(log_sink._LOG_BUFFER)
+    saved_drops = log_sink._DROP_COUNTS.copy()
+    log_sink._LOG_BUFFER.clear()
+    log_sink._DROP_COUNTS.clear()
+    monkeypatch.setattr(log_sink.settings, "log_level", "INFO")
+    yield log_sink
+    task = log_sink._FLUSH_TASK
+    if task is not None and not task.done():
+        task.cancel()
+    structlog.configure(**saved_config)
+    for name, value in saved.items():
+        setattr(log_sink, name, value)
+    log_sink._LOG_BUFFER[:] = saved_buffer
+    log_sink._DROP_COUNTS.clear()
+    log_sink._DROP_COUNTS.update(saved_drops)
+
+
+async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=None):
+    import structlog
+
+    from packages.optimizer import main as optimizer_main
+
+    optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
+    if failure is not None:
+        optimizer.generate_plan.side_effect = failure
+    sink.configure_structlog_with_db("optimizer")
+    with (
+        patch("packages.core.database.get_session", new=sentinel.factory),
+        patch.object(optimizer_main, "get_session", new=sentinel.factory),
+        patch.object(optimizer_main, "logger", structlog.get_logger("ciu2_admission")),
+        patch.object(optimizer_main, "get_setting", new=AsyncMock(return_value="rules")),
+        patch.object(
+            optimizer_main, "_select_optimizer", new=AsyncMock(return_value=("rules", optimizer))
+        ),
+        patch.object(
+            optimizer_main,
+            "get_device_data_quality",
+            new=AsyncMock(return_value={"ready": True, "reasons": []}),
+        ),
+        patch.object(optimizer_main.comfort_model, "arefresh_if_changed", new=AsyncMock()),
+        patch.object(optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()),
+        patch.object(optimizer_main, "AquareaWrapper", side_effect=AssertionError("device")),
+        patch.object(
+            optimizer_main, "resolve_learning_mode_state", new=AsyncMock(return_value=_INACTIVE())
+        ),
+        patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
+    ):
+        try:
+            result = await optimizer_main.run_optimization()
+        finally:
+            cooldown = optimizer_main._last_plan_generated_at
+            try:
+                await sink.shutdown_log_sink()
+            finally:
+                drained_buffer = list(sink._LOG_BUFFER)
+    return result, cooldown, drained_buffer
+
+
+async def test_CIU2_refusal_admits_and_drains_only_application_logs(production_log_sink):
+    sentinel = _DmlSentinel()
+    plan = _admissible_plan()
+    plan["planning_data_quality"]["control_allowed"] = "false"
+    plan["forecast_snapshot"]["household_marker"] = "PRIVATE_HOUSEHOLD_MARKER"
+
+    result, cooldown, buffer = await _refused_run_with_production_logging(
+        production_log_sink, sentinel, plan
+    )
+
+    assert result is None
+    assert cooldown == 0.0
+    assert buffer == []
+    assert sentinel.forbidden == []
+    assert sentinel.allowed_prunes
+    assert sentinel.rollbacks == 0
+    events = [record.event for record in sentinel.committed_logs]
+    assert "optimizer_no_plan" in events
+    refusal = next(
+        record for record in sentinel.committed_logs if record.event == "optimizer_no_plan"
+    )
+    assert json.loads(refusal.details_json) == {
+        "reason": "unvalidated_frozen_input_batch",
+        "refusal": "control_not_allowed",
+    }
+    assert refusal.service == "optimizer"
+    persisted = " ".join(str(record.details_json) for record in sentinel.committed_logs)
+    assert "PRIVATE_HOUSEHOLD_MARKER" not in persisted
+
+
+@pytest.mark.parametrize(("section", "clock_key"), _FROZEN_CLOCKS)
+async def test_CIU2_frozen_clock_refusal_drains_only_application_logs(
+    production_log_sink, section, clock_key
+):
+    sentinel = _DmlSentinel()
+    plan = _admissible_plan()
+    target = _frozen_clock_target(plan, section)
+    target[clock_key] = dt.datetime.fromisoformat(target[clock_key])
+
+    result, cooldown, buffer = await _refused_run_with_production_logging(
+        production_log_sink, sentinel, plan
+    )
+
+    assert result is None
+    assert cooldown == 0.0
+    assert buffer == []
+    assert sentinel.forbidden == []
+    assert sentinel.allowed_prunes
+    assert sentinel.rollbacks == 0
+    refusal = next(
+        record for record in sentinel.committed_logs if record.event == "optimizer_no_plan"
+    )
+    assert json.loads(refusal.details_json) == {
+        "reason": "unvalidated_frozen_input_batch",
+        "refusal": "malformed_clock",
+    }
+
+
+async def test_CIU2_log_commit_failure_never_admits_planning(production_log_sink):
+    sentinel = _DmlSentinel(fail_commits=10)
+    plan = _admissible_plan()
+    plan["diagnostic_status"] = "unproven"
+
+    result, cooldown, buffer = await _refused_run_with_production_logging(
+        production_log_sink, sentinel, plan
+    )
+
+    assert result is None
+    assert cooldown == 0.0
+    assert buffer == []
+    assert sentinel.committed_logs == []
+    assert sentinel.rollbacks >= 1
+    assert sentinel.forbidden == []
+    assert production_log_sink.log_sink_status()["drops"]
+
+
+async def test_CIU2_cancellation_preserves_log_drain(production_log_sink):
+    sentinel = _DmlSentinel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _refused_run_with_production_logging(
+            production_log_sink, sentinel, None, failure=asyncio.CancelledError()
+        )
+
+    assert sentinel.forbidden == []
+    assert "optimization_starting" in [record.event for record in sentinel.committed_logs]
+    assert production_log_sink._LOG_BUFFER == []
+
+
+async def test_CIU2_unsettled_log_writer_retains_ownership(production_log_sink, monkeypatch):
+    release = asyncio.Event()
+    sentinel = _DmlSentinel(block=release)
+    monkeypatch.setattr(production_log_sink, "_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(production_log_sink, "_ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    plan = _admissible_plan()
+    plan["planning_data_quality"]["status"] = "degraded"
+
+    with pytest.raises(RuntimeError, match="log writer unsettled"):
+        await _refused_run_with_production_logging(production_log_sink, sentinel, plan)
+
+    writer = production_log_sink._INFLIGHT_TASK
+    assert writer is not None and not writer.done()
+    retained = list(production_log_sink._INFLIGHT_BATCH)
+    assert retained and production_log_sink._LOG_BUFFER[: len(retained)] == retained
+    assert sentinel.cancellations >= 1
+    assert sentinel.committed_logs == []
+
+    release.set()
+    await asyncio.wait({writer}, timeout=5)
+    assert writer.done()
+    assert production_log_sink._INFLIGHT_TASK is None
+    assert sentinel.forbidden == []
+    assert "optimizer_no_plan" in [record.event for record in sentinel.committed_logs]
 
 
 async def test_activate_plan_refuses_diagnostic_before_supersession():
@@ -3325,9 +4591,10 @@ def lifecycle_status_api(tmp_path, monkeypatch, optimizer_status_data_quality):
     from packages.core.config import settings
     from packages.ml.lifecycle import ArtifactReference, LifecycleSnapshot
     from packages.ml.safe_persistence import publish_signed_artifact
-    from packages.ml import model_status
+    from packages.ml import model_status, seasonal_learning
     from packages.core.settings_service import SETTING_SPECS
 
+    real_seasonal_progress = seasonal_learning.get_seasonal_calibration_progress
     now = dt.datetime.now(dt.timezone.utc)
     monkeypatch.setattr(settings, "model_dir", str(tmp_path))
     monkeypatch.setattr(settings, "secret_key", "test-only-status-signing-key")
@@ -3448,7 +4715,13 @@ def lifecycle_status_api(tmp_path, monkeypatch, optimizer_status_data_quality):
 
     monkeypatch.setattr(model_status, "get_readiness_snapshot", AsyncMock(side_effect=capture))
     clear_artifact_status_cache()
-    return SimpleNamespace(state=state, reader=reader, artifact=artifact, now=now)
+    return SimpleNamespace(
+        state=state,
+        reader=reader,
+        artifact=artifact,
+        now=now,
+        real_seasonal_progress=real_seasonal_progress,
+    )
 
 
 @pytest.mark.parametrize(
@@ -3693,11 +4966,138 @@ async def test_invalid_reporting_counts_fail_unavailable(lifecycle_status_api, i
     assert status["control_ready"] is status["ordinary_writes_allowed"] is False
 
 
+def _captured_component(reporting_status, *, demand, fit_status="validated"):
+    return {
+        "collection": {
+            "availability": "assessed",
+            "total": 240 if demand else 30,
+            "train": 192 if demand else 24,
+            "holdout": 48 if demand else 6,
+            "minimum_train": 168 if demand else 20,
+            "minimum_holdout": 24 if demand else 3,
+            "remaining_train": 0,
+            "remaining_holdout": 0,
+            "reason": None,
+        },
+        "fit": {"availability": "persisted", "status": fit_status, "reason": None},
+        "reporting": {"status": reporting_status, "reason": None, "counts": None},
+        "next_step": (
+            "ready_for_reporting"
+            if reporting_status == "qualified-for-reporting"
+            else "await_prospective_reporting_qualification"
+        ),
+    }
+
+
+def _use_captured_seasonal_projection(fixture, monkeypatch, *, demand, indoor, indoor_fit):
+    """Run the real seasonal projection over one captured readiness snapshot."""
+    from packages.ml import model_status
+
+    monkeypatch.setattr(
+        "packages.ml.seasonal_learning.get_seasonal_calibration_progress",
+        fixture.real_seasonal_progress,
+    )
+    capture = model_status.get_readiness_snapshot.side_effect
+
+    async def captured(**kwargs):
+        snapshot = await capture(**kwargs)
+        settings_values = snapshot["context"]["settings"]
+        settings_values["seasonal_calibration_enabled"] = "true"
+        settings_values["_seasonal_calibration_campaign_since"] = (
+            fixture.now - dt.timedelta(days=20)
+        ).isoformat()
+        snapshot["seasonal_inputs"] = {
+            "average_outdoor": 2.0,
+            "outdoor_readings": 48,
+            "outdoor_data_reliable": True,
+            "open_revert_obligations": {"count": 0},
+        }
+        components = snapshot["readiness"]["components"]
+        if demand != "unavailable":
+            components["demand"] = _captured_component(demand, demand=True)
+        if indoor != "unavailable":
+            components["indoor_heating"] = _captured_component(
+                indoor, demand=False, fit_status=indoor_fit
+            )
+        return snapshot
+
+    monkeypatch.setattr(model_status, "get_readiness_snapshot", AsyncMock(side_effect=captured))
+    return model_status.get_readiness_snapshot
+
+
+@pytest.mark.parametrize(
+    ("demand", "indoor", "indoor_fit", "ready", "next_step"),
+    [
+        (
+            "qualified-for-reporting",
+            "qualified-for-reporting",
+            "validated",
+            True,
+            "ready_for_reporting",
+        ),
+        (
+            "candidate",
+            "qualified-for-reporting",
+            "validated",
+            False,
+            "await_prospective_reporting_qualification",
+        ),
+        (
+            "expired",
+            "qualified-for-reporting",
+            "validated",
+            False,
+            "await_prospective_reporting_qualification",
+        ),
+        (
+            "qualified-for-reporting",
+            "unqualified",
+            "not_declared",
+            False,
+            "await_indoor_heating_fit",
+        ),
+        ("unavailable", "unavailable", None, False, "readiness_unavailable"),
+    ],
+    ids=["qualified", "candidate", "expired", "tank_only", "unavailable"],
+)
+async def test_captured_readiness_projection_reports_without_exiting_observation(
+    lifecycle_status_api, monkeypatch, demand, indoor, indoor_fit, ready, next_step
+):
+    snapshot_reader = _use_captured_seasonal_projection(
+        lifecycle_status_api, monkeypatch, demand=demand, indoor=indoor, indoor_fit=indoor_fit
+    )
+    with (
+        patch("packages.core.settings_service.set_setting", new=AsyncMock()) as single_write,
+        patch("packages.core.settings_service.set_settings_bulk", new=AsyncMock()) as bulk_write,
+    ):
+        response = await get_optimizer_status()
+    seasonal = response["seasonal_calibration"]
+    assert seasonal["reporting_ready"] is ready
+    assert seasonal["next_step"] == next_step
+    assert seasonal["readiness"]["components"]["demand"]["reporting"]["status"] == demand
+    assert seasonal["enabled"] is True
+    assert seasonal["observe_only_active"] is True
+    assert seasonal["heating_season_detected"] is True
+    assert seasonal["auto_exit"] is False
+    assert seasonal["control_ready"] is False
+    assert response["control_ready"] is response["ordinary_writes_allowed"] is False
+    snapshot_reader.assert_awaited_once()
+    single_write.assert_not_awaited()
+    bulk_write.assert_not_awaited()
+
+
 async def test_qualification_success_reports_readiness_without_exiting_observation(
     lifecycle_status_api, monkeypatch
 ):
     from packages.ml.model_status import _empty_status
 
+    _use_captured_seasonal_projection(
+        lifecycle_status_api,
+        monkeypatch,
+        demand="qualified-for-reporting",
+        indoor="qualified-for-reporting",
+        indoor_fit="validated",
+    )
     reports = {
         component: {**_empty_status("fixture"), "status": "qualified-for-reporting"}
         for component in ("demand", "comfort", "thermal")

@@ -1890,9 +1890,22 @@ class TestManualCOPPostgreSQLMigration:
                     tokens.append(token)
             async with engine.connect() as connection:
                 retained = await retained_storage_state(connection)
-            next_native_position = 1 + max(
-                column[2] for column in retained_legacy["columns"] if column[0] == "device_status"
-            )
+            # Exactly the nullable, default-free columns 033-035 add to retained legacy tables.
+            assert head == "035", "update the exact legacy projection for migrations after 035"
+            additions = {
+                "device_status": (("native_policy_provenance", "jsonb"),),
+                "plan_actions": (("safety_claim_token", "uuid"),),
+                "consumption": (("source_timezone", "character varying(64)"),),
+                "prices": (("interval_schema", "character varying(64)"),),
+                "weather": (("units_schema", "character varying(64)"),),
+            }
+            assert set(additions) <= set(retained_legacy["raw_rows"])
+            # PostgreSQL appends after dropped attributes, so each re-upgrade leaves a gap.
+            next_positions = {
+                table: 1
+                + max(column[2] for column in retained_legacy["columns"] if column[0] == table)
+                for table in additions
+            }
             for operation, target in (
                 (command.upgrade, head),
                 (command.downgrade, "032"),
@@ -1904,30 +1917,27 @@ class TestManualCOPPostgreSQLMigration:
                         "marker": (target,)
                     }
                     expected_legacy = copy.deepcopy(retained_legacy)
-                    if target == head and head != "032":
+                    if target == head:
+                        added = tuple(
+                            (table, name, next_positions[table] + offset, sql_type, False, None)
+                            for table, columns in additions.items()
+                            for offset, (name, sql_type) in enumerate(columns)
+                        )
                         expected_legacy["columns"] = tuple(
                             sorted(
-                                (
-                                    *expected_legacy["columns"],
-                                    (
-                                        "device_status",
-                                        "native_policy_provenance",
-                                        next_native_position,
-                                        "jsonb",
-                                        False,
-                                        None,
-                                    ),
-                                ),
+                                (*expected_legacy["columns"], *added),
                                 key=lambda column: (column[0], column[2]),
                             )
                         )
-                        expected_legacy["raw_rows"]["device_status"] = tuple(
-                            row | {"native_policy_provenance": None}
-                            for row in expected_legacy["raw_rows"]["device_status"]
-                        )
+                        for table, columns in additions.items():
+                            expected_legacy["raw_rows"][table] = tuple(
+                                row | {name: None for name, _sql_type in columns}
+                                for row in expected_legacy["raw_rows"][table]
+                            )
                     assert await legacy_state(connection) == expected_legacy
-                    if target == head and head != "032":
-                        next_native_position += 1
+                    if target == head:
+                        for table, columns in additions.items():
+                            next_positions[table] += len(columns)
                 if target == head:
                     await asyncio.to_thread(command.check, config)
         finally:

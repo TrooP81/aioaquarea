@@ -16,7 +16,7 @@ for (const refusal of [
       body: JSON.stringify({ detail: refusal.detail }),
     }));
     page.on("dialog", (dialog) => dialog.accept());
-    await page.goto("/settings");
+    await page.goto("/settings?tab=system");
     const selected = page.getByRole("checkbox", { name: /Device status history/ });
     await selected.check();
     await page.getByRole("button", { name: "Reset Selected Data" }).click();
