@@ -1,5 +1,31 @@
 import { expect, test, type Page } from "./fixtures";
 
+for (const refusal of [
+  { status: 409, detail: { code: "unresolved_safety_reverts", action_id: 11763 }, message: "Reset blocked: an unresolved safety restore (action 11763) must be settled first." },
+  { status: 503, detail: { code: "ml_lifecycle_unavailable" }, message: "Reset unavailable: model lifecycle storage could not be reached. Try again later." },
+  { status: 409, detail: { code: "unresolved_safety_reverts", action_id: { unsafe: true } }, message: "Reset blocked: an unresolved safety restore must be settled first." },
+  { status: 400, detail: "A readable refusal", message: "A readable refusal" },
+  { status: 500, detail: ["not", "a", "message"], message: "Reset failed" },
+  { status: 500, detail: null, message: "Reset failed" },
+  { status: 500, detail: { unexpected: true }, message: "Reset failed" },
+]) {
+  test(`reset renders safe refusal: ${JSON.stringify(refusal.detail)}`, async ({ page }) => {
+    await mockSettings(page);
+    await page.route("**/api/admin/reset", (route) => route.fulfill({
+      status: refusal.status, contentType: "application/json",
+      body: JSON.stringify({ detail: refusal.detail }),
+    }));
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.goto("/settings");
+    const selected = page.getByRole("checkbox", { name: /Device status history/ });
+    await selected.check();
+    await page.getByRole("button", { name: "Reset Selected Data" }).click();
+    await expect(page.getByText(refusal.message, { exact: true })).toBeVisible();
+    await expect(selected).toBeChecked();
+    await expect(page.getByRole("button", { name: "Reset Selected Data" })).toBeEnabled();
+  });
+}
+
 const settings = {
   ml_maintenance_enabled: { value: "false", type: "bool", description: "Model maintenance" },
   seasonal_calibration_auto_exit: { value: "true", type: "bool", description: "Legacy automatic exit", read_only: true },
@@ -189,6 +215,22 @@ test("settings sends only applicable dirty values", async ({ page }) => {
   await expect.poll(() => saved).toEqual({ manual_price_eur_per_kwh: "0.20" });
 });
 
+test("R04 saves a finite zero price and retains it after reload", async ({ page }, testInfo) => {
+  let saved: Record<string, string> | undefined;
+  await mockSettings(page, (payload) => { saved = payload; });
+  await page.goto("/settings?tab=data");
+  const input = page.locator("#setting-manual_price_eur_per_kwh");
+  await input.fill("0");
+  await page.getByRole("button", { name: /Save 1 change/ }).click();
+  await expect.poll(() => saved).toEqual({ manual_price_eur_per_kwh: "0" });
+  await expect(page.getByRole("status").filter({ hasText: "Saved 1 setting(s)" })).toBeVisible();
+  await page.reload();
+  await expect(input).toHaveValue("0");
+  await expect(page.getByRole("button", { name: "Save  change" })).toBeDisabled();
+  await input.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("r04-finite-zero-saved.png") });
+});
+
 test("settings filters values that become inapplicable and masked secrets", async ({ page }) => {
   let saved: Record<string, string> | undefined;
   await mockSettings(page, (payload) => { saved = payload; });
@@ -208,18 +250,48 @@ test("settings filters values that become inapplicable and masked secrets", asyn
   });
 });
 
-test("settings retains the draft after an API save failure", async ({ page }) => {
-  await mockSettings(page, undefined, { status: 500, body: { detail: "Backend unavailable" } });
-  await page.goto("/settings?tab=data");
-  const input = page.locator("#setting-manual_price_eur_per_kwh");
-  await input.fill("0.20");
+for (const failure of [
+  { name: "API save failure", status: 500, detail: "Backend unavailable", message: "Backend unavailable" },
+  {
+    name: "R04 structured numeric refusal", status: 400,
+    detail: { invalid_values: { manual_price_eur_per_kwh: "Value must be finite" } },
+    message: "manual_price_eur_per_kwh: Value must be finite"
+  },
+  {
+    name: "R04 multi-field numeric refusal", status: 400,
+    detail: { invalid_values: { manual_price_eur_per_kwh: "Value must be finite", tank_min_temp: "Value must be at least 20" } },
+    message: "manual_price_eur_per_kwh: Value must be finite; tank_min_temp: Value must be at least 20"
+  },
+  {
+    name: "R04 empty numeric refusal", status: 400,
+    detail: { invalid_values: {} }, message: "Save failed"
+  },
+  {
+    name: "R04 malformed numeric refusal", status: 400,
+    detail: { invalid_values: ["Value must be finite"] }, message: "Save failed"
+  },
+  {
+    name: "R04 unknown structured refusal", status: 400,
+    detail: { code: "invalid_numeric_setting" }, message: "Save failed"
+  },
+  {
+    name: "R04 null structured refusal", status: 400,
+    detail: null, message: "Save failed"
+  },
+]) {
+  test(`settings retains the draft after ${failure.name}`, async ({ page }) => {
+    await mockSettings(page, undefined, { status: failure.status, body: { detail: failure.detail } });
+    await page.goto("/settings?tab=data");
+    const input = page.locator("#setting-manual_price_eur_per_kwh");
+    await input.fill("0.20");
 
-  await page.getByRole("button", { name: /Save 1 change/ }).click();
+    await page.getByRole("button", { name: /Save 1 change/ }).click();
 
-  await expect(page.locator(".override-banner[role=alert]")).toContainText("Backend unavailable");
-  await expect(input).toHaveValue("0.20");
-  await expect(page.getByRole("button", { name: /Save 1 change/ })).toBeEnabled();
-});
+    await expect(page.locator(".override-banner[role=alert]")).toContainText(failure.message);
+    await expect(input).toHaveValue("0.20");
+    await expect(page.getByRole("button", { name: /Save 1 change/ })).toBeEnabled();
+  });
+}
 
 test("advanced validation focuses the first applicable invalid field without a PUT", async ({ page }) => {
   let saves = 0;

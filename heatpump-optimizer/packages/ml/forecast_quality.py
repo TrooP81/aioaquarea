@@ -9,16 +9,18 @@ import math
 import statistics
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from packages.ml.models_common import is_finite_number as _finite_number
 import structlog
 from sqlalchemy import and_, desc, or_, select
 
-from packages.core.database import get_session
+from packages.core.database import copy_materialized_rows, get_session
 from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
@@ -784,20 +786,40 @@ async def materialize_native_inputs(
     device_id: str | None = None,
     timer_reader: Any | None = None,
     capabilities: tuple[str, ...] = (),
+    session=None,
+    context: dict | None = None,
+    raw: bool = False,
 ) -> dict[str, Any] | None:
-    from packages.core.device_status_snapshot import native_policy_settings
     from packages.core.settings_service import get_all_settings
-    from packages.ml.comfort_model import ComfortModel
-    from packages.ml.lifecycle import LIFECYCLE_SCHEMAS
+    from packages.poller.smartthings import get_selected_device_ids
 
-    values = await get_all_settings()
+    values = (
+        context["settings"]
+        if context is not None
+        else (
+            await get_all_settings(session=session)
+            if session is not None
+            else await get_all_settings()
+        )
+    )
+    selected_ids = await get_selected_device_ids(values=values)
+    reference_sensor = str(values.get("comfort_reference_sensor_id") or "").strip()
+    reference_blocked = bool(
+        reference_sensor and selected_ids and reference_sensor not in selected_ids
+    )
+    if reference_blocked and (
+        component == "comfort"
+        or component == "thermal"
+        and any(name.startswith("indoor_") for name in capabilities)
+    ):
+        return None
+    query_sensor_ids = [reference_sensor] if reference_sensor else selected_ids
     if timer_reader is not None:
-        await timer_reader.get_active_weekly_timer_slots(now)
         timer = timer_reader.cached_native_timer_provenance()
     else:
         timer = None
     since = now - dt.timedelta(hours=2)
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
         query = select(DeviceStatusRecord).where(
             DeviceStatusRecord.ts >= since, DeviceStatusRecord.ts <= now
         )
@@ -850,21 +872,20 @@ async def materialize_native_inputs(
             .scalars()
             .all()
         )
-        raw_indoor = (
-            (
-                await session.execute(
-                    select(IndoorTempReading)
-                    .where(
-                        IndoorTempReading.timestamp >= since,
-                        IndoorTempReading.timestamp <= now,
-                        IndoorTempReading.is_stale.is_(False),
-                    )
-                    .order_by(IndoorTempReading.timestamp)
-                    .limit(5001)
-                )
+        indoor_query = (
+            select(IndoorTempReading)
+            .where(
+                IndoorTempReading.timestamp >= since,
+                IndoorTempReading.timestamp <= now,
+                IndoorTempReading.is_stale.is_(False),
             )
-            .scalars()
-            .all()
+            .order_by(IndoorTempReading.timestamp)
+            .limit(5001)
+        )
+        if query_sensor_ids:
+            indoor_query = indoor_query.where(IndoorTempReading.device_id.in_(query_sensor_ids))
+        raw_indoor = (
+            [] if reference_blocked else (await session.execute(indoor_query)).scalars().all()
         )
         counters = (
             (
@@ -884,94 +905,179 @@ async def materialize_native_inputs(
         )
         if max(len(weather), len(prices), len(counters)) > 100 or len(raw_indoor) > 5000:
             return None
-        reference_sensor = str(values.get("comfort_reference_sensor_id") or "").strip()
-        readings, strategy, _ = ComfortModel._select_indoor_observations(
-            raw_indoor, reference_sensor
-        )
-        sensor_ids = (
-            [reference_sensor]
-            if reference_sensor
-            else sorted({row.device_id for row in raw_indoor})
-        )
-        fresh_ids = {
-            row.device_id for row in raw_indoor if 0 <= (now - row.timestamp).total_seconds() <= 900
-        }
-        indoor_available = bool(
-            readings
-            and sensor_ids
-            and set(sensor_ids) <= fresh_ids
-            and 0 <= (now - readings[-1].timestamp).total_seconds() <= 900
-        )
-        status_history = [_plain_record(row, DeviceStatusRecord) for row in statuses]
-        native = native_policy_settings(latest)
-        provenance = latest.native_policy_provenance or {}
-        timer = timer if isinstance(timer, dict) else provenance.get("timer", {"status": "unknown"})
-        dhw = latest.direction == "WATER" or latest.device_action == "HEATING_WATER"
-        if component == "thermal":
-            tank_capability = "tank_heating" if dhw else "tank_cooling"
-            indoor_capability = (
-                "indoor_heating" if latest.space_heating_active else "indoor_cooling"
-            )
-            capability = (
-                tank_capability
-                if not capabilities or tank_capability in capabilities
-                else indoor_capability
-            )
-            if capabilities and capability not in capabilities:
-                return None
-        else:
-            capability = "indoor" if component == "comfort" else "demand"
-        if component == "comfort" or capability.startswith("indoor_"):
-            if not indoor_available:
-                return None
-            basis = {"kind": strategy, "sensor_ids": sensor_ids, "resolution_c": 0.1}
-            history = [
-                {"timestamp": row.timestamp.isoformat(), "temperature": row.temperature}
-                for row in readings
-            ]
-        elif component == "demand":
-            basis = {"kind": "heatpump_counter", "sensor_ids": [device_id], "counter": "heat_kwh"}
-            history = [_plain_record(row, ConsumptionRecord) for row in counters]
-        else:
-            basis = {
-                "kind": "heatpump_temperature",
-                "sensor_ids": [device_id],
-                "field": "tank_temp",
-                "resolution_c": 1.0,
-            }
-            history = [
-                {"timestamp": row.ts.isoformat(), "temperature": row.tank_temp} for row in statuses
-            ]
-        current_indoor = readings[-1].temperature if indoor_available else None
-        older = [row for row in readings if row.timestamp <= now - dt.timedelta(hours=1)]
-        trend = current_indoor - older[-1].temperature if indoor_available and older else 0.0
-        return {
-            "issued_at": now.isoformat(),
+        data = {
+            "component": component,
+            "now": now,
             "device_id": device_id,
-            "capability": capability,
-            "sensor_basis": basis,
-            "sensor_history": history,
-            "status_history": status_history,
-            "native_settings": native,
-            "timer": timer,
-            "weather": [_plain_record(row, WeatherRecord) for row in weather],
-            "pricing": {
-                "available": bool(prices),
-                "points": [_plain_record(row, PriceRecord) for row in prices],
-            },
-            "indoor_temperature": current_indoor,
-            "indoor_trend": trend,
-            "tank_temperature": latest.tank_temp,
-            "schemas": {
-                "input": "frozen_native_inputs_v1",
-                "artifact": LIFECYCLE_SCHEMAS[component],
-                "weather_provider": weather_provider,
-                "price_provider": str(values.get("price_provider") or "unknown"),
-            },
-            "reference_sensor_id": reference_sensor,
+            "values": dict(values),
+            "selected_ids": list(selected_ids),
+            "reference_sensor": reference_sensor,
+            "reference_blocked": reference_blocked,
             "weather_provider": weather_provider,
-            "timezone": str(values.get("timezone") or "Europe/Amsterdam"),
+            "timer": timer,
+            "capabilities": capabilities,
         }
+        for name, rows, model in (
+            ("statuses", statuses, DeviceStatusRecord),
+            ("weather", weather, WeatherRecord),
+            ("prices", prices, PriceRecord),
+            ("raw_indoor", raw_indoor, IndoorTempReading),
+            ("counters", counters, ConsumptionRecord),
+        ):
+            data[name] = await copy_materialized_rows(
+                rows, [column.name for column in model.__table__.columns], context=context
+            )
+    return data if raw else _prepare_native_inputs(data)
+
+
+def _prepare_native_inputs(data: dict, *, component=None, capabilities=None) -> dict | None:
+    from packages.core.device_status_snapshot import native_policy_settings
+    from packages.ml.comfort_model import ComfortModel, SENSOR_SELECTION_SCHEMA
+    from packages.ml.lifecycle import LIFECYCLE_SCHEMAS
+
+    component = component or data["component"]
+    capabilities = data["capabilities"] if capabilities is None else capabilities
+    now, values, device_id = data["now"], data["values"], data["device_id"]
+    selected_ids, reference_sensor = data["selected_ids"], data["reference_sensor"]
+    reference_blocked = data["reference_blocked"]
+    if reference_blocked and (
+        component == "comfort"
+        or component == "thermal"
+        and any(name.startswith("indoor_") for name in capabilities)
+    ):
+        return None
+    statuses, weather, prices, counters = (
+        data[name] for name in ("statuses", "weather", "prices", "counters")
+    )
+    latest, since, timer = statuses[-1], now - dt.timedelta(hours=2), data["timer"]
+    weather_provider = data["weather_provider"]
+    raw_indoor = [
+        row
+        for row in data["raw_indoor"]
+        if (not selected_ids or row.device_id in selected_ids)
+        and (not reference_sensor or row.device_id == reference_sensor)
+        and _finite_number(row.temperature)
+        and 5 <= row.temperature <= 35
+        and not row.is_stale
+        and (timestamp := as_utc(row.timestamp)) is not None
+        and since <= timestamp <= now
+    ]
+    readings, strategy, _ = ComfortModel._select_indoor_observations(
+        raw_indoor, reference_sensor, selected_ids=selected_ids, as_of=now
+    )
+    sensor_ids = (
+        [reference_sensor]
+        if reference_sensor
+        else sorted(set(selected_ids) or {row.device_id for row in raw_indoor})
+    )
+    fresh_ids = {
+        row.device_id
+        for row in raw_indoor
+        if 0 <= (now - as_utc(row.timestamp)).total_seconds() <= 900
+    }
+    indoor_available = bool(
+        readings
+        and sensor_ids
+        and set(sensor_ids) <= fresh_ids
+        and not reference_blocked
+        and 0 <= (now - as_utc(readings[-1].timestamp)).total_seconds() <= 900
+    )
+    indoor_basis = {
+        "kind": strategy,
+        "sensor_ids": sensor_ids,
+        "resolution_c": 0.1,
+        "selection_schema": SENSOR_SELECTION_SCHEMA,
+        "selected_sensor_ids": sorted(set(selected_ids)),
+    }
+    indoor_history = [
+        {"timestamp": row.timestamp.isoformat(), "temperature": row.temperature} for row in readings
+    ]
+    status_history = [_plain_record(row, DeviceStatusRecord) for row in statuses]
+    native = native_policy_settings(latest)
+    provenance = latest.native_policy_provenance or {}
+    timer = (
+        timer
+        if isinstance(timer, dict) and timer.get("status") == "known"
+        else provenance.get("timer", {"status": "unknown"})
+    )
+    dhw = latest.direction == "WATER" or latest.device_action == "HEATING_WATER"
+    if component == "thermal":
+        tank_capability = "tank_heating" if dhw else "tank_cooling"
+        indoor_capability = "indoor_heating" if latest.space_heating_active else "indoor_cooling"
+        capability = (
+            tank_capability
+            if not capabilities or tank_capability in capabilities
+            else indoor_capability
+        )
+        if capabilities and capability not in capabilities:
+            return None
+    else:
+        capability = "indoor" if component == "comfort" else "demand"
+    if component == "comfort" or capability.startswith("indoor_"):
+        if not indoor_available:
+            return None
+        basis, history = indoor_basis, indoor_history
+    elif component == "demand":
+        basis = {"kind": "heatpump_counter", "sensor_ids": [device_id], "counter": "heat_kwh"}
+        history = [_plain_record(row, ConsumptionRecord) for row in counters]
+    else:
+        basis = {
+            "kind": "heatpump_temperature",
+            "sensor_ids": [device_id],
+            "field": "tank_temp",
+            "resolution_c": 1.0,
+        }
+        history = [
+            {"timestamp": row.ts.isoformat(), "temperature": row.tank_temp} for row in statuses
+        ]
+    current_indoor = readings[-1].temperature if indoor_available else None
+    older = [row for row in readings if as_utc(row.timestamp) <= now - dt.timedelta(hours=1)]
+    trend = (
+        (
+            (current_indoor - older[-1].temperature)
+            / max(
+                (as_utc(readings[-1].timestamp) - as_utc(older[-1].timestamp)).total_seconds()
+                / 3600,
+                1.0,
+            )
+        )
+        if indoor_available and older
+        else None
+    )
+    if component == "comfort" and not _finite_number(trend):
+        return None
+    return {
+        "issued_at": now.isoformat(),
+        "device_id": device_id,
+        "capability": capability,
+        "sensor_basis": basis,
+        "sensor_history": history,
+        "status_history": status_history,
+        "native_settings": native,
+        "timer": timer,
+        "weather": [_plain_record(row, WeatherRecord) for row in weather],
+        "pricing": {
+            "available": bool(prices),
+            "points": [_plain_record(row, PriceRecord) for row in prices],
+        },
+        "indoor_temperature": current_indoor,
+        "indoor_trend": trend,
+        "tank_temperature": latest.tank_temp,
+        "schemas": {
+            "input": "frozen_native_inputs_v2"
+            if component == "comfort" or capability.startswith("indoor_")
+            else "frozen_native_inputs_v1",
+            "artifact": LIFECYCLE_SCHEMAS[component],
+            "weather_provider": weather_provider,
+            "price_provider": str(values.get("price_provider") or "unknown"),
+        },
+        "reference_sensor_id": reference_sensor,
+        "configured_sensor_ids": selected_ids,
+        "indoor_sensor_basis": indoor_basis if indoor_available else None,
+        "indoor_sensor_history": indoor_history if indoor_available else [],
+        "weather_provider": weather_provider,
+        "timezone": str(values.get("timezone") or "Europe/Amsterdam"),
+    }
 
 
 def predict_native(
@@ -1116,6 +1222,12 @@ async def materialize_execution_page(page: dict[str, Any], *, now: dt.datetime) 
     start = min(row["issued_at"] for row in issues)
     end = min(now, max(row["target_at"] for row in issues))
     device_ids = {row["device_id"] for row in issues}
+    sensor_ids = {
+        sensor_id
+        for row in issues
+        for sensor_id in row["input_snapshot"].get("sensor_basis", {}).get("sensor_ids", [])
+        if isinstance(sensor_id, str) and sensor_id
+    }
     limit = 30_001
     async with get_session() as session:
         statuses = (
@@ -1139,6 +1251,7 @@ async def materialize_execution_page(page: dict[str, Any], *, now: dt.datetime) 
                 await session.execute(
                     select(IndoorTempReading)
                     .where(
+                        IndoorTempReading.device_id.in_(sensor_ids),
                         IndoorTempReading.timestamp >= start - dt.timedelta(minutes=15),
                         IndoorTempReading.timestamp <= min(now, end + dt.timedelta(minutes=10)),
                         IndoorTempReading.is_stale.is_(False),
@@ -1419,6 +1532,26 @@ def score_bucket(
     observed: list[float],
     persistence_errors: list[float],
 ) -> dict[str, float | int | None]:
+    if not all(
+        _finite_number(value)
+        for values in (abs_errors, signed_errors, predicted, observed, persistence_errors)
+        for value in values
+    ):
+        return {
+            "samples": 0,
+            **dict.fromkeys(
+                (
+                    "mae",
+                    "bias",
+                    "p90_abs_error",
+                    "p10_signed_error",
+                    "p90_signed_error",
+                    "r2",
+                    "persistence_mae",
+                    "persistence_improvement_c",
+                )
+            ),
+        }
     valid_r2_inputs = (
         len(predicted) == len(observed)
         and len(observed) >= 2
@@ -1426,21 +1559,28 @@ def score_bucket(
     )
     r2: float | None = None
     if valid_r2_inputs:
-        observed_mean = statistics.fmean(observed)
-        total_sum_squares = sum((value - observed_mean) ** 2 for value in observed)
-        residual_sum_squares = sum(
-            (observed_value - predicted_value) ** 2
-            for predicted_value, observed_value in zip(predicted, observed)
-        )
-        if total_sum_squares > 0 and math.isfinite(residual_sum_squares):
-            r2 = round(1 - residual_sum_squares / total_sum_squares, 3)
+        try:
+            observed_mean = statistics.fmean(observed)
+            total_sum_squares = sum((value - observed_mean) ** 2 for value in observed)
+            residual_sum_squares = sum(
+                (observed_value - predicted_value) ** 2
+                for predicted_value, observed_value in zip(predicted, observed)
+            )
+            if (
+                total_sum_squares > 0
+                and math.isfinite(total_sum_squares)
+                and math.isfinite(residual_sum_squares)
+            ):
+                r2 = round(1 - residual_sum_squares / total_sum_squares, 3)
+        except OverflowError:
+            r2 = None
     persistence_mae = (
         sum(abs(value) for value in persistence_errors) / len(persistence_errors)
         if persistence_errors and all(math.isfinite(value) for value in persistence_errors)
         else None
     )
     mae = sum(abs_errors) / len(abs_errors) if abs_errors else None
-    return {
+    result = {
         "samples": len(abs_errors),
         "mae": round(mae, 3) if mae is not None else None,
         # Positive means the forecast was too warm; negative means it was too cold.
@@ -1458,6 +1598,28 @@ def score_bucket(
             else None
         ),
     }
+    return {
+        key: value if value is None or _finite_number(value) else None
+        for key, value in result.items()
+    }
+
+
+def _required_horizon_identity(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value in HORIZONS
+
+
+def _required_horizon_buckets(
+    rows: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]] | None:
+    buckets: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        horizon = row.get("hours")
+        if not _required_horizon_identity(horizon) or horizon in buckets:
+            return None
+        buckets[horizon] = row
+    return buckets
 
 
 def _quality_gate(
@@ -1469,7 +1631,22 @@ def _quality_gate(
     required_horizons: dict[int, dict[str, float | int | None]] | None = None,
 ) -> dict[str, object]:
     """Fail closed unless all configured scorecard evidence passes."""
-    samples = int(overall.get("samples") or 0)
+    if not all(
+        _finite_number(value) for value in (min_r2, min_persistence_improvement_c, max_abs_bias_c)
+    ):
+        return {
+            "status": "failed",
+            "control_allowed": False,
+            "reason": "invalid_quality_thresholds",
+        }
+    samples = overall.get("samples")
+    samples = 0 if samples is None else samples
+    if not _finite_number(samples) or samples < 0 or int(samples) != samples:
+        return {
+            "status": "failed",
+            "control_allowed": False,
+            "reason": "invalid_scored_forecast_count",
+        }
     if samples < MIN_GATE_SAMPLES:
         return {
             "status": "observing",
@@ -1484,11 +1661,11 @@ def _quality_gate(
     mae = overall.get("mae")
     bias = overall.get("bias")
     p90 = overall.get("p90_abs_error")
-    if not isinstance(mae, (int, float)) or mae > MAX_GATE_MAE_C:
+    if not _finite_number(mae) or not 0 <= mae <= MAX_GATE_MAE_C:
         reasons.append("mae_above_threshold")
-    if not isinstance(bias, (int, float)) or abs(bias) > max_abs_bias_c:
+    if not _finite_number(bias) or abs(bias) > max_abs_bias_c:
         reasons.append("bias_above_threshold")
-    if not isinstance(p90, (int, float)) or p90 > MAX_GATE_P90_ABS_ERROR_C:
+    if not _finite_number(p90) or not 0 <= p90 <= MAX_GATE_P90_ABS_ERROR_C:
         reasons.append("p90_error_above_threshold")
     if reasons:
         return {
@@ -1501,38 +1678,53 @@ def _quality_gate(
         }
     r2 = overall.get("r2")
     persistence_improvement = overall.get("persistence_improvement_c")
-    if not isinstance(r2, (int, float)) or r2 < min_r2:
+    if not _finite_number(r2) or r2 < min_r2:
         reasons.append("r2_below_threshold")
     if (
-        not isinstance(persistence_improvement, (int, float))
+        not _finite_number(persistence_improvement)
         or persistence_improvement < min_persistence_improvement_c
     ):
         reasons.append("persistence_improvement_below_threshold")
     if required_horizons is None:
         reasons.append("required_horizons_missing")
+    elif not isinstance(required_horizons, dict) or any(
+        not _required_horizon_identity(horizon) for horizon in required_horizons
+    ):
+        reasons.append("invalid_required_horizon_identity")
     else:
         for horizon in HORIZONS:
             bucket = required_horizons.get(horizon)
             if not isinstance(bucket, dict):
                 reasons.append(f"horizon_{horizon}_missing")
                 continue
-            if int(bucket.get("samples") or 0) < MIN_HORIZON_GATE_SAMPLES:
+            if "hours" in bucket and (
+                not _required_horizon_identity(bucket["hours"]) or bucket["hours"] != horizon
+            ):
+                reasons.append(f"horizon_{horizon}_invalid_identity")
+                continue
+            horizon_samples = bucket.get("samples")
+            horizon_samples = 0 if horizon_samples is None else horizon_samples
+            if (
+                not _finite_number(horizon_samples)
+                or horizon_samples < MIN_HORIZON_GATE_SAMPLES
+                or int(horizon_samples) != horizon_samples
+            ):
                 reasons.append(f"horizon_{horizon}_insufficient_samples")
             horizon_mae = bucket.get("mae")
             horizon_bias = bucket.get("bias")
             horizon_p90 = bucket.get("p90_abs_error")
             horizon_r2 = bucket.get("r2")
             horizon_persistence_improvement = bucket.get("persistence_improvement_c")
-            if not isinstance(horizon_mae, (int, float)) or horizon_mae > MAX_GATE_MAE_C:
+            if not _finite_number(horizon_mae) or not 0 <= horizon_mae <= MAX_GATE_MAE_C:
                 reasons.append(f"horizon_{horizon}_mae_above_threshold")
-            if not isinstance(horizon_bias, (int, float)) or abs(horizon_bias) > max_abs_bias_c:
+            if not _finite_number(horizon_bias) or abs(horizon_bias) > max_abs_bias_c:
                 reasons.append(f"horizon_{horizon}_bias_above_threshold")
-            if not isinstance(horizon_p90, (int, float)) or horizon_p90 > MAX_GATE_P90_ABS_ERROR_C:
+            if not _finite_number(horizon_p90) or not 0 <= horizon_p90 <= MAX_GATE_P90_ABS_ERROR_C:
                 reasons.append(f"horizon_{horizon}_p90_error_above_threshold")
-            if not isinstance(horizon_r2, (int, float)) or horizon_r2 < min_r2:
+            if not _finite_number(horizon_r2) or horizon_r2 < min_r2:
                 reasons.append(f"horizon_{horizon}_r2_below_threshold")
             if (
-                not isinstance(horizon_persistence_improvement, (int, float))
+                not _finite_number(horizon_persistence_improvement)
                 or horizon_persistence_improvement < min_persistence_improvement_c
             ):
                 reasons.append(f"horizon_{horizon}_persistence_improvement_below_threshold")
@@ -1566,14 +1758,23 @@ def apply_control_gate_hysteresis(
     previous = (metadata or {}).get("forecast_quality_gate", {})
     normalized_context = evaluation_context or {"live_baseline_applied": False}
     previous_context = previous.get("evaluation_context", {"live_baseline_applied": False})
+    previous_horizons = previous.get("required_horizons", ())
+    valid_horizons = (
+        bool(required_horizons)
+        and all(_required_horizon_identity(horizon) for horizon in required_horizons)
+        and len(set(required_horizons)) == len(required_horizons)
+    )
     same_schema = (
-        previous.get("schema") == schema
-        and tuple(previous.get("required_horizons", ())) == required_horizons
+        valid_horizons
+        and previous.get("schema") == schema
+        and isinstance(previous_horizons, (list, tuple))
+        and all(_required_horizon_identity(horizon) for horizon in previous_horizons)
+        and tuple(previous_horizons) == required_horizons
         and previous_context == normalized_context
     )
     passes = int(previous.get("pass_streak", 0)) if same_schema else 0
     failures = int(previous.get("failure_streak", 0)) if same_schema else 0
-    raw_status = str(gate.get("status", "error"))
+    raw_status = str(gate.get("status", "error")) if valid_horizons else "failed"
     if raw_status == "passed" and bool(gate.get("control_allowed")):
         passes += 1
         failures = 0
@@ -1584,14 +1785,16 @@ def apply_control_gate_hysteresis(
         status = "fallback" if failures >= failures_required else "observing"
     return {
         "schema": schema,
-        "required_horizons": list(required_horizons),
+        "required_horizons": list(required_horizons) if valid_horizons else [],
         "evaluation_context": normalized_context,
         "pass_streak": passes,
         "failure_streak": failures,
         "status": status,
         "control_allowed": status == "allowed",
         "raw_status": raw_status,
-        "reason": gate.get("reason", "scorecard_unavailable"),
+        "reason": gate.get("reason", "scorecard_unavailable")
+        if valid_horizons
+        else "invalid_required_horizon_identity",
     }
 
 
@@ -1617,15 +1820,9 @@ async def evaluate_live_control_gate(
         get_float = get_float or get_float_setting
         get_int = get_int or get_int_setting
     if get_string is None:
-        if scorecard_loader is not None:
+        from packages.core.settings_service import get_string_setting
 
-            async def get_string(_key: str) -> str:
-                return "shadow"
-
-        else:
-            from packages.core.settings_service import get_string_setting
-
-            get_string = get_string_setting
+        get_string = get_string_setting
     try:
         configured_mode = await get_string("space_heating_baseline_mode")
         effective_mode = configured_mode if configured_mode in {"off", "shadow", "on"} else "shadow"
@@ -1636,11 +1833,7 @@ async def evaluate_live_control_gate(
             if "evaluation_context" not in str(exc):
                 raise
             scorecard = await scorecard_loader()
-        horizon_buckets = {
-            int(row["hours"]): row
-            for row in scorecard.get("horizons", [])
-            if isinstance(row, dict) and isinstance(row.get("hours"), int)
-        }
+        horizon_buckets = _required_horizon_buckets(scorecard.get("horizons", []))
         raw_gate = _quality_gate(
             scorecard.get("overall", {}),
             min_r2=await get_float("indoor_forecast_min_r2"),
@@ -1819,7 +2012,7 @@ def _collect_baseline_pairs(
     for point in candidate:
         if not isinstance(point, dict):
             continue
-        target_ts = as_utc(point.get("ts"))
+        target_ts = _saved_forecast_instant(point.get("ts"))
         control_point = control_by_ts.get(target_ts)
         hour = point.get("hour")
         candidate_prediction = point.get("predicted_indoor_temp")
@@ -1833,11 +2026,11 @@ def _collect_baseline_pairs(
             )
             continue
         if (
-            hour not in HORIZONS
+            not _required_horizon_identity(hour)
             or target_ts is None
-            or not isinstance(candidate_prediction, (int, float))
-            or not isinstance(control_prediction, (int, float))
-            or not isinstance(baseline_fraction, (int, float))
+            or not _finite_number(candidate_prediction)
+            or not _finite_number(control_prediction)
+            or not _finite_number(baseline_fraction)
             or float(baseline_fraction) == 0
         ):
             exclusions["invalid_or_zero_baseline_pair"] = (
@@ -2106,11 +2299,7 @@ def prediction_intervals_for_weather(
 ) -> list[dict[str, float | int | str | None]]:
     """Select horizon- and weather-aware intervals for each planned hour."""
 
-    horizons = {
-        int(row["hours"]): row
-        for row in scorecard.get("horizons", [])
-        if isinstance(row, dict) and isinstance(row.get("hours"), int)
-    }
+    horizons = _required_horizon_buckets(scorecard.get("horizons", [])) or {}
     regimes = scorecard.get("regimes") if isinstance(scorecard.get("regimes"), dict) else {}
     corrections = scorecard.get("bias_correction", {})
     by_horizon = corrections.get("by_horizon_c", {}) if isinstance(corrections, dict) else {}
@@ -2202,11 +2391,9 @@ def control_adjustments_for_weather(
     regime_quality = scorecard.get("regime_quality")
     if not isinstance(regime_quality, dict):
         regime_quality = {}
-    horizon_scores = {
-        int(row["hours"]): row
-        for row in scorecard.get("horizons", [])
-        if isinstance(row, dict) and isinstance(row.get("hours"), int)
-    }
+    horizon_scores = _required_horizon_buckets(scorecard.get("horizons", []))
+    invalid_horizons = horizon_scores is None
+    horizon_scores = horizon_scores or {}
     horizon_quality = scorecard.get("horizon_quality")
     if not isinstance(horizon_quality, dict):
         horizon_quality = {}
@@ -2239,7 +2426,7 @@ def control_adjustments_for_weather(
         )
 
     return {
-        "control_allowed": not failed_regimes and not failed_horizons,
+        "control_allowed": not invalid_horizons and not failed_regimes and not failed_horizons,
         "failed_regimes": sorted(failed_regimes),
         "failed_horizons": sorted(failed_horizons),
         "condition_margins_c": margins,
@@ -2263,6 +2450,11 @@ def _source_kind(source: str) -> str:
     return "rule_thermal_fallback"
 
 
+def _forecast_evidence_role(series: str, source: str) -> str:
+    """A learned candidate has one role, regardless of serving slot or source alias."""
+    return "learned_forecast" if _source_kind(source) == "learned_comfort_model" else series
+
+
 def _validation_sensor_input(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """Read the immutable sensor provenance needed for a fair comparison.
 
@@ -2272,16 +2464,50 @@ def _validation_sensor_input(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """
 
     control_input = snapshot.get("control_input")
-    if not isinstance(control_input, dict) or not control_input.get("available"):
+    if not isinstance(control_input, dict) or control_input.get("available") is not True:
         return None
     reference_id = control_input.get("reference_sensor_id")
-    if isinstance(reference_id, str) and reference_id.strip():
-        return {"method": "reference_sensor", "sensor_ids": [reference_id.strip()]}
+    if reference_id is not None and not isinstance(reference_id, str):
+        return None
     sensor_ids = control_input.get("sensor_ids")
+    if "sensor_ids" in control_input and (
+        not isinstance(sensor_ids, list)
+        or not sensor_ids
+        or any(not isinstance(sensor_id, str) or not sensor_id.strip() for sensor_id in sensor_ids)
+    ):
+        return None
+    if isinstance(reference_id, str) and reference_id.strip():
+        if isinstance(sensor_ids, list) and reference_id.strip() not in {
+            sensor_id.strip() for sensor_id in sensor_ids
+        }:
+            return None
+        if "sensor_basis" in snapshot and (
+            not isinstance(snapshot["sensor_basis"], dict)
+            or snapshot["sensor_basis"].get("kind") != "reference"
+        ):
+            return None
+        return {"method": "reference_sensor", "sensor_ids": [reference_id.strip()]}
     if not isinstance(sensor_ids, list):
         return None
-    selected = [str(sensor_id).strip() for sensor_id in sensor_ids if str(sensor_id).strip()]
+    if "sensor_basis" in snapshot and (
+        not isinstance(snapshot["sensor_basis"], dict)
+        or snapshot["sensor_basis"].get("kind") != "median"
+    ):
+        return None
+    selected = sorted({sensor_id.strip() for sensor_id in sensor_ids})
     return {"method": "selected_sensor_median", "sensor_ids": selected} if selected else None
+
+
+def _saved_forecast_instant(value: object) -> dt.datetime | None:
+    if not isinstance(value, (str, dt.datetime)):
+        return None
+    try:
+        parsed = value if isinstance(value, dt.datetime) else dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(dt.timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _persistence_origin(snapshot: dict[str, Any]) -> tuple[dt.datetime, float] | None:
@@ -2291,16 +2517,15 @@ def _persistence_origin(snapshot: dict[str, Any]) -> tuple[dt.datetime, float] |
     if not isinstance(observed_history, list) or not observed_history:
         return None
     origin = observed_history[0]
-    if not isinstance(origin, dict) or origin.get("hour") != 0:
+    if not isinstance(origin, dict) or type(origin.get("hour")) is not int or origin["hour"] != 0:
         return None
-    issue_timestamp = as_utc(snapshot.get("issue_timestamp"))
-    origin_timestamp = as_utc(origin.get("ts"))
+    issue_timestamp = _saved_forecast_instant(snapshot.get("issue_timestamp"))
+    origin_timestamp = _saved_forecast_instant(origin.get("ts"))
     temperature = origin.get("temperature")
     if (
         issue_timestamp is None
         or origin_timestamp != issue_timestamp
-        or not isinstance(temperature, (int, float))
-        or not math.isfinite(float(temperature))
+        or not _finite_number(temperature)
     ):
         return None
     return issue_timestamp, float(temperature)
@@ -2341,11 +2566,28 @@ def _observed_temperature_at(
     if not nearby:
         return None
 
+    unique: dict[tuple[str, dt.datetime], Any] = {}
+    conflicts: set[tuple[str, dt.datetime]] = set()
+    for row in nearby:
+        identity = (row.device_id, as_utc(row.timestamp))
+        previous = unique.get(identity)
+        if previous is None:
+            unique[identity] = row
+        elif (
+            not _finite_number(previous.temperature)
+            or not _finite_number(row.temperature)
+            or previous.temperature != row.temperature
+        ):
+            conflicts.add(identity)
+    nearby = list(unique.values())
+
     if sensor_input.get("method") == "reference_sensor":
         nearest = min(
             nearby,
             key=lambda row: abs((as_utc(row.timestamp) - target_ts).total_seconds()),
         )
+        if (nearest.device_id, as_utc(nearest.timestamp)) in conflicts:
+            return None
         return float(nearest.temperature)
 
     # The plan used a robust median across these selected rooms. Reconstruct
@@ -2358,6 +2600,10 @@ def _observed_temperature_at(
             (as_utc(current.timestamp) - target_ts).total_seconds()
         ):
             closest_by_device[device_id] = row
+    if any(
+        (row.device_id, as_utc(row.timestamp)) in conflicts for row in closest_by_device.values()
+    ):
+        return None
     return float(statistics.median(float(row.temperature) for row in closest_by_device.values()))
 
 
@@ -2477,6 +2723,8 @@ async def get_forecast_scorecard(
 
     def empty_series() -> dict[str, Any]:
         return {
+            "outcomes": {},
+            "conflicts": set(),
             "abs": [],
             "signed": [],
             "predicted": [],
@@ -2492,10 +2740,45 @@ async def get_forecast_scorecard(
             "plans": set(),
         }
 
+    def record_forecast_target(identity: tuple[object, ...]) -> None:
+        issued_horizon = identity[:-1]
+        target = identity[-1]
+        previous = issued_forecast_targets.get(issued_horizon)
+        if previous is not None and previous != target:
+            conflicting_forecast_targets.add(issued_horizon)
+            conflicting_evidence.add((*issued_horizon, previous))
+            conflicting_evidence.add(identity)
+        elif previous is None:
+            issued_forecast_targets[issued_horizon] = target
+
+    def record_outcome(
+        series: dict[str, Any],
+        *,
+        identity: tuple[object, ...],
+        provenance: tuple[object, ...],
+        **outcome: Any,
+    ) -> None:
+        if identity in series["conflicts"]:
+            return
+        signature = (
+            provenance,
+            outcome["predicted"],
+            outcome["observed"],
+            outcome["persistence_error"],
+            _weather_regimes(outcome["weather_point"]),
+        )
+        previous = series["outcomes"].get(identity)
+        if previous is not None and previous[0] != signature:
+            del series["outcomes"][identity]
+            series["conflicts"].add(identity)
+            conflicting_evidence.add(identity)
+        elif previous is None:
+            series["outcomes"][identity] = (signature, outcome)
+
     def add_outcome(
         series: dict[str, Any],
         *,
-        plan_id: int,
+        forecast_origin: tuple[object, ...],
         lead_hours: int,
         abs_error: float,
         signed_error: float,
@@ -2514,7 +2797,7 @@ async def get_forecast_scorecard(
         series["horizon_predicted"][lead_hours].append(predicted)
         series["horizon_observed"][lead_hours].append(observed)
         series["horizon_persistence_errors"][lead_hours].append(persistence_error)
-        series["plans"].add(plan_id)
+        series["plans"].add(forecast_origin)
         for regime in _weather_regimes(weather_point):
             series["regime_abs"][regime].append(abs_error)
             series["regime_signed"][regime].append(signed_error)
@@ -2527,9 +2810,22 @@ async def get_forecast_scorecard(
     }
     by_source: dict[str, dict[str, Any]] = defaultdict(empty_series)
     exclusions: dict[str, int] = defaultdict(int)
+    conflicting_evidence: set[tuple[object, ...]] = set()
+    issued_forecast_targets: dict[tuple[object, ...], object] = {}
+    conflicting_forecast_targets: set[tuple[object, ...]] = set()
     baseline_exclusions: dict[str, int] = defaultdict(int)
     baseline_pairs: list[dict[str, Any]] = []
     baseline_plans: set[int] = set()
+    baseline_outcomes: dict[tuple[object, ...], tuple[dict[str, Any], int]] = {}
+    baseline_predictions: dict[tuple[object, ...], tuple[float, ...]] = {}
+    baseline_prediction_targets: dict[tuple[object, ...], dt.datetime] = {}
+    baseline_conflicts: set[tuple[object, ...]] = set()
+    baseline_plan_by_origin: dict[tuple[object, ...], int] = {}
+    ambiguous_baseline_horizons: set[tuple[object, ...]] = set()
+    ambiguous_baseline_scopes: set[tuple[object, ...]] = set()
+    ambiguous_forecast_points: set[tuple[object, ...]] = set()
+    ambiguous_forecast_sources: set[tuple[object, ...]] = set()
+    ambiguous_forecast_series: set[tuple[object, ...]] = set()
     unresolved_revert_devices: set[str] = set()
     unresolved_revert_lookup_failed = False
     historical_revert_overlap_rows: list[tuple[str, dt.datetime, str, dt.datetime | None]] = []
@@ -2593,38 +2889,203 @@ async def get_forecast_scorecard(
         except Exception:
             logger.exception("forecast_baseline_historical_revert_overlap_lookup_failed")
             historical_revert_overlap_lookup_failed = True
+
+    def saved_targets(snapshot: dict[str, Any]) -> set[tuple[object, ...]]:
+        targets: set[tuple[object, ...]] = set()
+        for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+            curve = snapshot.get(name)
+            if not isinstance(curve, list):
+                continue
+            for point in curve:
+                if not isinstance(point, dict) or not _required_horizon_identity(point.get("hour")):
+                    continue
+                target = _saved_forecast_instant(point.get("ts"))
+                if target is not None:
+                    targets.add((name, point["hour"], target))
+        return targets
+
+    saved_plans: list[dict[str, Any]] = []
+    scopes_by_plan: dict[int, set[tuple[object, ...]]] = defaultdict(set)
+    scope_values: dict[tuple[object, ...], dict[str, Any]] = {}
+    statuses_by_scope: dict[tuple[object, ...], set[str]] = defaultdict(set)
+    targets_by_scope: dict[tuple[object, ...], set[tuple[object, ...]]] = defaultdict(set)
+    malformed_plans: set[int] = set()
+    malformed_provenance: list[tuple[int | None, dict[str, Any], set[tuple[object, ...]]]] = []
+    ambiguous_scopes: set[tuple[object, ...]] = set()
     for plan in plans:
+        valid_plan_id = type(plan.id) is int and plan.id > 0
         try:
             payload = json.loads(plan.plan_json)
             snapshot = payload.get("forecast_snapshot") if isinstance(payload, dict) else None
-            forecast = snapshot.get("forecast_with_plan") if isinstance(snapshot, dict) else None
-            shadow_forecast = (
-                snapshot.get("shadow_forecast_with_plan") if isinstance(snapshot, dict) else None
-            )
-            weather = snapshot.get("weather_forecast") if isinstance(snapshot, dict) else None
         except (TypeError, ValueError):
+            if valid_plan_id:
+                malformed_plans.add(plan.id)
             continue
         if not isinstance(snapshot, dict):
             exclusions["forecast_unavailable_or_legacy"] += 1
+            if valid_plan_id:
+                malformed_plans.add(plan.id)
             continue
         if _snapshot_live_baseline_applied(snapshot) != bool(
             evaluation_context["live_baseline_applied"]
         ):
             exclusions["baseline_mode_mismatch"] += 1
             continue
+        declared_targets = saved_targets(snapshot)
+        reasons = []
+        if not valid_plan_id:
+            reasons.append("invalid_plan_identity")
+        plan_device_id = payload.get("device_id")
+        hints: dict[str, Any] = {}
+        if not isinstance(plan_device_id, str) or not plan_device_id.strip():
+            reasons.append("missing_device_provenance")
+        else:
+            hints["device_id"] = plan_device_id.strip()
         sensor_input = _validation_sensor_input(snapshot)
         if sensor_input is None:
-            exclusions["missing_sensor_provenance"] += 1
-            continue
+            reasons.append("missing_sensor_provenance")
+        else:
+            hints["sensor_basis"] = (
+                sensor_input["method"],
+                tuple(sorted(set(sensor_input["sensor_ids"]))),
+            )
+        issue = _saved_forecast_instant(snapshot.get("issue_timestamp"))
+        if issue is not None:
+            hints["issue_timestamp"] = issue
+        history = snapshot.get("observed_history")
+        origin_hint = (
+            _saved_forecast_instant(history[0].get("ts"))
+            if isinstance(history, list) and history and isinstance(history[0], dict)
+            else None
+        )
+        if issue is None and origin_hint is not None:
+            hints["forecast_origin"] = origin_hint
         origin = _persistence_origin(snapshot)
         if origin is None:
-            exclusions[
+            reasons.append(
                 "legacy_scoring_schema"
                 if snapshot.get("scoring_schema") != "forecast_outcome_v2_persistence_origin"
                 else "missing_persistence_origin"
-            ] += 1
+            )
+        else:
+            hints["forecast_origin"] = origin[0]
+        if snapshot.get("forecast_status") not in {"available", "fallback"}:
+            reasons.append("forecast_unavailable_or_legacy")
+        if reasons:
+            for reason in reasons:
+                exclusions[reason] += 1
+            if valid_plan_id:
+                malformed_plans.add(plan.id)
+            malformed_provenance.append(
+                (plan.id if valid_plan_id else None, hints, declared_targets)
+            )
             continue
-        plan_device_id = payload.get("device_id") if isinstance(payload, dict) else None
+        scope = tuple(
+            hints[name]
+            for name in ("device_id", "sensor_basis", "issue_timestamp", "forecast_origin")
+        )
+        scope_values[scope] = hints
+        statuses_by_scope[scope].add(snapshot["forecast_status"])
+        targets_by_scope[scope].update(declared_targets)
+        scopes_by_plan[plan.id].add(scope)
+        saved_plans.append(
+            {
+                "plan": plan,
+                "payload": payload,
+                "snapshot": snapshot,
+                "sensor_input": sensor_input,
+                "origin": origin,
+                "scope": scope,
+            }
+        )
+
+    for plan_id, scopes in scopes_by_plan.items():
+        if plan_id in malformed_plans or len(scopes) > 1:
+            ambiguous_scopes.update(scopes)
+    ambiguous_scopes.update(
+        scope for scope, statuses in statuses_by_scope.items() if len(statuses) > 1
+    )
+    for plan_id, hints, declared_targets in malformed_provenance:
+        known_scopes = scopes_by_plan.get(plan_id, set())
+        if known_scopes:
+            ambiguous_scopes.update(known_scopes)
+        else:
+            possible_scopes = {
+                scope
+                for scope, values in scope_values.items()
+                if all(values.get(name) == value for name, value in hints.items())
+            }
+            if "issue_timestamp" not in hints and "forecast_origin" not in hints:
+                exclusions["unidentifiable_forecast_provenance"] += 1
+                if declared_targets:
+                    possible_scopes.intersection_update(
+                        scope
+                        for scope, targets in targets_by_scope.items()
+                        if declared_targets.intersection(targets)
+                    )
+                elif not hints:
+                    possible_scopes.clear()
+            ambiguous_scopes.update(possible_scopes)
+    if ambiguous_scopes:
+        exclusions["ambiguous_forecast_provenance"] = len(ambiguous_scopes)
+
+    peer_roles: dict[tuple[object, ...], set[str]] = defaultdict(set)
+    peer_horizon_roles: dict[tuple[object, ...], set[str]] = defaultdict(set)
+    for saved in saved_plans:
+        for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+            curve = saved["snapshot"].get(name)
+            if not isinstance(curve, list):
+                continue
+            for point in curve:
+                if not isinstance(point, dict) or _forecast_source(point) == "unknown":
+                    continue
+                role = _forecast_evidence_role(name, _forecast_source(point))
+                peer_roles[(saved["scope"], name)].add(role)
+                if _required_horizon_identity(point.get("hour")):
+                    peer_horizon_roles[(saved["scope"], name, point["hour"])].add(role)
+
+    for saved in saved_plans:
+        scope = saved["scope"]
+        if scope in ambiguous_scopes:
+            continue
+        plan = saved["plan"]
+        payload = saved["payload"]
+        snapshot = saved["snapshot"]
+        sensor_input = saved["sensor_input"]
+        origin = saved["origin"]
+        plan_device_id = scope_values[scope]["device_id"]
+        forecast = snapshot.get("forecast_with_plan")
+        shadow_forecast = snapshot.get("shadow_forecast_with_plan")
+        weather = snapshot.get("weather_forecast")
+        for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+            if name not in snapshot and name == "shadow_forecast_with_plan":
+                continue
+            curve = snapshot.get(name)
+            roles = peer_roles.get((scope, name)) or {name}
+            if not isinstance(curve, list) or not curve:
+                ambiguous_forecast_series.update((scope, role) for role in roles)
+                continue
+            for point in curve:
+                if not isinstance(point, dict):
+                    ambiguous_forecast_series.update((scope, role) for role in roles)
+                    continue
+                lead = point.get("hour")
+                if _required_horizon_identity(lead):
+                    source = _forecast_source(point)
+                    if source == "unknown":
+                        horizon_roles = peer_horizon_roles.get((scope, name, lead)) or roles
+                        ambiguous_forecast_points.update(
+                            (scope, role, lead) for role in horizon_roles
+                        )
+                    elif _saved_forecast_instant(point.get("ts")) is None:
+                        ambiguous_forecast_sources.add(
+                            (
+                                scope,
+                                _forecast_evidence_role(name, source),
+                                _source_kind(source),
+                                lead,
+                            )
+                        )
         if dispatch_lookup_failed:
             baseline_exclusions["dispatch_contamination_lookup_failed"] += 1
         elif dispatch_lookup_overflowed:
@@ -2650,42 +3111,113 @@ async def get_forecast_scorecard(
         elif plan.id in dispatched_action_times:
             baseline_exclusions["dispatch_in_or_near_window"] += 1
         else:
+            current_pairs: list[dict[str, Any]] = []
             _collect_baseline_pairs(
                 payload=payload,
                 snapshot=snapshot,
                 readings=readings,
                 sensor_input=sensor_input,
                 plan_id=plan.id,
-                pairs=baseline_pairs,
-                plan_ids=baseline_plans,
+                pairs=current_pairs,
+                plan_ids=set(),
                 exclusions=baseline_exclusions,
                 dispatched_at=None,
             )
-        if snapshot.get("forecast_status") != "available":
+            for curve_name in ("forecast_with_plan_baseline", "forecast_with_plan_zero_baseline"):
+                curve = snapshot.get(curve_name)
+                if not isinstance(curve, list):
+                    ambiguous_baseline_scopes.add(scope)
+                    continue
+                for point in curve:
+                    if not isinstance(point, dict) or not _required_horizon_identity(
+                        point.get("hour")
+                    ):
+                        continue
+                    lead = point["hour"]
+                    target = _saved_forecast_instant(point.get("ts"))
+                    if target is None:
+                        ambiguous_baseline_horizons.add((scope, lead))
+                        continue
+                    pair_identity = (scope, lead, target)
+                    issued_horizon = (scope, curve_name, lead)
+                    previous_target = baseline_prediction_targets.get(issued_horizon)
+                    if previous_target is not None and previous_target != target:
+                        baseline_conflicts.add((scope, lead, previous_target))
+                        baseline_conflicts.add(pair_identity)
+                    elif previous_target is None:
+                        baseline_prediction_targets[issued_horizon] = target
+                    values = [point.get("predicted_indoor_temp")]
+                    if curve_name == "forecast_with_plan_baseline":
+                        values.append(point.get("baseline_heating_fraction"))
+                    if not all(_finite_number(value) for value in values):
+                        baseline_conflicts.add(pair_identity)
+                        continue
+                    signature = tuple(float(value) for value in values)
+                    prediction_identity = (scope, curve_name, lead, target)
+                    previous = baseline_predictions.get(prediction_identity)
+                    if previous is not None and previous != signature:
+                        baseline_conflicts.add(pair_identity)
+                    else:
+                        baseline_predictions[prediction_identity] = signature
+            for pair in current_pairs:
+                pair_identity = (scope, pair["hour"], pair["ts"])
+                previous = baseline_outcomes.get(pair_identity)
+                if previous is not None and previous[0] != pair:
+                    baseline_conflicts.add(pair_identity)
+                else:
+                    baseline_outcomes[pair_identity] = (
+                        pair,
+                        min(plan.id, previous[1]) if previous is not None else plan.id,
+                    )
+        if snapshot.get("forecast_status") not in {"available", "fallback"}:
             exclusions["forecast_unavailable_or_legacy"] += 1
             continue
         if not isinstance(forecast, list):
             exclusions["missing_forecast"] += 1
+            ambiguous_forecast_series.add((scope, "forecast_with_plan"))
             continue
 
-        learned_forecast = _learned_candidate(forecast, shadow_forecast)
+        fallback_only = snapshot.get("forecast_status") == "fallback"
+        learned_forecast = _learned_candidate(None, shadow_forecast)
         _, issue_temperature = origin
+        provenance = (
+            origin[0],
+            plan_device_id,
+            sensor_input["method"],
+            tuple(sorted(set(sensor_input["sensor_ids"]))),
+            snapshot["forecast_status"],
+        )
 
         for index, point in enumerate(forecast):
             if not isinstance(point, dict):
                 continue
             lead_hours = point.get("hour")
             predicted = point.get("predicted_indoor_temp")
-            target_ts = as_utc(point.get("ts")) if point.get("ts") else None
-            if (
-                lead_hours not in HORIZONS
-                or not isinstance(predicted, (int, float))
-                or target_ts is None
-            ):
+            target_ts = _saved_forecast_instant(point.get("ts"))
+            if not _required_horizon_identity(lead_hours):
+                continue
+            if target_ts is None:
+                exclusions["missing_target_provenance"] += 1
                 continue
             source = _forecast_source(point)
             if source == "unknown":
                 exclusions["missing_prediction_source"] += 1
+                ambiguous_forecast_points.add((scope, "forecast_with_plan", lead_hours))
+                continue
+            if fallback_only and _source_kind(source) == "learned_comfort_model":
+                exclusions["fallback_not_learned_evidence"] += 1
+                continue
+            identity = (
+                scope,
+                _forecast_evidence_role("forecast_with_plan", source),
+                _source_kind(source),
+                lead_hours,
+                target_ts,
+            )
+            record_forecast_target(identity)
+            if not _finite_number(predicted):
+                conflicting_evidence.add(identity)
+                exclusions["non_finite_outcome"] += 1
                 continue
             if target_ts > now - dt.timedelta(minutes=15) or not readings:
                 continue
@@ -2703,10 +3235,12 @@ async def get_forecast_scorecard(
                 weather[index] if isinstance(weather, list) and index < len(weather) else {}
             )
             weather_input = weather_point if isinstance(weather_point, dict) else {}
-            lead = int(lead_hours)
-            add_outcome(
+            lead = lead_hours
+            record_outcome(
                 all_series,
-                plan_id=plan.id,
+                identity=identity,
+                provenance=provenance,
+                forecast_origin=scope,
                 lead_hours=lead,
                 abs_error=abs_error,
                 signed_error=signed_error,
@@ -2716,10 +3250,12 @@ async def get_forecast_scorecard(
                 weather_point=weather_input,
             )
             family = _source_kind(source)
-            if learned_forecast is forecast and family == "learned_comfort_model":
-                add_outcome(
+            if not fallback_only and family == "learned_comfort_model":
+                record_outcome(
                     by_family[family],
-                    plan_id=plan.id,
+                    identity=identity,
+                    provenance=provenance,
+                    forecast_origin=scope,
                     lead_hours=lead,
                     abs_error=abs_error,
                     signed_error=signed_error,
@@ -2729,9 +3265,11 @@ async def get_forecast_scorecard(
                     weather_point=weather_input,
                 )
             elif family != "learned_comfort_model":
-                add_outcome(
+                record_outcome(
                     by_family[family],
-                    plan_id=plan.id,
+                    identity=identity,
+                    provenance=provenance,
+                    forecast_origin=scope,
                     lead_hours=lead,
                     abs_error=abs_error,
                     signed_error=signed_error,
@@ -2740,9 +3278,11 @@ async def get_forecast_scorecard(
                     persistence_error=persistence_error,
                     weather_point=weather_input,
                 )
-            add_outcome(
+            record_outcome(
                 by_source[source],
-                plan_id=plan.id,
+                identity=identity,
+                provenance=provenance,
+                forecast_origin=scope,
                 lead_hours=lead,
                 abs_error=abs_error,
                 signed_error=signed_error,
@@ -2758,28 +3298,45 @@ async def get_forecast_scorecard(
                     continue
                 lead_hours = point.get("hour")
                 predicted = point.get("predicted_indoor_temp")
-                target_ts = as_utc(point.get("ts")) if point.get("ts") else None
-                if (
-                    lead_hours not in HORIZONS
-                    or not isinstance(predicted, (int, float))
-                    or target_ts is None
-                    or target_ts > now - dt.timedelta(minutes=15)
-                    or not math.isfinite(float(predicted))
-                ):
+                target_ts = _saved_forecast_instant(point.get("ts"))
+                if not _required_horizon_identity(lead_hours):
+                    continue
+                if target_ts is None:
+                    exclusions["missing_target_provenance"] += 1
+                    continue
+                source = _forecast_source(point)
+                if source == "unknown":
+                    exclusions["missing_prediction_source"] += 1
+                    ambiguous_forecast_points.add((scope, "shadow_forecast_with_plan", lead_hours))
+                    continue
+                if _source_kind(source) != "learned_comfort_model":
+                    continue
+                identity = (
+                    scope,
+                    _forecast_evidence_role("shadow_forecast_with_plan", source),
+                    _source_kind(source),
+                    lead_hours,
+                    target_ts,
+                )
+                record_forecast_target(identity)
+                if not _finite_number(predicted):
+                    conflicting_evidence.add(identity)
+                    exclusions["non_finite_outcome"] += 1
+                    continue
+                if target_ts > now - dt.timedelta(minutes=15):
                     continue
                 observed = _observed_temperature_at(readings, target_ts, sensor_input)
                 if observed is None or not math.isfinite(observed):
                     continue
-                source = _forecast_source(point)
-                if _source_kind(source) != "learned_comfort_model":
-                    continue
                 weather_point = (
                     weather[index] if isinstance(weather, list) and index < len(weather) else {}
                 )
-                add_outcome(
+                record_outcome(
                     by_family["learned_comfort_model"],
-                    plan_id=plan.id,
-                    lead_hours=int(lead_hours),
+                    identity=identity,
+                    provenance=provenance,
+                    forecast_origin=scope,
+                    lead_hours=lead_hours,
                     abs_error=abs(float(predicted) - observed),
                     signed_error=float(predicted) - observed,
                     predicted=float(predicted),
@@ -2788,7 +3345,44 @@ async def get_forecast_scorecard(
                     weather_point=weather_point if isinstance(weather_point, dict) else {},
                 )
 
+    if conflicting_evidence:
+        exclusions["conflicting_forecast_identity"] = len(conflicting_evidence)
+    if conflicting_forecast_targets:
+        exclusions["conflicting_forecast_target"] = len(conflicting_forecast_targets)
+    if ambiguous_forecast_points or ambiguous_forecast_sources:
+        exclusions["ambiguous_forecast_point"] = len(ambiguous_forecast_points) + len(
+            ambiguous_forecast_sources
+        )
+    if ambiguous_forecast_series:
+        exclusions["ambiguous_forecast_series"] = len(ambiguous_forecast_series)
+    for identity, (pair, plan_id) in baseline_outcomes.items():
+        scope, lead, _ = identity
+        if (
+            identity not in baseline_conflicts
+            and (scope, lead) not in ambiguous_baseline_horizons
+            and scope not in ambiguous_baseline_scopes
+        ):
+            baseline_pairs.append(pair)
+            baseline_plan_by_origin[scope] = min(
+                plan_id, baseline_plan_by_origin.get(scope, plan_id)
+            )
+    baseline_plans.update(baseline_plan_by_origin.values())
+    if baseline_conflicts:
+        baseline_exclusions["conflicting_forecast_identity"] = len(baseline_conflicts)
+    if ambiguous_baseline_horizons or ambiguous_baseline_scopes:
+        baseline_exclusions["ambiguous_forecast_provenance"] = len(
+            ambiguous_baseline_horizons
+        ) + len(ambiguous_baseline_scopes)
+
     def score(series: dict[str, Any]) -> dict[str, Any]:
+        for identity, (_, outcome) in series["outcomes"].items():
+            if (
+                identity not in conflicting_evidence
+                and (identity[0], identity[1], identity[3]) not in ambiguous_forecast_points
+                and identity[:4] not in ambiguous_forecast_sources
+                and (identity[0], identity[1]) not in ambiguous_forecast_series
+            ):
+                add_outcome(series, **outcome)
         return _source_score(
             series["abs"],
             series["signed"],

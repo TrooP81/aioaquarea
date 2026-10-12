@@ -7,6 +7,68 @@ export type ModelReportingState =
 
 export type ModelComponent = "demand" | "comfort" | "thermal";
 
+export interface ReadinessCollection {
+    availability: "assessed" | "not_assessed" | "unavailable";
+    total: number | null;
+    train: number | null;
+    holdout: number | null;
+    minimum_train: number | null;
+    minimum_holdout: number | null;
+    remaining_train: number | null;
+    remaining_holdout: number | null;
+    reason: string | null;
+}
+
+export interface ReadinessComponent {
+    collection: ReadinessCollection;
+    fit: {
+        availability: "persisted" | "not_assessed" | "unavailable";
+        status: string | null;
+        data_cutoff?: string | null;
+        artifact_hash?: string | null;
+        role?: string | null;
+        request_id?: string | null;
+        requested_family?: string | null;
+        validation?: Record<string, unknown> | null;
+        reason?: string | null;
+    };
+    reporting: ModelReportingProgress & {
+        status?: ModelReportingState;
+        artifact_hash?: string | null;
+        scope?: Record<string, unknown> | null;
+        current_scope_match?: boolean | null;
+        qualification_expires_at?: string | null;
+        reason?: string | null;
+    };
+    next_step: string;
+}
+
+export interface SeasonalReadiness {
+    as_of: string | null;
+    generation: string | null;
+    context_digest: string | null;
+    source_watermarks: Record<string, {
+        copied_rows: number;
+        first_at: string | null;
+        last_at: string | null;
+        content_digest: string;
+    }>;
+    availability: "assessed" | "unavailable";
+    reason: string | null;
+    components: Partial<Record<"demand" | "indoor_heating" | "indoor_cooling", ReadinessComponent>>;
+    maintenance: {
+        enabled: boolean | null;
+        preference: "automatic" | "manual" | "unknown";
+        queue_count: number | null;
+        running: boolean | null;
+        phase: string | null;
+        request_id?: string | null;
+        last_attempt_at: string | null;
+        next_due_at: string | null;
+        reason: string | null;
+    };
+}
+
 export interface ModelReportingProgress {
     last_valid_outcome_at?: string | null;
     maintenance_enabled?: boolean | null;

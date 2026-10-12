@@ -35,7 +35,9 @@ from aioaquarea import (
 from aioaquarea.data import StatusDataMode
 
 from ..config import settings
+from ..device_data_quality import _as_utc
 from ..panasonic_special_status import optimizer_special_status_supported
+from ..safety_attempts import SafetyAttempt
 from ..resilience import (
     CircuitBreaker,
     DistributedReadQuota,
@@ -77,6 +79,31 @@ class ConsumptionSnapshot:
         if all(component is None for component in components):
             return None
         return sum(component for component in components if component is not None)
+
+
+@dataclass(frozen=True)
+class RestoreStatusProof:
+    device: object
+    device_id: str
+    live: bool
+    read_started_at: dt.datetime
+    read_finished_at: dt.datetime
+    started_monotonic: float
+    finished_monotonic: float
+    observed_at: dt.datetime | None
+    retrieved_at: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class _RestoreCommand:
+    task: asyncio.Task
+    command: str
+    values: tuple
+    action: object
+    source_id: int
+    device_id: str
+    claim_token: object
+    owner: SafetyAttempt
 
 
 @dataclass
@@ -180,7 +207,7 @@ class AquareaWrapper:
 
     def __init__(self, *, read_only: bool = False) -> None:
         self._read_only = read_only
-        self.__restore_command: ContextVar[tuple | None] = ContextVar(
+        self.__restore_command: ContextVar[_RestoreCommand | None] = ContextVar(
             "aquarea_restore_command", default=None
         )
         self._client: Client | None = None
@@ -215,23 +242,35 @@ class AquareaWrapper:
         """Initialize session and redis; login failures are retried on device access."""
         from ..settings_service import get_user_tz
 
-        self._timezone = ZoneInfo(await get_user_tz())
         try:
+            self._timezone = ZoneInfo(await get_user_tz())
             self._session = aiohttp.ClientSession()
             self._redis = redis.from_url(settings.redis_url)
             self._redis_circuit_breaker = RedisCircuitBreaker(self._redis)
             if settings.panasonic_distributed_read_quota_enabled:
                 self._read_quota = DistributedReadQuota(self._redis)
-        except Exception:
-            await self.stop()
+        except BaseException:
+            from ..runtime_ownership import finish_owned_cleanup
+
+            await finish_owned_cleanup(self.stop)
             raise
 
         try:
             await self._ensure_authenticated()
+        except asyncio.CancelledError:
+            from ..runtime_ownership import finish_owned_cleanup
+
+            await finish_owned_cleanup(self.stop)
+            raise
         except PanasonicCredentialsMissingError as exc:
             logger.warning("%s", exc)
         except Exception as exc:
             logger.warning("Panasonic login deferred until next device access: %s", exc)
+        except BaseException:
+            from ..runtime_ownership import finish_owned_cleanup
+
+            await finish_owned_cleanup(self.stop)
+            raise
 
     @contextmanager
     def safety_write(self):
@@ -243,7 +282,7 @@ class AquareaWrapper:
         finally:
             safety_write_context.reset(token)
 
-    async def _dispatch_linked_restore(self, action, source) -> dict:
+    async def _dispatch_linked_restore(self, action, source, *, attempt: SafetyAttempt) -> dict:
         """Dispatch only the exact command of a validated, claimed linked restore."""
         from ..safety_reverts import (
             normalize_zone_id,
@@ -258,6 +297,7 @@ class AquareaWrapper:
             or source.id != action.reverts_action_id
             or action.status != "executing"
             or action.safety_claimed_at is None
+            or action.safety_claim_token is None
         ):
             raise PermissionError("Only claimed, existing linked restores may dispatch")
         validate_action_pair(source, action)
@@ -274,7 +314,22 @@ class AquareaWrapper:
                     baseline,
                 ),
             )
-        token = self.__restore_command.set((asyncio.current_task(), command, values))
+        attempt.assert_dispatchable(action)
+        if attempt.authority_check is None:
+            raise PermissionError("Restore attempt has no current-claim authority check")
+        await attempt.authority_check()
+        token = self.__restore_command.set(
+            _RestoreCommand(
+                asyncio.current_task(),
+                command,
+                values,
+                action,
+                source.id,
+                action.device_id,
+                action.safety_claim_token,
+                attempt,
+            )
+        )
         try:
             with self.safety_write():
                 return await get_action_handler(action_type).dispatch(self, payload) or {}
@@ -311,10 +366,16 @@ class AquareaWrapper:
 
     async def stop(self) -> None:
         """Cleanup."""
-        if self._session:
-            await self._session.close()
-        if self._redis:
-            await self._redis.aclose()
+        session, client = self._session, self._redis
+        try:
+            if session:
+                await session.close()
+        finally:
+            if client:
+                await client.aclose()
+        self._session = self._redis = None
+        self._client = self._device = self._device_info = None
+        self._authenticated = False
 
     async def _authenticate(self) -> None:
         """Authenticate, respecting circuit breaker."""
@@ -548,7 +609,12 @@ class AquareaWrapper:
                 raise RuntimeError("Selected Panasonic device has no identity")
             return str(device_id)
 
-    async def refresh_device(self, *, quota_context: ReadQuotaContext | None = None):
+    async def refresh_device(
+        self,
+        *,
+        quota_context: ReadQuotaContext | None = None,
+        _safety_attempt: SafetyAttempt | None = None,
+    ):
         """Refresh device data using one logical Panasonic read token.
 
         Creating a device already fetches its current status. Avoid an
@@ -556,6 +622,9 @@ class AquareaWrapper:
         limiter tokens and duplicated the cloud request.
         """
         self._raise_if_adapter_backoff_active()
+        if _safety_attempt is not None:
+            _safety_attempt.assert_live()
+            await _safety_attempt.authority_check()
 
         if self._distributed_quota_enabled():
             starvation = self._quota_starvation.get(quota_context) if quota_context else None
@@ -565,11 +634,23 @@ class AquareaWrapper:
             reservation = await self._reserve_background_read(
                 ReadQuotaCategory.STATUS, quota_context=quota_context
             )
-            return await self._refresh_device_unreserved(reservation, quota_context=quota_context)
+            if _safety_attempt is not None:
+                await _safety_attempt.authority_check()
+            return await self._refresh_device_unreserved(
+                reservation, quota_context=quota_context, safety_attempt=_safety_attempt
+            )
 
         await self._read_limiter.acquire()
+        if _safety_attempt is not None:
+            await _safety_attempt.authority_check()
         return await self._refresh_device_unreserved(
-            ReadQuotaReservation("", ReadQuotaCategory.STATUS, 1, "local")
+            ReadQuotaReservation("", ReadQuotaCategory.STATUS, 1, "local"),
+            safety_attempt=_safety_attempt,
+        )
+
+    async def _refresh_restore_status(self, attempt: SafetyAttempt) -> RestoreStatusProof:
+        return await self.refresh_device(
+            quota_context=ReadQuotaContext.EXECUTOR_VERIFICATION, _safety_attempt=attempt
         )
 
     async def _refresh_device_unreserved(
@@ -577,7 +658,12 @@ class AquareaWrapper:
         reservation: ReadQuotaReservation | None,
         *,
         quota_context: ReadQuotaContext | None = None,
+        safety_attempt: SafetyAttempt | None = None,
     ):
+        if safety_attempt is not None:
+            await safety_attempt.authority_check()
+        read_started_at = dt.datetime.now(dt.timezone.utc)
+        started_monotonic = time.monotonic()
         async with self._device_lock:
             if reservation is not None:
                 self._assert_reservation_account(reservation)
@@ -586,8 +672,15 @@ class AquareaWrapper:
                     if starvation is not None:
                         self._record_quota_starvation_recovery(starvation)
             if self._device is None:
-                return await self._initialize_device_locked(reservation=reservation)
+                device = await self._initialize_device_locked(reservation=reservation)
+                return (
+                    self._restore_status_proof(device, read_started_at, started_monotonic)
+                    if safety_attempt is not None
+                    else device
+                )
             device = self._device
+        if safety_attempt is not None:
+            await safety_attempt.authority_check()
         try:
             await device.refresh_data(allow_cached_fallback=False)
         except DeviceUnavailableError as exc:
@@ -603,7 +696,25 @@ class AquareaWrapper:
                 retry_after_seconds=retry_after,
             ) from exc
         self._record_live_status(device)
-        return device
+        return (
+            self._restore_status_proof(device, read_started_at, started_monotonic)
+            if safety_attempt is not None
+            else device
+        )
+
+    @staticmethod
+    def _restore_status_proof(device, read_started_at, started_monotonic) -> RestoreStatusProof:
+        return RestoreStatusProof(
+            device=device,
+            device_id=str(getattr(device, "long_id", "")),
+            live=device.status_data_mode == StatusDataMode.LIVE,
+            read_started_at=read_started_at,
+            read_finished_at=dt.datetime.now(dt.timezone.utc),
+            started_monotonic=started_monotonic,
+            finished_monotonic=time.monotonic(),
+            observed_at=getattr(device, "status_observed_at", None),
+            retrieved_at=getattr(device, "status_retrieved_at", None),
+        )
 
     async def get_active_weekly_timer_slots(self, at: dt.datetime | None = None) -> tuple | None:
         """Cache one timer read per hour; None means unknown, not an empty program."""
@@ -633,11 +744,16 @@ class AquareaWrapper:
 
     def cached_native_timer_provenance(self) -> dict:
         timer = self._weekly_timer
+        as_of = dt.datetime.now(dt.timezone.utc)
+        monotonic_now = time.monotonic()
         if (
             timer is None
             or not isinstance(getattr(timer, "enabled", None), bool)
             or self._weekly_timer_fetched_at is None
-            or time.monotonic() - self._weekly_timer_fetched_at >= _WEEKLY_TIMER_CACHE_SECONDS
+            or self._weekly_timer_fetched_at > monotonic_now
+            or monotonic_now - self._weekly_timer_fetched_at >= _WEEKLY_TIMER_CACHE_SECONDS
+            or self._weekly_timer_fetched_wall_at is None
+            or _as_utc(self._weekly_timer_fetched_wall_at) > as_of
         ):
             return {"status": "unknown"}
         return {
@@ -782,6 +898,15 @@ class AquareaWrapper:
     def _record_live_status(self, device) -> None:
         try:
             self._require_live_status(device)
+            as_of = dt.datetime.now(dt.timezone.utc)
+            for value in (
+                getattr(device, "status_observed_at", None),
+                getattr(device, "status_retrieved_at", None),
+            ):
+                if value is not None and (
+                    not isinstance(value, dt.datetime) or _as_utc(value) > as_of
+                ):
+                    raise PanasonicCachedStatusError(reason="inadmissible_status_clock")
         except PanasonicCachedStatusError as exc:
             self._last_live_status_at = None
             device_id = getattr(device, "long_id", None) or getattr(
@@ -843,9 +968,13 @@ class AquareaWrapper:
 
         if (
             self._last_live_status_at is None
+            or self._last_live_status_at > time.monotonic()
             or time.monotonic() - self._last_live_status_at > _COMMAND_STATUS_MAX_AGE_SECONDS
         ):
             device = await self.refresh_device()
+        self._require_write_permission()
+        if getattr(device, "long_id", None) != self.__restore_command.get().device_id:
+            raise PermissionError("Restore device identity changed during live preflight")
         return device
 
     def _require_write_permission(self, command: str | None = None, values: tuple = ()) -> None:
@@ -856,13 +985,26 @@ class AquareaWrapper:
         permit = self.__restore_command.get()
         if (
             permit is None
-            or permit[0] is not asyncio.current_task()
-            or (command is not None and permit[1:] != (command, values))
+            or permit.task is not asyncio.current_task()
+            or (command is not None and (permit.command, permit.values) != (command, values))
         ):
             raise PermissionError(
                 "Ordinary writes are prohibited in this observe-only build; "
                 "optimization requires a new reviewed, approved build"
             )
+        permit.owner.assert_dispatchable(permit.action)
+        if (
+            permit.source_id != permit.owner.source_id
+            or permit.device_id != permit.owner.device_id
+            or permit.claim_token != permit.owner.token
+        ):
+            raise PermissionError("Restore permit scope is no longer current")
+
+    async def _before_restore_io(self) -> None:
+        self._require_write_permission()
+        permit = self.__restore_command.get()
+        await permit.owner.authority_check()
+        self._require_write_permission()
 
     async def _prepare_write(self):
         """Reserve write capacity without letting the live preflight go stale."""
@@ -957,6 +1099,7 @@ class AquareaWrapper:
             logger.info("Force DHW became %s while waiting; skipping write", state)
             return False
 
+        await self._before_restore_io()
         result = await device.set_force_dhw(state)
         logger.info("Set force DHW to %s", state)
         return result if command_result_type and isinstance(result, command_result_type) else True
@@ -1013,6 +1156,7 @@ class AquareaWrapper:
             )
             return
 
+        await self._before_restore_io()
         await device.set_temperature(temperature, zone_id=resolved_zone_id)
         logger.info("Set zone %s heat target to %sC", resolved_zone_id, temperature)
 

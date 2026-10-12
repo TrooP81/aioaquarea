@@ -861,9 +861,19 @@ class TestCOPRetirementLifecycle:
         with (
             patch.object(
                 seasonal_learning,
-                "get_seasonal_calibration_status",
-                new=AsyncMock(side_effect=[status, {**status, "observe_only_active": False}]),
+                "_transition_seasonal_campaign",
+                new=AsyncMock(return_value=status),
             ) as read_status,
+            patch.object(
+                seasonal_learning,
+                "get_seasonal_calibration_progress",
+                new=AsyncMock(
+                    return_value={
+                        "demand": {"trained": False},
+                        "indoor_heating": {"samples": 64, "remaining_samples": 0},
+                    }
+                ),
+            ),
             patch.object(seasonal_learning, "get_bool_setting", new=AsyncMock(return_value=True)),
             patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
             patch.object(seasonal_learning, "set_settings_bulk", new=AsyncMock()) as save_settings,
@@ -897,8 +907,8 @@ class TestCOPRetirementLifecycle:
             result = await seasonal_learning.run_seasonal_calibration_cycle()
 
         demand.training_data_quality.assert_awaited_once_with()
-        demand.arefresh_committed.assert_awaited_once_with()
-        thermal.arefresh_if_changed.assert_awaited_once_with()
+        demand.arefresh_committed.assert_not_awaited()
+        thermal.arefresh_if_changed.assert_not_awaited()
         thermal.calibrate.assert_not_awaited()
         assert result["demand"]["minimum_samples"] == 168
         assert result["demand"]["usable_samples"] == usable_samples
@@ -1235,6 +1245,91 @@ class TestDemandModel:
         with pytest.raises(asyncio.CancelledError):
             await task
         factory.assert_not_called()
+        assert asyncio.get_running_loop() not in demand._PREPARATION_FLIGHTS
+
+    async def test_R12_same_key_request_during_cancelled_session_cleanup_is_independent(
+        self, monkeypatch
+    ):
+        from contextlib import asynccontextmanager
+
+        from packages.ml import demand_model_core as demand
+
+        entered = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        sessions = []
+
+        @asynccontextmanager
+        async def session_factory():
+            sessions.append(True)
+            current = len(sessions)
+
+            async def execute(_statement):
+                if current == 1:
+                    entered.set()
+                    await asyncio.Future()
+                return _FakeResult([])
+
+            try:
+                yield SimpleNamespace(execute=execute)
+            finally:
+                if current == 1:
+                    cleanup_entered.set()
+                    await release_cleanup.wait()
+
+        monkeypatch.setattr(demand, "get_session", session_factory)
+        monkeypatch.setattr(demand, "get_user_tz", AsyncMock(return_value="UTC"))
+        first = asyncio.create_task(demand.DemandModel().training_data_quality())
+        second = None
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            first.cancel()
+            await asyncio.wait_for(cleanup_entered.wait(), 2)
+            flight = demand._PREPARATION_FLIGHTS[asyncio.get_running_loop()][1]
+            assert not first.done() and not flight.task.done()
+            second = asyncio.create_task(demand.DemandModel().training_data_quality())
+            result = await asyncio.wait_for(asyncio.shield(second), 2)
+            assert second.cancelling() == 0
+            assert result["training_blocker"] == "preparation_busy"
+            assert result["ready_to_train"] is False
+            assert len(sessions) == 1
+            assert demand._PREPARATION_FLIGHTS[asyncio.get_running_loop()][1] is flight
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            recovered = await demand.DemandModel().training_data_quality()
+            assert recovered["training_blocker"] != "preparation_busy"
+            assert len(sessions) == 2
+        finally:
+            release_cleanup.set()
+            for task in (first, second):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (first, second) if task is not None), return_exceptions=True
+            )
+        assert asyncio.get_running_loop() not in demand._PREPARATION_FLIGHTS
+
+    async def test_R12_shared_preparation_exception_is_propagated_without_leak(self, monkeypatch):
+        from packages.ml import demand_model_core as demand
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        error = ValueError("s2 materialization failed")
+
+        async def materialize(_self, **_kwargs):
+            entered.set()
+            await release.wait()
+            raise error
+
+        monkeypatch.setattr(demand.DemandModel, "_materialize_prepared", materialize)
+        first = asyncio.create_task(demand.DemandModel()._prepare_data())
+        await entered.wait()
+        second = asyncio.create_task(demand.DemandModel()._prepare_data())
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert results == [error, error]
+        assert first.cancelling() == second.cancelling() == 0
         assert asyncio.get_running_loop() not in demand._PREPARATION_FLIGHTS
 
     async def test_incompatible_preparation_is_busy_without_materializing(self, monkeypatch):

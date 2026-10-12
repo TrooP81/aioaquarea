@@ -18,7 +18,6 @@ from packages.core.models import (
 from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.device_data_quality import get_device_data_quality
-from packages.core.pricing import get_active_price_context
 from packages.core.services import AquareaWrapper
 from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.core.settings_service import get_setting
@@ -56,7 +55,16 @@ def _validate_unique_restore_keys(restore_actions: list[dict]) -> None:
         seen_revert_keys.add(reverts_action_key)
 
 
-def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, object], ...]]:
+def _action_instant(value: str | dt.datetime) -> dt.datetime:
+    instant = dt.datetime.fromisoformat(value) if isinstance(value, str) else value
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(dt.timezone.utc)
+
+
+def _planned_action_signature(
+    action: dict,
+) -> tuple[str, dt.datetime, tuple[tuple[str, object], ...]]:
     """Compare only device-relevant action fields, not changing explanations."""
     payload = action.get("payload") or {}
     relevant = tuple(
@@ -66,12 +74,12 @@ def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, 
             if key in payload
         )
     )
-    return str(action["type"]), str(action["ts"]), relevant
+    return str(action["type"]), _action_instant(action["ts"]), relevant
 
 
 def _stored_action_signature(
     action: PlanActionRecord,
-) -> tuple[str, str, tuple[tuple[str, object], ...]]:
+) -> tuple[str, dt.datetime, tuple[tuple[str, object], ...]]:
     payload = json.loads(action.payload_json) if action.payload_json else {}
     relevant = tuple(
         sorted(
@@ -80,7 +88,7 @@ def _stored_action_signature(
             if key in payload
         )
     )
-    return str(action.action_type), action.scheduled_ts.isoformat(), relevant
+    return str(action.action_type), _action_instant(action.scheduled_ts), relevant
 
 
 async def _has_material_near_term_change(session, plan: dict) -> tuple[bool, int | None]:
@@ -161,8 +169,33 @@ def _selected_layer_version(layer_name: str) -> str:
 async def get_optimizer_status_snapshot(
     layer: str,
     reload_models: bool = False,
+    *,
+    reporting_inputs: dict | None = None,
 ) -> dict[str, object]:
     """Return the selected layer and loaded model state for the given configuration."""
+    if reporting_inputs is not None:
+        layer_name = "milp" if layer == "milp_preferred" else "rules"
+        demand_trained = bool(reporting_inputs.get("demand_trained"))
+        return {
+            "active_layer": f"{MILPOptimizer.VERSION}+ml"
+            if layer_name == "milp" and demand_trained
+            else MILPOptimizer.VERSION
+            if layer_name == "milp"
+            else RulesOptimizer.VERSION,
+            "ordinary_writes_allowed": False,
+            "control_ready": False,
+            "build_policy": "observe_only",
+            "configured_layer": layer,
+            "effective_layer": layer_name,
+            "selection_reason": "auto_milp_disabled_cop_retired"
+            if layer == "auto"
+            else "configured_layer",
+            "cop_trained": False,
+            "cop_source": "assumed",
+            "cop_measured": False,
+            "demand_trained": demand_trained,
+            "planning_data_quality": reporting_inputs.get("planning_data_quality"),
+        }
     layer_name, _ = await _select_optimizer(layer, reload_models=reload_models)
     try:
         planning_data_quality = await get_planning_data_quality()
@@ -242,6 +275,8 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
 
     # Serialize scheduled and queued diagnostic generation within this process.
     async with _optimization_lock:
+        if scheduled and _time.monotonic() - _last_plan_generated_at < _OPTIMIZATION_COOLDOWN_S:
+            return None
         try:
             learning_mode_state = await resolve_learning_mode_state()
         except asyncio.CancelledError:
@@ -277,44 +312,6 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 )
                 return None
 
-            # Rules are deliberately kept available as the conservative
-            # fallback.  The richer ML/MILP plan needs a complete, fresh
-            # forecast and price horizon; without it, rules can still make a
-            # safe schedule from their own defensive data checks.
-            if layer_name == "milp":
-                try:
-                    input_quality = await get_planning_data_quality()
-                except Exception as exc:  # noqa: BLE001 - readiness failures must block control
-                    logger.error(
-                        "optimization_paused_planning_data_quality_check_failed",
-                        reason="quality_check_failed",
-                        error_type=type(exc).__name__,
-                    )
-                    input_quality = {
-                        "control_allowed": False,
-                        "status": "unavailable",
-                        "reasons": ["quality_check_failed"],
-                        "price": {},
-                        "weather": {},
-                    }
-            else:
-                input_quality = {
-                    "control_allowed": True,
-                    "status": "rules_not_gated",
-                    "reasons": [],
-                    "price": {},
-                    "weather": {},
-                }
-
-            if layer_name == "milp" and not input_quality["control_allowed"]:
-                logger.warning(
-                    "optimization_paused_degraded_input_data",
-                    reasons=input_quality["reasons"],
-                    price=input_quality["price"],
-                    weather=input_quality["weather"],
-                )
-                return None
-
             logger.info("optimization_starting", configured_layer=layer, selected=layer_name)
 
             plan = None
@@ -328,6 +325,13 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                         detail=str(exc),
                     )
                     plan = await _new_rules_optimizer().generate_plan()
+                    if plan is not None:
+                        plan["fallback_diagnostics"] = {
+                            "milp_status": "conditional_infeasible"
+                            if isinstance(exc, InfeasibleError)
+                            else "unproven",
+                            "reason": type(exc).__name__,
+                        }
                 except Exception as exc:
                     logger.error(
                         "milp_unexpected_error_fallback",
@@ -341,10 +345,18 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 logger.info("optimizer_no_plan", reason="insufficient data")
                 return None
 
-            # The active context opens its own short-lived read session. Fetch
-            # it before the lifecycle transaction so no nested DB session is
-            # held while a plan is being activated.
-            price_context = await get_active_price_context()
+            from packages.core.pricing import PriceContext
+
+            input_quality = plan.get("planning_data_quality")
+            if not isinstance(input_quality, dict) or not input_quality.get("control_allowed"):
+                logger.info("optimizer_no_plan", reason="unvalidated_frozen_input_batch")
+                return None
+            price_input = input_quality["price"]
+            price_context = PriceContext(
+                area=price_input["area"],
+                source=price_input["source"],
+                currency=price_input["currency"],
+            )
             generated_at = dt.datetime.now(dt.timezone.utc)
             provenance = {
                 "schema_version": 1,
@@ -401,6 +413,15 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 )
             plan["actions"] = []
             plan["diagnostic"] = True
+            trace = plan.get("represented_strategy")
+            if isinstance(trace, dict):
+                trace["price_currency"] = price_context.currency
+            replay = plan.get("serialized_replay")
+            if isinstance(replay, dict):
+                replay["price_currency"] = price_context.currency
+            accounting = plan.get("cost_accounting")
+            if isinstance(accounting, dict):
+                accounting["price_currency"] = price_context.currency
             provenance["execution_policy"] = "observe_only_build"
             async with get_session() as session:
                 plan_record = PlanRecord(
@@ -587,14 +608,17 @@ async def _shutdown_runtime(scheduler, wrapper: AquareaWrapper) -> None:
                     pending=len(still_pending),
                     timeout_seconds=_EXECUTOR_SHUTDOWN_WAIT_S,
                 )
+                raise RuntimeError("executor ownership unsettled; wrapper disposal forbidden")
 
-            for task in pending:
+            for task in done:
                 _executor_shutdown_tasks.discard(task)
-    finally:
+    except BaseException:
+        raise
+    else:
         await wrapper.stop()
 
 
-async def main() -> None:
+async def _run_service(wrapper, scheduler) -> None:
     """Main entry point for the optimizer service."""
     from packages.core.logging import configure_logging
     from packages.core.service_health import record_service_heartbeat
@@ -637,10 +661,8 @@ async def main() -> None:
             )
             logger.info("comfort_model_initial_maintenance_requested", request=comfort_result)
 
-    wrapper = AquareaWrapper()
     await wrapper.start()
 
-    scheduler = create_scheduler()
     await record_service_heartbeat("optimizer")
 
     async def _scheduled_optimization():
@@ -704,9 +726,22 @@ async def main() -> None:
         await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
+
+
+async def main() -> None:
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+
+    wrapper, scheduler = None, None
+    try:
+        wrapper = AquareaWrapper()
+        scheduler = create_scheduler()
+        await _run_service(wrapper, scheduler)
     finally:
-        await _shutdown_runtime(scheduler, wrapper)
-        logger.info("optimizer_stopped")
+
+        async def cleanup():
+            await close_service_resources(scheduler=scheduler, wrapper=wrapper)
+
+        await finish_owned_cleanup(cleanup)
 
 
 if __name__ == "__main__":

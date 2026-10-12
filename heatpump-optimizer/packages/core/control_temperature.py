@@ -133,6 +133,7 @@ async def get_control_temperature(
         select(IndoorTempReading)
         .where(
             IndoorTempReading.timestamp >= cutoff,
+            IndoorTempReading.timestamp <= now,
             IndoorTempReading.is_stale.is_(False),
         )
         .order_by(IndoorTempReading.timestamp.desc(), IndoorTempReading.id.desc())

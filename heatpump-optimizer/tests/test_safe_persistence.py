@@ -655,6 +655,18 @@ async def test_bounded_orphan_cursor_advances_past_protected_files(
     for path in paths:
         path.write_bytes(b"local test orphan")
         os.utime(path, (old, old))
+    original_scandir = os.scandir
+
+    def ordered_entries():
+        with original_scandir(artifact_directory) as entries:
+            yield from sorted(entries, key=lambda entry: entry.name)
+
+    def scandir(directory):
+        if directory == artifact_directory or directory == str(artifact_directory):
+            return ordered_entries()
+        return original_scandir(directory)
+
+    monkeypatch.setattr(module.os, "scandir", scandir)
     snapshot = lifecycle_state[0]
     sessions = PublicationSessions()
 

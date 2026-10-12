@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from dataclasses import replace
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models import DeviceStatusRecord, SpaceHeatingGateRecord
+from packages.core.device_data_quality import _as_utc, device_status_clock_issue
 from packages.core.settings_service import get_space_heating_gate_config
 from packages.core.space_heating_gate import GateEvidence, SpaceHeatingGateState, transition_gate
 
@@ -18,8 +20,11 @@ def _device_lock_key(device_id: str) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
-async def ingest_device_status(session: AsyncSession, record: DeviceStatusRecord) -> GateEvidence:
+async def ingest_device_status(
+    session: AsyncSession, record: DeviceStatusRecord, *, now: dt.datetime | None = None
+) -> GateEvidence:
     """Add a status and its raw-sensor gate transition in one DB transaction."""
+    now = _as_utc(now) or dt.datetime.now(dt.timezone.utc)
     config = await get_space_heating_gate_config()
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:key)"), {"key": _device_lock_key(record.device_id)}
@@ -38,8 +43,12 @@ async def ingest_device_status(session: AsyncSession, record: DeviceStatusRecord
         if row is not None and row.config_fingerprint == config.fingerprint
         else SpaceHeatingGateState.UNKNOWN
     )
-    evidence = transition_gate(previous_state, record.heat_pump_outdoor_temp, config)
-    now = dt.datetime.now(dt.timezone.utc)
+    clock_issue = device_status_clock_issue(record, as_of=now)
+    evidence = transition_gate(
+        previous_state, None if clock_issue else record.heat_pump_outdoor_temp, config
+    )
+    if clock_issue:
+        evidence = replace(evidence, reason_code=clock_issue)
     if row is None:
         row = SpaceHeatingGateRecord(device_id=record.device_id)
         session.add(row)

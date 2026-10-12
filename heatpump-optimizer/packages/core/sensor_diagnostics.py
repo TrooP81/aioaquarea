@@ -12,6 +12,12 @@ STALE_AFTER = dt.timedelta(minutes=15)
 MIN_SAMPLES_FOR_SHADOW = 24
 
 
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
 def summarize_sensor_diagnostics(
     rows: Iterable[Any], *, reference_sensor_id: str = "", now: dt.datetime | None = None
 ) -> dict[str, Any]:
@@ -22,9 +28,7 @@ def summarize_sensor_diagnostics(
     It only surfaces cadence, staleness and broad cross-room spread as a
     shadow diagnostic for the user to review.
     """
-    now = now or dt.datetime.now(dt.timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=dt.timezone.utc)
+    now = _as_utc(now or dt.datetime.now(dt.timezone.utc))
     grouped: dict[str, list[Any]] = defaultdict(list)
     for row in rows:
         grouped[str(row.device_id)].append(row)
@@ -32,13 +36,14 @@ def summarize_sensor_diagnostics(
     sensors: list[dict[str, Any]] = []
     medians: list[float] = []
     for device_id, readings in grouped.items():
-        readings.sort(key=lambda row: row.timestamp)
-        fresh = [row for row in readings if not bool(row.is_stale)]
+        readings.sort(key=lambda row: _as_utc(row.timestamp))
+        fresh = [
+            row for row in readings if not bool(row.is_stale) and _as_utc(row.timestamp) <= now
+        ]
         latest = readings[-1]
-        latest_ts = latest.timestamp
-        if latest_ts.tzinfo is None:
-            latest_ts = latest_ts.replace(tzinfo=dt.timezone.utc)
-        age_seconds = max(0, round((now - latest_ts).total_seconds()))
+        latest_ts = _as_utc(latest.timestamp)
+        future = latest_ts > now
+        age_seconds = round((now - latest_ts).total_seconds()) if not future else None
         temperatures = [float(row.temperature) for row in fresh]
         median = round(float(statistics.median(temperatures)), 2) if temperatures else None
         if median is not None:
@@ -49,7 +54,10 @@ def summarize_sensor_diagnostics(
         if not fresh:
             state = "no_fresh_data"
             reasons.append("no_fresh_readings")
-        elif age_seconds > STALE_AFTER.total_seconds():
+        elif future:
+            state = "future_clock"
+            reasons.append("latest_reading_future")
+        elif age_seconds is not None and age_seconds > STALE_AFTER.total_seconds():
             state = "stale"
             reasons.append("latest_reading_stale")
         elif len(fresh) < MIN_SAMPLES_FOR_SHADOW:
@@ -88,7 +96,11 @@ def summarize_sensor_diagnostics(
         (
             item
             for item in sorted(
-                sensors, key=lambda item: (-item["fresh_samples"], item["age_seconds"])
+                sensors,
+                key=lambda item: (
+                    -item["fresh_samples"],
+                    item["age_seconds"] if item["age_seconds"] is not None else float("inf"),
+                ),
             )
             if item["state"] == "healthy"
         ),

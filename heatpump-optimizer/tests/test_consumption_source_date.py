@@ -60,6 +60,88 @@ def test_cumulative_intervals_accepts_reset_on_new_source_date() -> None:
     assert cumulative_intervals(records) == [(dt.datetime(2026, 7, 15, 22, 5, tzinfo=UTC), 0.2)]
 
 
+def test_R14_source_day_precedes_counter_magnitude_and_devices_are_independent():
+    records = [
+        SimpleNamespace(
+            **vars(_record(dt.datetime(2026, 7, 15, 22, tzinfo=UTC), 1.0, dt.date(2026, 7, 15))),
+            device_id="a",
+        ),
+        SimpleNamespace(
+            **vars(_record(dt.datetime(2026, 7, 15, 22, tzinfo=UTC), 100.0, dt.date(2026, 7, 15))),
+            device_id="b",
+        ),
+        SimpleNamespace(
+            **vars(_record(dt.datetime(2026, 7, 15, 23, tzinfo=UTC), 2.0, dt.date(2026, 7, 16))),
+            device_id="a",
+        ),
+        SimpleNamespace(
+            **vars(_record(dt.datetime(2026, 7, 15, 23, tzinfo=UTC), 101.0, dt.date(2026, 7, 15))),
+            device_id="b",
+        ),
+    ]
+    assert sum(kwh for _, kwh in cumulative_intervals(records)) == 3.0
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_R14_first_unknown_counter_does_not_invent_energy(confirmed):
+    from packages.ml.models_common import iter_counter_change_intervals
+
+    start = dt.datetime(2026, 10, 12, 8, tzinfo=UTC)
+    rows = [
+        SimpleNamespace(
+            device_id="a",
+            ts=start + dt.timedelta(minutes=15 * index),
+            heat_kwh=value,
+            source_date=start.date(),
+            source_timezone="UTC",
+        )
+        for index, value in enumerate((None, 2.0, 2.5, 2.5))
+    ]
+    intervals = list(
+        iter_counter_change_intervals(rows, "heat_kwh", ZoneInfo("UTC"), confirm_changes=confirmed)
+    )
+    assert len(intervals) == 1
+    assert intervals[0].energy_kwh == 0.5
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("source_day", [dt.date(2026, 3, 29), dt.date(2026, 10, 25)])
+def test_R14_recorded_source_timezone_controls_reset_boundary(confirmed, source_day):
+    from packages.ml.models_common import iter_counter_change_intervals
+
+    zone = ZoneInfo("Europe/Stockholm")
+    boundary = dt.datetime.combine(source_day, dt.time.min, tzinfo=zone).astimezone(UTC)
+    rows = [
+        SimpleNamespace(
+            device_id="a",
+            ts=boundary - dt.timedelta(minutes=10),
+            heat_kwh=1.0,
+            source_date=source_day - dt.timedelta(days=1),
+            source_timezone="Europe/Stockholm",
+        ),
+        SimpleNamespace(
+            device_id="a",
+            ts=boundary + dt.timedelta(minutes=10),
+            heat_kwh=2.0,
+            source_date=source_day,
+            source_timezone="Europe/Stockholm",
+        ),
+        SimpleNamespace(
+            device_id="a",
+            ts=boundary + dt.timedelta(minutes=20),
+            heat_kwh=2.0,
+            source_date=source_day,
+            source_timezone="Europe/Stockholm",
+        ),
+    ]
+    intervals = list(
+        iter_counter_change_intervals(rows, "heat_kwh", zone, confirm_changes=confirmed)
+    )
+    assert len(intervals) == 1
+    assert intervals[0].start_ts == boundary
+    assert intervals[0].energy_kwh == 2.0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("instant", "expected_date", "expected_month"),

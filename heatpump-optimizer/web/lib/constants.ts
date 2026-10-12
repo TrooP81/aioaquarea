@@ -184,6 +184,7 @@ export function reasonLabel(code: string | null | undefined): string {
     comfort_at_risk: "Comfort risk forecast",
     new_plans_paused: "New plans paused",
     control_state_unavailable: "Control state unavailable",
+    readiness_unavailable: "Readiness unavailable",
   });
 }
 

@@ -1,4 +1,81 @@
-import { controlState, defaultBody, demandDataQuality, expect, manualCOPObservation, manualCOPResponse, modelLifecycleStatus, retiredCopModel, test, type Page } from "./fixtures";
+import { controlState, defaultBody, demandDataQuality, expect, manualCOPObservation, manualCOPResponse, modelLifecycleStatus, readinessOptimizerStatus, retiredCopModel, test, type Page } from "./fixtures";
+
+test.describe("Localized readiness", () => {
+    test("SR-2 UR5 390-positive-indoor-no-qualified-unknown-maintenance", async ({ page }, testInfo) => {
+        const mutations: string[] = [];
+        page.on("request", (request) => {
+            if (request.method() !== "GET" && new URL(request.url()).pathname.startsWith("/api/")) mutations.push(request.url());
+        });
+        await page.route("**/api/optimizer/status", (route) => route.fulfill({
+            contentType: "application/json", body: JSON.stringify(readinessOptimizerStatus()),
+        }));
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+        const summary = page.getByTestId("seasonal-reporting-summary");
+        await expect(summary).toContainText("Demand evidence: 390/168 total milestone");
+        await expect(page.getByTestId("readiness-demand")).toContainText("Total: 390; Train: 308/168; Holdout: 78/24");
+        await expect(page.getByTestId("readiness-demand")).toContainText("Awaiting fit or validation.");
+        const indoor = page.getByTestId("readiness-indoor_heating");
+        await expect(indoor).toContainText("Total: 64; Train: 28/20; Holdout: 20/3");
+        await expect(indoor).toContainText("Fit: Validated");
+        await expect(indoor).toContainText("Native outcomes: 48; Missing: 12");
+        await expect(indoor).toContainText("Awaiting prospective reporting qualification.");
+        await expect(summary).not.toContainText("0/20");
+        await expect(summary).toContainText("Model maintenance status is unknown.");
+        await expect(summary).toContainText("Maintenance preference: unknown.");
+        await expect(summary).not.toContainText("Automatic maintenance is selected");
+        await expect(page.getByTestId("lifecycle-thermal")).toHaveAttribute("data-reporting-state", "candidate");
+        expect(mutations).toEqual([]);
+        expect(await summary.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath("sr-390-positive.png"), fullPage: true });
+    });
+
+    test("SR-4 UR5 unknown collection has no fabricated zero progress", async ({ page }, testInfo) => {
+        await page.route("**/api/optimizer/status", (route) => route.fulfill({
+            contentType: "application/json", body: JSON.stringify(readinessOptimizerStatus({ available: false })),
+        }));
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+        const summary = page.getByTestId("seasonal-reporting-summary");
+        await expect(page.getByTestId("readiness-indoor_heating")).toContainText("Total: Unknown; Train: Unknown/20; Holdout: Unknown/3");
+        await expect(summary.locator("progress")).toHaveCount(0);
+        await expect(summary).not.toContainText("0/20");
+        await expect(summary).toContainText("Queued: Unknown; Running: Unknown; Phase: Unknown");
+        await expect(summary).toContainText("Last attempt: Unknown; Next due: Unknown");
+        await expect(page.getByText("Unrecognized status (readiness_unavailable)", { exact: false })).toHaveCount(0);
+        expect(await summary.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath("sr-unknown-progress.png"), fullPage: true });
+    });
+
+    test("SR-4 UR5 nullable thresholds and snapshot context remain unknown", async ({ page }, testInfo) => {
+        const fixture = readinessOptimizerStatus();
+        const readiness = fixture.seasonal_calibration.readiness;
+        readiness.as_of = readiness.generation = readiness.context_digest = null;
+        readiness.source_watermarks = {};
+        for (const stage of Object.values(readiness.components)) {
+            stage.collection.minimum_train = stage.collection.minimum_holdout = null;
+            stage.collection.remaining_train = stage.collection.remaining_holdout = null;
+            stage.next_step = "readiness_unavailable";
+        }
+        await page.route("**/api/optimizer/status", (route) => route.fulfill({
+            contentType: "application/json", body: JSON.stringify(fixture),
+        }));
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+        const summary = page.getByTestId("seasonal-reporting-summary");
+        await expect(summary).toContainText("As of: Unknown; Generation: Unknown; Context: Unknown");
+        await expect(page.getByTestId("readiness-demand")).toContainText("Demand evidence: 390/Unknown total milestone");
+        await expect(page.getByTestId("readiness-indoor_heating")).toContainText("Total: 64; Train: 28/Unknown; Holdout: 20/Unknown");
+        await expect(summary.locator("progress")).toHaveCount(0);
+        await expect(summary).not.toContainText("NaN");
+        await expect(summary).toContainText("Readiness unavailable.");
+        expect(await summary.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath("sr-null-threshold-context.png"), fullPage: true });
+    });
+});
 
 interface ManualLedgerState {
     rows: ReturnType<typeof manualCOPObservation>[];
@@ -485,6 +562,65 @@ async function mockOptimizerStatus(page: import("@playwright/test").Page, status
         route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(status) }),
     );
 }
+
+test.describe("Live pump status freshness", () => {
+    const cases = [
+        {
+            name: "fresh",
+            dataFreshness: {
+                latest_device_status: "2026-10-10T11:59:30+00:00",
+                age_seconds: 30,
+                stale_after_seconds: 900,
+                fresh: true,
+            },
+            ageText: "Updated just now",
+        },
+        {
+            name: "stale",
+            dataFreshness: {
+                latest_device_status: "2026-10-10T11:30:00+00:00",
+                age_seconds: 1800,
+                stale_after_seconds: 900,
+                fresh: false,
+            },
+            ageText: "Updated 30 minutes ago",
+        },
+        {
+            name: "missing",
+            dataFreshness: {
+                latest_device_status: null,
+                age_seconds: null,
+                stale_after_seconds: 900,
+                fresh: false,
+            },
+            ageText: "Unavailable",
+        },
+        { name: "omitted", dataFreshness: undefined, ageText: "Unavailable" },
+    ] as const;
+
+    for (const { name, dataFreshness, ageText } of cases) {
+        test(`renders ${name} persisted status without changing warning policy`, async ({ page }) => {
+            await page.clock.setFixedTime(new Date("2026-10-10T12:00:00Z"));
+            await mockOptimizerStatus(page, { ...statusWithFreshData, data_freshness: dataFreshness });
+            await page.goto("/?view=under-the-hood");
+            await page.getByRole("button", { name: "Show diagnostics" }).click();
+            const decisionEngine = page.getByRole("heading", { name: "Decision engine details" }).locator("..");
+            const liveStatus = decisionEngine.locator("p").filter({ hasText: "Live pump status:" });
+
+            await expect(liveStatus).toBeVisible();
+            await expect(liveStatus.locator(".data-age")).toHaveText(ageText);
+            if (dataFreshness?.fresh) {
+                await expect(liveStatus).not.toContainText("restore preconditions may be unavailable");
+                await expect(liveStatus).not.toHaveClass(/text-warning/);
+                await expect(liveStatus.locator(".data-age--stale")).toHaveCount(0);
+            } else {
+                await expect(liveStatus).toContainText("restore preconditions may be unavailable");
+                await expect(liveStatus).toHaveClass(/text-warning/);
+                await expect(liveStatus.locator(".data-age--stale")).toHaveCount(1);
+            }
+        });
+    }
+});
 
 test.describe("Models status split", () => {
     test("keeps diagnostics collapsed with an accessible keyboard disclosure", async ({ page }) => {

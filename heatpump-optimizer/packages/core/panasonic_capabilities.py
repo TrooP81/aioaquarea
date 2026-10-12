@@ -111,8 +111,9 @@ def build_panasonic_capabilities(
         return {
             "integration_supported": True,
             "device_supported": device_supported,
-            "available": commands_allowed and device_supported is True,
-            "policy": policy,
+            "available": commands_allowed and device_supported is True and policy == "manual_only",
+            "policy": "observe_only_build" if policy == "automatic_with_plan" else policy,
+            "ordinary_automation_allowed": False,
             "values": values or [],
         }
 
@@ -127,9 +128,7 @@ def build_panasonic_capabilities(
         "observed_range": tank_temperature_limits,
         "whole_degrees_only": True,
     }
-    tank_temperature_command["available"] = (
-        commands_allowed and has_tank is True and tank_temperature_limits is not None
-    )
+    tank_temperature_command["available"] = False
     zone_temperature_command = command(
         policy="automatic_with_plan",
         values=zones,
@@ -139,7 +138,7 @@ def build_panasonic_capabilities(
         "observed_ranges": zone_ranges,
         "whole_degrees_only": True,
     }
-    zone_temperature_command["available"] = commands_allowed and bool(zones) and bool(zone_ranges)
+    zone_temperature_command["available"] = False
     special_status_supported = (
         getattr(latest_status, "special_status_supported", None) if observed_device else None
     )
@@ -153,6 +152,8 @@ def build_panasonic_capabilities(
         },
         "availability": {
             "commands_allowed": commands_allowed,
+            "ordinary_automation_allowed": False,
+            "execution_policy": "observe_only_build",
             "reason": reason,
             "last_live_status_at": status_at.isoformat() if status_at else None,
             "poller_heartbeat_at": heartbeat_at.isoformat() if heartbeat_at else None,

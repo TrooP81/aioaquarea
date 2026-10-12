@@ -21,20 +21,35 @@ class LearningStateSnapshot:
         return self.manual_enabled or self.seasonal_active
 
 
-async def get_learning_state() -> LearningStateSnapshot:
+async def get_learning_state(
+    *, context=None, materialized=None, session=None
+) -> LearningStateSnapshot:
     """Read manual and seasonal observe-only state without changing it."""
 
-    snapshot, _ = await get_learning_state_details()
+    snapshot, _ = await get_learning_state_details(
+        context=context, materialized=materialized, session=session
+    )
     return snapshot
 
 
-async def get_learning_state_details() -> tuple[LearningStateSnapshot, dict[str, Any]]:
+async def get_learning_state_details(
+    *, context=None, materialized=None, session=None
+) -> tuple[LearningStateSnapshot, dict[str, Any]]:
     """Read learning sources and retain seasonal detail for the API response."""
 
     try:
-        from packages.core.settings_service import get_bool_setting
+        from packages.core.settings_service import SETTING_SPECS, get_bool_setting
 
-        manual_enabled = await get_bool_setting("learning_mode_enabled")
+        if context is not None:
+            manual_enabled = bool(
+                SETTING_SPECS["learning_mode_enabled"].parse(
+                    context["settings"]["learning_mode_enabled"]
+                )
+            )
+        elif session is not None:
+            manual_enabled = await get_bool_setting("learning_mode_enabled", session=session)
+        else:
+            manual_enabled = await get_bool_setting("learning_mode_enabled")
         if manual_enabled:
             return LearningStateSnapshot(True, False, True), {}
     except Exception as exc:  # noqa: BLE001 - callers must fail closed on incomplete state
@@ -46,7 +61,15 @@ async def get_learning_state_details() -> tuple[LearningStateSnapshot, dict[str,
     try:
         from packages.ml.seasonal_learning import get_seasonal_calibration_status
 
-        seasonal = await get_seasonal_calibration_status()
+        if context is None and materialized is None and session is None:
+            seasonal = await get_seasonal_calibration_status()
+        else:
+            seasonal = await get_seasonal_calibration_status(
+                now=context.get("as_of") if context else None,
+                context=context,
+                materialized=materialized,
+                session=session,
+            )
         return (
             LearningStateSnapshot(
                 manual_enabled=manual_enabled,

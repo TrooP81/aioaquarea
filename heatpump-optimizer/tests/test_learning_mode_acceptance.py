@@ -25,6 +25,83 @@ class _AsyncContext:
         return False
 
 
+@pytest.mark.parametrize("case", ["cold", "restore", "warming", "optout", "lock_timeout"])
+async def test_UR4_SR3_cycle_atomic_latch_and_precedence(case):
+    from packages.core.settings_service import SETTING_SPECS
+
+    now = dt.datetime(2026, 10, 11, 12, tzinfo=dt.timezone.utc)
+    values = {key: spec.serialize_default() for key, spec in SETTING_SPECS.items()}
+    values["seasonal_calibration_enabled"] = "true"
+    values["seasonal_calibration_max_outdoor_c"] = "12"
+    values["seasonal_calibration_window_days"] = "7"
+    evidence = {
+        "average_outdoor": 5.0,
+        "outdoor_readings": 24,
+        "open_revert_obligations": {"count": 0},
+    }
+    if case == "warming":
+        values["_seasonal_calibration_campaign_since"] = (now - dt.timedelta(days=2)).isoformat()
+        evidence["average_outdoor"] = 18.0
+    session = AsyncMock()
+    entered = []
+
+    class Context(_AsyncContext):
+        async def __aexit__(self, *args):
+            entered.append("closed")
+            return False
+
+    async def execute(statement, *_args):
+        sql = str(statement)
+        entered.append(sql)
+        if case == "lock_timeout" and "LOCK TABLE" in sql:
+            raise TimeoutError("owned contention")
+        return SimpleNamespace(one=lambda: (evidence["average_outdoor"], 24))
+
+    async def read_values(**_kwargs):
+        if case == "optout" and any("LOCK TABLE" in entry for entry in entered):
+            return {**values, "seasonal_calibration_enabled": "false"}
+        return dict(values)
+
+    async def write(updates, *, session):
+        assert entered.index(
+            next(entry for entry in entered if "pg_advisory" in entry)
+        ) < entered.index(next(entry for entry in entered if "LOCK TABLE" in entry))
+        values.update(updates)
+
+    session.execute.side_effect = execute
+    with (
+        patch.object(seasonal_learning, "get_session", return_value=Context(session)),
+        patch.object(seasonal_learning, "get_all_settings", side_effect=read_values),
+        patch(
+            "packages.core.safety_reverts.unresolved_revert_summary",
+            new=AsyncMock(return_value={"count": 1 if case == "restore" else 0}),
+        ),
+        patch.object(seasonal_learning, "set_settings_bulk", side_effect=write) as writes,
+        patch.object(seasonal_learning, "get_bool_setting", new=AsyncMock(return_value=False)),
+        patch("packages.ml.lifecycle.enqueue_maintenance_request", new=AsyncMock()) as enqueue,
+    ):
+        result = await seasonal_learning.run_seasonal_calibration_cycle(now=now)
+    enqueue.assert_not_awaited()
+    if case == "cold":
+        assert result["observe_only_active"] is True
+        assert result["campaign_since"] == now.isoformat()
+        assert result["cycle"] == "maintenance_disabled"
+        writes.assert_awaited_once()
+        assert writes.await_args.kwargs["session"] is session
+    elif case == "restore":
+        assert result["observe_only_active"] is False
+        assert result["seasonal_first_deferred_at"] == now.isoformat()
+        assert not values["_seasonal_calibration_campaign_since"]
+    elif case == "warming":
+        assert result["observe_only_active"] is True
+        assert result["campaign_since"] == (now - dt.timedelta(days=2)).isoformat()
+        writes.assert_not_awaited()
+    else:
+        assert result["observe_only_active"] is False
+        writes.assert_not_awaited()
+    assert "closed" in entered
+
+
 @pytest.mark.asyncio
 async def test_manual_learning_survives_seasonal_lookup_failure():
     with (
@@ -377,39 +454,59 @@ async def test_learning_mode_status_preserves_wire_semantics_for_manual_and_seas
 
 @pytest.mark.asyncio
 async def test_seasonal_learning_deferral_timestamp_is_set_then_cleared_and_reactivates():
+    from packages.core.settings_service import SETTING_SPECS
+
     now = dt.datetime(2026, 9, 27, 12, tzinfo=dt.timezone.utc)
     session = MagicMock()
     query_result = SimpleNamespace(one=lambda: (5.0, 24))
-    unresolved = [
+    values = {key: spec.serialize_default() for key, spec in SETTING_SPECS.items()}
+    values.update(
         {
-            "count": 1,
-            "oldest_scheduled_at": now - dt.timedelta(hours=1),
-            "oldest_age_seconds": 3600,
-            "action_types": ["force_dhw_off"],
-        },
-        {"count": 0, "oldest_scheduled_at": None, "oldest_age_seconds": None, "action_types": []},
-    ]
-    deferred_at = (now - dt.timedelta(minutes=30)).isoformat()
+            "seasonal_calibration_enabled": "true",
+            "seasonal_calibration_max_outdoor_c": "12",
+            "seasonal_calibration_window_days": "7",
+        }
+    )
+    unresolved = {
+        "count": 1,
+        "oldest_scheduled_at": now - dt.timedelta(hours=1),
+        "oldest_age_seconds": 3600,
+        "action_types": ["force_dhw_off"],
+    }
+
+    async def write_settings(updates, *, session):
+        values.update(updates)
+
     with (
         patch.object(
             seasonal_learning,
-            "_settings",
-            new=AsyncMock(return_value=(True, 12.0, 7, True, True)),
+            "get_all_settings",
+            new=AsyncMock(side_effect=lambda **kwargs: dict(values)),
         ),
         patch.object(seasonal_learning, "get_session", return_value=_AsyncContext(session)),
         patch(
             "packages.core.safety_reverts.unresolved_revert_summary",
-            new=AsyncMock(side_effect=unresolved),
+            new=AsyncMock(side_effect=lambda *args, **kwargs: dict(unresolved)),
         ),
         patch.object(
-            seasonal_learning,
-            "get_setting",
-            new=AsyncMock(side_effect=["", "", "", deferred_at]),
-        ),
-        patch.object(seasonal_learning, "set_settings_bulk", new=AsyncMock()) as write,
+            seasonal_learning, "set_settings_bulk", new=AsyncMock(side_effect=write_settings)
+        ) as write,
+        patch.object(seasonal_learning, "get_bool_setting", new=AsyncMock(return_value=False)),
     ):
         session.execute = AsyncMock(return_value=query_result)
-        blocked = await seasonal_learning.get_seasonal_calibration_status(now=now)
+        before_cycle = await seasonal_learning.get_seasonal_calibration_status(now=now)
+        assert before_cycle["observe_only_active"] is False
+        assert before_cycle["seasonal_first_deferred_at"] is None
+        write.assert_not_awaited()
+        blocked = await seasonal_learning.run_seasonal_calibration_cycle(now=now)
+        unresolved.update(
+            count=0, oldest_scheduled_at=None, oldest_age_seconds=None, action_types=[]
+        )
+        pending = await seasonal_learning.get_seasonal_calibration_status(now=now)
+        assert pending["observe_only_active"] is False
+        assert pending["reason"] == "awaiting_explicit_seasonal_cycle"
+        assert write.await_count == 1
+        await seasonal_learning.run_seasonal_calibration_cycle(now=now)
         active = await seasonal_learning.get_seasonal_calibration_status(now=now)
 
     assert blocked["observe_only_active"] is False
@@ -424,18 +521,31 @@ async def test_seasonal_learning_deferral_timestamp_is_set_then_cleared_and_reac
     assert write.await_args_list[0].args == (
         {"_seasonal_calibration_safety_deferred_since": now.isoformat()},
     )
-    assert write.await_args_list[1].args == ({"_seasonal_calibration_safety_deferred_since": ""},)
-    assert write.await_args_list[2].args == (
-        {"_seasonal_calibration_campaign_since": now.isoformat()},
+    assert write.await_args_list[1].args == (
+        {
+            "_seasonal_calibration_campaign_since": now.isoformat(),
+            "_seasonal_calibration_safety_deferred_since": "",
+        },
     )
+    assert write.await_count == 2
+    assert all(call.kwargs["session"] is session for call in write.await_args_list)
 
 
 @pytest.mark.asyncio
 async def test_seasonal_success_warming_and_manual_training_never_clear_observation():
     from packages.api.routers import models_router
+    from packages.core.settings_service import SETTING_SPECS
 
     now = dt.datetime(2026, 10, 9, 12, tzinfo=dt.timezone.utc)
-    persisted = {"seasonal_calibration_enabled": "true", "learning_mode_enabled": "true"}
+    persisted = {key: spec.serialize_default() for key, spec in SETTING_SPECS.items()}
+    persisted.update(
+        {
+            "seasonal_calibration_enabled": "true",
+            "learning_mode_enabled": "true",
+            "seasonal_calibration_max_outdoor_c": "12",
+            "seasonal_calibration_window_days": "7",
+        }
+    )
     outdoor = [5.0, 24]
     session = MagicMock()
     session.execute = AsyncMock(return_value=SimpleNamespace(one=lambda: tuple(outdoor)))
@@ -460,20 +570,28 @@ async def test_seasonal_success_warming_and_manual_training_never_clear_observat
         }
     )
 
-    async def read_setting(key):
-        return persisted.get(key, "")
-
-    async def write_settings(updates):
+    async def write_settings(updates, *, session):
         persisted.update(updates)
 
     with (
         patch.object(
-            seasonal_learning, "_settings", new=AsyncMock(return_value=(True, 12.0, 7, True, True))
+            seasonal_learning,
+            "get_all_settings",
+            new=AsyncMock(side_effect=lambda **kwargs: dict(persisted)),
         ),
         patch.object(seasonal_learning, "get_session", return_value=_AsyncContext(session)),
-        patch.object(seasonal_learning, "get_setting", new=read_setting),
         patch.object(seasonal_learning, "set_settings_bulk", new=write_settings),
         patch.object(seasonal_learning, "get_bool_setting", new=AsyncMock(return_value=True)),
+        patch.object(
+            seasonal_learning,
+            "get_seasonal_calibration_progress",
+            new=AsyncMock(
+                return_value={
+                    "demand": {"trained": True},
+                    "indoor_heating": {"samples": 64, "remaining_samples": 0},
+                }
+            ),
+        ),
         patch("packages.ml.models.demand_model", demand),
         patch("packages.ml.thermal.thermal_model", thermal),
         patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
@@ -486,7 +604,8 @@ async def test_seasonal_success_warming_and_manual_training_never_clear_observat
         ),
     ):
         cold = await seasonal_learning.get_seasonal_calibration_status(now=now)
-        completed_fit = await seasonal_learning.run_seasonal_calibration_cycle()
+        assert cold["observe_only_active"] is False
+        completed_fit = await seasonal_learning.run_seasonal_calibration_cycle(now=now)
         manual_training = await models_router.trigger_ml_training()
         manual_thermal = await models_router.calibrate_thermal_model()
         manual_comfort = await models_router.trigger_comfort_model_training()
@@ -506,11 +625,13 @@ async def test_seasonal_success_warming_and_manual_training_never_clear_observat
     assert manual_thermal["control_ready"] is manual_comfort["control_ready"] is False
     assert manual_state == LearningStateSnapshot(True, False, True)
     demand.train.assert_not_awaited()
-    assert cold["observe_only_active"] is True
+    demand.arefresh_committed.assert_not_awaited()
+    thermal.arefresh_if_changed.assert_not_awaited()
+    assert completed_fit["observe_only_active"] is True
     assert warm["heating_season_detected"] is False
     assert missing["outdoor_readings"] == 0
     assert warm["observe_only_active"] is missing["observe_only_active"] is True
-    assert cold["campaign_since"] == warm["campaign_since"] == missing["campaign_since"]
+    assert completed_fit["campaign_since"] == warm["campaign_since"] == missing["campaign_since"]
     assert cold["auto_exit"] is warm["auto_exit"] is missing["auto_exit"] is False
     assert persisted["seasonal_calibration_enabled"] == "true"
     assert persisted["learning_mode_enabled"] == "true"
@@ -518,25 +639,21 @@ async def test_seasonal_success_warming_and_manual_training_never_clear_observat
 
 @pytest.mark.asyncio
 async def test_persisted_seasonal_observation_survives_outdoor_lookup_failure():
+    from packages.core.settings_service import SETTING_SPECS
+
+    values = {key: spec.serialize_default() for key, spec in SETTING_SPECS.items()}
+    values.update(
+        {
+            "seasonal_calibration_enabled": "true",
+            "_seasonal_calibration_campaign_since": "2026-10-09T12:00:00+00:00",
+        }
+    )
     session = SimpleNamespace(
         execute=AsyncMock(side_effect=RuntimeError("outdoor telemetry unavailable"))
     )
     with (
-        patch.object(
-            seasonal_learning, "_settings", new=AsyncMock(return_value=(True, 12.0, 7, True, False))
-        ),
+        patch.object(seasonal_learning, "get_all_settings", new=AsyncMock(return_value=values)),
         patch.object(seasonal_learning, "get_session", return_value=_AsyncContext(session)),
-        patch.object(
-            seasonal_learning,
-            "get_setting",
-            new=AsyncMock(
-                side_effect=lambda key: (
-                    "2026-10-09T12:00:00+00:00"
-                    if key == "_seasonal_calibration_campaign_since"
-                    else ""
-                )
-            ),
-        ),
         patch.object(seasonal_learning, "set_settings_bulk", new=AsyncMock()) as write,
         patch("packages.core.settings_service.get_bool_setting", new=AsyncMock(return_value=False)),
     ):

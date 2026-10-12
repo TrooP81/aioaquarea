@@ -6,7 +6,7 @@ import datetime as dt
 import asyncio
 from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from weakref import WeakKeyDictionary
 from zoneinfo import ZoneInfo
@@ -15,7 +15,7 @@ import numpy as np
 from sqlalchemy import select
 
 from packages.core.config import settings as app_settings
-from packages.core.database import get_session
+from packages.core.database import copy_materialized_rows, get_session
 from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord
 from packages.core.settings_service import get_user_tz
 from packages.ml.lifecycle import LifecycleUnavailable
@@ -65,9 +65,47 @@ class _PreparationFlight:
     task: asyncio.Task
     worker_started: asyncio.Event
     waiters: int = 0
+    joinable: bool = True
 
 
 _PREPARATION_FLIGHTS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _partition_demand_samples(bounds):
+    return chronological_fit_holdout(bounds, holdout_fraction=0.2, embargo=DEMAND_LABEL_EMBARGO)
+
+
+def _demand_sample_counts(prepared: dict) -> dict:
+    bounds = prepared["bounds"]
+    fit, holdout = _partition_demand_samples(bounds)
+    finite = np.isfinite(prepared["features"]).all() and np.isfinite(prepared["targets"]).all()
+    if not finite:
+        return {
+            "availability": "unavailable",
+            "total": None,
+            "train": None,
+            "holdout": None,
+            "minimum_train": MIN_TRAINING_SAMPLES,
+            "minimum_holdout": 24,
+            "remaining_train": None,
+            "remaining_holdout": None,
+            "reason": "nonfinite_training_inputs",
+        }
+    return {
+        "availability": "assessed",
+        "total": len(bounds),
+        "train": len(fit),
+        "holdout": len(holdout),
+        "minimum_train": MIN_TRAINING_SAMPLES,
+        "minimum_holdout": 24,
+        "remaining_train": max(0, MIN_TRAINING_SAMPLES - len(fit)),
+        "remaining_holdout": max(0, 24 - len(holdout)),
+        "reason": "insufficient_train"
+        if len(fit) < MIN_TRAINING_SAMPLES
+        else "insufficient_holdout"
+        if len(holdout) < 24
+        else None,
+    }
 
 
 def build_demand_candidate(data: dict[str, object]) -> dict[str, object] | None:
@@ -80,9 +118,7 @@ def build_demand_candidate(data: dict[str, object]) -> dict[str, object] | None:
         or not np.isfinite(targets).all()
     ):
         return None
-    fit, holdout = chronological_fit_holdout(
-        bounds, holdout_fraction=0.2, embargo=DEMAND_LABEL_EMBARGO
-    )
+    fit, holdout = _partition_demand_samples(bounds)
     if len(fit) < MIN_TRAINING_SAMPLES or len(holdout) < 24:
         return None
     models = {}
@@ -383,8 +419,12 @@ class DemandModel:
             results.append({"p10": p10, "p50": p50, "p90": p90})
         return results
 
-    async def training_data_quality(self) -> dict[str, object]:
+    async def training_data_quality(self, *, materialized=None, context=None) -> dict[str, object]:
         """Return live, explainable readiness data without training a model."""
+        if materialized is not None:
+            return self._preprocess_materialized({**materialized, "log_quality": False})["quality"]
+        if context is not None:
+            raise ValueError("Captured context requires materialized demand inputs")
         try:
             await self._prepare_data()
         except DemandPreparationBusy:
@@ -410,7 +450,9 @@ class DemandModel:
         if current is not None and current[1].task.done():
             _PREPARATION_FLIGHTS.pop(loop)
             current = None
-        if current is not None and current[0] != key:
+        if current is not None and (
+            current[0] != key or not current[1].joinable or current[1].task.cancelling()
+        ):
             raise DemandPreparationBusy("demand_preparation_busy")
         if current is None:
             started = asyncio.Event()
@@ -459,6 +501,7 @@ class DemandModel:
                 and not flight.worker_started.is_set()
                 and not flight.task.done()
             ):
+                flight.joinable = False
                 flight.task.cancel()
                 with suppress(asyncio.CancelledError):
                     await flight.task
@@ -467,17 +510,19 @@ class DemandModel:
         self._sample_devices = prepared["devices"]
         return prepared["features"], prepared["targets"]
 
-    async def _materialize_prepared(
+    async def _materialize_training_rows(
         self,
         *,
-        lifecycle_evidence: bool,
         cutoff: dt.datetime | None,
-        device_id: str | None,
-        weather_provider: str | None,
-        worker,
-        worker_started: asyncio.Event,
+        device_id: str | None = None,
+        weather_provider: str | None = None,
+        lifecycle_evidence: bool = False,
+        session=None,
+        context=None,
     ):
-        timezone = ZoneInfo(await get_user_tz())
+        timezone = ZoneInfo(
+            context["settings"]["timezone"] if context is not None else await get_user_tz()
+        )
         consumption_query = select(
             ConsumptionRecord.device_id,
             ConsumptionRecord.ts,
@@ -486,6 +531,7 @@ class DemandModel:
             ConsumptionRecord.tank_kwh,
             ConsumptionRecord.outdoor_temp,
             ConsumptionRecord.source_date,
+            ConsumptionRecord.source_timezone,
         )
         weather_query = select(
             WeatherRecord.ts,
@@ -514,7 +560,7 @@ class DemandModel:
             status_query = status_query.where(DeviceStatusRecord.device_id == device_id)
         if weather_provider is not None:
             weather_query = weather_query.where(WeatherRecord.source == weather_provider)
-        async with get_session() as session:
+        async with get_session() if session is None else nullcontext(session) as session:
             consumption_rows = (
                 await session.execute(consumption_query.order_by(ConsumptionRecord.ts))
             ).all()
@@ -531,13 +577,54 @@ class DemandModel:
             > DEMAND_MAX_MATERIALIZED_ROWS
         ):
             raise ValueError("Demand materialization overflow")
-        data = {
-            "consumption_rows": consumption_rows,
-            "weather_rows": weather_rows,
-            "statuses": statuses,
+        consumption_names = (
+            "device_id",
+            "ts",
+            "heat_kwh",
+            "cool_kwh",
+            "tank_kwh",
+            "outdoor_temp",
+            "source_date",
+            "source_timezone",
+        )
+        weather_names = (
+            "ts",
+            "temperature",
+            "wind_speed",
+            "irradiance",
+            "precipitation",
+            "humidity",
+            "cloud_cover",
+        )
+        return {
+            "consumption_rows": await copy_materialized_rows(
+                consumption_rows, consumption_names, context=context
+            ),
+            "weather_rows": await copy_materialized_rows(
+                weather_rows, weather_names, context=context
+            ),
+            "statuses": await copy_materialized_rows(
+                statuses,
+                [column.name for column in DeviceStatusRecord.__table__.columns],
+                context=context,
+            ),
             "timezone": timezone,
             "lifecycle_evidence": lifecycle_evidence,
+            "max_rate_kw": context["demand_max_rate_kw"]
+            if context is not None
+            else self._max_plausible_rate_kw(),
+            "log_quality": context is None,
         }
+
+    async def _materialize_prepared(
+        self, *, lifecycle_evidence, cutoff, device_id, weather_provider, worker, worker_started
+    ):
+        data = await self._materialize_training_rows(
+            lifecycle_evidence=lifecycle_evidence,
+            cutoff=cutoff,
+            device_id=device_id,
+            weather_provider=weather_provider,
+        )
         worker_started.set()
         if worker is not None:
             return await worker(self._preprocess_materialized, data)
@@ -577,7 +664,15 @@ class DemandModel:
         }
 
     def _prepare_materialized(
-        self, *, consumption_rows, weather_rows, statuses, timezone, lifecycle_evidence
+        self,
+        *,
+        consumption_rows,
+        weather_rows,
+        statuses,
+        timezone,
+        lifecycle_evidence,
+        max_rate_kw=None,
+        log_quality: bool = True,
     ):
         self._sample_bounds = []
         self._sample_devices = set()
@@ -600,7 +695,7 @@ class DemandModel:
                 return None
             return weather_rows[idx]
 
-        max_rate = self._max_plausible_rate_kw()
+        max_rate = self._max_plausible_rate_kw() if max_rate_kw is None else max_rate_kw
         X_list: list[np.ndarray] = []
         y_list: list[float] = []
         intervals = 0
@@ -773,7 +868,8 @@ class DemandModel:
         for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS:
             if not log_data_quality[f"counter_{key}"]:
                 log_data_quality.pop(f"counter_{key}")
-        _logger.info("demand_training_data_prepared", **log_data_quality)
+        if log_quality:
+            _logger.info("demand_training_data_prepared", **log_data_quality)
         return np.array(X_list), np.array(y_list)
 
     async def materialize_candidate(

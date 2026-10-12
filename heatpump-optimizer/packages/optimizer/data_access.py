@@ -3,99 +3,45 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import asdict
 
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.models import DeviceStatusRecord, PriceRecord, WeatherRecord
-from packages.core.settings_service import get_setting
+from packages.core.models import DeviceStatusRecord
+from packages.core.planning_data_quality import load_planning_input_batch
+
+
+async def _input_batch(session, start, end):
+    batch = session.info.get("planning_input_batch")
+    if batch is None or batch.start != start or batch.end != end:
+        batch = await load_planning_input_batch(session, start, end)
+        session.info["planning_input_batch"] = batch
+    return batch
 
 
 async def get_prices(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[tuple[dt.datetime, float]]:
     """Fetch prices from DB for the active provider's area."""
-    provider = await get_setting("price_provider")
-    if provider == "entsoe":
-        area = (await get_setting("entsoe_area")) or "10YNL----------L"
-    elif provider == "manual":
-        area = "manual"
-    else:
-        area = "tibber"
-
-    result = await session.execute(
-        select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
-        .where(
-            and_(
-                PriceRecord.ts >= start,
-                PriceRecord.ts < end,
-                PriceRecord.area == area,
-            )
-        )
-        .order_by(PriceRecord.ts)
-    )
-    return [(row.ts, row.price_eur_per_kwh) for row in result.all()]
+    batch = await _input_batch(session, start, end)
+    return [(row.ts, row.value) for row in batch.prices]
 
 
 async def get_weather(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[tuple[dt.datetime, float]]:
     """Fetch weather forecast (temperature only) from DB."""
-    provider = (await get_setting("weather_provider")) or "open-meteo"
-    result = await session.execute(
-        select(WeatherRecord.ts, WeatherRecord.temperature)
-        .where(
-            and_(
-                WeatherRecord.ts >= start,
-                WeatherRecord.ts < end,
-                WeatherRecord.source == provider,
-            )
-        )
-        .order_by(WeatherRecord.ts)
-    )
-    return [(row.ts, row.temperature) for row in result.all()]
+    batch = await _input_batch(session, start, end)
+    return [(row.ts, row.temperature) for row in batch.weather]
 
 
 async def get_weather_full(
     session: AsyncSession, start: dt.datetime, end: dt.datetime
 ) -> list[dict]:
     """Fetch full weather data for the indoor model from DB."""
-    provider = (await get_setting("weather_provider")) or "open-meteo"
-    result = await session.execute(
-        select(
-            WeatherRecord.ts,
-            WeatherRecord.temperature,
-            WeatherRecord.wind_speed,
-            WeatherRecord.irradiance,
-            WeatherRecord.precipitation,
-            WeatherRecord.humidity,
-            WeatherRecord.cloud_cover,
-            WeatherRecord.source,
-            WeatherRecord.forecast_issued_at,
-        )
-        .where(
-            and_(
-                WeatherRecord.ts >= start,
-                WeatherRecord.ts < end,
-                WeatherRecord.source == provider,
-            )
-        )
-        .order_by(WeatherRecord.ts)
-    )
-    return [
-        {
-            "ts": row.ts,
-            "temperature": row.temperature,
-            "wind_speed": row.wind_speed,
-            "irradiance": row.irradiance,
-            "precipitation": row.precipitation,
-            "humidity": row.humidity,
-            "cloud_cover": row.cloud_cover,
-            "source": getattr(row, "source", None),
-            "forecast_issued_at": getattr(row, "forecast_issued_at", None),
-        }
-        for row in result.all()
-    ]
+    batch = await _input_batch(session, start, end)
+    return [asdict(row) for row in batch.weather]
 
 
 async def get_last_status(session: AsyncSession):

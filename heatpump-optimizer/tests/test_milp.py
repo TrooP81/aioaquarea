@@ -140,6 +140,19 @@ class TestMILPSolver:
             current_tank_temp=48.0,
             current_indoor_temp=20.0,
             indoor_targets=[15.0] * 24,
+            indoor_rates=[(0.2, -0.1)] * 24,
+            gate_states=[SpaceHeatingGateState.ALLOWED] * 24,
+            hardware_tank_ceiling=55,
+            tank_max_temp_setting=55,
+            tank_min_per_hour=[48] * 24,
+            observation_context={
+                "device_id": "snapshot-device",
+                "observed_at": prices[0][0],
+                "captured_at": prices[0][0],
+                "max_age_seconds": 900,
+                "tank_target_c": 55,
+                "force_dhw": 0,
+            },
         )
 
         snapshot = plan["forecast_snapshot"]

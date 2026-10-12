@@ -79,7 +79,10 @@ async def get_baseline_promotion_readiness() -> bool:
 
 @router.get("/api/settings")
 async def get_settings():
-    values = await get_all_settings()
+    try:
+        values = await get_all_settings()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = {}
     for key, schema in SETTINGS_SCHEMA.items():
         if key.startswith("_"):

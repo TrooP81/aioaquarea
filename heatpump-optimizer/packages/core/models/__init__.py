@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import (
     BigInteger,
@@ -25,7 +26,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -119,6 +120,7 @@ class ConsumptionRecord(Base):
     )
     device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     source_date: Mapped[dt.date | None] = mapped_column(Date)
+    source_timezone: Mapped[str | None] = mapped_column(String(64))
     heat_kwh: Mapped[float | None] = mapped_column(Float)
     cool_kwh: Mapped[float | None] = mapped_column(Float)
     tank_kwh: Mapped[float | None] = mapped_column(Float)
@@ -148,6 +150,7 @@ class PriceRecord(Base):
     # When the provider response was retrieved. ``ts`` is the market hour,
     # which can be in the future and therefore cannot prove feed freshness.
     fetched_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    interval_schema: Mapped[str | None] = mapped_column(String(64))
 
 
 class WeatherRecord(Base):
@@ -170,6 +173,7 @@ class WeatherRecord(Base):
     # When this forecast was retrieved. ``ts`` is the forecasted hour, not the
     # age of the weather information used by a plan.
     forecast_issued_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    units_schema: Mapped[str | None] = mapped_column(String(64))
 
 
 class PlanRecord(Base):
@@ -259,6 +263,7 @@ class PlanActionRecord(Base):
     )
     safety_next_retry_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     safety_claimed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    safety_claim_token: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 class ExecutorVerificationReadRecord(Base):

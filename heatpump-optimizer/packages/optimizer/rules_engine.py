@@ -192,7 +192,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         rule sources can also request different quiet levels; collapse only
         identical levels while preserving legitimate LEVEL1 -> LEVEL2 changes.
         """
-        ordered = sorted(actions, key=lambda action: str(action.get("ts", "")))
+        ordered = sorted(
+            actions,
+            key=lambda action: (
+                cls._action_timestamp(action) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+            ),
+        )
 
         # Panasonic special status and absolute zone boosts both write the same
         # zone target. Never allow a mode transition to invalidate a frozen
@@ -233,11 +238,11 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 else 1
             )
 
-        quiet_at_timestamp: dict[str, dict[str, Any]] = {}
+        quiet_at_timestamp: dict[dt.datetime | None, dict[str, Any]] = {}
         non_quiet: list[dict[str, Any]] = []
         for action in ordered:
             if str(action.get("type", "")) in {"quiet_mode_on", "quiet_mode_off"}:
-                timestamp = str(action.get("ts", ""))
+                timestamp = cls._action_timestamp(action)
                 current = quiet_at_timestamp.get(timestamp)
                 if current is None or quiet_level(action) >= quiet_level(current):
                     quiet_at_timestamp[timestamp] = action
@@ -245,10 +250,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 non_quiet.append(action)
         ordered = sorted(
             [*non_quiet, *quiet_at_timestamp.values()],
-            key=lambda action: str(action.get("ts", "")),
+            key=lambda action: (
+                cls._action_timestamp(action) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+            ),
         )
         normalised: list[dict[str, Any]] = []
-        seen_exact: set[tuple[str, str, str]] = set()
+        seen_exact: set[tuple[dt.datetime | None, str, str]] = set()
         active_quiet_level = (
             initial_quiet_level
             if isinstance(initial_quiet_level, int)
@@ -259,7 +266,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
 
         for action in ordered:
             action_type = str(action.get("type", ""))
-            timestamp = str(action.get("ts", ""))
+            timestamp = cls._action_timestamp(action)
             payload = action.get("payload", {})
             payload_key = json.dumps(payload, sort_keys=True, default=str)
             exact_key = (timestamp, action_type, payload_key)
@@ -293,10 +300,19 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             return None
         learning_mode_active = learning_mode_state is LearningModeState.ACTIVE
 
-        async with get_session() as session:
+        async with get_session(read_only=True, isolation_level="REPEATABLE READ") as session:
             prices = await self._get_prices(session, horizon_start, horizon_end)
             weather = await self._get_weather(session, horizon_start, horizon_end)
             weather_full = await self._get_weather_full(session, horizon_start, horizon_end)
+            from packages.core.planning_data_quality import (
+                PlanningInputBatch,
+                planning_batch_quality,
+            )
+
+            batch = session.info.get("planning_input_batch")
+            input_quality = (
+                planning_batch_quality(batch) if isinstance(batch, PlanningInputBatch) else None
+            )
             last_status = await self._get_last_status(session)
             gate_row = (
                 (
@@ -334,6 +350,15 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
 
         if not prices:
             return None
+        if input_quality is not None:
+            if not input_quality["control_allowed"]:
+                logger.info("rules_inputs_unavailable", reasons=input_quality["reasons"])
+                return None
+            effective_hours = input_quality["effective_horizon_hours"]
+            prices = prices[:effective_hours]
+            weather = weather[:effective_hours]
+            weather_full = weather_full[:effective_hours]
+            horizon_end = horizon_start + dt.timedelta(hours=effective_hours)
 
         if last_status and getattr(last_status, "holiday_mode", None) == 1:
             return {
@@ -345,6 +370,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 "cop_measured": False,
                 "heating_efficiency": {"source": "assumed", "measured": False},
                 "cost_estimate": 0.0,
+                "planning_data_quality": input_quality,
                 "note": "holiday_mode_active_optimization_suspended",
             }
 
@@ -636,7 +662,72 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         if last_status is not None:
             for action in actions:
                 action["device_id"] = last_status.device_id
-        cost_estimate = await self._estimate_cost(actions, prices)
+        from packages.optimizer import DataIncompleteError, InfeasibleError
+        from packages.optimizer.represented_strategy import (
+            SCHEMA,
+            assumed_native_demand,
+            build_represented_plan,
+            observation_context,
+            represented_rules_commands,
+        )
+        from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
+        from packages.ml.thermal import assumed_heating_efficiency
+
+        unproven_actions = [
+            action for action in actions if action["type"] not in {"force_dhw_on", "force_dhw_off"}
+        ]
+        actions = [
+            action for action in actions if action["type"] in {"force_dhw_on", "force_dhw_off"}
+        ]
+        try:
+            actions = represented_rules_commands(actions)
+            native_gates = [evidence.state for evidence in gate_projections]
+            native_demand = assumed_native_demand(weather, native_gates)
+            represented = build_represented_plan(
+                prices=prices,
+                weather=weather,
+                cop_fn=lambda outdoor, hour=12: assumed_heating_efficiency(outdoor),
+                demand_per_hour=native_demand,
+                current_tank_temp=getattr(last_status, "tank_temp", None),
+                current_indoor_temp=current_indoor_temp,
+                context=await observation_context(last_status, now),
+                dhw_deadlines=[
+                    int((deadline - horizon_start).total_seconds() // 3600)
+                    for deadline, _ in local_dhw_deadlines_in_horizon(
+                        comfort_schedule, horizon_start, tz_name
+                    )
+                    if 0 < (deadline - horizon_start).total_seconds() // 3600 <= len(prices)
+                ],
+                indoor_targets=[comfort_temp_min] * len(prices),
+                tank_min_per_hour=[
+                    await get_float_setting(
+                        "tank_min_temp"
+                        if is_comfort_hour(comfort_schedule, timestamp, tz_name=tz_name)
+                        else "tank_min_temp_offpeak"
+                    )
+                    for timestamp, _ in prices
+                ],
+                tank_max_temp_setting=await get_float_setting("tank_max_temp"),
+                gate_states=native_gates,
+                indoor_max_temp_setting=comfort_temp_max,
+                hardware_tank_ceiling=getattr(last_status, "tank_heat_max", None),
+                serialized_actions=actions,
+            )
+            if represented["diagnostic_status"] != "conditional_feasible":
+                raise DataIncompleteError("Actual rules initial state unavailable")
+        except (DataIncompleteError, InfeasibleError) as error:
+            logger.info(
+                "rules_strategy_unproven",
+                reason=type(error).__name__,
+                diagnostic_status="conditional_infeasible"
+                if isinstance(error, InfeasibleError)
+                else "unproven",
+            )
+            return None
+        cost_estimate = represented["cost_estimate"]
+        cost_accounting = await self._estimate_unshifted_baseline(
+            prices, device_id=last_status.device_id if last_status is not None else None, now=now
+        )
         forecast_snapshot = self._build_forecast_snapshot(
             prices=prices,
             weather=weather,
@@ -691,6 +782,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             live_baseline_fractions=live_baseline_fractions,
             learning_mode_active=learning_mode_active,
         )
+        forecast_snapshot["forecast_with_plan"] = represented["forecast_snapshot"][
+            "forecast_with_plan"
+        ]
+        forecast_snapshot["forecast"] = forecast_snapshot["forecast_with_plan"]
+        forecast_snapshot["represented_strategy"] = represented["represented_strategy"]
+        forecast_snapshot["serialized_replay"] = represented["serialized_replay"]
 
         return {
             "device_id": last_status.device_id if last_status is not None else None,
@@ -702,6 +799,20 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             "cop_measured": False,
             "heating_efficiency": {"source": "assumed", "measured": False},
             "cost_estimate": cost_estimate,
+            "cost_accounting": {
+                **represented["cost_accounting"],
+                "observed_baseline": cost_accounting,
+            },
+            "diagnostic_status": "conditional_feasible",
+            "represented_strategy": represented["represented_strategy"],
+            "serialized_replay": represented["serialized_replay"],
+            "diagnostic_strategy_actions": actions,
+            "unproven_strategies": {
+                "schema": SCHEMA,
+                "status": "unproven",
+                "actions": unproven_actions,
+            },
+            "planning_data_quality": input_quality,
             "forecast_snapshot": forecast_snapshot,
             "control_input": {
                 "indoor_temp": latest_indoor_temp,
@@ -734,30 +845,43 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
 
     async def _estimate_cost(
         self, actions: list[dict], prices: list[tuple[dt.datetime, float]]
-    ) -> float:
-        if not prices:
-            return 0.0
-        avg_price = sum(p for _, p in prices) / len(prices)
+    ) -> float | None:
+        # Meter history alone cannot establish the energy of these serialized commands.
+        return None
 
-        estimated_kwh_per_day = 15.0
+    async def _estimate_unshifted_baseline(self, prices, *, device_id, now):
+        from packages.core.plan_outcome import observed_rate_baseline
+
+        result = observed_rate_baseline([], prices, device_id=device_id)
+        if not device_id:
+            return {**result, "baseline_unavailable_reason": "device_unavailable"}
         try:
-            from sqlalchemy import func as sa_func
-
-            since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
-            heat = sa_func.coalesce(ConsumptionRecord.heat_kwh, 0)
-            cool = sa_func.coalesce(ConsumptionRecord.cool_kwh, 0)
-            tank = sa_func.coalesce(ConsumptionRecord.tank_kwh, 0)
-            async with get_session() as session:
-                result = await session.execute(
-                    select(sa_func.avg(heat + cool + tank)).where(ConsumptionRecord.ts >= since)
+            timezone_name = await get_user_tz()
+            async with get_session(read_only=True) as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(ConsumptionRecord)
+                            .where(
+                                ConsumptionRecord.device_id == device_id,
+                                ConsumptionRecord.ts >= now - dt.timedelta(days=7),
+                                ConsumptionRecord.ts <= now,
+                            )
+                            .order_by(ConsumptionRecord.ts)
+                            .limit(20001)
+                        )
+                    )
+                    .scalars()
+                    .all()
                 )
-                avg_kwh = result.scalar()
-                if avg_kwh and avg_kwh > 0:
-                    estimated_kwh_per_day = float(avg_kwh)
-        except Exception:
-            logger.warning("failed to estimate average daily consumption", exc_info=True)
-
-        return avg_price * estimated_kwh_per_day
+            if len(rows) > 20000:
+                return {**result, "baseline_unavailable_reason": "source_row_budget_exceeded"}
+            return observed_rate_baseline(
+                rows, prices, device_id=device_id, timezone_name=timezone_name
+            )
+        except Exception as error:
+            logger.warning("rules_cost_baseline_unavailable", error_type=type(error).__name__)
+            return {**result, "baseline_unavailable_reason": "source_unavailable"}
 
     async def _get_prices(
         self, session: AsyncSession, start: dt.datetime, end: dt.datetime

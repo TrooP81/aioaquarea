@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import datetime as dt
 import asyncio
+import copy
 import hashlib
 import os
+import stat
 import pickle
 import platform
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -180,6 +182,7 @@ class MaintenanceRequest:
     attempted_at: dt.datetime | None = None
     finished_at: dt.datetime | None = None
     details: dict[str, Any] | None = None
+    dedup_key: str | None = None
 
     def response(self, enabled: bool) -> dict[str, Any]:
         reason = (self.details or {}).get("reason")
@@ -223,7 +226,25 @@ def _request(row: MLMaintenanceRequestRecord) -> MaintenanceRequest:
         row.attempted_at,
         row.finished_at,
         dict(row.details),
+        row.dedup_key,
     )
+
+
+def _thermal_request_family(details: dict[str, Any], dedup_key: str | None) -> str | None:
+    family = details.get("family")
+    if "family" in details and (not isinstance(family, str) or family not in {"tank_", "indoor_"}):
+        raise ValueError("Invalid thermal maintenance family")
+    legacy_family = None
+    if dedup_key is not None and not isinstance(dedup_key, str):
+        raise ValueError("Invalid thermal maintenance family identity")
+    if dedup_key and dedup_key.startswith("thermal-family:"):
+        parts = dedup_key.split(":", 2)
+        if len(parts) != 3 or not parts[2] or parts[1] not in {"tank_", "indoor_"}:
+            raise ValueError("Invalid legacy thermal maintenance family")
+        legacy_family = parts[1]
+    if family is not None and legacy_family is not None and family != legacy_family:
+        raise ValueError("Conflicting thermal maintenance family")
+    return family or legacy_family
 
 
 def _reference(row: MLArtifactRecord) -> ArtifactReference:
@@ -232,13 +253,13 @@ def _reference(row: MLArtifactRecord) -> ArtifactReference:
         epoch=row.epoch,
         component=row.component,
         schema_version=row.schema_version,
-        manifest=row.manifest,
+        manifest=copy.deepcopy(row.manifest),
         role=row.role,
         committed_revision=row.committed_revision,
         qualified_at=row.qualified_at,
         qualification_expires_at=row.qualification_expires_at,
         last_valid_outcome_at=row.last_valid_outcome_at,
-        qualification_scope=row.qualification_scope,
+        qualification_scope=copy.deepcopy(row.qualification_scope),
         retained_until=row.retained_until,
     )
 
@@ -298,11 +319,31 @@ def _can_publish(
     )
 
 
+def _artifact_entry_identity(reference: ArtifactReference) -> tuple[int, ...] | None:
+    try:
+        metadata = safe_persistence.artifact_path(
+            reference.artifact_hash, resolve_entry=False
+        ).lstat()
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    except (OSError, ValueError):
+        return None
+
+
 def verify_reference(reference: ArtifactReference) -> tuple[SignedArtifact, bytes]:
+    entry_before = _artifact_entry_identity(reference)
     try:
         schema = LIFECYCLE_SCHEMAS.get(reference.component)
         if schema is None or schema != reference.schema_version:
             raise ValueError("Artifact schema mismatch")
+        if entry_before is not None and entry_before[2] not in {stat.S_IFREG, stat.S_IFDIR}:
+            raise ValueError("Artifact entry is not a regular file")
         artifact, payload = safe_persistence.verify_signed_artifact(
             reference.artifact_hash, component=reference.component, schema_version=schema
         )
@@ -310,8 +351,21 @@ def verify_reference(reference: ArtifactReference) -> tuple[SignedArtifact, byte
             raise ValueError("Committed artifact manifest mismatch")
         return artifact, payload
     except OSError as error:
+        entry_after = _artifact_entry_identity(reference)
+        if (
+            entry_before is not None
+            and entry_before == entry_after
+            and entry_before[2] != stat.S_IFREG
+        ):
+            raise ArtifactIntegrityError(
+                reference, ValueError("Confirmed non-file artifact entry")
+            ) from error
         raise ArtifactUnavailableError(reference, error) from error
     except ValueError as error:
+        if entry_before is not None and entry_before != _artifact_entry_identity(reference):
+            raise ArtifactUnavailableError(
+                reference, OSError("Artifact entry changed during verification")
+            ) from error
         raise ArtifactIntegrityError(reference, error) from error
 
 
@@ -472,13 +526,13 @@ class Lifecycle:
             state.lease_owner,
             state.lease_expires_at,
             tuple(_reference(artifact) for _, artifact in rows if artifact is not None),
-            state.checkpoints,
+            copy.deepcopy(state.checkpoints),
             state.next_maintenance_at,
             state.last_demand_attempt_at,
         )
 
-    async def read(self) -> LifecycleSnapshot:
-        async with self._sessions() as session:
+    async def read(self, *, session=None) -> LifecycleSnapshot:
+        async with self._sessions() if session is None else nullcontext(session) as session:
             return await self._read(session)
 
     async def initialize(self) -> LifecycleSnapshot:
@@ -543,6 +597,7 @@ class Lifecycle:
         source: str,
         *,
         dedup_key: str | None = None,
+        family: str | None = None,
         lease: Lease | None = None,
         automatic: bool = False,
     ) -> MaintenanceRequest | None:
@@ -554,6 +609,12 @@ class Lifecycle:
         dedup_key = dedup_key or request_id
         if len(dedup_key) > 128:
             raise ValueError("Maintenance dedup key must be at most 128 characters")
+        if family is not None and component != "thermal":
+            raise ValueError("Maintenance family is only supported for thermal requests")
+        if component == "thermal":
+            family = _thermal_request_family(
+                {"family": family} if family is not None else {}, dedup_key
+            )
         async with self._sessions() as session:
             if automatic:
                 setting = (
@@ -592,7 +653,7 @@ class Lifecycle:
                         source=source,
                         dedup_key=dedup_key,
                         status="queued",
-                        details={},
+                        details={"family": family} if family is not None else {},
                     )
                     .on_conflict_do_nothing(index_elements=["epoch", "component", "dedup_key"])
                     .returning(MLMaintenanceRequestRecord)
@@ -608,6 +669,9 @@ class Lifecycle:
                         )
                     )
                 ).scalar_one()
+            if component == "thermal" and family is not None:
+                if _thermal_request_family(row.details, row.dedup_key) != family:
+                    raise ValueError("Maintenance family conflicts with existing request")
             return _request(row)
 
     async def get_request(self, request_id: str) -> MaintenanceRequest | None:
@@ -655,7 +719,13 @@ class Lifecycle:
                     MLMaintenanceRequestRecord.status == "running",
                     MLMaintenanceRequestRecord.fence.is_distinct_from(lease.fence),
                 )
-                .values(status="queued", fence=None, details={"reason": "owner_restarted"})
+                .values(
+                    status="queued",
+                    fence=None,
+                    details=MLMaintenanceRequestRecord.details.op("||")(
+                        {"reason": "owner_restarted"}
+                    ),
+                )
             )
         return True
 
@@ -710,7 +780,9 @@ class Lifecycle:
                         fence=lease.fence,
                         attempted_at=func.clock_timestamp(),
                         finished_at=None,
-                        details={},
+                        details={"family": row.details["family"]}
+                        if "family" in row.details
+                        else {},
                     )
                     .returning(MLMaintenanceRequestRecord)
                 )
@@ -727,7 +799,7 @@ class Lifecycle:
                     MLMaintenanceRequestRecord.component == component,
                     MLMaintenanceRequestRecord.status == "queued",
                 )
-                .values(details={"reason": reason})
+                .values(details=MLMaintenanceRequestRecord.details.op("||")({"reason": reason}))
             )
 
     async def finish_request(
@@ -735,6 +807,8 @@ class Lifecycle:
     ) -> None:
         if status not in {"succeeded", "failed", "cancelled", "queued"}:
             raise ValueError("Invalid maintenance completion status")
+        if "family" in details:
+            raise ValueError("Maintenance completion cannot change family identity")
         async with self._sessions() as session:
             await self._lock(session, lease)
             result = await session.execute(
@@ -747,7 +821,7 @@ class Lifecycle:
                 )
                 .values(
                     status=status,
-                    details=details,
+                    details=MLMaintenanceRequestRecord.details.op("||")(details),
                     finished_at=func.clock_timestamp() if status != "queued" else None,
                     fence=lease.fence if status != "queued" else None,
                 )
@@ -1472,6 +1546,9 @@ class Lifecycle:
         self, lease: Lease, reference: ArtifactReference, reason: str
     ) -> None:
         safe_persistence._require_publication_owner()
+        integrity_failure = reason == "artifact_integrity_failure"
+        damage_confirmed = integrity_failure or reason == "artifact_missing_confirmed"
+        entry_before = _artifact_entry_identity(reference) if damage_confirmed else None
         retain_history = bool(
             reference.role == "incumbent"
             and reference.qualified_at is not None
@@ -1481,11 +1558,25 @@ class Lifecycle:
         async with self._sessions() as session:
             await self._lock(session, lease)
             state = await self._read(session)
-            if not any(
-                ref.artifact_hash == reference.artifact_hash and ref.role == reference.role
-                for ref in state.references
-            ):
+            if reference not in state.references:
                 raise CASConflict("invalidation_reference_changed")
+            if damage_confirmed:
+                if entry_before != _artifact_entry_identity(reference):
+                    raise CASConflict("invalidation_artifact_entry_changed")
+                if integrity_failure:
+                    try:
+                        _artifact, payload = await asyncio.to_thread(verify_reference, reference)
+                        await asyncio.to_thread(pickle.loads, payload)
+                    except (ValueError, pickle.UnpicklingError, EOFError):
+                        pass
+                    else:
+                        raise CASConflict("invalidation_artifact_integrity_recovered")
+                elif not await asyncio.to_thread(_confirm_artifact_missing, reference):
+                    raise ArtifactUnavailableError(
+                        reference, OSError("Artifact missing confirmation is no longer valid")
+                    )
+                if entry_before != _artifact_entry_identity(reference):
+                    raise CASConflict("invalidation_artifact_entry_changed")
             checkpoints = dict(state.checkpoints or {})
             checkpoints["invalidated:" + reference.artifact_hash] = {
                 "component": reference.component,
@@ -1505,12 +1596,13 @@ class Lifecycle:
                     .returning(MLLifecycleStateRecord.revision)
                 )
             ).scalar_one()
-            await session.execute(
+            invalidated = await session.execute(
                 update(MLArtifactRecord)
                 .where(
                     MLArtifactRecord.epoch == lease.epoch,
                     MLArtifactRecord.artifact_hash == reference.artifact_hash,
                     MLArtifactRecord.role == reference.role,
+                    MLArtifactRecord.committed_revision == reference.committed_revision,
                 )
                 .values(
                     role="retained" if reference.role == "candidate" else reference.role,
@@ -1525,6 +1617,8 @@ class Lifecycle:
                     committed_revision=revision,
                 )
             )
+            if invalidated.rowcount != 1:
+                raise CASConflict("invalidation_reference_changed")
         logger.warning(
             "ml_component_invalidated",
             component=reference.component,
@@ -1635,7 +1729,7 @@ class Lifecycle:
         return pairs, complete and actual == expected
 
     async def reporting_evidence(
-        self, reference: ArtifactReference, *, now: dt.datetime
+        self, reference: ArtifactReference, *, now: dt.datetime, session=None
     ) -> dict[str, Any]:
         from packages.ml.forecast_quality import NATIVE_POLICY_SCHEMA
 
@@ -1730,7 +1824,7 @@ class Lifecycle:
                 ),
             ).label("exclusions"),
         ).select_from(evidence)
-        async with self._sessions() as session:
+        async with self._sessions() if session is None else nullcontext(session) as session:
             result = (await session.execute(statement)).mappings().one()
         latest = result["last_valid_outcome_at"]
         return {
@@ -2079,9 +2173,16 @@ class MaintenanceRunner:
                     fitted = await self._fit(hooks.fit, inputs) if inputs is not None else None
                     await self._guard(lease, lost)
                     if fitted is None:
-                        await self.lifecycle.finish_request(
-                            lease, request.id, "queued", {"reason": "insufficient_training_data"}
+                        diagnostics = (
+                            inputs.get("diagnostics") if isinstance(inputs, dict) else None
                         )
+                        details = {
+                            "reason": (diagnostics or {}).get("reason")
+                            or "insufficient_training_data"
+                        }
+                        if diagnostics:
+                            details["readiness_rejection"] = diagnostics
+                        await self.lifecycle.finish_request(lease, request.id, "queued", details)
                         results[component] = "queued"
                     else:
                         snapshot = await self.lifecycle.read()
@@ -2235,7 +2336,13 @@ async def update_maintenance_gate(session: AsyncSession, enabled: bool) -> None:
         await session.execute(
             update(MLMaintenanceRequestRecord)
             .where(MLMaintenanceRequestRecord.status == "running")
-            .values(status="queued", fence=None, details={"reason": "maintenance_disabled"})
+            .values(
+                status="queued",
+                fence=None,
+                details=MLMaintenanceRequestRecord.details.op("||")(
+                    {"reason": "maintenance_disabled"}
+                ),
+            )
         )
 
 
@@ -2330,13 +2437,22 @@ def native_component_hooks(
 
     def component_hooks(component):
         async def materialize(_request):
+            requested_family = None
+            if component == "thermal" and _request is not None:
+                try:
+                    requested_family = _thermal_request_family(
+                        _request.details or {}, _request.dedup_key
+                    )
+                except ValueError:
+                    return None
             cutoff = _now()
             inputs = await quality.materialize_native_inputs(
                 component, now=cutoff, timer_reader=timer_reader
             )
-            if inputs is None:
-                return None
+            input_families: dict[str, dict[str, Any]] = {}
             if component == "demand":
+                if inputs is None:
+                    return None
                 data = await DemandModel().materialize_candidate(
                     cutoff=cutoff,
                     device_id=inputs["device_id"],
@@ -2344,21 +2460,58 @@ def native_component_hooks(
                     worker=runner._fit,
                 )
             elif component == "comfort":
+                if inputs is None:
+                    return None
                 data = await ComfortModel()._materialize_window_dataset(
                     data_cutoff=cutoff, device_id=inputs["device_id"], raw=True
                 )
             else:
+                for family in ("tank_", "indoor_"):
+                    current_family = (
+                        "tank_"
+                        if inputs and inputs["sensor_basis"]["kind"] == "heatpump_temperature"
+                        else "indoor_"
+                    )
+                    scoped = (
+                        inputs
+                        if inputs is not None and current_family == family
+                        else await quality.materialize_native_inputs(
+                            component,
+                            now=cutoff,
+                            device_id=inputs["device_id"] if inputs else None,
+                            timer_reader=timer_reader,
+                            capabilities=(family + "heating", family + "cooling"),
+                        )
+                    )
+                    if scoped is not None:
+                        input_families[family] = scoped
+                        inputs = inputs or scoped
+                if not input_families or inputs is None:
+                    return None
+                if requested_family is not None:
+                    inputs = input_families.get(requested_family)
+                    if inputs is None:
+                        return None
                 data = await materialize_thermal_inputs(
                     inputs["device_id"],
                     inputs["reference_sensor_id"],
                     inputs["weather_provider"],
                     cutoff,
+                    selected_ids=inputs["configured_sensor_ids"],
                 )
             if data is None:
                 return None
-            return {"data": data, "inputs": inputs, "data_cutoff": cutoff}
+            return {
+                "data": data,
+                "inputs": inputs,
+                "data_cutoff": cutoff,
+                "input_families": input_families,
+                "requested_family": requested_family,
+            }
 
         def fit(materialized):
+            fitted_inputs = materialized["inputs"]
+            remaining_families = ()
             if component == "demand":
                 payload = build_demand_candidate(materialized["data"])
                 horizons, capabilities = (60, 180, 360, 720, 1440), ("demand",)
@@ -2389,28 +2542,48 @@ def native_component_hooks(
                 horizons = tuple(sorted(payload["direct_models"])) if payload else ()
                 capabilities = ("indoor",)
             else:
-                payload = build_thermal_candidate(materialized["data"])
-                prefix = (
+                diagnostics = materialized.setdefault("diagnostics", {})
+                payload = build_thermal_candidate(materialized["data"], diagnostics=diagnostics)
+                diagnostics["requested_family"] = materialized.get("requested_family")
+                if payload is None:
+                    return None
+                quality.check_exact_fit(component, payload)
+                default_family = (
                     "tank_"
                     if materialized["inputs"]["sensor_basis"]["kind"] == "heatpump_temperature"
                     else "indoor_"
                 )
-                capabilities = (
-                    tuple(
-                        name for name in payload["declared_components"] if name.startswith(prefix)
+                input_families = materialized.get("input_families") or {
+                    default_family: materialized["inputs"]
+                }
+                supported = {
+                    family: tuple(
+                        name for name in payload["declared_components"] if name.startswith(family)
                     )
-                    if payload
-                    else ()
-                )
+                    for family in input_families
+                    if any(name.startswith(family) for name in payload["declared_components"])
+                }
+                requested = materialized.get("requested_family")
+                family = requested or next(iter(supported), None)
+                if family is None or family not in supported:
+                    diagnostics["reason"] = "requested_family_unvalidated"
+                    return None
+                fitted_inputs = input_families[family]
+                capabilities = supported[family]
+                if requested is None:
+                    remaining_families = tuple(name for name in supported if name != family)
                 horizons = (15, 30, 60)
             if payload is None or not horizons or not capabilities:
                 return None
-            quality.check_exact_fit(component, payload)
+            if component != "thermal":
+                quality.check_exact_fit(component, payload)
             return {
                 **materialized,
+                "inputs": fitted_inputs,
                 "payload": payload,
                 "horizons": horizons,
                 "capabilities": capabilities,
+                "remaining_families": remaining_families,
             }
 
         async def commit(lease, fitted, state):
@@ -2424,7 +2597,7 @@ def native_component_hooks(
                 "fit_id": str(uuid.uuid4()),
                 "data_cutoff": fitted["data_cutoff"].isoformat(),
                 "frozen_at": _now().isoformat(),
-                "input_schema": "frozen_native_inputs_v1",
+                "input_schema": fitted["inputs"]["schemas"]["input"],
                 "output_schema": LIFECYCLE_SCHEMAS[component],
                 "runtime_versions": {
                     "python": platform.python_version(),
@@ -2466,12 +2639,22 @@ def native_component_hooks(
                 round_trip_check=lambda restored: quality.check_exact_fit(component, restored),
             )
             await guard(lease)
-            return await lifecycle.publish(
+            publication = await lifecycle.publish(
                 lease,
                 artifact,
                 expected_revision=state.revision,
                 expected_incumbent=incumbent.artifact_hash if incumbent else None,
             )
+            if publication.committed:
+                for family in fitted.get("remaining_families", ()):
+                    await lifecycle.enqueue(
+                        component,
+                        "scheduled",
+                        lease=lease,
+                        dedup_key=f"thermal-family:{family}:{artifact.artifact_hash}",
+                        family=family,
+                    )
+            return publication
 
         async def review(lease, reference):
             now, manifest = _now(), reference.manifest

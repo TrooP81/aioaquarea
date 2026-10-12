@@ -33,6 +33,150 @@ from packages.core.space_heating_baseline import (
 from packages.optimizer.rules_engine import RulesOptimizer, minimum_floor_protection_duties
 
 
+class TestR09SavedForecastValidity:
+    @staticmethod
+    def _snapshot():
+        start = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        timestamp = (start + dt.timedelta(hours=1)).isoformat()
+        return start, {
+            "version": "indoor_forecast_v5",
+            "forecast_status": "fallback",
+            "current_indoor": 20.0,
+            "forecast": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
+            "forecast_with_plan": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
+            "forecast_no_heating": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
+            "target_schedule": [{"ts": timestamp, "target": 20.0}],
+            "weather_forecast": [{"ts": timestamp, "outdoor_temp": 0.0}],
+            "price_forecast": [{"ts": timestamp, "price_eur_per_kwh": -0.2, "price_per_kwh": -0.2}],
+            "forecast_quality": {},
+        }
+
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "forecast",
+            "forecast_with_plan",
+            "forecast_no_heating",
+            "prediction_lower_c",
+            "prediction_upper_c",
+            "current_indoor",
+            "target",
+            "outdoor_temp",
+            "price_eur_per_kwh",
+            "price_per_kwh",
+            "metadata",
+        ],
+    )
+    def test_SC058_nonfinite_saved_windows_are_unusable(self, invalid, field):
+        start, snapshot = self._snapshot()
+        if field in {"forecast", "forecast_with_plan", "forecast_no_heating"}:
+            snapshot[field][0]["predicted_indoor_temp"] = invalid
+        elif field in {"prediction_lower_c", "prediction_upper_c"}:
+            snapshot["forecast_with_plan"][0][field] = invalid
+        elif field == "current_indoor":
+            snapshot[field] = invalid
+        elif field == "target":
+            snapshot["target_schedule"][0][field] = invalid
+        elif field == "outdoor_temp":
+            snapshot["weather_forecast"][0][field] = invalid
+        elif field == "metadata":
+            snapshot["forecast_quality"]["mae"] = invalid
+        else:
+            snapshot["price_forecast"][0][field] = invalid
+
+        assert _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1) is None
+
+    @pytest.mark.parametrize("field", ["prediction", "target", "price"])
+    def test_nonfinite_numeric_strings_are_not_valid_curve_numbers(self, field):
+        start, snapshot = self._snapshot()
+        if field == "prediction":
+            snapshot["forecast_with_plan"][0]["predicted_indoor_temp"] = "NaN"
+        elif field == "target":
+            snapshot["target_schedule"][0]["target"] = "NaN"
+        else:
+            snapshot["price_forecast"][0]["price_eur_per_kwh"] = "NaN"
+
+        assert _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1) is None
+
+    def test_zero_outdoor_and_negative_prices_remain_valid(self):
+        start, snapshot = self._snapshot()
+        result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+        assert result is not None
+        assert result["weather_forecast"][0]["outdoor_temp"] == 0.0
+        assert result["price_forecast"][0]["price_per_kwh"] == -0.2
+
+
+@pytest.mark.parametrize("fault", ["weather", "price", "indoor"])
+async def test_R09_live_numeric_fault_returns_valid_unavailable_api(monkeypatch, fault):
+    import httpx
+    from fastapi import FastAPI
+
+    from packages.api.routers import models_router
+    from packages.api.schemas import IndoorForecastResponse
+    from packages.core.models import DeviceStatusRecord, PriceRecord, WeatherRecord
+    from packages.ml.thermal import ThermalModel
+    from tests.test_optimizer_api_contracts import _session_context
+
+    now = dt.datetime.now(dt.timezone.utc)
+    target = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    status = DeviceStatusRecord(ts=now, device_id="s2-device", outdoor_temp=5, zone1_temp=35)
+    weather = WeatherRecord(
+        ts=target, source="open-meteo", temperature=float("nan") if fault == "weather" else 5
+    )
+    price = PriceRecord(
+        ts=target, area="SE3", price_eur_per_kwh=float("inf") if fault == "price" else 0.2
+    )
+
+    async def execute(statement):
+        model = statement.column_descriptions[0]["entity"]
+        rows = [weather] if model is WeatherRecord else [price] if model is PriceRecord else []
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: status if model is DeviceStatusRecord else None,
+            scalars=lambda: SimpleNamespace(all=lambda: rows),
+        )
+
+    model = ThermalModel()
+    model.arefresh_if_changed = AsyncMock(return_value=False)
+    monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
+    monkeypatch.setattr(
+        models_router,
+        "_read_live_forecast_quality",
+        AsyncMock(return_value={"status": "fallback", "control_allowed": False}),
+    )
+    monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
+    monkeypatch.setattr(
+        models_router, "get_session", lambda: _session_context(SimpleNamespace(execute=execute))
+    )
+    monkeypatch.setattr(
+        "packages.core.control_temperature.get_control_temperature",
+        AsyncMock(
+            return_value=ControlTemperature(
+                value=float("nan") if fault == "indoor" else 20,
+                confidence="high",
+                sensor_count=1,
+                sample_count=1,
+                latest_reading=now,
+            )
+        ),
+    )
+    app = FastAPI()
+    app.include_router(models_router.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://s2.invalid",
+    ) as client:
+        response = await client.get("/api/thermal/indoor-forecast?hours=1")
+
+    assert response.status_code == 200
+    body = IndoorForecastResponse.model_validate(response.json())
+    assert body.forecast_status == "unavailable"
+    assert body.forecast_with_plan == body.forecast == body.forecast_no_heating == []
+    assert body.forecast_quality["control_allowed"] is False
+    assert "nonfinite" in body.forecast_unavailable_reason
+    json.dumps(response.json(), allow_nan=False)
+
+
 @pytest.mark.parametrize("version", ["indoor_forecast_v1", "indoor_forecast_v2"])
 def test_legacy_v1_v2_snapshot_read(version):
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)

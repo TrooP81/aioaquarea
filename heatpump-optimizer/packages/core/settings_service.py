@@ -33,15 +33,27 @@ class SettingSpec:
     max_value: float | None = None
 
     def serialize_default(self) -> str:
+        if self.value_type in {"int", "float"} and self.default != "":
+            self.parse(self.default)
         return self.default
 
     def parse(self, value: str) -> Any:
         if self.value_type in {"str", "secret", "json"}:
             return value
-        if self.value_type == "int":
-            return int(value)
-        if self.value_type == "float":
-            return float(value)
+        if self.value_type in {"int", "float"}:
+            if isinstance(value, bool):
+                raise ValueError(f"{self.key} must be a finite numeric value")
+            try:
+                parsed = int(value) if self.value_type == "int" else float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{self.key} must be a valid {self.value_type}") from exc
+            if isinstance(parsed, float) and not math.isfinite(parsed):
+                raise ValueError(f"{self.key} must be finite")
+            if self.min_value is not None and parsed < self.min_value:
+                raise ValueError(f"{self.key} must be at least {self.min_value}")
+            if self.max_value is not None and parsed > self.max_value:
+                raise ValueError(f"{self.key} must be at most {self.max_value}")
+            return parsed
         if self.value_type == "bool":
             return _parse_bool(value)
         raise ValueError(f"Unsupported setting type: {self.value_type}")
@@ -610,29 +622,25 @@ def validate_setting_value(key: str, value: str) -> None:
 
     if spec.value_type in {"int", "float", "bool"}:
         try:
-            parsed = spec.parse(value)
+            spec.parse(value)
         except ValueError as exc:
             raise ValueError(f"{key} must be a valid {spec.value_type} ({exc})") from exc
-        if spec.min_value is not None or spec.max_value is not None:
-            if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
-                raise ValueError(f"{key} must be a finite numeric value")
-            numeric = float(parsed)
-            if not math.isfinite(numeric):
-                raise ValueError(f"{key} must be finite")
-            if spec.min_value is not None and numeric < spec.min_value:
-                raise ValueError(f"{key} must be at least {spec.min_value}")
-            if spec.max_value is not None and numeric > spec.max_value:
-                raise ValueError(f"{key} must be at most {spec.max_value}")
 
 
 def _default_setting_value(spec: SettingSpec) -> str:
     if spec.default_env and hasattr(env_settings, spec.default_env):
-        return str(getattr(env_settings, spec.default_env))
-    return spec.serialize_default()
+        value = str(getattr(env_settings, spec.default_env))
+    else:
+        value = spec.serialize_default()
+    if spec.value_type in {"int", "float"} and value != "":
+        spec.parse(value)
+    return value
 
 
-async def get_all_settings() -> dict[str, str]:
+async def get_all_settings(*, session=None) -> dict[str, str]:
     """Load all settings from DB, falling back to env vars."""
+    from contextlib import nullcontext
+
     result: dict[str, str] = {}
 
     # Start with env fallbacks / defaults
@@ -640,21 +648,26 @@ async def get_all_settings() -> dict[str, str]:
         result[key] = _default_setting_value(spec)
 
     # Override with DB values
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
         rows = await session.execute(select(SettingRecord))
         for row in rows.scalars().all():
             if row.key in SETTINGS_SCHEMA:
                 result[row.key] = row.value
 
+    for key, spec in SETTING_SPECS.items():
+        if spec.value_type in {"int", "float"} and result[key] != "":
+            spec.parse(result[key])
     result["seasonal_calibration_auto_exit"] = "false"
     return result
 
 
-async def get_setting(key: str) -> str:
+async def get_setting(key: str, *, session=None) -> str:
     """Get a single setting value (DB first, then env fallback)."""
+    from contextlib import nullcontext
+
     if key == "seasonal_calibration_auto_exit":
         return "false"
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
         row = await session.execute(select(SettingRecord).where(SettingRecord.key == key))
         record = row.scalar_one_or_none()
         if record is not None:
@@ -665,20 +678,32 @@ async def get_setting(key: str) -> str:
     return _default_setting_value(spec)
 
 
-async def get_typed_setting(key: str) -> Any:
+async def get_typed_setting(key: str, *, session=None) -> Any:
     spec = get_setting_spec(key)
-    raw_value = await get_setting(key)
+    raw_value = (
+        await get_setting(key) if session is None else await get_setting(key, session=session)
+    )
     if raw_value == "" and spec.value_type not in {"str", "secret", "json"}:
         return spec.parse(spec.serialize_default()) if spec.serialize_default() else None
     return spec.parse(raw_value)
 
 
-async def get_int_setting(key: str) -> int:
-    return int(await get_typed_setting(key))
+async def get_int_setting(key: str, *, session=None) -> int:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
+    return int(value)
 
 
-async def get_float_setting(key: str) -> float:
-    return float(await get_typed_setting(key))
+async def get_float_setting(key: str, *, session=None) -> float:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
+    return float(value)
 
 
 async def get_heat_curve_config() -> HeatCurveConfig:
@@ -712,8 +737,12 @@ async def set_heat_curve_verification_state(state: dict[str, Any]) -> None:
     await set_setting("_heat_curve_verification_state", json.dumps(state, sort_keys=True))
 
 
-async def get_bool_setting(key: str) -> bool:
-    value = await get_typed_setting(key)
+async def get_bool_setting(key: str, *, session=None) -> bool:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
     if isinstance(value, str):
         try:
             return _parse_bool(value)
@@ -731,7 +760,9 @@ async def set_setting(key: str, value: str) -> None:
     if key == "seasonal_calibration_enabled":
         await set_settings_bulk({key: value})
         return
-    if SETTINGS_SCHEMA.get(key, {}).get("read_only"):
+    if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
+        "type"
+    ) in {"int", "float"}:
         validate_setting_value(key, value)
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -748,16 +779,20 @@ async def set_setting(key: str, value: str) -> None:
             await update_maintenance_gate(session, _parse_bool(value))
 
 
-async def set_settings_bulk(updates: dict[str, str]) -> None:
+async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
     """Atomically validate and upsert multiple settings.
 
     Heat-curve and gate settings are one configuration: no concurrent bulk
     writer may persist a valid individual value that makes the combined
     thresholds invalid.
     """
+    from contextlib import nullcontext
+
     updates = dict(updates)
     for key, value in updates.items():
-        if SETTINGS_SCHEMA.get(key, {}).get("read_only"):
+        if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
+            "type"
+        ) in {"int", "float"}:
             validate_setting_value(key, value)
     if "seasonal_calibration_enabled" in updates and not _parse_bool(
         updates["seasonal_calibration_enabled"]
@@ -766,7 +801,7 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
         updates["_seasonal_calibration_safety_deferred_since"] = ""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:key)"),
             {
@@ -896,6 +931,7 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
     from packages.core.models import DeviceStatusRecord
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    timezone_name = await get_user_tz()
 
     async with get_session() as session:
         from sqlalchemy import select
@@ -917,7 +953,7 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
     }
 
     for ts, action in rows:
-        local = _to_local(ts)
+        local = _to_local(ts, tz_name=timezone_name)
         day_type = "weekday" if local.weekday() < 5 else "weekend"
         hour = local.hour
         total_counts[day_type][hour] += 1

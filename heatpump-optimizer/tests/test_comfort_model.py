@@ -202,6 +202,297 @@ class TestComfortArtifactRefresh:
         legacy_load.assert_not_called()
 
 
+class _WindowFeatureSpy:
+    def __init__(self):
+        self.rows = []
+
+    def predict(self, features):
+        rows = np.asarray(features, dtype=float)
+        self.rows.append(rows.copy())
+        return 0.1 * rows[:, 0]
+
+
+class TestR05WindowServing:
+    @staticmethod
+    def _model():
+        model = ComfortModel()
+        spy = _WindowFeatureSpy()
+        model._model = spy
+        model._direct_models = {60: spy}
+        model._passive_direct_models = {180: spy}
+        model._metrics = {
+            "delta_target": True,
+            "passive_horizons": {"180": {"status": "trained", "mae": 0.1, "persistence_mae": 0.8}},
+        }
+        return model, spy
+
+    def test_forward_uses_exact_trained_lift_and_time_context(self):
+        model, spy = self._model()
+        expected = ComfortModel._controlled_window_features(
+            mean_supply_lift=15.0,
+            mean_target_lift=20.0,
+            window_heat_fraction=1.0,
+            final_hour_heat_fraction=1.0,
+            outdoor_temp=5.0,
+            wind_speed=3.0,
+            irradiance=0.0,
+            precipitation=0.0,
+            humidity=60.0,
+            cloud_cover=0.5,
+            hour=3,
+            issue_indoor_temp=20.0,
+            issue_indoor_trend=-0.25,
+        )
+
+        prediction = model.predict_indoor_temp(
+            35.0,
+            5.0,
+            indoor_temp=20.0,
+            zone_target_temp=40.0,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+            hour=3,
+            indoor_trend_c_per_hour=-0.25,
+            forecast_horizon_minutes=60,
+        )
+
+        np.testing.assert_array_equal(spy.rows[0][0], expected)
+        assert prediction == pytest.approx(21.5)
+
+    def test_inverse_uses_the_same_forward_lift_schema(self):
+        model, spy = self._model()
+
+        required = model.required_zone_temp(21.5, 5.0, indoor_temp=20.0, hour=3)
+
+        assert required == pytest.approx(35.0, abs=0.6)
+        assert spy.rows[0][0, :4].tolist() == [0.0, 0.0, 1.0, 1.0]
+        assert spy.rows[0][0, 10] == pytest.approx(np.sin(2 * np.pi * 3 / 24))
+
+    def test_passive_serving_uses_zero_heat_lifts(self):
+        model, spy = self._model()
+
+        prediction, readiness = model.predict_passive_indoor_temp(
+            outdoor_temp=8.0, indoor_temp=21.0, forecast_horizon_minutes=180
+        )
+
+        expected = ComfortModel._passive_window_features(
+            ComfortModel._controlled_window_features(
+                mean_supply_lift=0.0,
+                mean_target_lift=0.0,
+                window_heat_fraction=0.0,
+                final_hour_heat_fraction=0.0,
+                outdoor_temp=8.0,
+                wind_speed=3.0,
+                irradiance=0.0,
+                precipitation=0.0,
+                humidity=60.0,
+                cloud_cover=0.5,
+                hour=12,
+                issue_indoor_temp=5.0,
+                issue_indoor_trend=0.0,
+            )
+        )
+        np.testing.assert_array_equal(spy.rows[0][0], expected)
+        assert readiness["ready"] is True
+        assert prediction == 21.0
+
+    @pytest.mark.parametrize("field", ["indoor_temp", "zone_target_temp"])
+    def test_missing_required_controlled_context_is_unavailable(self, field):
+        model, spy = self._model()
+        inputs = dict(
+            zone_water_temp=35.0,
+            outdoor_temp=5.0,
+            indoor_temp=20.0,
+            zone_target_temp=40.0,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+        )
+        inputs[field] = None
+
+        assert model.predict_indoor_temp(**inputs) is None
+        assert spy.rows == []
+
+
+class TestR33PassiveFiniteValidity:
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "indoor_temp",
+            "outdoor_temp",
+            "wind_speed",
+            "irradiance",
+            "precipitation",
+            "humidity",
+            "cloud_cover",
+            "forecast_horizon_minutes",
+            "max_change_c_per_hour",
+        ],
+    )
+    def test_invalid_inputs_refuse_before_estimator(self, field, value):
+        import json
+
+        model, spy = TestR05WindowServing._model()
+        inputs = dict(
+            outdoor_temp=8.0,
+            indoor_temp=21.0,
+            wind_speed=3.0,
+            irradiance=0.0,
+            precipitation=0.0,
+            humidity=60.0,
+            cloud_cover=0.5,
+            forecast_horizon_minutes=180,
+            max_change_c_per_hour=0.5,
+        )
+        inputs[field] = value
+
+        prediction, readiness = model.predict_passive_indoor_temp(**inputs)
+
+        assert prediction is None
+        assert readiness["ready"] is False
+        assert spy.rows == []
+        json.dumps(readiness, allow_nan=False)
+
+    @pytest.mark.parametrize("field", ["mae", "persistence_mae"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_invalid_validation_metrics_never_report_ready(self, field, value):
+        import json
+
+        model, spy = TestR05WindowServing._model()
+        model._metrics["passive_horizons"]["180"][field] = value
+
+        prediction, readiness = model.predict_passive_indoor_temp(
+            outdoor_temp=8.0, indoor_temp=21.0, forecast_horizon_minutes=180
+        )
+
+        assert prediction is None
+        assert readiness["ready"] is False
+        assert spy.rows == []
+        json.dumps(readiness, allow_nan=False)
+
+
+class TestR09ComfortInverseValidity:
+    @pytest.mark.parametrize("target", [float("nan"), float("inf"), float("-inf"), True, None])
+    def test_invalid_target_refuses_before_estimator(self, target):
+        model, spy = TestR05WindowServing._model()
+
+        result = model.required_zone_temp(target, 5.0, indoor_temp=20.0, hour=3)
+
+        assert result is None
+        assert spy.rows == []
+
+
+class TestR07SelectedSensorMaterialization:
+    @pytest.mark.parametrize(
+        ("reference", "selected", "expected"),
+        [
+            ("", "selected", 20.0),
+            ("", "other", 28.0),
+            ("selected", "selected", 20.0),
+            ("other", "selected", None),
+        ],
+    )
+    async def test_historical_selection_filters_before_limit(
+        self, monkeypatch, reference, selected, expected
+    ):
+        from sqlalchemy.sql import operators, visitors
+        from sqlalchemy.sql.elements import BinaryExpression
+
+        from packages.core.models import IndoorTempReading
+        from packages.ml import comfort_model as module
+
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            IndoorTempReading(device_id="selected", timestamp=now, temperature=20, is_stale=False)
+        ]
+        rows += [
+            IndoorTempReading(
+                device_id="other",
+                timestamp=now + dt.timedelta(seconds=offset),
+                temperature=28,
+                is_stale=False,
+            )
+            for offset in (1, 2, 3)
+        ]
+        monkeypatch.setattr(
+            module,
+            "get_all_settings",
+            AsyncMock(
+                return_value={
+                    "comfort_reference_sensor_id": reference,
+                    "smartthings_device_ids": selected,
+                    "weather_provider": "open-meteo",
+                }
+            ),
+        )
+        statements = []
+
+        async def execute(statement):
+            statements.append(statement)
+            if statement.column_descriptions[0]["entity"] is IndoorTempReading:
+                predicates = [
+                    node
+                    for criterion in statement._where_criteria
+                    for node in visitors.iterate(criterion)
+                    if isinstance(node, BinaryExpression)
+                    and getattr(node.left, "name", None) == "device_id"
+                    and node.operator is operators.in_op
+                ]
+                assert len(predicates) == 1
+                assert set(predicates[0].right.value) == {selected}
+                assert statement._limit_clause.value == 50_001
+                result_rows = rows
+            else:
+                result_rows = []
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: result_rows))
+
+        monkeypatch.setattr(
+            module, "get_session", lambda: _AsyncContextManager(SimpleNamespace(execute=execute))
+        )
+        data = await ComfortModel()._materialize_window_dataset(
+            data_cutoff=now + dt.timedelta(seconds=4), device_id="audit-device", raw=True
+        )
+
+        if expected is None:
+            assert isinstance(data, WindowDataset)
+            assert data.evidence["blocker"] == "reference_sensor_not_selected"
+            assert statements == []
+        else:
+            assert data["readings"][0].temperature == expected
+            assert data["source_sensor_count"] == 1
+            assert data["sensor_selection_schema"] == "selected_indoor_sensors_v2"
+
+    def test_equal_sensor_weight_and_nonfinite_observation_filter(self):
+        from packages.core.models import IndoorTempReading
+
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            IndoorTempReading(
+                device_id="selected",
+                timestamp=now + dt.timedelta(seconds=offset),
+                temperature=20,
+                is_stale=False,
+            )
+            for offset in (0, 1, 2)
+        ]
+        rows += [
+            IndoorTempReading(
+                device_id="other",
+                timestamp=now + dt.timedelta(seconds=3),
+                temperature=28,
+                is_stale=False,
+            ),
+            IndoorTempReading(
+                device_id="invalid", timestamp=now, temperature=float("nan"), is_stale=False
+            ),
+        ]
+
+        observations, _, count = ComfortModel._select_indoor_observations(rows, "")
+
+        assert count == 2
+        assert observations[0].temperature == 24.0
+
+
 class TestPassiveDirectForecastReadiness:
     def test_direct_passive_forecast_can_be_ready_without_heating_control(self):
         model = ComfortModel()
@@ -663,25 +954,24 @@ class TestComfortModelTrained:
         humidity = rng.uniform(30, 95, n)
         cloud_cover = rng.uniform(0, 1, n)
         hours = rng.randint(0, 24, n)
-        # Previous indoor temp — slightly correlated with target
-        prev_indoor = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 2.0, n)
-
-        X = np.column_stack(
+        X = np.vstack(
             [
-                water_temps,
-                water_temps,
-                np.ones(n),
-                np.ones(n),
-                outdoor_temps,
-                wind,
-                irradiance,
-                precipitation,
-                humidity,
-                cloud_cover,
-                np.sin(2.0 * np.pi * hours / 24.0),
-                np.cos(2.0 * np.pi * hours / 24.0),
-                prev_indoor,
-                np.zeros(n),
+                ComfortModel._controlled_window_features(
+                    mean_supply_lift=water_temps[index] - 20.0,
+                    mean_target_lift=water_temps[index] - 20.0,
+                    window_heat_fraction=1.0,
+                    final_hour_heat_fraction=1.0,
+                    outdoor_temp=outdoor_temps[index],
+                    wind_speed=wind[index],
+                    irradiance=irradiance[index],
+                    precipitation=precipitation[index],
+                    humidity=humidity[index],
+                    cloud_cover=cloud_cover[index],
+                    hour=int(hours[index]),
+                    issue_indoor_temp=20.0,
+                    issue_indoor_trend=0.0,
+                )
+                for index in range(n)
             ]
         )
         # Simplified thermal relationship
@@ -710,44 +1000,56 @@ class TestComfortModelTrained:
         model._metrics = {"mae": 0.5, "r2": 0.95}
         return model
 
+    @staticmethod
+    def _predict(model, water, outdoor):
+        return model.predict_indoor_temp(
+            water,
+            outdoor,
+            indoor_temp=20.0,
+            zone_target_temp=water,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+            hour=12,
+        )
+
     def test_is_trained(self, trained_model):
         assert trained_model.is_trained is True
 
     def test_predict_indoor_temp(self, trained_model):
         # water=35, outdoor=5 → expected ≈ 0.3*35 + 0.2*5 + 10 = 21.5
-        result = trained_model.predict_indoor_temp(35.0, 5.0)
+        result = self._predict(trained_model, 35.0, 5.0)
         assert result is not None
         assert 18.0 < result < 25.0  # reasonable range
 
     def test_predict_higher_water_temp_gives_higher_indoor(self, trained_model):
-        low = trained_model.predict_indoor_temp(25.0, 5.0)
-        high = trained_model.predict_indoor_temp(50.0, 5.0)
+        low = self._predict(trained_model, 25.0, 5.0)
+        high = self._predict(trained_model, 50.0, 5.0)
         assert high > low
 
     def test_predict_higher_outdoor_gives_higher_indoor(self, trained_model):
-        cold = trained_model.predict_indoor_temp(35.0, -5.0)
-        warm = trained_model.predict_indoor_temp(35.0, 20.0)
+        cold = self._predict(trained_model, 35.0, -5.0)
+        warm = self._predict(trained_model, 35.0, 20.0)
         assert warm > cold
 
     def test_required_zone_temp_inverse(self, trained_model):
         # Ask for 21 °C indoor, should return a water temp
-        water = trained_model.required_zone_temp(21.0, 5.0)
+        water = trained_model.required_zone_temp(21.0, 5.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert 25.0 <= water <= 55.0
 
         # Verify: predicting with that water temp should give ~21 °C
-        predicted = trained_model.predict_indoor_temp(water, 5.0)
+        predicted = self._predict(trained_model, water, 5.0)
         assert abs(predicted - 21.0) < 1.0
 
     def test_required_zone_temp_clamps_at_max(self, trained_model):
         # Request impossibly high indoor temp → should return MAX_ZONE_WATER_TEMP
-        water = trained_model.required_zone_temp(40.0, -10.0)
+        water = trained_model.required_zone_temp(40.0, -10.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert water == 65.0  # MAX_ZONE_WATER_TEMP
 
     def test_required_zone_temp_clamps_at_min(self, trained_model):
         # Request very low indoor temp on warm day → should return MIN_ZONE_WATER_TEMP
-        water = trained_model.required_zone_temp(10.0, 25.0)
+        water = trained_model.required_zone_temp(10.0, 25.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert water == 20.0  # MIN_ZONE_WATER_TEMP
 

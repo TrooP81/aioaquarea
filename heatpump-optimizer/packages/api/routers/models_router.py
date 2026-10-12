@@ -27,6 +27,7 @@ from packages.core.models import (
 )
 from packages.ml.forecast_quality import get_forecast_scorecard as build_forecast_scorecard
 from packages.ml.lifecycle import Lifecycle, LifecycleUnavailable, enqueue_maintenance_request
+from packages.ml.models_common import is_finite_number
 from packages.core.settings_service import get_bool_setting
 
 router = APIRouter()
@@ -191,6 +192,23 @@ async def metrics() -> PlainTextResponse:
     )
 
 
+def _numeric_forecast_unavailable(reason: str) -> dict[str, Any]:
+    return IndoorForecastResponse(
+        forecast=[],
+        forecast_with_plan=[],
+        forecast_no_heating=[],
+        target_schedule=[],
+        weather_forecast=[],
+        price_forecast=[],
+        planned_actions=[],
+        forecast_source="unavailable",
+        forecast_status="unavailable",
+        forecast_unavailable_reason=reason,
+        forecast_quality={"status": "unavailable", "control_allowed": False, "reason": reason},
+        room_comfort={"status": "unavailable", "reason": reason},
+    ).model_dump(mode="json")
+
+
 def _plan_forecast_window(
     plan_json: str,
     forecast_start: dt.datetime,
@@ -200,6 +218,8 @@ def _plan_forecast_window(
     try:
         payload = json.loads(plan_json)
         snapshot = payload.get("forecast_snapshot") if isinstance(payload, dict) else None
+        if isinstance(snapshot, dict):
+            json.dumps(snapshot, allow_nan=False)
     except (TypeError, ValueError):
         return None
     if not isinstance(snapshot, dict) or snapshot.get("version") not in {
@@ -260,7 +280,19 @@ def _plan_forecast_window(
         result = []
         for relative_hour, index in enumerate(indexes, start=1):
             source = snapshot[key][index]
-            if not isinstance(source, dict) or source.get("predicted_indoor_temp") is None:
+            if not isinstance(source, dict) or not is_finite_number(
+                source.get("predicted_indoor_temp")
+            ):
+                return []
+            if any(
+                source.get(field) is not None and not is_finite_number(source[field])
+                for field in (
+                    "space_heating_fraction",
+                    "baseline_heating_fraction",
+                    "prediction_lower_c",
+                    "prediction_upper_c",
+                )
+            ):
                 return []
             result.append(
                 {
@@ -295,7 +327,20 @@ def _plan_forecast_window(
         price = snapshot["price_forecast"][index]
         if not all(isinstance(row, dict) for row in (target, weather_row, price)):
             return None
-        if target.get("target") is None or weather_row.get("ts") is None or price.get("ts") is None:
+        if (
+            not is_finite_number(target.get("target"))
+            or weather_row.get("ts") is None
+            or price.get("ts") is None
+        ):
+            return None
+        if any(
+            row.get(field) is not None and not is_finite_number(row[field])
+            for row, fields in (
+                (weather_row, ("outdoor_temp", "wind_speed", "irradiance", "precipitation")),
+                (price, ("price_per_kwh", "price_eur_per_kwh")),
+            )
+            for field in fields
+        ):
             return None
         targets.append(
             {
@@ -330,6 +375,8 @@ def _plan_forecast_window(
         current_indoor = float(snapshot.get("current_indoor"))
     except (TypeError, ValueError):
         current_indoor = None
+    if current_indoor is not None and not is_finite_number(current_indoor):
+        return None
 
     legacy_snapshot = snapshot.get("version") in {
         "indoor_forecast_v1",
@@ -806,6 +853,8 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
 @router.get("/api/thermal/heat-curve-advice")
 async def get_heat_curve_advice():
     """Explain a small, manual Panasonic curve adjustment from live comfort data."""
+    from packages.core.control_temperature import get_control_temperature
+    from packages.core.device_data_quality import get_device_data_quality
     from packages.core.heat_curve import (
         HEAT_CURVE_SETTING_KEYS,
         evaluate_heat_curve_verification,
@@ -817,7 +866,6 @@ async def get_heat_curve_advice():
         get_heat_curve_config,
         get_heat_curve_verification_state,
         get_space_heating_gate_config,
-        set_heat_curve_verification_state,
     )
     from packages.core.space_heating_gate import resolve_effective_gate
 
@@ -827,19 +875,22 @@ async def get_heat_curve_advice():
     verification_state = await get_heat_curve_verification_state()
     now = dt.datetime.now(dt.timezone.utc)
 
-    async with get_session() as session:
+    async with get_session(read_only=True) as session:
         status = (
             await session.execute(
-                select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
-            )
-        ).scalar_one_or_none()
-        indoor_temp = (
-            await session.execute(
-                select(IndoorTempReading.temperature)
-                .order_by(IndoorTempReading.timestamp.desc())
+                select(DeviceStatusRecord)
+                .where(DeviceStatusRecord.ts <= now)
+                .order_by(desc(DeviceStatusRecord.ts))
                 .limit(1)
             )
-        ).scalar()
+        ).scalar_one_or_none()
+        status_quality = await get_device_data_quality(now=now, session=session, status=status)
+        control_temperature = await get_control_temperature(now=now, session=session)
+        indoor_temp = (
+            control_temperature.value
+            if control_temperature.is_usable and is_finite_number(control_temperature.value)
+            else None
+        )
         gate_row = (
             (
                 await session.execute(
@@ -956,7 +1007,7 @@ async def get_heat_curve_advice():
 
     outdoor_temp = (
         float(status.outdoor_temp)
-        if status is not None and status.outdoor_temp is not None
+        if status is not None and is_finite_number(status.outdoor_temp) and status_quality["ready"]
         else None
     )
     elapsed_hours = (now - started_at).total_seconds() / 3600 if started_at is not None else 0.0
@@ -973,9 +1024,6 @@ async def get_heat_curve_advice():
         and verification_state.get("status") != "verified"
     ):
         verification["completed_at"] = now.isoformat()
-        await set_heat_curve_verification_state(verification)
-    elif verification_state and verification_state.get("source") == "audit_recovery":
-        await set_heat_curve_verification_state(verification_state)
 
     readings = {
         "indoor_temp_c": float(indoor_temp) if indoor_temp is not None else None,
@@ -998,7 +1046,7 @@ async def get_heat_curve_advice():
         outdoor_temp,
         gate_evidence,
     )
-    if gate_evidence.state != "ALLOWED":
+    if gate_evidence.state != "ALLOWED" or advice["status"] == "insufficient_data":
         return {
             **advice,
             "readings": readings,
@@ -1032,6 +1080,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     )
     from packages.core.settings_service import (
         get_comfort_schedule,
+        get_float_setting,
         get_heat_curve_config,
         get_space_heating_gate_config,
         get_setting,
@@ -1084,7 +1133,35 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         price_records = price_result.scalars().all()
 
     if not status:
-        return {"error": "No device data available"}
+        return _numeric_forecast_unavailable("no_device_data")
+
+    if any(
+        value is not None and not is_finite_number(value)
+        for value in (
+            control_temperature.value,
+            status.outdoor_temp,
+            status.zone1_temp,
+        )
+    ):
+        return _numeric_forecast_unavailable("nonfinite_current_forecast_input")
+    if any(
+        (value := getattr(record, field, None)) is not None and not is_finite_number(value)
+        for record in weather_records
+        for field in (
+            "temperature",
+            "wind_speed",
+            "irradiance",
+            "precipitation",
+            "humidity",
+            "cloud_cover",
+        )
+    ):
+        return _numeric_forecast_unavailable("nonfinite_weather_forecast_input")
+    if any(
+        record.price_eur_per_kwh is not None and not is_finite_number(record.price_eur_per_kwh)
+        for record in price_records
+    ):
+        return _numeric_forecast_unavailable("nonfinite_price_forecast_input")
 
     current_indoor = float(control_temperature.value) if control_temperature.is_usable else None
     outdoor = status.outdoor_temp if status.outdoor_temp is not None else 7.0
@@ -1147,15 +1224,21 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
                 }
             )
 
-    heat_curve = await get_heat_curve_config()
-    comfort_temp_min = float(await get_setting("comfort_temp_min") or 20.0)
-    comfort_temp_max = float(await get_setting("comfort_temp_max") or 22.0)
+    try:
+        heat_curve = await get_heat_curve_config()
+        comfort_temp_min = await get_float_setting("comfort_temp_min")
+        comfort_temp_max = await get_float_setting("comfort_temp_max")
+    except ValueError:
+        return _numeric_forecast_unavailable("nonfinite_or_invalid_forecast_setting")
     room_envelope = _safe_room_comfort_envelope(
         control_temperature, comfort_temp_max=comfort_temp_max
     )
     from packages.core.space_heating_gate import project_gate_states, resolve_effective_gate
 
-    gate_config = await get_space_heating_gate_config()
+    try:
+        gate_config = await get_space_heating_gate_config()
+    except ValueError:
+        return _numeric_forecast_unavailable("nonfinite_or_invalid_gate_setting")
     effective_gate = resolve_effective_gate(gate_row, gate_config)
     gate_projections = project_gate_states(
         effective_gate,

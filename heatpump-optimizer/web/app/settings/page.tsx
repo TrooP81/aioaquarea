@@ -451,8 +451,20 @@ export default function SettingsPage() {
         body: JSON.stringify({ settings: updates }),
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Save failed");
+        const errorResponse: unknown = await res.json();
+        const detail = errorResponse !== null && typeof errorResponse === "object" && "detail" in errorResponse
+          ? errorResponse.detail : undefined;
+        let failureMessage = typeof detail === "string" ? detail : "";
+        if (detail !== null && typeof detail === "object" && "invalid_values" in detail) {
+          const invalidValues = detail.invalid_values;
+          if (invalidValues !== null && typeof invalidValues === "object" && !Array.isArray(invalidValues)) {
+            failureMessage = Object.entries(invalidValues)
+              .filter(([, reason]) => typeof reason === "string")
+              .map(([key, reason]) => `${key}: ${reason}`)
+              .join("; ");
+          }
+        }
+        throw new Error(failureMessage || "Save failed");
       }
       setMessage({ text: `Saved ${Object.keys(updates).length} setting(s)`, type: "success" });
       await fetchSettings();

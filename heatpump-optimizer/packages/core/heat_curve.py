@@ -169,6 +169,21 @@ def heat_curve_advice(
             "gate_reason": gate_evidence.reason_code,
         }
 
+    if any(
+        not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
+        for value in (indoor_temp, outdoor_temp, comfort_target)
+    ):
+        return {
+            "status": "insufficient_data",
+            "indoor_error_c": None,
+            "current": config.as_dict(),
+            "suggested": None,
+            "reasons": ["Fresh, finite indoor and outdoor observations are required for advice."],
+            "manual_only": True,
+            "controllability": "insufficient_data",
+            "gate_state": gate_evidence.state,
+            "gate_reason": gate_evidence.reason_code,
+        }
     if indoor_temp is not None:
         indoor_error = round(indoor_temp - comfort_target, 1)
         if indoor_error > 0.5:

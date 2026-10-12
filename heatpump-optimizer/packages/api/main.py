@@ -42,26 +42,29 @@ if not is_auth_enabled():
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+
     wrapper: AquareaWrapper | None = None
-    if settings.panasonic_distributed_read_quota_enabled:
-        wrapper = AquareaWrapper(read_only=True)
-        try:
-            await wrapper.start()
-        except Exception:
-            logger.exception("Panasonic quota wrapper startup failed")
-            try:
-                await wrapper.stop()
-            except Exception:
-                logger.exception("Panasonic quota wrapper partial shutdown failed")
-        else:
-            application.state.aquarea_wrapper = wrapper
     try:
+        configure_logging("api")
+        if settings.panasonic_distributed_read_quota_enabled:
+            wrapper = AquareaWrapper(read_only=True)
+            try:
+                await wrapper.start()
+            except Exception:
+                logger.exception("Panasonic quota wrapper startup failed")
+                await finish_owned_cleanup(wrapper.stop)
+            else:
+                application.state.aquarea_wrapper = wrapper
         yield
     finally:
-        active_wrapper = getattr(application.state, "aquarea_wrapper", None)
-        if active_wrapper is not None:
-            await active_wrapper.stop()
-            del application.state.aquarea_wrapper
+
+        async def cleanup():
+            await close_service_resources(wrapper=wrapper)
+            if hasattr(application.state, "aquarea_wrapper"):
+                del application.state.aquarea_wrapper
+
+        await finish_owned_cleanup(cleanup)
 
 
 app = FastAPI(

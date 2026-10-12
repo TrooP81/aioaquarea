@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import asyncio
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
@@ -14,7 +13,6 @@ from packages.core.database import get_session
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
-    ConsumptionRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
@@ -417,14 +415,24 @@ async def cancel_override(override_id: int):
     return {"status": "cancelled"}
 
 
-async def _learning_mode_status() -> dict[str, object]:
+async def _learning_mode_status(*, context=None, materialized=None, now=None) -> dict[str, object]:
     """Return learning-mode state plus how long it has been collecting data."""
     from packages.core.learning_state import get_learning_state_details
     from packages.core.settings_service import get_setting
 
-    learning, seasonal = await get_learning_state_details()
+    if context is None:
+        learning, seasonal = await get_learning_state_details()
+    else:
+        learning, seasonal = await get_learning_state_details(
+            context=context, materialized=materialized
+        )
     enabled = learning.manual_enabled
-    since_raw = await get_setting("learning_mode_since")
+    since_raw = (
+        await get_setting("learning_mode_since")
+        if context is None
+        else context["settings"]["learning_mode_since"]
+    )
+    now = now or dt.datetime.now(dt.timezone.utc)
     since_iso: str | None = since_raw or None
     days_elapsed: float | None = None
     if enabled and since_iso:
@@ -432,16 +440,17 @@ async def _learning_mode_status() -> dict[str, object]:
             started = dt.datetime.fromisoformat(since_iso)
             if started.tzinfo is None:
                 started = started.replace(tzinfo=dt.timezone.utc)
-            days_elapsed = round(
-                (dt.datetime.now(dt.timezone.utc) - started).total_seconds() / 86400, 2
-            )
+            days_elapsed = round((now - started).total_seconds() / 86400, 2)
         except ValueError:
             since_iso = None
 
-    now = dt.datetime.now(dt.timezone.utc)
-    async with get_session() as session:
-        obligations = await unresolved_revert_summary(session, now=now)
-    obligations = serialize_unresolved_revert_summary(obligations)
+    if context is None:
+        async with get_session() as session:
+            obligations = await unresolved_revert_summary(session, now=now)
+    else:
+        obligations = (materialized or {}).get("open_revert_obligations", {"count": None})
+    if obligations.get("count") is not None:
+        obligations = serialize_unresolved_revert_summary(obligations)
     sources = ["manual"] if enabled else []
     if learning.seasonal_active:
         sources.append("seasonal")
@@ -524,34 +533,45 @@ async def set_learning_mode(body: LearningModeUpdate, force: bool = Query(False)
 @router.get("/api/optimizer/status")
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
-    from packages.core.settings_service import get_setting
-    from packages.ml.models import DemandModel, MODEL_DIR
-    from packages.ml.model_status import get_model_reporting_statuses, get_model_status
+    from packages.ml.models import MODEL_DIR
+    from packages.ml.model_status import get_readiness_snapshot, get_model_status
     from packages.ml.seasonal_learning import get_seasonal_calibration_progress
-    from packages.ml.thermal import thermal_model
     from packages.optimizer.main import get_optimizer_status_snapshot
     from packages.optimizer.rules import RulesOptimizer
 
-    layer = await get_setting("optimizer_layer") or "rules_only"
-    optimizer_status = await get_optimizer_status_snapshot(layer)
-    learning_mode = await _learning_mode_status()
-
-    await thermal_model.arefresh_if_changed()
-    async with get_session() as session:
-        consumption_count = await session.execute(
-            select(func.count()).select_from(ConsumptionRecord)
-        )
-        total_consumption = consumption_count.scalar() or 0
-
-    cop_model, model_lifecycle, demand_quality = await asyncio.gather(
-        get_model_status("cop", MODEL_DIR),
-        get_model_reporting_statuses(MODEL_DIR),
-        DemandModel().training_data_quality(),
+    snapshot = await get_readiness_snapshot(route="/api/optimizer/status")
+    context = snapshot["context"]
+    layer = (context["settings"].get("optimizer_layer") or "rules_only") if context else None
+    model_lifecycle = snapshot["model_lifecycle"]
+    optimizer_status = await get_optimizer_status_snapshot(
+        layer or "rules_only",
+        reporting_inputs={
+            "demand_trained": model_lifecycle["demand"]["status"] == "qualified-for-reporting"
+        },
     )
+    if context is not None:
+        learning_mode = await _learning_mode_status(
+            context=context, materialized=snapshot["seasonal_inputs"], now=snapshot["as_of"]
+        )
+    else:
+        learning_mode = {
+            "enabled": False,
+            "effective_active": False,
+            "sources": [],
+            "state_reliable": False,
+            "build_policy": "observe_only",
+            "ordinary_writes_allowed": False,
+            "optimization_requires_new_build": True,
+            "linked_restores_eligible": True,
+            "since": None,
+            "days_elapsed": None,
+            "open_revert_obligations": {"count": None},
+        }
+    cop_model = await get_model_status("cop", MODEL_DIR)
     demand_model = model_lifecycle["demand"]
-    demand_model["source_records"] = total_consumption
+    demand_quality = snapshot["demand_quality"]
     try:
-        seasonal = await get_seasonal_calibration_progress()
+        seasonal = await get_seasonal_calibration_progress(snapshot=snapshot)
     except Exception as error:
         logger.warning("seasonal_reporting_unavailable", error_type=type(error).__name__)
         seasonal = {
@@ -559,17 +579,14 @@ async def get_optimizer_status():
             "observe_only_active": None,
             "reason": "seasonal_reporting_unavailable",
             "auto_exit": False,
+            "readiness": snapshot["readiness"],
+            "reporting_ready": False,
+            "next_step": "readiness_unavailable",
         }
-    seasonal["reporting_ready"] = all(
-        model_lifecycle[component]["status"] == "qualified-for-reporting"
-        for component in ("demand", "thermal")
-    )
     seasonal["control_ready"] = False
     seasonal["auto_exit"] = False
-    if seasonal["reporting_ready"]:
-        seasonal["next_step"] = "ready_for_reporting"
 
-    return {
+    response = {
         "configured_layer": layer,
         "build_policy": "observe_only",
         "ordinary_writes_allowed": False,
@@ -596,17 +613,20 @@ async def get_optimizer_status():
             "lifecycle": model_lifecycle["thermal"],
             "status": model_lifecycle["thermal"]["status"],
             "control_ready": False,
-            "calibrated": thermal_model.params.last_calibrated is not None,
-            "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),
-            "confidence": thermal_model.confidence_for("tank_heating"),
-            "indoor_heating_confidence": thermal_model.confidence_for("indoor_heating"),
-            "indoor_heating_samples": thermal_model.params.indoor_heating_samples,
-            "calibration_status": dict(thermal_model.params.calibration_status),
-            "last_calibrated": thermal_model.params.last_calibrated.isoformat()
-            if thermal_model.params.last_calibrated
-            else None,
+            **snapshot["thermal_model"],
         },
     }
+    data_quality = snapshot["device_quality"]
+    if data_quality is None:
+        return response
+    timestamp = data_quality["timestamp"]
+    response["data_freshness"] = {
+        "latest_device_status": timestamp.isoformat() if timestamp else None,
+        "age_seconds": data_quality["age_seconds"],
+        "stale_after_seconds": data_quality["threshold_seconds"],
+        "fresh": data_quality["ready"],
+    }
+    return response
 
 
 @router.post("/api/optimize-now")

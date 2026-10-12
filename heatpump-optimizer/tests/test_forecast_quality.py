@@ -1,7 +1,7 @@
 import datetime as dt
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -589,6 +589,1614 @@ def _scorecard_session(plans, readings, unresolved):
     return session
 
 
+@pytest.mark.parametrize("cache_state", ["unknown", "expired", "fresh"])
+async def test_R11_native_materialization_never_refreshes_remote_timer(monkeypatch, cache_state):
+    from packages.core.services import aquarea
+    from packages.ml import forecast_quality
+
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    wrapper = aquarea.AquareaWrapper()
+    timer = SimpleNamespace(enabled=False, slots=(), active_slots=lambda *_args: ())
+    remote = AsyncMock(return_value=timer)
+    wrapper.get_device = AsyncMock(return_value=SimpleNamespace(get_weekly_timer=remote))
+    wrapper._distributed_quota_enabled = Mock(return_value=False)
+    wrapper._read_limiter.acquire = AsyncMock()
+    wrapper._reserve_background_read = AsyncMock()
+    if cache_state != "unknown":
+        wrapper._weekly_timer = timer
+        wrapper._weekly_timer_fetched_at = aquarea.time.monotonic() - (
+            4000 if cache_state == "expired" else 0
+        )
+        wrapper._weekly_timer_fetched_wall_at = now
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_all_settings", AsyncMock(return_value={})
+    )
+    empty = SimpleNamespace(scalars=lambda: SimpleNamespace(all=list))
+    session = SimpleNamespace(execute=AsyncMock(return_value=empty))
+    monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+
+    result = await forecast_quality.materialize_native_inputs(
+        "demand", now=now, timer_reader=wrapper
+    )
+
+    assert result is None
+    remote.assert_not_awaited()
+    wrapper.get_device.assert_not_awaited()
+    wrapper._read_limiter.acquire.assert_not_awaited()
+    wrapper._reserve_background_read.assert_not_awaited()
+    assert wrapper.cached_native_timer_provenance()["status"] == (
+        "known" if cache_state == "fresh" else "unknown"
+    )
+
+
+async def test_R19_fallback_only_history_has_descriptive_not_learned_scores(monkeypatch):
+    from packages.core import safety_reverts
+    from packages.ml import forecast_quality
+
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    target = now - dt.timedelta(hours=1)
+    plan = _baseline_scorecard_plan(101, "audit-device", target)
+    payload = json.loads(plan.plan_json)
+    payload["forecast_snapshot"]["forecast_status"] = "fallback"
+    plan.plan_json = json.dumps(payload)
+    session = _scorecard_session(
+        [plan], [SimpleNamespace(device_id="room", timestamp=target, temperature=20.0)], set()
+    )
+    monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+    monkeypatch.setattr(
+        safety_reverts, "unresolved_revert_device_ids", AsyncMock(return_value=(set(), False))
+    )
+    monkeypatch.setattr(
+        safety_reverts, "historical_revert_overlap_rows", AsyncMock(return_value=([], False))
+    )
+
+    scorecard = await forecast_quality.get_forecast_scorecard(
+        now=now, evaluation_context={"live_baseline_applied": False}
+    )
+
+    assert scorecard["fallback"]["overall"]["samples"] == 1
+    assert scorecard["fallback"]["overall"]["mae"] == pytest.approx(0.2)
+    assert scorecard["all_forecasts"]["overall"]["samples"] == 1
+    assert scorecard["overall"]["samples"] == 0
+    assert scorecard["quality_gate"]["control_allowed"] is False
+    assert scorecard["prospective_qualification_eligible"] is False
+    assert scorecard["forecast_kind"] == "counterfactual"
+    json.dumps(scorecard, allow_nan=False)
+
+
+@pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+@pytest.mark.parametrize(
+    "first_hours,valid_first",
+    [
+        pytest.param((True,), False, id="boolean-true"),
+        pytest.param((False,), False, id="boolean-false"),
+        pytest.param(("1",), False, id="string-hour"),
+        pytest.param((1.0,), False, id="float-hour"),
+        pytest.param((True, 1), True, id="boolean-before-integer"),
+        pytest.param((1, True), True, id="integer-before-boolean"),
+        pytest.param((False, "1", 1.0, True, 1), True, id="invalid-parallel-rows"),
+        pytest.param((1,), True, id="canonical-integers"),
+    ],
+)
+async def test_R03_saved_history_requires_canonical_integer_hours(
+    monkeypatch, reader, first_hours, valid_first
+):
+    from packages.core import safety_reverts
+    from packages.core.models import IndoorTempReading, PlanRecord
+    from packages.ml import forecast_quality
+
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    plans, readings = [], []
+    for plan_index in range(12):
+        issue = now - dt.timedelta(hours=36 + 25 * plan_index)
+        canonical = []
+        for lead in (1, 3, 6, 12, 24):
+            target = issue + dt.timedelta(hours=lead)
+            observed = 20.0 + 0.2 * plan_index + 0.01 * lead
+            canonical.append(
+                {
+                    "hour": lead,
+                    "ts": target.isoformat(),
+                    "predicted_indoor_temp": observed + 0.1,
+                    "model_source": "comfort_model_controlled",
+                }
+            )
+            readings.append(
+                IndoorTempReading(
+                    timestamp=target, device_id="room", temperature=observed, is_stale=False
+                )
+            )
+        tested = [{**canonical[0], "hour": hour} for hour in first_hours] + canonical[1:]
+        snapshot = json.loads(
+            _baseline_scorecard_plan(plan_index + 1, "audit-device", issue).plan_json
+        )["forecast_snapshot"]
+        snapshot["issue_timestamp"] = issue.isoformat()
+        snapshot["observed_history"] = [{"hour": 0, "ts": issue.isoformat(), "temperature": 18.0}]
+        snapshot["forecast_with_plan"] = tested
+        if reader == "shadow":
+            snapshot["forecast_with_plan"] = [
+                {**point, "model_source": "rule_thermal_fallback"} for point in canonical
+            ]
+            snapshot["shadow_forecast_with_plan"] = tested
+        elif reader == "fallback":
+            snapshot["forecast_status"] = "fallback"
+            snapshot["forecast_with_plan"] = [
+                {**point, "model_source": "rule_thermal_fallback"} for point in tested
+            ]
+        snapshot["weather_forecast"] = [{} for _ in snapshot["forecast_with_plan"]]
+        plans.append(
+            PlanRecord(
+                id=plan_index + 1,
+                created_at=issue,
+                horizon_start=issue,
+                horizon_end=issue + dt.timedelta(hours=24),
+                plan_json=json.dumps(
+                    {"device_id": "audit-device", "actions": [], "forecast_snapshot": snapshot}
+                ),
+            )
+        )
+    session = _scorecard_session(plans, sorted(readings, key=lambda row: row.timestamp), set())
+    monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+    monkeypatch.setattr(
+        safety_reverts, "unresolved_revert_device_ids", AsyncMock(return_value=(set(), False))
+    )
+    monkeypatch.setattr(
+        safety_reverts, "historical_revert_overlap_rows", AsyncMock(return_value=([], False))
+    )
+
+    scorecard = await forecast_quality.get_forecast_scorecard(
+        now=now, evaluation_context={"live_baseline_applied": False}
+    )
+
+    scored = scorecard["fallback"] if reader == "fallback" else scorecard
+    assert scored["overall"]["samples"] == (60 if valid_first else 48)
+    assert scored["overall"]["mae"] == pytest.approx(0.1)
+    assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+        1: 12 if valid_first else 0,
+        3: 12,
+        6: 12,
+        12: 12,
+        24: 12,
+    }
+    if reader == "fallback":
+        assert scorecard["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+    else:
+        assert scorecard["quality_gate"]["control_allowed"] is valid_first
+    if reader != "shadow":
+        assert scorecard["all_forecasts"]["overall"]["samples"] == scored["overall"]["samples"]
+        assert (
+            sum(source["overall"]["samples"] for source in scorecard["sources"].values())
+            == (scored["overall"]["samples"])
+        )
+    assert scorecard["forecast_kind"] == "counterfactual"
+    assert scorecard["prospective_qualification_eligible"] is False
+    serialized = json.loads(json.dumps(scorecard, allow_nan=False))
+    assert set(serialized["horizon_quality"]) == {"1", "3", "6", "12", "24"}
+
+
+@pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+async def test_R03_saved_history_duplicate_outcomes_cannot_inflate_quorum(monkeypatch, reader):
+    from packages.core import safety_reverts
+    from packages.core.models import IndoorTempReading, PlanRecord
+    from packages.ml import forecast_quality
+
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    plans, readings = [], []
+    for plan_index in range(6):
+        issue = now - dt.timedelta(hours=36 + 25 * plan_index)
+        canonical = []
+        for lead in (1, 3, 6, 12, 24):
+            target = issue + dt.timedelta(hours=lead)
+            observed = 20.0 + 0.2 * plan_index + 0.01 * lead
+            canonical.append(
+                {
+                    "hour": lead,
+                    "ts": target.isoformat(),
+                    "predicted_indoor_temp": observed + 0.1,
+                    "model_source": "comfort_model_controlled",
+                }
+            )
+            readings.append(
+                IndoorTempReading(
+                    timestamp=target, device_id="room", temperature=observed, is_stale=False
+                )
+            )
+        snapshot = json.loads(
+            _baseline_scorecard_plan(plan_index + 1, "audit-device", issue).plan_json
+        )["forecast_snapshot"]
+        snapshot["issue_timestamp"] = issue.isoformat()
+        snapshot["observed_history"] = [{"hour": 0, "ts": issue.isoformat(), "temperature": 18.0}]
+        snapshot["forecast_with_plan"] = canonical * 2
+        if reader == "shadow":
+            snapshot["forecast_with_plan"] = [
+                {**point, "model_source": "rule_thermal_fallback"} for point in canonical
+            ]
+            snapshot["shadow_forecast_with_plan"] = canonical * 2
+        elif reader == "fallback":
+            snapshot["forecast_status"] = "fallback"
+            snapshot["forecast_with_plan"] = [
+                {**point, "model_source": "rule_thermal_fallback"} for point in canonical * 2
+            ]
+        snapshot["weather_forecast"] = [{} for _point in snapshot["forecast_with_plan"]]
+        plans.append(
+            PlanRecord(
+                id=plan_index + 1,
+                created_at=issue,
+                horizon_start=issue,
+                horizon_end=issue + dt.timedelta(hours=24),
+                plan_json=json.dumps(
+                    {"device_id": "audit-device", "actions": [], "forecast_snapshot": snapshot}
+                ),
+            )
+        )
+    session = _scorecard_session(plans, sorted(readings, key=lambda row: row.timestamp), set())
+    monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+    monkeypatch.setattr(
+        safety_reverts, "unresolved_revert_device_ids", AsyncMock(return_value=(set(), False))
+    )
+    monkeypatch.setattr(
+        safety_reverts, "historical_revert_overlap_rows", AsyncMock(return_value=([], False))
+    )
+
+    scorecard = await forecast_quality.get_forecast_scorecard(
+        now=now, evaluation_context={"live_baseline_applied": False}
+    )
+
+    scored = scorecard["fallback"] if reader == "fallback" else scorecard
+    assert scored["overall"]["samples"] <= 30
+    assert all(row["samples"] <= 6 for row in scored["horizons"])
+    assert scorecard["quality_gate"]["control_allowed"] is False
+    assert scorecard["prospective_qualification_eligible"] is False
+    json.dumps(scorecard, allow_nan=False)
+
+
+class TestR03SavedEvidenceDeduplication:
+    @staticmethod
+    def history(reader, plan_count=6):
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        plans, readings = [], []
+        for index in range(plan_count):
+            issue = now - dt.timedelta(hours=36 + 25 * index)
+            plan = _baseline_scorecard_plan(
+                index + 1, "audit-device", issue + dt.timedelta(hours=1)
+            )
+            payload = json.loads(plan.plan_json)
+            snapshot = payload["forecast_snapshot"]
+            points = []
+            for lead in (1, 3, 6, 12, 24):
+                target = issue + dt.timedelta(hours=lead)
+                observed = 20.0 + 0.2 * index + 0.01 * lead
+                points.append(
+                    {
+                        "hour": lead,
+                        "ts": target.isoformat(),
+                        "predicted_indoor_temp": observed + 0.1,
+                        "model_source": "comfort_model_controlled",
+                    }
+                )
+                readings.append(
+                    SimpleNamespace(device_id="room", timestamp=target, temperature=observed)
+                )
+            snapshot["observed_history"][0]["temperature"] = 18.0
+            snapshot["forecast_with_plan"] = points
+            if reader in {"shadow", "fallback"}:
+                snapshot["forecast_with_plan"] = [
+                    {**point, "model_source": "rule_thermal_fallback"} for point in points
+                ]
+            if reader == "shadow":
+                snapshot["shadow_forecast_with_plan"] = points
+            elif reader == "fallback":
+                snapshot["forecast_status"] = "fallback"
+            snapshot["weather_forecast"] = [{} for _ in points]
+            plan.horizon_end = issue + dt.timedelta(hours=24)
+            plan.plan_json = json.dumps(payload)
+            plans.append(plan)
+        return now, plans, readings
+
+    @staticmethod
+    async def score(monkeypatch, now, plans, readings, pages=None):
+        from packages.core import safety_reverts
+        from packages.ml import forecast_quality
+
+        session = _scorecard_session(plans, readings, set())
+        if pages is not None:
+            session.execute.side_effect = [
+                SimpleNamespace(scalars=lambda rows=rows: SimpleNamespace(all=lambda: rows))
+                for rows in pages
+            ] + [SimpleNamespace(all=lambda: readings), SimpleNamespace(all=list)]
+        monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+        monkeypatch.setattr(
+            safety_reverts, "unresolved_revert_device_ids", AsyncMock(return_value=(set(), False))
+        )
+        monkeypatch.setattr(
+            safety_reverts, "historical_revert_overlap_rows", AsyncMock(return_value=([], False))
+        )
+        return await forecast_quality.get_forecast_scorecard(
+            now=now,
+            max_plans=4 if pages is not None else 60,
+            evaluation_context={"live_baseline_applied": False},
+        )
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_clone_ids_do_not_create_independent_forecasts(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader)
+        plans += [SimpleNamespace(**{**vars(plan), "id": plan.id + 100}) for plan in plans]
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 6
+        assert scored["overall"]["samples"] == 30
+        assert all(row["samples"] == 6 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_missing_device_provenance_cannot_authorize(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader, plan_count=12)
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            payload.pop("device_id")
+            plan.plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 0
+        assert scored["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["missing_device_provenance"] == 12
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_malformed_sensor_copy_invalidates_origin(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader, plan_count=12)
+        for plan in list(plans):
+            payload = json.loads(plan.plan_json)
+            payload["forecast_snapshot"].pop("control_input")
+            plans.append(SimpleNamespace(**{**vars(plan), "plan_json": json.dumps(payload)}))
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 0
+        assert scored["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["missing_sensor_provenance"] == 12
+        assert scorecard["exclusions"]["ambiguous_forecast_provenance"] == 12
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("replay", ["pages", "utc-offsets"])
+    async def test_clone_ids_across_pages_and_offsets(self, monkeypatch, reader, replay):
+        now, plans, readings = self.history(reader)
+        copies = []
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            if replay == "utc-offsets":
+                snapshot = payload["forecast_snapshot"]
+                offset = dt.timezone(dt.timedelta(hours=-4))
+                for row in [snapshot, *snapshot["observed_history"]]:
+                    key = "issue_timestamp" if row is snapshot else "ts"
+                    row[key] = dt.datetime.fromisoformat(row[key]).astimezone(offset).isoformat()
+                for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                    for point in snapshot.get(name, []):
+                        point["ts"] = (
+                            dt.datetime.fromisoformat(point["ts"]).astimezone(offset).isoformat()
+                        )
+            copies.append(
+                SimpleNamespace(
+                    **{**vars(plan), "id": plan.id + 100, "plan_json": json.dumps(payload)}
+                )
+            )
+        replayed = plans + copies
+        pages = [replayed[8:], replayed[4:8], replayed[:4], []] if replay == "pages" else None
+
+        scorecard = await self.score(monkeypatch, now, replayed, readings, pages)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 6
+        assert scored["overall"]["samples"] == 30
+        assert all(row["samples"] == 6 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["evidence_coverage_complete"] is True
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("device_id", [None, "", "  ", True, 42, 1.0, [], {}])
+    async def test_invalid_device_provenance_is_not_coerced(self, monkeypatch, reader, device_id):
+        now, plans, readings = self.history(reader, plan_count=12)
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            payload["device_id"] = device_id
+            plan.plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["missing_device_provenance"] == 12
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize(
+        "control_input,sensor_basis",
+        [
+            (None, None),
+            ({"available": True}, None),
+            ({"available": "true", "reference_sensor_id": "room"}, None),
+            ({"available": True, "reference_sensor_id": True}, None),
+            ({"available": True, "sensor_ids": ["room", None]}, None),
+            ({"available": True, "sensor_ids": ["room", {}]}, None),
+            ({"available": True, "sensor_ids": ["room", ""]}, None),
+            ({"available": True, "sensor_ids": "room"}, None),
+            ({"available": True, "reference_sensor_id": "", "sensor_ids": []}, None),
+            ({"available": True, "reference_sensor_id": "room", "sensor_ids": ["office"]}, None),
+            ({"available": True, "reference_sensor_id": "room"}, {}),
+            ({"available": True, "reference_sensor_id": "room"}, {"kind": "median"}),
+        ],
+    )
+    async def test_incomplete_sensor_provenance_cannot_authorize(
+        self, monkeypatch, reader, control_input, sensor_basis
+    ):
+        now, plans, readings = self.history(reader, plan_count=12)
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            snapshot = payload["forecast_snapshot"]
+            snapshot["control_input"] = control_input
+            if sensor_basis is not None:
+                snapshot["sensor_basis"] = sensor_basis
+            plan.plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["missing_sensor_provenance"] == 12
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("different_id", [False, True])
+    @pytest.mark.parametrize("ordering", ["bad-first", "bad-last", "third-copy"])
+    @pytest.mark.parametrize("missing", ["device", "sensor", "issue"])
+    async def test_malformed_origin_peers_never_restore_evidence(
+        self, monkeypatch, reader, different_id, ordering, missing
+    ):
+        now, plans, readings = self.history(reader)
+        payload = json.loads(plans[0].plan_json)
+        if missing == "device":
+            payload["device_id"] = ""
+        elif missing == "sensor":
+            payload["forecast_snapshot"]["control_input"]["sensor_ids"] = ["room", None]
+        else:
+            payload["forecast_snapshot"].pop("issue_timestamp")
+        bad = SimpleNamespace(
+            **{
+                **vars(plans[0]),
+                "id": 101 if different_id else plans[0].id,
+                "plan_json": json.dumps(payload),
+            }
+        )
+        plans.insert(0 if ordering != "bad-last" else len(plans), bad)
+        if ordering == "third-copy":
+            plans += [SimpleNamespace(**vars(plans[1])), SimpleNamespace(**vars(bad))]
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 5
+        assert scored["overall"]["samples"] == 25
+        assert all(row["samples"] == 5 for row in scored["horizons"])
+        assert scorecard["exclusions"]["ambiguous_forecast_provenance"] == 1
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("malformed", ["prediction", "source", "target"])
+    async def test_different_id_malformed_point_invalidates_only_its_peer(
+        self, monkeypatch, reader, bad_first, malformed
+    ):
+        now, plans, readings = self.history(reader)
+        payload = json.loads(plans[0].plan_json)
+        name = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        point = payload["forecast_snapshot"][name][0]
+        if malformed == "prediction":
+            point["predicted_indoor_temp"] += 2.0
+        elif malformed == "source":
+            point.pop("model_source")
+        else:
+            point["ts"] = dt.datetime.fromisoformat(point["ts"]).replace(tzinfo=None).isoformat()
+        bad = SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        plans.insert(0 if bad_first else len(plans), bad)
+        plans.append(SimpleNamespace(**{**vars(plans[1 if bad_first else 0]), "id": 201}))
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 29
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            1: 5,
+            3: 6,
+            6: 6,
+            12: 6,
+            24: 6,
+        }
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_unrelated_invalid_cohort_does_not_block_valid_origins(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader, plan_count=12)
+        payload = json.loads(plans[0].plan_json)
+        payload["device_id"] = "unrelated-device"
+        payload["forecast_snapshot"].pop("control_input")
+        plans.append(
+            SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 12
+        assert scored["overall"]["samples"] == 60
+        assert all(row["samples"] == 12 for row in scored["horizons"])
+        assert scored["quality_gate"]["control_allowed"] is True
+        assert scorecard["quality_gate"]["control_allowed"] is (reader != "fallback")
+        assert not scorecard["exclusions"].get("ambiguous_forecast_provenance")
+
+    @pytest.mark.parametrize("conflict", [False, True])
+    async def test_baseline_comparison_counts_unique_origins(self, monkeypatch, conflict):
+        now, plans, readings = self.history("primary")
+        original = await self.score(monkeypatch, now, plans, readings)
+        copies = [SimpleNamespace(**{**vars(plan), "id": plan.id + 100}) for plan in plans]
+        if conflict:
+            payload = json.loads(copies[0].plan_json)
+            payload["forecast_snapshot"]["forecast_with_plan_baseline"][0][
+                "predicted_indoor_temp"
+            ] += 2.0
+            copies[0].plan_json = json.dumps(payload)
+
+        replayed = await self.score(monkeypatch, now, plans + copies, readings)
+
+        assert original["baseline_comparison"]["plans_scored"] == 6
+        assert original["baseline_comparison"]["pairs_scored"] == 6
+        assert replayed["baseline_comparison"]["plans_scored"] == (5 if conflict else 6)
+        assert replayed["baseline_comparison"]["pairs_scored"] == (5 if conflict else 6)
+        assert replayed["overall"]["samples"] == 30
+        assert replayed["quality_gate"]["control_allowed"] is False
+
+    @pytest.mark.parametrize("learned", [False, True])
+    async def test_actual_rules_serializer_origins_score_without_invented_fields(
+        self, monkeypatch, learned
+    ):
+        from packages.core.control_temperature import ControlTemperature, SensorTemperature
+        from packages.core.heat_curve import HeatCurveConfig
+        from packages.optimizer import rules_engine
+
+        now, plans, readings = self.history("primary" if learned else "fallback", plan_count=12)
+        predictor = Mock()
+        monkeypatch.setattr(
+            rules_engine.thermal_model, "predict_indoor_controlled_curve", predictor
+        )
+        monkeypatch.setattr(
+            rules_engine.thermal_model, "predict_indoor_candidate_curve", Mock(return_value=None)
+        )
+        for index, plan in enumerate(plans):
+            issue = plan.created_at
+            predictor.return_value = [
+                {
+                    "hour": lead,
+                    "predicted_indoor_temp": 20.0 + 0.2 * index + 0.01 * lead + 0.1,
+                    "source": "comfort_model_controlled" if learned else "linear_controlled",
+                }
+                for lead in range(1, 25)
+            ]
+            control = ControlTemperature(
+                value=18.0,
+                confidence="high",
+                sensor_count=1,
+                sample_count=1,
+                latest_reading=issue,
+                reference_sensor_id="room",
+                sensors=(SensorTemperature("room", "Room", "Room", 18.0, issue),),
+            )
+            prices = [(issue + dt.timedelta(hours=hour), 0.1) for hour in range(24)]
+            snapshot = rules_engine.RulesOptimizer._build_forecast_snapshot(
+                prices=prices,
+                weather=[(timestamp, 5.0) for timestamp, _ in prices],
+                weather_full=[],
+                actions=[],
+                horizon_start=issue,
+                current_indoor=18.0,
+                current_water_temp=35.0,
+                heat_curve=HeatCurveConfig(),
+                comfort_schedule={},
+                comfort_temp_target=21.0,
+                comfort_temp_min=18.0,
+                tz_name="UTC",
+                quality_gate={"control_allowed": learned},
+                control_temperature=control,
+                control_input={
+                    "available": control.is_usable,
+                    "reference_sensor_id": control.reference_sensor_id,
+                    "sensor_ids": [sensor.device_id for sensor in control.sensors],
+                },
+            )
+            assert snapshot["issue_timestamp"] == issue.isoformat()
+            assert snapshot["observed_history"][0]["ts"] == issue.isoformat()
+            assert snapshot["sensor_basis"]["kind"] == "reference"
+            assert snapshot["forecast_status"] == ("available" if learned else "fallback")
+            assert "generation_id" not in snapshot
+            plan.plan_json = json.dumps(
+                {"device_id": "audit-device", "actions": [], "forecast_snapshot": snapshot},
+                allow_nan=False,
+            )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        clones = [SimpleNamespace(**{**vars(plan), "id": plan.id + 100}) for plan in plans]
+        replayed = await self.score(monkeypatch, now, plans + clones, readings)
+
+        for result in (scorecard, replayed):
+            scored = result if learned else result["fallback"]
+            assert scored["plans_scored"] == 12
+            assert scored["overall"]["samples"] == 60
+            assert scored["overall"]["mae"] == pytest.approx(0.1)
+            assert all(row["samples"] == 12 for row in scored["horizons"])
+            assert result["quality_gate"]["control_allowed"] is learned
+            assert result["prospective_qualification_eligible"] is False
+            json.dumps(result, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("related", [False, True])
+    async def test_missing_origin_uses_only_identifiable_target_cohort(
+        self, monkeypatch, reader, related
+    ):
+        now, plans, readings = self.history(reader, plan_count=12)
+        payload = json.loads(plans[0].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        snapshot.pop("issue_timestamp")
+        snapshot.pop("observed_history")
+        if not related:
+            for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                for point in snapshot.get(name, []):
+                    point["ts"] = (
+                        dt.datetime.fromisoformat(point["ts"]) - dt.timedelta(days=1)
+                    ).isoformat()
+        plans.append(
+            SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == (11 if related else 12)
+        assert scored["overall"]["samples"] == (55 if related else 60)
+        assert all(row["samples"] == (11 if related else 12) for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is (
+            not related and reader != "fallback"
+        )
+        assert scorecard["exclusions"]["missing_persistence_origin"] == 1
+        assert scorecard["exclusions"]["unidentifiable_forecast_provenance"] == 1
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    async def test_one_issued_horizon_cannot_have_conflicting_targets(
+        self, monkeypatch, reader, bad_first
+    ):
+        now, plans, readings = self.history(reader)
+        copies = []
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            name = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+            for point in payload["forecast_snapshot"][name]:
+                point["ts"] = (
+                    dt.datetime.fromisoformat(point["ts"]) + dt.timedelta(minutes=1)
+                ).isoformat()
+            copies.append(
+                SimpleNamespace(
+                    **{**vars(plan), "id": plan.id + 100, "plan_json": json.dumps(payload)}
+                )
+            )
+        replayed = copies + plans if bad_first else plans + copies
+        replayed += [SimpleNamespace(**{**vars(plan), "id": plan.id + 200}) for plan in plans]
+
+        scorecard = await self.score(monkeypatch, now, replayed, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 0
+        assert scored["overall"]["samples"] == 0
+        assert all(row["samples"] == 0 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["conflicting_forecast_target"] == 30
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("field", ["schema", "issue", "origin", "origin-hour", "origin-value"])
+    async def test_missing_required_origin_never_earns_quorum(self, monkeypatch, reader, field):
+        now, plans, readings = self.history(reader, plan_count=12)
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            snapshot = payload["forecast_snapshot"]
+            if field == "schema":
+                snapshot.pop("scoring_schema")
+            elif field == "issue":
+                snapshot["issue_timestamp"] = "not-an-issue"
+            elif field == "origin":
+                snapshot["observed_history"][0]["ts"] = None
+            elif field == "origin-hour":
+                snapshot["observed_history"][0]["hour"] = False
+            else:
+                snapshot["observed_history"][0]["temperature"] = float("nan")
+            plan.plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        reason = "legacy_scoring_schema" if field == "schema" else "missing_persistence_origin"
+        assert scorecard["exclusions"][reason] == 12
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("malformed_target", [False, True])
+    async def test_source_labels_do_not_split_immutable_origin(
+        self, monkeypatch, reader, malformed_target
+    ):
+        now, plans, readings = self.history(reader, plan_count=1)
+        payload = json.loads(plans[0].plan_json)
+        name = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        for point in payload["forecast_snapshot"][name]:
+            point["model_source"] = (
+                "linear_controlled"
+                if reader == "fallback"
+                else "comfort_model_physics_continuation"
+            )
+        plans.append(
+            SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        )
+        if malformed_target:
+            bad_payload = json.loads(plans[0].plan_json)
+            bad_payload["forecast_snapshot"][name][0]["ts"] = None
+            plans.append(
+                SimpleNamespace(
+                    **{**vars(plans[0]), "id": 201, "plan_json": json.dumps(bad_payload)}
+                )
+            )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == (4 if malformed_target else 5)
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            1: 0 if malformed_target else 1,
+            3: 1,
+            6: 1,
+            12: 1,
+            24: 1,
+        }
+        assert scorecard["quality_gate"]["control_allowed"] is False
+
+    @pytest.mark.parametrize("reader", ["shadow", "fallback"])
+    async def test_equal_values_at_real_distinct_origins_remain_independent(
+        self, monkeypatch, reader
+    ):
+        now, plans, readings = self.history(reader, plan_count=2)
+        name = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        first = json.loads(plans[0].plan_json)["forecast_snapshot"][name]
+        payload = json.loads(plans[1].plan_json)
+        for index, point in enumerate(payload["forecast_snapshot"][name]):
+            point["predicted_indoor_temp"] = first[index]["predicted_indoor_temp"]
+        plans[1].plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 2
+        assert scored["overall"]["samples"] == 10
+        assert all(row["samples"] == 2 for row in scored["horizons"])
+
+    async def test_actual_milp_serializer_does_not_invent_learned_provenance(self, monkeypatch):
+        from packages.optimizer.milp import MILPOptimizer
+
+        now, plans, readings = self.history("primary", plan_count=1)
+        issue = plans[0].created_at
+        produced = MILPOptimizer()._solve(
+            [(issue, 0.1)],
+            [(issue, 5.0)],
+            cop_fn=lambda temperature, hour=12: 3.0,
+            demand_per_hour=[4.0],
+            current_tank_temp=48.0,
+        )
+        assert produced is not None
+        snapshot = produced["forecast_snapshot"]
+        assert snapshot["forecast_with_plan"][0]["source"] == "milp_solution"
+        assert "model_source" not in snapshot["forecast_with_plan"][0]
+        plans[0].plan_json = json.dumps(
+            {"device_id": "audit-device", "actions": [], "forecast_snapshot": snapshot},
+            allow_nan=False,
+        )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        assert scorecard["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["exclusions"]["legacy_scoring_schema"] == 1
+        assert scorecard["prospective_qualification_eligible"] is False
+
+    @classmethod
+    def serialized_history(cls, monkeypatch, reader, plan_count=12):
+        from packages.core.control_temperature import ControlTemperature, SensorTemperature
+
+        now, plans, readings = cls.history(reader, plan_count=plan_count)
+        controlled = Mock()
+        candidate = Mock(return_value=None)
+        monkeypatch.setattr(
+            rules_engine.thermal_model, "predict_indoor_controlled_curve", controlled
+        )
+        monkeypatch.setattr(rules_engine.thermal_model, "predict_indoor_candidate_curve", candidate)
+        for index, plan in enumerate(plans):
+            issue = plan.created_at
+            learned = [
+                {
+                    "hour": lead,
+                    "predicted_indoor_temp": 20.0 + 0.2 * index + 0.01 * lead + 0.1,
+                    "source": "comfort_model_controlled",
+                    "segment_kind": "direct",
+                }
+                for lead in range(1, 25)
+            ]
+            controlled.return_value = (
+                learned
+                if reader == "primary"
+                else [{**point, "source": "linear_controlled"} for point in learned]
+            )
+            candidate.return_value = learned if reader == "shadow" else None
+            control = ControlTemperature(
+                value=18.0,
+                confidence="high",
+                sensor_count=1,
+                sample_count=1,
+                latest_reading=issue,
+                reference_sensor_id="room",
+                sensors=(SensorTemperature("room", "Room", "Room", 18.0, issue),),
+            )
+            prices = [(issue + dt.timedelta(hours=hour), 0.1) for hour in range(24)]
+            snapshot = rules_engine.RulesOptimizer._build_forecast_snapshot(
+                prices=prices,
+                weather=[(timestamp, 5.0) for timestamp, _ in prices],
+                weather_full=[],
+                actions=[],
+                horizon_start=issue,
+                current_indoor=18.0,
+                current_water_temp=35.0,
+                heat_curve=HeatCurveConfig(),
+                comfort_schedule={},
+                comfort_temp_target=21.0,
+                comfort_temp_min=18.0,
+                tz_name="UTC",
+                quality_gate={"control_allowed": reader == "primary"},
+                control_temperature=control,
+                control_input={
+                    "available": control.is_usable,
+                    "reference_sensor_id": control.reference_sensor_id,
+                    "sensor_ids": [sensor.device_id for sensor in control.sensors],
+                },
+            )
+            plan.plan_json = json.dumps(
+                {"device_id": "audit-device", "actions": [], "forecast_snapshot": snapshot},
+                allow_nan=False,
+            )
+        return now, plans, readings
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_repair4_independent_serializer_clones_across_pages(self, monkeypatch, reader):
+        now, plans, readings = self.serialized_history(monkeypatch, reader, plan_count=6)
+        copies = [SimpleNamespace(**{**vars(plan), "id": plan.id + 100}) for plan in plans]
+        pages = [copies[2:], copies[:2] + plans[4:], plans[:4], []]
+
+        scorecard = await self.score(monkeypatch, now, plans + copies, readings, pages)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 6
+        assert scored["overall"]["samples"] == 30
+        assert all(row["samples"] == 6 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        assert scorecard["evidence_coverage_complete"] is True
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("missing", ["device", "sensor", "origin"])
+    async def test_repair4_independent_serializer_malformed_peer(
+        self, monkeypatch, reader, bad_first, missing
+    ):
+        now, plans, readings = self.serialized_history(monkeypatch, reader)
+        payload = json.loads(plans[0].plan_json)
+        if missing == "device":
+            payload.pop("device_id")
+        elif missing == "sensor":
+            payload["forecast_snapshot"].pop("control_input")
+        else:
+            payload["forecast_snapshot"]["observed_history"] = []
+        bad = SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        plans.insert(0 if bad_first else len(plans), bad)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 11
+        assert scored["overall"]["samples"] == 55
+        assert all(row["samples"] == 11 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        assert scorecard["exclusions"]["ambiguous_forecast_provenance"] == 1
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_repair4_independent_serializer_valid_quorum(self, monkeypatch, reader):
+        now, plans, readings = self.serialized_history(monkeypatch, reader)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 12
+        assert scored["overall"]["samples"] == 60
+        assert all(row["samples"] == 12 for row in scored["horizons"])
+        assert scored["quality_gate"]["control_allowed"] is True
+        assert scorecard["quality_gate"]["control_allowed"] is (reader != "fallback")
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("malformed", ["all_sources_missing", "empty", "not_list"])
+    async def test_QR_F1_identifiable_shadow_peer_invalidates_only_its_learned_origin(
+        self, monkeypatch, bad_first, malformed
+    ):
+        now, plans, readings = self.serialized_history(monkeypatch, "shadow")
+        payload = json.loads(plans[0].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        if malformed == "all_sources_missing":
+            for point in snapshot["shadow_forecast_with_plan"]:
+                point.pop("model_source")
+        else:
+            snapshot["shadow_forecast_with_plan"] = [] if malformed == "empty" else None
+        bad = SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        plans.insert(0 if bad_first else len(plans), bad)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        assert scorecard["overall"]["samples"] == 55
+        assert all(row["samples"] == 11 for row in scorecard["horizons"])
+        assert scorecard["fallback"]["overall"]["samples"] == 60
+        assert all(row["samples"] == 12 for row in scorecard["fallback"]["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("conflict", [False, True])
+    @pytest.mark.parametrize("copies_first", [False, True])
+    async def test_R03_serializer_source_aliases_are_not_independent(
+        self, monkeypatch, reader, conflict, copies_first
+    ):
+        now, plans, readings = self.serialized_history(monkeypatch, reader, plan_count=6)
+        copies = []
+        name = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        for plan in plans:
+            payload = json.loads(plan.plan_json)
+            for point in payload["forecast_snapshot"][name]:
+                point["model_source"] = (
+                    "comfort_model_physics_continuation"
+                    if reader != "fallback"
+                    else "another_unproven_fallback"
+                )
+                if conflict:
+                    point["predicted_indoor_temp"] += 1.0
+            copies.append(
+                SimpleNamespace(
+                    **{**vars(plan), "id": plan.id + 100, "plan_json": json.dumps(payload)}
+                )
+            )
+        rows = copies + plans if copies_first else plans + copies
+
+        scorecard = await self.score(monkeypatch, now, rows, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == (0 if conflict else 30)
+        assert all(row["samples"] == (0 if conflict else 6) for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_conflicting_saved_roles_cannot_retain_favorable_peer(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader)
+        payload = json.loads(plans[0].plan_json)
+        payload["forecast_snapshot"]["forecast_status"] = (
+            "available" if reader == "fallback" else "fallback"
+        )
+        plans.append(
+            SimpleNamespace(**{**vars(plans[0]), "id": 101, "plan_json": json.dumps(payload)})
+        )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 5
+        assert scored["overall"]["samples"] == 25
+        assert all(row["samples"] == 5 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize(
+        "copies", ["offsets", "scope-offsets", "plan-rows", "plan-pages", "outcomes"]
+    )
+    async def test_replayed_evidence_counts_once(self, monkeypatch, reader, copies):
+        now, plans, readings = self.history(reader)
+        pages = None
+        if copies == "offsets":
+            for plan in plans:
+                payload = json.loads(plan.plan_json)
+                snapshot = payload["forecast_snapshot"]
+                series = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+                snapshot[series] += [
+                    {
+                        **point,
+                        "ts": dt.datetime.fromisoformat(point["ts"])
+                        .astimezone(dt.timezone(dt.timedelta(hours=2)))
+                        .isoformat(),
+                    }
+                    for point in snapshot[series]
+                ]
+                plan.plan_json = json.dumps(payload)
+        elif copies == "scope-offsets":
+            for plan in list(plans):
+                payload = json.loads(plan.plan_json)
+                snapshot = payload["forecast_snapshot"]
+                offset = dt.timezone(dt.timedelta(hours=2))
+                snapshot["issue_timestamp"] = (
+                    dt.datetime.fromisoformat(snapshot["issue_timestamp"])
+                    .astimezone(offset)
+                    .isoformat()
+                )
+                snapshot["observed_history"][0]["ts"] = snapshot["issue_timestamp"]
+                for series in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                    for point in snapshot.get(series, []):
+                        point["ts"] = (
+                            dt.datetime.fromisoformat(point["ts"]).astimezone(offset).isoformat()
+                        )
+                plans.append(SimpleNamespace(**{**vars(plan), "plan_json": json.dumps(payload)}))
+        elif copies == "plan-rows":
+            plans = plans + [SimpleNamespace(**vars(plan)) for plan in plans]
+        elif copies == "plan-pages":
+            pages = [list(reversed(plans[2:])), list(reversed(plans[:4])), []]
+        else:
+            readings += [SimpleNamespace(**vars(row)) for row in readings]
+        scorecard = await self.score(monkeypatch, now, plans, readings, pages)
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 6
+        assert scored["overall"]["samples"] == 30
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            hour: 6 for hour in (1, 3, 6, 12, 24)
+        }
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["evidence_coverage_complete"] is True
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("copies", ["prediction", "plan-row", "outcome", "nonfinite"])
+    async def test_conflicting_identity_is_excluded(self, monkeypatch, reader, bad_first, copies):
+        now, plans, readings = self.history(reader)
+        if copies == "outcome":
+            bad = SimpleNamespace(**vars(readings[0]))
+            bad.temperature += 2.0
+            bad.timestamp = bad.timestamp.astimezone(dt.timezone(dt.timedelta(hours=2)))
+            readings.insert(0 if bad_first else len(readings), bad)
+        else:
+            plan = plans[0]
+            payload = json.loads(plan.plan_json)
+            snapshot = payload["forecast_snapshot"]
+            series = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+            point = snapshot[series][0]
+            bad = {
+                **point,
+                "predicted_indoor_temp": float("nan")
+                if copies == "nonfinite"
+                else point["predicted_indoor_temp"] + 2.0,
+            }
+            if copies == "plan-row":
+                snapshot[series][0] = bad
+                plans.insert(
+                    0 if bad_first else len(plans),
+                    SimpleNamespace(**{**vars(plan), "plan_json": json.dumps(payload)}),
+                )
+            else:
+                snapshot[series][:1] = [bad, point] if bad_first else [point, bad]
+                plan.plan_json = json.dumps(payload)
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 29
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            1: 5,
+            3: 6,
+            6: 6,
+            12: 6,
+            24: 6,
+        }
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("invalid_prediction", [{"value": 20.11}, [20.11]])
+    async def test_unhashable_prediction_conflict_is_excluded(
+        self, monkeypatch, reader, bad_first, invalid_prediction
+    ):
+        now, plans, readings = self.history(reader)
+        payload = json.loads(plans[0].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        series = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        point = snapshot[series][0]
+        bad = {**point, "predicted_indoor_temp": invalid_prediction}
+        snapshot[series][:1] = [bad, point] if bad_first else [point, bad]
+        plans[0].plan_json = json.dumps(payload)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 29
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            1: 5,
+            3: 6,
+            6: 6,
+            12: 6,
+            24: 6,
+        }
+        assert scorecard["exclusions"]["conflicting_forecast_identity"] == 1
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("scope", ["device", "sensor", "issue"])
+    async def test_conflicting_persisted_scope_copies_are_excluded(
+        self, monkeypatch, reader, bad_first, scope
+    ):
+        now, plans, readings = self.history(reader)
+        plan = plans[0]
+        payload = json.loads(plan.plan_json)
+        snapshot = payload["forecast_snapshot"]
+        if scope == "device":
+            payload["device_id"] = "other-device"
+        elif scope == "sensor":
+            snapshot["control_input"]["reference_sensor_id"] = "other-room"
+            snapshot["control_input"]["sensor_ids"] = ["other-room"]
+            readings += [
+                SimpleNamespace(**{**vars(row), "device_id": "other-room"})
+                for row in list(readings)
+            ]
+        else:
+            issue = dt.datetime.fromisoformat(snapshot["issue_timestamp"]) + dt.timedelta(hours=1)
+            snapshot["issue_timestamp"] = issue.isoformat()
+            snapshot["observed_history"][0]["ts"] = issue.isoformat()
+        plans.insert(
+            0 if bad_first else len(plans),
+            SimpleNamespace(**{**vars(plan), "plan_json": json.dumps(payload)}),
+        )
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 5
+        assert scored["overall"]["samples"] == 25
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert all(row["samples"] == 5 for row in scored["horizons"])
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    @pytest.mark.parametrize("bad_first", [False, True])
+    @pytest.mark.parametrize("method", ["reference_sensor", "selected_sensor_median"])
+    async def test_nan_sensor_conflict_is_excluded_by_saved_reader(
+        self, monkeypatch, reader, bad_first, method
+    ):
+        now, plans, readings = self.history(reader)
+        if method == "selected_sensor_median":
+            readings += [
+                SimpleNamespace(
+                    **{**vars(row), "device_id": "kitchen", "temperature": row.temperature + 2.0}
+                )
+                for row in list(readings)
+            ]
+            for plan in plans:
+                payload = json.loads(plan.plan_json)
+                snapshot = payload["forecast_snapshot"]
+                snapshot["control_input"]["reference_sensor_id"] = ""
+                snapshot["control_input"]["sensor_ids"] = ["room", "kitchen"]
+                for series in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                    for point in snapshot.get(series, []):
+                        point["predicted_indoor_temp"] += 1.0
+                plan.plan_json = json.dumps(payload)
+        bad = SimpleNamespace(**vars(readings[0]))
+        bad.temperature = float("nan")
+        bad.timestamp = bad.timestamp.astimezone(dt.timezone(dt.timedelta(hours=-4)))
+        readings.insert(0 if bad_first else len(readings), bad)
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 29
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert {row["hours"]: row["samples"] for row in scored["horizons"]} == {
+            1: 5,
+            3: 6,
+            6: 6,
+            12: 6,
+            24: 6,
+        }
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_distinct_issues_share_target_without_cross_collapse(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader, plan_count=2)
+        first = json.loads(plans[0].plan_json)["forecast_snapshot"]
+        first_issue = dt.datetime.fromisoformat(first["issue_timestamp"])
+        second_issue = first_issue - dt.timedelta(hours=2)
+        payload = json.loads(plans[1].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        snapshot["issue_timestamp"] = second_issue.isoformat()
+        snapshot["observed_history"][0]["ts"] = second_issue.isoformat()
+        for index, lead in enumerate((1, 3, 6, 12, 24)):
+            readings[5 + index].timestamp = second_issue + dt.timedelta(hours=lead)
+            if lead == 3:
+                readings[5 + index].temperature = readings[0].temperature
+            for series in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                if series in snapshot:
+                    point = snapshot[series][index]
+                    point["ts"] = readings[5 + index].timestamp.isoformat()
+                    point["predicted_indoor_temp"] = readings[5 + index].temperature + 0.1
+        plans[1].created_at = second_issue
+        plans[1].horizon_start = second_issue
+        plans[1].horizon_end = second_issue + dt.timedelta(hours=24)
+        plans[1].plan_json = json.dumps(payload)
+        assert first_issue != second_issue
+        assert plans[0].id != plans[1].id
+        assert readings[0].timestamp == readings[6].timestamp
+        assert first["forecast_with_plan"][0]["hour"] == 1
+        assert snapshot["forecast_with_plan"][1]["hour"] == 3
+
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["plans_scored"] == 2
+        assert scored["overall"]["samples"] == 10
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert all(row["samples"] == 2 for row in scored["horizons"])
+        assert not scorecard["exclusions"].get("conflicting_forecast_identity")
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard["prospective_qualification_eligible"] is False
+        json.dumps(scorecard, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_replay_permutation_preserves_scoring_metrics(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader)
+        payload = json.loads(plans[0].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        series = "shadow_forecast_with_plan" if reader == "shadow" else "forecast_with_plan"
+        point = snapshot[series][0]
+        snapshot[series].append({**point, "predicted_indoor_temp": 99.0})
+        plans[0].plan_json = json.dumps(payload)
+        replayed = plans + [SimpleNamespace(**vars(plan)) for plan in plans]
+        outcomes = readings + [SimpleNamespace(**vars(row)) for row in readings]
+        forward = await self.score(monkeypatch, now, replayed, outcomes)
+        reversed_plans = []
+        for plan in reversed(replayed):
+            payload = json.loads(plan.plan_json)
+            snapshot = payload["forecast_snapshot"]
+            for name in ("forecast_with_plan", "shadow_forecast_with_plan"):
+                if name in snapshot:
+                    snapshot[name].reverse()
+            reversed_plans.append(
+                SimpleNamespace(**{**vars(plan), "plan_json": json.dumps(payload)})
+            )
+
+        backward = await self.score(monkeypatch, now, reversed_plans, list(reversed(outcomes)))
+
+        for name in ("overall", "horizons", "quality_gate", "bias_correction"):
+            assert forward[name] == backward[name]
+        for name in ("fallback", "passive_weather_model", "all_forecasts", "sources"):
+            assert forward[name] == backward[name]
+        scored = backward["fallback"] if reader == "fallback" else backward
+        assert scored["overall"]["samples"] == 29
+        assert scored["overall"]["mae"] == pytest.approx(0.1)
+        assert backward["quality_gate"]["control_allowed"] is False
+        assert backward["prospective_qualification_eligible"] is False
+        json.dumps(backward, allow_nan=False)
+
+    @pytest.mark.parametrize("reader", ["primary", "shadow", "fallback"])
+    async def test_unique_quorum_remains_available(self, monkeypatch, reader):
+        now, plans, readings = self.history(reader, plan_count=12)
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        scored = scorecard["fallback"] if reader == "fallback" else scorecard
+        assert scored["overall"]["samples"] == 60
+        assert all(row["samples"] == 12 for row in scored["horizons"])
+        assert scored["quality_gate"]["control_allowed"] is True
+        assert scorecard["quality_gate"]["control_allowed"] is (reader != "fallback")
+
+    @pytest.mark.parametrize("plan_id", [True, 1.0, "1"])
+    async def test_malformed_plan_identity_is_not_coerced(self, monkeypatch, plan_id):
+        now, plans, readings = self.history("primary", plan_count=1)
+        plans[0].id = plan_id
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        assert scorecard["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+
+    async def test_equal_values_from_distinct_issues_remain_distinct(self, monkeypatch):
+        now, plans, readings = self.history("primary", plan_count=2)
+        first = json.loads(plans[0].plan_json)["forecast_snapshot"]["forecast_with_plan"]
+        payload = json.loads(plans[1].plan_json)
+        for index, point in enumerate(payload["forecast_snapshot"]["forecast_with_plan"]):
+            point["predicted_indoor_temp"] = first[index]["predicted_indoor_temp"]
+            readings[5 + index].temperature = readings[index].temperature
+        plans[1].plan_json = json.dumps(payload)
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        assert scorecard["overall"]["samples"] == 10
+        assert all(row["samples"] == 2 for row in scorecard["horizons"])
+
+    @pytest.mark.parametrize(
+        "source,family",
+        [
+            ("rule_thermal_fallback", "fallback"),
+            ("comfort_model_passive_direct", "passive_weather_model"),
+        ],
+    )
+    async def test_conflicting_learned_shadow_preserves_only_unrelated_family(
+        self, monkeypatch, source, family
+    ):
+        now, plans, readings = self.history("primary", plan_count=1)
+        payload = json.loads(plans[0].plan_json)
+        snapshot = payload["forecast_snapshot"]
+        points = snapshot["forecast_with_plan"]
+        snapshot["shadow_forecast_with_plan"] = [
+            {**point, "predicted_indoor_temp": 99.0} for point in points
+        ]
+        snapshot["forecast_with_plan"] = points + [
+            {**point, "model_source": source} for point in points
+        ]
+        plans[0].plan_json = json.dumps(payload)
+        scorecard = await self.score(monkeypatch, now, plans, readings)
+        assert scorecard["overall"]["samples"] == 0
+        assert scorecard["quality_gate"]["control_allowed"] is False
+        assert scorecard[family]["overall"]["samples"] == 5
+        assert scorecard["all_forecasts"]["overall"]["samples"] == 5
+        assert scorecard["sources"][source]["overall"]["samples"] == 5
+        assert scorecard["sources"]["comfort_model_controlled"]["overall"]["samples"] == 0
+        assert scorecard["exclusions"]["conflicting_forecast_identity"] == 5
+
+    @pytest.mark.parametrize("method", ["reference_sensor", "selected_sensor_median"])
+    @pytest.mark.parametrize("conflicting", [False, True])
+    def test_sensor_copies_do_not_change_outcomes(self, method, conflicting):
+        target = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            SimpleNamespace(device_id="room", timestamp=target, temperature=20.0),
+            SimpleNamespace(
+                device_id="room",
+                timestamp=target.astimezone(dt.timezone(dt.timedelta(hours=2))),
+                temperature=22.0 if conflicting else 20.0,
+            ),
+            SimpleNamespace(device_id="kitchen", timestamp=target, temperature=22.0),
+        ]
+        sensor_ids = ["room"] if method == "reference_sensor" else ["room", "kitchen"]
+        observed = _observed_temperature_at(
+            rows, target, {"method": method, "sensor_ids": sensor_ids}
+        )
+        assert observed == (None if conflicting else 20.0 if method == "reference_sensor" else 21.0)
+
+
+@pytest.mark.parametrize("reference", ["", "selected", "deselected"])
+async def test_R07_native_scope_and_median_only_use_frozen_selected_sensors(monkeypatch, reference):
+    from sqlalchemy.sql import operators, visitors
+    from sqlalchemy.sql.elements import BinaryExpression
+
+    from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+    from packages.ml import forecast_quality
+
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    status = DeviceStatusRecord(
+        ts=now,
+        device_id="audit-device",
+        tank_temp=45,
+        tank_target_temp=50,
+        zone1_temp=35,
+        zone1_target_temp=35,
+        direction="PUMP",
+        device_action="HEATING",
+        space_heating_active=True,
+        native_policy_provenance={
+            "timer": {
+                "status": "known",
+                "enabled": False,
+                "slots": [],
+                "fetched_at": now.isoformat(),
+                "timezone": "UTC",
+            }
+        },
+    )
+    readings = [
+        IndoorTempReading(
+            timestamp=now - dt.timedelta(minutes=65),
+            device_id="selected",
+            temperature=20,
+            is_stale=False,
+        ),
+        IndoorTempReading(
+            timestamp=now - dt.timedelta(seconds=4),
+            device_id="selected",
+            temperature=20,
+            is_stale=False,
+        ),
+        IndoorTempReading(
+            timestamp=now + dt.timedelta(seconds=1),
+            device_id="selected",
+            temperature=30,
+            is_stale=False,
+        ),
+        IndoorTempReading(
+            timestamp=now, device_id="selected", temperature=float("nan"), is_stale=False
+        ),
+    ]
+    readings += [
+        IndoorTempReading(
+            timestamp=now - dt.timedelta(seconds=offset),
+            device_id="deselected",
+            temperature=28,
+            is_stale=False,
+        )
+        for offset in (3, 2, 1)
+    ]
+    weather = WeatherRecord(
+        ts=now, source="open-meteo", temperature=5, forecast_issued_at=now - dt.timedelta(hours=1)
+    )
+    values = {
+        "comfort_reference_sensor_id": reference,
+        "smartthings_device_ids": "selected",
+        "weather_provider": "open-meteo",
+        "price_provider": "manual",
+        "timezone": "UTC",
+    }
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_all_settings", AsyncMock(return_value=values)
+    )
+    statements = []
+
+    async def execute(statement):
+        statements.append(statement)
+        model = statement.column_descriptions[0]["entity"]
+        if model is IndoorTempReading:
+            predicates = [
+                node
+                for criterion in statement._where_criteria
+                for node in visitors.iterate(criterion)
+                if isinstance(node, BinaryExpression)
+                and getattr(node.left, "name", None) == "device_id"
+                and node.operator is operators.in_op
+            ]
+            assert len(predicates) == 1
+            assert set(predicates[0].right.value) == {"selected"}
+            assert statement._limit_clause.value == 5001
+            rows = readings
+        else:
+            rows = (
+                [status]
+                if model is DeviceStatusRecord
+                else [weather]
+                if model is WeatherRecord
+                else []
+            )
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+    monkeypatch.setattr(
+        forecast_quality, "get_session", lambda: _AsyncContext(SimpleNamespace(execute=execute))
+    )
+
+    result = await forecast_quality.materialize_native_inputs("comfort", now=now)
+
+    if reference == "deselected":
+        assert result is None
+        assert statements == []
+    else:
+        assert result["sensor_basis"]["sensor_ids"] == ["selected"]
+        assert result["sensor_basis"]["selection_schema"] == "selected_indoor_sensors_v2"
+        assert result["indoor_temperature"] == 20
+        assert result["indoor_trend"] == 0
+        assert result["schemas"]["input"] == "frozen_native_inputs_v2"
+        assert all(row["temperature"] == 20 for row in result["sensor_history"])
+        json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("case", ["frozen_union", "empty", "overflow"])
+async def test_R34_execution_page_sensor_scope_is_sql_bounded(monkeypatch, case):
+    from sqlalchemy.sql import operators, visitors
+    from sqlalchemy.sql.elements import BinaryExpression
+
+    from packages.core import safety_reverts
+    from packages.core.models import IndoorTempReading
+    from packages.ml import forecast_quality
+
+    issue = TestProspectiveNativeEvidence._issue()
+    second = {
+        **issue,
+        "input_snapshot": {
+            **issue["input_snapshot"],
+            "sensor_basis": {"kind": "reference", "sensor_ids": ["other"]},
+        },
+    }
+    statements = []
+
+    async def execute(statement):
+        statements.append(statement)
+        rows = []
+        if statement.column_descriptions[0]["entity"] is IndoorTempReading:
+            predicates = [
+                node
+                for criterion in statement._where_criteria
+                for node in visitors.iterate(criterion)
+                if isinstance(node, BinaryExpression)
+                and getattr(node.left, "name", None) == "device_id"
+                and node.operator is operators.in_op
+            ]
+            assert len(predicates) == 1
+            assert set(predicates[0].right.value) == {"room", "other"}
+            assert statement._limit_clause.value == 30_001
+            if case == "overflow":
+                rows = [
+                    IndoorTempReading(
+                        device_id="room",
+                        timestamp=issue["target_at"],
+                        temperature=20,
+                        is_stale=False,
+                    )
+                ] * 30_001
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+    session = SimpleNamespace(execute=execute)
+    monkeypatch.setattr(forecast_quality, "get_session", lambda: _AsyncContext(session))
+    unresolved = AsyncMock(return_value=(set(), False))
+    historical = AsyncMock(return_value=([], False))
+    monkeypatch.setattr(safety_reverts, "unresolved_revert_device_ids", unresolved)
+    monkeypatch.setattr(safety_reverts, "historical_revert_overlap_rows", historical)
+    page = {
+        "rows": [] if case == "empty" else [{"issue": issue}, {"issue": second}],
+        "high_water": 5,
+        "cursor": 5,
+        "complete": True,
+    }
+
+    result = await forecast_quality.materialize_execution_page(page, now=issue["target_at"])
+
+    assert result["complete"] is (case != "overflow")
+    assert page["high_water"] == page["cursor"] == 5
+    if case == "empty":
+        assert statements == []
+        unresolved.assert_not_awaited()
+        historical.assert_not_awaited()
+    else:
+        assert len(statements) == 5
+        unresolved.assert_awaited_once_with(session)
+        historical.assert_awaited_once()
+
+
 def _bucket(abs_errors: list[float], signed_errors: list[float]) -> dict:
     observed = [20.0 + index * 0.1 for index in range(len(abs_errors))]
     predicted = [value + error for value, error in zip(observed, signed_errors)]
@@ -710,6 +2318,250 @@ def _passing_horizon(hours: int) -> dict:
     }
 
 
+class TestR03RequiredHorizonIdentity:
+    @staticmethod
+    async def evaluate(horizons):
+        from packages.ml.forecast_quality import evaluate_live_control_gate
+
+        return await evaluate_live_control_gate(
+            model_metrics={},
+            record_gate=lambda gate, **context: {**gate, **context},
+            scorecard_loader=AsyncMock(
+                return_value={
+                    "overall": {**_passing_horizon(0), "samples": 30},
+                    "horizons": horizons,
+                }
+            ),
+            get_float=AsyncMock(side_effect=lambda key: 0.5 if key.endswith("bias_c") else 0.15),
+            get_int=AsyncMock(return_value=2),
+            get_string=AsyncMock(return_value="off"),
+        )
+
+    @pytest.mark.parametrize(
+        "hours", [True, False, "1", 1.0, 6.5, float("nan"), float("inf"), float("-inf"), None, 0, 2]
+    )
+    async def test_invalid_identity_fails_closed(self, hours):
+        horizons = [_passing_horizon(hour) for hour in (1, 3, 6, 12, 24)]
+        horizons[0]["hours"] = hours
+
+        result = await self.evaluate(horizons)
+
+        assert result["control_allowed"] is False
+        assert result["status"] in {"failed", "fallback"}
+        json.dumps(result, allow_nan=False)
+
+    @pytest.mark.parametrize("hours", [True, False, 1, "1", 1.0, 2])
+    @pytest.mark.parametrize("extra_first", [False, True])
+    async def test_duplicate_or_unknown_identity_cannot_complete_coverage(self, hours, extra_first):
+        horizons = [_passing_horizon(hour) for hour in (1, 3, 6, 12, 24)]
+        horizons.insert(0 if extra_first else len(horizons), _passing_horizon(hours))
+
+        result = await self.evaluate(horizons)
+
+        assert result["control_allowed"] is False
+        json.dumps(result, allow_nan=False)
+
+    async def test_integer_horizons_and_serialized_keys_keep_positive_control(self):
+        horizons = json.loads(json.dumps([_passing_horizon(hour) for hour in (1, 3, 6, 12, 24)]))
+
+        result = await self.evaluate(horizons)
+
+        assert result["control_allowed"] is True and result["status"] == "passed"
+        assert set(json.loads(result["evaluation_id"])["horizons"]) == {"1", "3", "6", "12", "24"}
+        json.dumps(result, allow_nan=False)
+
+    @pytest.mark.parametrize("location", ["key", "row"])
+    @pytest.mark.parametrize(
+        "hours", [True, False, "1", 1.0, float("nan"), float("inf"), float("-inf"), None, 0, 2]
+    )
+    def test_mapped_identity_is_validated_before_lookup(self, location, hours):
+        horizons = {hour: _passing_horizon(hour) for hour in (1, 3, 6, 12, 24)}
+        if location == "key":
+            horizons[hours] = horizons.pop(1)
+        else:
+            horizons[1]["hours"] = hours
+
+        result = _quality_gate({**_passing_horizon(0), "samples": 30}, required_horizons=horizons)
+
+        assert result["control_allowed"] is False
+        json.dumps(result, allow_nan=False)
+
+    @pytest.mark.parametrize("missing", [1, 3, 6, 12, 24])
+    async def test_missing_horizon_does_not_complete_coverage(self, missing):
+        result = await self.evaluate(
+            [_passing_horizon(hour) for hour in (1, 3, 6, 12, 24) if hour != missing]
+        )
+
+        assert result["control_allowed"] is False
+        assert f"horizon_{missing}_missing" in result["reason"]
+
+    @pytest.mark.parametrize("hours", [True, False, "1", 1.0, float("nan"), float("inf"), 0, 2])
+    def test_invalid_current_hysteresis_horizon_never_allows_control(self, hours):
+        required = (hours, 3, 6, 12, 24)
+
+        result = apply_control_gate_hysteresis(
+            {"status": "passed", "control_allowed": True},
+            {},
+            schema="R03",
+            required_horizons=required,
+            passes_required=1,
+        )
+
+        assert result["control_allowed"] is False and result["raw_status"] == "failed"
+        json.dumps(result, allow_nan=False)
+
+    @pytest.mark.parametrize("hours", [True, 1.0])
+    def test_noncanonical_previous_hysteresis_horizon_cannot_carry_streak(self, hours):
+        result = apply_control_gate_hysteresis(
+            {"status": "passed", "control_allowed": True},
+            {
+                "forecast_quality_gate": {
+                    "schema": "R03",
+                    "required_horizons": [hours, 3, 6, 12, 24],
+                    "pass_streak": 1,
+                }
+            },
+            schema="R03",
+            required_horizons=(1, 3, 6, 12, 24),
+        )
+
+        assert result["pass_streak"] == 1 and result["control_allowed"] is False
+
+    @pytest.mark.parametrize("hours", [True, False, "1", 1.0, float("nan"), float("inf"), 0, 2])
+    def test_weather_readers_cannot_alias_invalid_horizon(self, hours):
+        horizons = [_passing_horizon(hour) for hour in (1, 3, 6, 12, 24)]
+        horizons[0]["hours"] = hours
+        scorecard = {"overall": _passing_horizon(0), "horizons": horizons}
+
+        adjustments = control_adjustments_for_weather(scorecard, [{"temperature": 8.0}])
+        intervals = prediction_intervals_for_weather(scorecard, [{"temperature": 8.0}])
+
+        assert adjustments["control_allowed"] is False
+        assert intervals[0]["source"] == "overall"
+
+    def test_weather_reader_keeps_legitimate_string_json_keys(self):
+        scorecard = json.loads(
+            json.dumps(
+                {
+                    "overall": _passing_horizon(0),
+                    "horizons": [
+                        {**_passing_horizon(1), "p10_signed_error": -0.5, "p90_signed_error": 0.8}
+                    ],
+                    "horizon_quality": {"1": {"status": "passed"}},
+                    "bias_correction": {"by_horizon_c": {"1": 0.25}},
+                }
+            )
+        )
+
+        adjustments = control_adjustments_for_weather(scorecard, [{"temperature": 8.0}])
+        intervals = prediction_intervals_for_weather(scorecard, [{"temperature": 8.0}])
+
+        assert adjustments["control_allowed"] is True
+        assert intervals[0]["source"] == "1h"
+        assert intervals[0]["lower_offset_c"] == pytest.approx(-1.05)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+@pytest.mark.parametrize(
+    "field", ["samples", "mae", "bias", "p90_abs_error", "r2", "persistence_improvement_c"]
+)
+@pytest.mark.parametrize("scope", ["overall", "horizon"])
+def test_R03_nonfinite_score_gate_fails_closed(value, field, scope):
+    overall = {**_passing_horizon(0), "samples": 30}
+    horizons = {hour: _passing_horizon(hour) for hour in (1, 3, 6, 12, 24)}
+    (overall if scope == "overall" else horizons[6])[field] = value
+
+    gate = _quality_gate(overall, required_horizons=horizons)
+
+    assert gate["control_allowed"] is False
+    assert gate["status"] in {"failed", "observing"}
+    json.dumps(gate, allow_nan=False)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+@pytest.mark.parametrize("threshold", ["min_r2", "min_persistence_improvement_c", "max_abs_bias_c"])
+def test_R03_nonfinite_gate_threshold_fails_closed(value, threshold):
+    gate = _quality_gate(
+        {**_passing_horizon(0), "samples": 30},
+        required_horizons={hour: _passing_horizon(hour) for hour in (1, 3, 6, 12, 24)},
+        **{threshold: value},
+    )
+
+    assert gate["control_allowed"] is False
+    json.dumps(gate, allow_nan=False)
+
+
+def test_R03_finite_complete_score_gate_passes():
+    gate = _quality_gate(
+        {**_passing_horizon(0), "samples": 30},
+        required_horizons={hour: _passing_horizon(hour) for hour in (1, 3, 6, 12, 24)},
+    )
+
+    assert gate["control_allowed"] is True
+    json.dumps(gate, allow_nan=False)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+@pytest.mark.parametrize(
+    "field", ["abs_errors", "signed_errors", "predicted", "observed", "persistence_errors"]
+)
+def test_R03_nonfinite_score_bucket_is_serializable_unavailable(value, field):
+    inputs = {
+        "abs_errors": [0.2, 0.2, 0.2],
+        "signed_errors": [0.2, 0.2, 0.2],
+        "predicted": [20.2, 21.2, 22.2],
+        "observed": [20.0, 21.0, 22.0],
+        "persistence_errors": [0.5, 0.5, 0.5],
+    }
+    inputs[field][1] = value
+
+    score = score_bucket(**inputs)
+
+    assert score["samples"] == 0
+    assert score["mae"] is None
+    json.dumps(score, allow_nan=False)
+
+
+def test_R03_score_bucket_overflow_is_serializable_unavailable():
+    score = score_bucket([1e308] * 3, [1e308] * 3, [1e308] * 3, [-1e308] * 3, [1e308] * 3)
+
+    assert score["mae"] is None
+    json.dumps(score, allow_nan=False)
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+@pytest.mark.parametrize("injected", [False, True])
+async def test_R20_default_and_injected_gate_read_actual_baseline_mode(monkeypatch, mode, injected):
+    from packages.ml.forecast_quality import evaluate_live_control_gate
+
+    loader = AsyncMock(
+        return_value={
+            "overall": {**_passing_horizon(0), "samples": 30},
+            "horizons": [_passing_horizon(hour) for hour in (1, 3, 6, 12, 24)],
+        }
+    )
+    reader = AsyncMock(return_value=mode)
+    monkeypatch.setattr("packages.ml.forecast_quality.get_forecast_scorecard", loader)
+    monkeypatch.setattr("packages.core.settings_service.get_string_setting", reader)
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_float_setting",
+        AsyncMock(side_effect=lambda key: 0.5 if key.endswith("bias_c") else 0.15),
+    )
+    monkeypatch.setattr("packages.core.settings_service.get_int_setting", AsyncMock(return_value=2))
+
+    result = await evaluate_live_control_gate(
+        model_metrics={},
+        record_gate=lambda gate, **context: {**gate, **context},
+        **({"scorecard_loader": loader} if injected else {}),
+    )
+
+    reader.assert_awaited_once_with("space_heating_baseline_mode")
+    expected_context = {"live_baseline_applied": mode == "on"}
+    loader.assert_awaited_once_with(evaluation_context=expected_context)
+    assert result["evaluation_context"] == expected_context
+    assert result["status"] == "passed"
+
+
 def test_quality_gate_requires_per_horizon_r2_and_persistence_improvement():
     horizons = {hour: _passing_horizon(hour) for hour in (1, 3, 6, 12, 24)}
     horizons[6]["r2"] = 0.1
@@ -805,12 +2657,16 @@ async def test_same_scorecard_is_recorded_once_and_new_scorecard_advances_streak
     async def get_int(name):
         return 2 if name.endswith("passes_required") else 1
 
+    async def get_string(_name):
+        return "shadow"
+
     first = await evaluate_live_control_gate(
         model_metrics={},
         record_gate=model.record_forecast_quality_gate,
         scorecard_loader=scorecard_loader,
         get_float=get_float,
         get_int=get_int,
+        get_string=get_string,
     )
     duplicate = await evaluate_live_control_gate(
         model_metrics={},
@@ -818,6 +2674,7 @@ async def test_same_scorecard_is_recorded_once_and_new_scorecard_advances_streak
         scorecard_loader=scorecard_loader,
         get_float=get_float,
         get_int=get_int,
+        get_string=get_string,
     )
     new_scorecard = await evaluate_live_control_gate(
         model_metrics={},
@@ -825,6 +2682,7 @@ async def test_same_scorecard_is_recorded_once_and_new_scorecard_advances_streak
         scorecard_loader=scorecard_loader,
         get_float=get_float,
         get_int=get_int,
+        get_string=get_string,
     )
 
     assert first["failure_streak"] == 1

@@ -209,6 +209,7 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
                 ts=now,
                 device_id=device.long_id,
                 source_date=snapshot.date,
+                source_timezone=timezone_name,
                 heat_kwh=snapshot.heat_kwh,
                 cool_kwh=snapshot.cool_kwh,
                 tank_kwh=snapshot.tank_kwh,
@@ -251,6 +252,7 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
             ts=now,
             device_id=device.long_id,
             source_date=local_now.date(),
+            source_timezone=timezone_name,
             heat_kwh=heat,
             cool_kwh=cool,
             tank_kwh=tank,
@@ -302,6 +304,7 @@ async def poll_prices() -> None:
                             "price_currency": feed.currency,
                             "price_source": feed.source,
                             "fetched_at": fetched_at,
+                            "interval_schema": "hourly_duration_weighted_v1",
                         }
                         for ts, price in prices
                     ]
@@ -311,6 +314,7 @@ async def poll_prices() -> None:
                     set_={
                         "price_eur_per_kwh": stmt.excluded.price_eur_per_kwh,
                         "price_currency": stmt.excluded.price_currency,
+                        "interval_schema": stmt.excluded.interval_schema,
                         "price_source": stmt.excluded.price_source,
                         "fetched_at": stmt.excluded.fetched_at,
                     },
@@ -402,6 +406,7 @@ async def poll_weather() -> None:
                             "cloud_cover": entry.get("cloud_cover"),
                             "precipitation": entry.get("precipitation"),
                             "forecast_issued_at": entry.get("forecast_issued_at"),
+                            "units_schema": entry.get("units_schema"),
                         }
                         for entry in weather_data
                     ]
@@ -416,6 +421,7 @@ async def poll_weather() -> None:
                         "cloud_cover": stmt.excluded.cloud_cover,
                         "precipitation": stmt.excluded.precipitation,
                         "forecast_issued_at": stmt.excluded.forecast_issued_at,
+                        "units_schema": stmt.excluded.units_schema,
                     },
                 )
                 await session.execute(stmt)
@@ -488,17 +494,15 @@ async def deliver_operational_alerts() -> None:
         logger.error("operational_alert_delivery_failed", error=str(exc))
 
 
-async def main() -> None:
+async def _run_service(wrapper, maintenance, scheduler) -> None:
     """Main entry point for the poller service."""
     from packages.core.logging import configure_logging
-    from packages.ml.lifecycle import MaintenanceRunner, enqueue_maintenance_request
+    from packages.ml.lifecycle import enqueue_maintenance_request
 
     configure_logging("poller")
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
-    wrapper = AquareaWrapper(read_only=True)
-    maintenance = MaintenanceRunner(timer_reader=wrapper)
     await wrapper.start()
 
     startup_slot = int(utc_now().timestamp() // (6 * 3600))
@@ -510,7 +514,6 @@ async def main() -> None:
             dedup_key=f"startup:{startup_slot}",
         )
 
-    scheduler = create_scheduler()
     await record_service_heartbeat("poller", poll_interval_seconds=settings.poll_interval_seconds)
 
     scheduler.add_job(
@@ -615,11 +618,26 @@ async def main() -> None:
         await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
+
+
+async def main() -> None:
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+    from packages.ml.lifecycle import MaintenanceRunner
+
+    wrapper, maintenance, scheduler = None, None, None
+    try:
+        wrapper = AquareaWrapper(read_only=True)
+        maintenance = MaintenanceRunner(timer_reader=wrapper)
+        scheduler = create_scheduler()
+        await _run_service(wrapper, maintenance, scheduler)
     finally:
-        scheduler.shutdown(wait=True)
-        await maintenance.close()
-        await wrapper.stop()
-        logger.info("poller_stopped")
+
+        async def cleanup():
+            await close_service_resources(
+                scheduler=scheduler, maintenance=maintenance, wrapper=wrapper
+            )
+
+        await finish_owned_cleanup(cleanup)
 
 
 if __name__ == "__main__":

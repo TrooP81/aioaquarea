@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DataAge } from "./DataAge";
 import { LAYER_LABELS, MODEL_REPORTING_LABELS, reasonLabel, seasonalReasonLabel } from "@/lib/constants";
-import type { ControlState, ModelComponent, ModelLifecycleStatus, ModelLifecycleStatuses, ModelReportingState, SpaceHeatingGate } from "@/lib/api-types";
+import type { ControlState, ModelComponent, ModelLifecycleStatus, ModelLifecycleStatuses, ModelReportingState, ReadinessComponent, SeasonalReadiness, SpaceHeatingGate } from "@/lib/api-types";
 import { OptimizerDiagnostics } from "./OptimizerDiagnostics";
 import { WhyItDecides } from "./WhyItDecides";
 import { ManualCOPMonitoring } from "./ManualCOPMonitoring";
@@ -13,7 +13,7 @@ interface ModelInfo {
   status?: ModelReportingState;
   last_trained: string | null;
   samples?: number;
-  source_records?: number;
+  source_records?: number | null;
   metrics?: { mae?: number; cv_std?: number; samples?: number; baseline_mae?: number; validation_method?: string };
   unavailable_reason?: "retired" | "not_found" | "integrity_check_failed" | "incompatible_artifact" | "load_failed" | null;
   data_quality?: DemandDataQuality;
@@ -22,12 +22,12 @@ interface ModelInfo {
 interface DemandDataQuality {
   raw_records: number;
   intervals: number;
-  usable_samples: number;
+  usable_samples: number | null;
   minimum_samples: number;
   rejected_nonpositive: number;
   rejected_rate_bounds: number;
   weather_matches: number;
-  remaining_samples?: number;
+  remaining_samples?: number | null;
   heating_activity_ratio?: number;
   training_blocker?: string | null;
   seasonal_guidance?: string;
@@ -45,10 +45,10 @@ interface ModelTrainResult {
 
 interface ThermalInfo {
   calibrated: boolean;
-  tank_heating_rate: number;
+  tank_heating_rate: number | null;
   confidence: string;
   indoor_heating_confidence: string;
-  indoor_heating_samples: number;
+  indoor_heating_samples: number | null;
   calibration_status?: Record<string, string>;
   last_calibrated: string | null;
 }
@@ -114,16 +114,17 @@ interface OptimizerStatusData {
     cutoff_c?: number | null;
   };
   seasonal_calibration?: {
-    enabled: boolean;
-    observe_only_active: boolean;
-    heating_season_detected: boolean;
+    enabled: boolean | null;
+    observe_only_active: boolean | null;
+    heating_season_detected: boolean | null;
     reason: string;
     average_outdoor_c: number | null;
     next_step?: string;
-    auto_train?: boolean;
+    auto_train?: boolean | null;
     auto_exit?: boolean;
-    demand?: { usable_samples?: number; minimum_samples?: number; remaining_samples?: number; trained?: boolean };
-    indoor_heating?: { samples?: number; minimum_samples?: number; remaining_samples?: number };
+    readiness?: SeasonalReadiness;
+    demand?: { usable_samples?: number | null; minimum_samples?: number; remaining_samples?: number | null; trained?: boolean };
+    indoor_heating?: { samples?: number | null; minimum_samples?: number; remaining_samples?: number | null };
   };
   decision_readiness?: { state: "ready" | "collecting" | "fallback"; title: string; detail: string };
   cop_model: ModelInfo;
@@ -202,7 +203,7 @@ interface ModelCard {
   detail: string;
   unavailableReason?: string;
   nextStep: string;
-  capabilities?: Array<{ label: string; state: "ready" | "learning" | "waiting" }>;
+  capabilities?: Array<{ label: string; state: "ready" | "learning" | "waiting" | "unknown" }>;
 }
 
 interface TrainMessage {
@@ -227,7 +228,66 @@ function formatDate(iso: string | null): string {
   return d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 }
 
-function LifecycleDetails({ component, status }: { component: ModelComponent; status?: ModelLifecycleStatus }) {
+function readinessStepLabel(step: string): string {
+  const labels: Record<string, string> = {
+    await_fit_or_validation: "Awaiting fit or validation.",
+    await_successful_demand_training: "Awaiting demand fit and validation.",
+    await_indoor_heating_fit: "Awaiting indoor-heating fit and validation.",
+    await_prospective_reporting_qualification: "Awaiting prospective reporting qualification.",
+    collect_space_heating_evidence: "Collecting eligible heating evidence.",
+    collect_indoor_heating_evidence: "Collecting eligible indoor-heating evidence.",
+    wait_for_heating_season: "Waiting for heating-season observations.",
+    enable_observe_only_campaign: "Observe-only campaign is not enabled.",
+    ready_for_reporting: "Qualified for reporting; observation is unchanged.",
+    readiness_unavailable: "Readiness unavailable.",
+  };
+  return labels[step] ?? reasonLabel(step);
+}
+
+function readinessReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    running_request_proof_unavailable: "Current maintenance activity is not proven.",
+    no_running_request: "No running maintenance request.",
+    lifecycle_not_initialized: "Maintenance lifecycle not initialized.",
+    insufficient_train: "Training partition below minimum.",
+    insufficient_holdout: "Holdout partition below minimum.",
+    no_persisted_fit: "No persisted fit.",
+    snapshot_materialization_unavailable: "Snapshot unavailable.",
+    readiness_input_budget_exceeded: "Snapshot exceeds the input budget.",
+    readiness_row_limit_exceeded: "Source history exceeds the row limit.",
+    nonfinite_training_inputs: "Training inputs contain invalid values.",
+    source_not_assessed: "Source inputs not assessed.",
+    reference_sensor_not_selected: "Reference sensor is not selected.",
+    seasonal_reporting_unavailable: "Seasonal evidence unavailable.",
+    awaiting_explicit_seasonal_cycle: "Awaiting the explicit seasonal cycle.",
+  };
+  return labels[reason] ?? reasonLabel(reason);
+}
+
+function ReadinessDetails({ name, label, stage }: { name: string; label: string; stage: ReadinessComponent }) {
+  const collection = stage.collection;
+  const progress = collection.train != null && collection.minimum_train != null && collection.minimum_train > 0
+    ? Math.min(100, Math.round(100 * collection.train / collection.minimum_train)) : null;
+  const fit = stage.fit;
+  const reporting = stage.reporting;
+  return (
+    <div data-testid={`readiness-${name}`} style={{ marginTop: "0.75rem", minWidth: 0, overflowWrap: "anywhere" }}>
+      <strong>{label}</strong>
+      {name === "demand" && <div>Demand evidence: {collection.total ?? "Unknown"}/{collection.minimum_train ?? "Unknown"} total milestone</div>}
+      <div>Total: {collection.total ?? "Unknown"}; Train: {collection.train ?? "Unknown"}/{collection.minimum_train ?? "Unknown"}; Holdout: {collection.holdout ?? "Unknown"}/{collection.minimum_holdout ?? "Unknown"}</div>
+      {progress != null && <progress value={progress} max={100} aria-label={`${label} training collection`} style={{ width: "100%", display: "block" }} />}
+      {collection.reason && <div>Collection: {readinessReasonLabel(collection.reason)}</div>}
+      <div>Fit: {fit.status === "validated" ? "Validated" : fit.status === "awaiting_fit" ? "Not yet fitted" : fit.status ? reasonLabel(fit.status) : "Unknown"}{fit.reason ? `; ${readinessReasonLabel(fit.reason)}` : ""}</div>
+      <div>Fit cutoff: {fit.data_cutoff ? formatDate(fit.data_cutoff) : "Not assessed"}; Reference: {fit.artifact_hash?.slice(0, 12) ?? fit.request_id ?? "Not assessed"}</div>
+      <div>Native outcomes: {reporting.counts?.pairs ?? "Not assessed"}; Missing: {reporting.missing_counts?.paired_outcomes ?? "Unknown"}; Pending: {reporting.pending_outcomes ?? "Unknown"}</div>
+      <div>Device-days missing: {reporting.missing_counts?.device_day_clusters ?? "Unknown"}; Cohorts missing: {reporting.missing_counts?.issue_cohorts ?? "Unknown"}; Outdoor bins missing: {reporting.missing_diversity?.populated_outdoor_bins ?? "Unknown"}</div>
+      <div>Checkpoint: {reporting.next_decision_checkpoint ? formatDate(reporting.next_decision_checkpoint.at) : "Not assessed"}; Qualification expiry: {reporting.qualification_expires_at ? formatDate(reporting.qualification_expires_at) : "Not assessed"}</div>
+      <div>Next: {readinessStepLabel(stage.next_step)}</div>
+    </div>
+  );
+}
+
+function LifecycleDetails({ component, status, maintenance }: { component: ModelComponent; status?: ModelLifecycleStatus; maintenance?: SeasonalReadiness["maintenance"] }) {
   const missing = status?.missing_counts;
   const diversity = status?.missing_diversity;
   const checkpoint = status?.next_decision_checkpoint;
@@ -235,6 +295,8 @@ function LifecycleDetails({ component, status }: { component: ModelComponent; st
   const horizonGaps = Object.entries(diversity?.pairs_per_horizon ?? {});
   const binGaps = Object.entries(diversity?.pairs_per_outdoor_bin ?? {});
   const available = Boolean(status && status.status !== "unavailable");
+  const maintenanceEnabled = maintenance ? maintenance.enabled : status?.maintenance_enabled;
+  const nextMaintenance = maintenance ? maintenance.next_due_at : status?.next_cadence_at;
   return (
     <div className="model-card-details" data-testid={`lifecycle-${component}`} data-reporting-state={status?.status ?? "unavailable"} style={{ overflowWrap: "anywhere" }}>
       <div>Incumbent: {modelStateLabel(status?.incumbent_status ?? "unavailable")}</div>
@@ -250,7 +312,7 @@ function LifecycleDetails({ component, status }: { component: ModelComponent; st
       {binGaps.length > 0 && <div>Outdoor-bin pairs missing: {binGaps.map(([bin, count]) => `${bin} C: ${count}`).join("; ")}</div>}
       <div>Exclusions: {exclusions.length ? exclusions.map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${count}`).join("; ") : status?.counts ? "0 recorded" : "unavailable"}</div>
       <div>Pending outcomes: {status?.pending_outcomes ?? "unavailable"}</div>
-      <div>Next maintenance: {status?.maintenance_enabled === false ? "Disabled" : status?.next_cadence_at ? formatDate(status.next_cadence_at) : "Unavailable"}</div>
+      <div>Next maintenance: {maintenanceEnabled === false ? "Disabled" : nextMaintenance ? formatDate(nextMaintenance) : maintenanceEnabled == null ? "Unknown" : "Unavailable"}</div>
       {status?.cadence_hours != null && <div>Minimum attempt cadence: {status.cadence_hours} hours</div>}
       <div>Last valid outcome: {status?.last_valid_outcome_at ? formatDate(status.last_valid_outcome_at) : available ? "None recorded" : "Unavailable"}</div>
       <div>Qualification expires: {status?.qualification_expires_at ? formatDate(status.qualification_expires_at) : available ? "None recorded" : "Unavailable"}</div>
@@ -437,6 +499,9 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
   }
 
   const demandQuality = status.demand_model.data_quality;
+  const readiness = status.seasonal_calibration?.readiness;
+  const demandStage = readiness?.components.demand;
+  const indoorStage = readiness?.components.indoor_heating;
   const lifecycleStatuses = status.model_lifecycle ?? controlState?.model_lifecycle ?? {};
   const dataFreshness = status.data_freshness ?? {
     latest_device_status: null,
@@ -445,8 +510,8 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
     fresh: false,
   };
   const demandDetail = demandQuality
-    ? `${status.demand_model.source_records ?? 0} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""} · ${demandQuality.usable_samples}/${demandQuality.minimum_samples} usable intervals${demandQuality.remaining_samples ? ` · ${demandQuality.remaining_samples} still needed` : ""}${demandQuality.training_blocker === "waiting_for_space_heating_season" ? " · waiting for heating season" : ""}${demandQuality.rejected_rate_bounds > 0 ? ` · ${demandQuality.rejected_rate_bounds} rejected as implausible rate` : ""}${demandQuality.weather_matches > 0 ? ` · weather matched ${demandQuality.weather_matches}` : ""}`
-    : `${status.demand_model.source_records ?? 0} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""}`;
+    ? `${status.demand_model.source_records ?? "Unknown"} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""} · ${demandQuality.usable_samples ?? "Unknown"}/${demandQuality.minimum_samples} usable intervals${demandQuality.remaining_samples ? ` · ${demandQuality.remaining_samples} still needed` : ""}${demandQuality.training_blocker === "waiting_for_space_heating_season" ? " · waiting for heating season" : ""}${demandQuality.rejected_rate_bounds > 0 ? ` · ${demandQuality.rejected_rate_bounds} rejected as implausible rate` : ""}${demandQuality.weather_matches > 0 ? ` · weather matched ${demandQuality.weather_matches}` : ""}`
+    : `${status.demand_model.source_records ?? "Unknown"} energy readings${status.demand_model.metrics?.mae != null ? ` · validation MAE ${status.demand_model.metrics.mae.toFixed(3)} kW` : ""}`;
 
   const models: ModelCard[] = [
     {
@@ -458,13 +523,13 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
       lastTrained: status.demand_model.last_trained,
       detail: demandDetail,
       unavailableReason: modelUnavailableReason(status.demand_model.unavailable_reason),
-      nextStep: lifecycleStatuses.demand?.status === "qualified-for-reporting"
+      nextStep: demandStage ? readinessStepLabel(demandStage.next_step) : lifecycleStatuses.demand?.status === "qualified-for-reporting"
         ? "Reporting qualification is current; observation is unchanged."
         : status.demand_model.trained
           ? "Prospective reporting qualification is pending."
           : demandQuality?.training_blocker === "waiting_for_space_heating_season"
             ? "Wait for heating weather; manual retraining cannot create the missing evidence."
-            : `${demandQuality?.remaining_samples ?? 0} more usable heating interval(s) are needed.`,
+            : `${demandQuality?.remaining_samples ?? "Unknown"} additional usable heating interval(s) are needed.`,
     },
     {
       component: "thermal",
@@ -473,15 +538,15 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
       plain: "Learns how fast your tank and rooms heat up",
       state: lifecycleStatuses.thermal?.status ?? "unavailable",
       lastTrained: status.thermal_model.last_calibrated,
-      detail: `Tank: ${status.thermal_model.tank_heating_rate ?? "unavailable"} °C/h · ${status.thermal_model.confidence ?? "unavailable"} · Indoor heat: ${status.thermal_model.indoor_heating_confidence ?? "unavailable"} (${status.thermal_model.indoor_heating_samples ?? "unavailable"} samples)${status.thermal_model.calibration_status?.zone_cooling ? ` · Zone cooling: ${reasonLabel(status.thermal_model.calibration_status.zone_cooling)}` : ""}`,
-      nextStep: lifecycleStatuses.thermal?.status === "qualified-for-reporting"
+      detail: `Artifact diagnostics · Tank: ${status.thermal_model.tank_heating_rate ?? "unavailable"} °C/h · ${status.thermal_model.confidence ?? "unavailable"} · Indoor fit: ${status.thermal_model.indoor_heating_confidence ?? "unavailable"} (${status.thermal_model.indoor_heating_samples ?? "unavailable"} artifact samples)${status.thermal_model.calibration_status?.zone_cooling ? ` · Zone cooling: ${reasonLabel(status.thermal_model.calibration_status.zone_cooling)}` : ""}`,
+      nextStep: indoorStage ? readinessStepLabel(indoorStage.next_step) : lifecycleStatuses.thermal?.status === "qualified-for-reporting"
         ? "Qualified only for the declared reporting horizons and thermal components."
         : status.thermal_model.indoor_heating_confidence === "learned"
           ? "A learned fit does not confer prospective reporting qualification."
           : "Tank calibration is available, but indoor heating still uses safe defaults until confirmed heating samples exist.",
       capabilities: [
         { label: "Tank response", state: lifecycleStatuses.thermal?.status === "qualified-for-reporting" && lifecycleStatuses.thermal.qualification_scope?.capabilities?.includes("tank_heating") ? "ready" : status.thermal_model.calibrated ? "learning" : "waiting" },
-        { label: "Indoor heating", state: lifecycleStatuses.thermal?.status === "qualified-for-reporting" && lifecycleStatuses.thermal.qualification_scope?.capabilities?.includes("indoor_heating") ? "ready" : status.thermal_model.indoor_heating_samples > 0 ? "learning" : "waiting" },
+        { label: "Indoor heating", state: lifecycleStatuses.thermal?.status === "qualified-for-reporting" && lifecycleStatuses.thermal.qualification_scope?.capabilities?.includes("indoor_heating") ? "ready" : indoorStage ? indoorStage.collection.total == null ? "unknown" : indoorStage.collection.total > 0 ? "learning" : "waiting" : status.thermal_model.indoor_heating_samples != null && status.thermal_model.indoor_heating_samples > 0 ? "learning" : "unknown" },
       ],
     },
   ];
@@ -521,7 +586,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
 
   const activeLayerLabel = LAYER_LABELS[status.active_layer] || status.active_layer;
   const demandTrainingBlocked = !demandQuality?.ready_to_train
-    || demandQuality.usable_samples < demandQuality.minimum_samples;
+    || demandQuality.usable_samples == null || demandQuality.usable_samples < demandQuality.minimum_samples;
   const comfortActiveHeatingRows = typeof comfort?.metrics?.active_heating_rows === "number"
     ? comfort.metrics.active_heating_rows
     : 0;
@@ -546,12 +611,6 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
   const layerExplanation = status.configured_layer === "auto"
     ? "Automatic mode uses rules while COP is retired."
     : `Fixed setting — using ${activeLayerLabel}.`;
-  const demandProgress = status.seasonal_calibration?.demand?.minimum_samples
-    ? Math.min(100, Math.round(100 * (status.seasonal_calibration.demand.usable_samples ?? 0) / status.seasonal_calibration.demand.minimum_samples))
-    : null;
-  const indoorHeatingProgress = status.seasonal_calibration?.indoor_heating?.minimum_samples
-    ? Math.min(100, Math.round(100 * (status.seasonal_calibration.indoor_heating.samples ?? 0) / status.seasonal_calibration.indoor_heating.minimum_samples))
-    : null;
   const limitations = [
     "Ordinary writes are prohibited in this build; optimization requires a new reviewed, approved build.",
     !dataFreshness.fresh ? "Live pump status is stale; restore preconditions may be unavailable." : null,
@@ -621,20 +680,33 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
         </section>
         <section><h3>Seasonal calibration</h3>{status.seasonal_calibration ? (
           <p className={status.seasonal_calibration.observe_only_active ? "text-warning text-sm" : "text-muted text-xs"}>
-            Seasonal calibration: {seasonalReasonLabel(status.seasonal_calibration.reason)}
+            Seasonal calibration: {status.seasonal_calibration.reason === "awaiting_explicit_seasonal_cycle" || status.seasonal_calibration.reason === "seasonal_reporting_unavailable" ? readinessReasonLabel(status.seasonal_calibration.reason) : seasonalReasonLabel(status.seasonal_calibration.reason)}
             {status.seasonal_calibration.average_outdoor_c != null ? ` · recent outdoor average ${status.seasonal_calibration.average_outdoor_c.toFixed(1)}°C` : ""}
             {status.seasonal_calibration.observe_only_active && " — device commands are paused while natural heating data is collected."}
             {status.seasonal_calibration.next_step ? ` Next: ${reasonLabel(status.seasonal_calibration.next_step)}.` : ""}
           </p>
         ) : <p className="optimizer-readable-text">Unavailable.</p>}
-          {status.seasonal_calibration?.enabled && (
-            <div data-testid="seasonal-reporting-summary" className="indoor-temp-card text-muted text-xs" style={{ margin: "0.75rem 0", display: "block", overflowWrap: "anywhere" }}>
+          {status.seasonal_calibration && (
+            <div data-testid="seasonal-reporting-summary" className="text-muted text-xs" style={{ margin: "0.75rem 0", display: "block", minWidth: 0, overflowWrap: "anywhere" }}>
               <strong>Season readiness</strong>
-              <div>Demand evidence: {status.seasonal_calibration.demand?.usable_samples ?? "unavailable"}/{status.seasonal_calibration.demand?.minimum_samples ?? "unavailable"} {demandProgress != null ? `(${demandProgress}%)` : ""}</div>
-              {demandProgress != null && <progress value={demandProgress} max={100} aria-label="Demand-model seasonal evidence" style={{ width: "100%" }} />}
-              <div>Indoor-heating evidence: {status.seasonal_calibration.indoor_heating?.samples ?? "unavailable"}/{status.seasonal_calibration.indoor_heating?.minimum_samples ?? "unavailable"} {indoorHeatingProgress != null ? `(${indoorHeatingProgress}%)` : ""}</div>
-              {indoorHeatingProgress != null && <progress value={indoorHeatingProgress} max={100} aria-label="Indoor-heating seasonal evidence" style={{ width: "100%" }} />}
-              <div>{lifecycleStatuses.demand?.maintenance_enabled === false ? "Model maintenance is disabled." : status.seasonal_calibration.auto_train ? "Automatic maintenance is selected when evidence is ready." : "Manual maintenance is selected."}</div>
+              {readiness ? <>
+                <div>As of: {readiness.as_of ? formatDate(readiness.as_of) : "Unknown"}; Generation: {readiness.generation?.slice(0, 8) ?? "Unknown"}; Context: {readiness.context_digest?.slice(0, 8) ?? "Unknown"}</div>
+                {demandStage && <ReadinessDetails name="demand" label="Demand collection" stage={demandStage} />}
+                {indoorStage && <ReadinessDetails name="indoor_heating" label="Indoor-heating collection" stage={indoorStage} />}
+                {readiness.components.indoor_cooling && <ReadinessDetails name="indoor_cooling" label="Indoor-cooling collection" stage={readiness.components.indoor_cooling} />}
+                <div data-testid="readiness-maintenance" style={{ marginTop: "0.75rem" }}>
+                  <div>{readiness.maintenance.enabled === false ? "Model maintenance is disabled." : readiness.maintenance.enabled === true ? "Model maintenance is enabled." : "Model maintenance status is unknown."}</div>
+                  <div>Maintenance preference: {readiness.maintenance.preference}.</div>
+                  <div>Queued: {readiness.maintenance.queue_count ?? "Unknown"}; Running: {readiness.maintenance.running === true ? "Yes" : readiness.maintenance.running === false ? "No" : "Unknown"}; Phase: {readiness.maintenance.phase ?? "Unknown"}</div>
+                  <div>Last attempt: {readiness.maintenance.last_attempt_at ? formatDate(readiness.maintenance.last_attempt_at) : "Unknown"}; Next due: {readiness.maintenance.next_due_at ? formatDate(readiness.maintenance.next_due_at) : "Unknown"}</div>
+                  {readiness.maintenance.reason && <div>{readinessReasonLabel(readiness.maintenance.reason)}</div>}
+                </div>
+              </> : <>
+                <div>Demand evidence: {status.seasonal_calibration.demand?.usable_samples ?? "Unknown"}/{status.seasonal_calibration.demand?.minimum_samples ?? "Unknown"}</div>
+                <div>Indoor-heating collection: unavailable.</div>
+                <div>{lifecycleStatuses.demand?.maintenance_enabled === false ? "Model maintenance is disabled." : lifecycleStatuses.demand?.maintenance_enabled === true ? "Model maintenance is enabled." : "Model maintenance status is unknown."}</div>
+                <div>Maintenance preference: {status.seasonal_calibration.auto_train === true ? "automatic" : status.seasonal_calibration.auto_train === false ? "manual" : "unknown"}.</div>
+              </>}
             </div>
           )}</section>
         <section><h3>Sensor diagnostics</h3>{sensorDiagnostics ? (
@@ -685,7 +757,7 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
                 )}
                 <div className="model-next-step"><strong>What this means:</strong> {m.nextStep}</div>
               </div>
-              <LifecycleDetails component={m.component} status={m.lifecycle} />
+              <LifecycleDetails component={m.component} status={m.lifecycle} maintenance={readiness?.maintenance} />
             </div>
           ))}
         </div></section>

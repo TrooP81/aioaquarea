@@ -6,6 +6,58 @@ from fastapi import HTTPException
 from packages.api.routers import settings
 
 
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "NaN"])
+@pytest.mark.parametrize(
+    "key", ["comfort_temp_target", "sh_max_power_kw", "manual_price_eur_per_kwh"]
+)
+async def test_R04_SC046_api_rejects_nonfinite_numeric_settings(monkeypatch, raw, key):
+    import httpx
+    from fastapi import Depends, FastAPI
+
+    from packages.api.auth import require_auth
+
+    writes = AsyncMock()
+    monkeypatch.setattr("packages.api.auth.settings.api_token", "s2-public-offline-token")
+    monkeypatch.setattr(settings, "set_settings_bulk", writes)
+    app = FastAPI(dependencies=[Depends(require_auth)])
+    app.include_router(settings.router)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://s2.invalid",
+    ) as client:
+        response = await client.put(
+            "/api/settings",
+            json={"settings": {key: raw}},
+            headers={"Authorization": "Bearer s2-public-offline-token"},
+        )
+
+    assert response.status_code == 400
+    assert key in response.json()["detail"]["invalid_values"]
+    writes.assert_not_awaited()
+
+
+async def test_R04_invalid_persisted_numeric_settings_have_valid_api_error(monkeypatch):
+    import httpx
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(
+        settings,
+        "get_all_settings",
+        AsyncMock(side_effect=ValueError("manual price must be finite")),
+    )
+    app = FastAPI()
+    app.include_router(settings.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://s2.invalid",
+    ) as client:
+        response = await client.get("/api/settings")
+
+    assert response.status_code == 400
+    assert "finite" in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 async def test_update_settings_returns_bad_request_for_bulk_validation_error():
     with patch.object(

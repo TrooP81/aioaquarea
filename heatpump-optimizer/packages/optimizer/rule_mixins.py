@@ -389,7 +389,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         )
         if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
             return actions
-        base_hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        base_hours_needed = max(1, math.ceil(prediction.estimated_hours))
         for deadline, ready_hour in self._local_dhw_deadlines_in_horizon(
             comfort_schedule, horizon_start, tz_name
         ):
@@ -438,7 +438,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 )
                 hours_needed = max(
                     1,
-                    int(projected_prediction.estimated_hours + 0.9),
+                    math.ceil(projected_prediction.estimated_hours),
                 )
                 off_time = slot_start + dt.timedelta(hours=hours_needed)
                 coast_hours = max(0.0, (deadline - off_time).total_seconds() / 3600.0)
@@ -455,6 +455,28 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     break
                 slot_start = adjusted_start
 
+            projected_tank_temp = self._project_tank_temperature(
+                current_tank_temp,
+                horizon_start,
+                slot_start,
+                tank_target,
+                weather,
+                current_outdoor_temp,
+                actions,
+            )
+            projected_prediction = thermal_model.predict_tank_heating_time(
+                current_temp=projected_tank_temp,
+                target_temp=float(tank_target),
+                outdoor_temp=self._get_outdoor_at(weather, slot_start, current_outdoor_temp),
+            )
+            hours_needed = max(1, math.ceil(projected_prediction.estimated_hours))
+            off_time = slot_start + dt.timedelta(hours=hours_needed)
+            price_hours = {ts for ts, price in prices if math.isfinite(price)}
+            if off_time > deadline or any(
+                slot_start + dt.timedelta(hours=hour) not in price_hours
+                for hour in range(hours_needed)
+            ):
+                continue
             if projected_prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
                 continue
             actions.append(
@@ -547,7 +569,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
             return []
 
-        hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        hours_needed = max(1, math.ceil(prediction.estimated_hours))
+        price_hours = {ts for ts, price in prices if math.isfinite(price)}
+        if any(
+            slot_start + dt.timedelta(hours=hour) not in price_hours for hour in range(hours_needed)
+        ):
+            return []
         actions: list[dict] = [
             {
                 "ts": slot_start.isoformat(),

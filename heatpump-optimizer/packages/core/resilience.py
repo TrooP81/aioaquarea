@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal, Mapping
 
+from redis.exceptions import NoScriptError
+
 logger = logging.getLogger(__name__)
 
 safety_write_context: ContextVar[bool] = ContextVar("safety_write_context", default=False)
@@ -245,7 +247,7 @@ return {admitted, tokens, retry_after, tonumber(counters[1]) or 0, tonumber(coun
         try:
             return await self._client.evalsha(self._script_sha, 1, key, *arguments)
         except Exception as exc:
-            if "NOSCRIPT" not in str(exc).upper():
+            if not isinstance(exc, NoScriptError) and "NOSCRIPT" not in str(exc).upper():
                 raise
             self._script_sha = await self._client.script_load(self._SCRIPT)
             return await self._client.evalsha(self._script_sha, 1, key, *arguments)

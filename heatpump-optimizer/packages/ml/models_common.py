@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import statistics
 import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -38,6 +40,14 @@ COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS = (
     "reset_abandoned",
     "reset_unresolved",
 )
+
+
+def is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and (isinstance(value, int) or math.isfinite(value))
+    )
 
 
 class _ConsumptionRowLike(Protocol):
@@ -149,6 +159,12 @@ def iter_counter_change_intervals(
     def reset_boundary(row: _ConsumptionRowLike, kind: str) -> dt.datetime:
         end_ts = _aware_utc(row.ts)
         if kind == "source_day_reset":
+            source_zone = getattr(row, "source_timezone", None)
+            source_date = getattr(row, "source_date", None)
+            if source_zone is not None and source_date is not None:
+                return dt.datetime.combine(
+                    source_date, dt.time.min, tzinfo=ZoneInfo(source_zone)
+                ).astimezone(dt.timezone.utc)
             return end_ts.replace(hour=0, minute=0, second=0, microsecond=0)
         local_end = row.ts.astimezone(timezone)
         return local_end.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
@@ -191,6 +207,14 @@ def iter_counter_change_intervals(
 
         for row in rows:
             device_id = row.device_id
+            value = getattr(row, counter, None)
+            if not is_finite_number(value) or value < 0:
+                anchors.pop(device_id, None)
+                pending_positive.pop(device_id, None)
+                pending_reset.pop(device_id, None)
+                pending_corrections.pop(device_id, None)
+                increment("counter_unavailable")
+                continue
             anchor = anchors.get(device_id)
             if anchor is None:
                 anchors[device_id] = row
@@ -210,10 +234,13 @@ def iter_counter_change_intervals(
                     begin_reset(device_id, row, newer_reset_kind)
                     continue
                 reset_value = getattr(reset_row, counter) or 0.0
-                if (
-                    reset_value - COUNTER_CONFIRMATION_EPSILON
-                    <= new_value
-                    < old_value - COUNTER_CONFIRMATION_EPSILON
+                if reset_value - COUNTER_CONFIRMATION_EPSILON <= new_value and (
+                    (
+                        reset_kind == "source_day_reset"
+                        and getattr(anchor, "source_date", None) is not None
+                        and getattr(reset_row, "source_date", None) is not None
+                    )
+                    or new_value < old_value - COUNTER_CONFIRMATION_EPSILON
                 ):
                     pending_reset.pop(device_id, None)
                     increment("reset_confirmed")
@@ -243,6 +270,12 @@ def iter_counter_change_intervals(
                 pending_positive.pop(device_id, None)
                 increment("positive_abandoned")
                 begin_reset(device_id, row, pending_reset_kind)
+                continue
+            if kind is not None:
+                if pending is not None:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_abandoned")
+                begin_reset(device_id, row, kind)
                 continue
 
             if pending is not None:
@@ -308,6 +341,12 @@ def iter_counter_change_intervals(
     pending_corrections: dict[str, _ConsumptionRowLike] = {}
     for row in rows:
         device_id = row.device_id
+        value = getattr(row, counter, None)
+        if not is_finite_number(value) or value < 0:
+            anchors.pop(device_id, None)
+            pending_corrections.pop(device_id, None)
+            increment("counter_unavailable")
+            continue
         anchor = anchors.get(device_id)
         if anchor is None:
             anchors[device_id] = row
@@ -317,14 +356,19 @@ def iter_counter_change_intervals(
         new_value = getattr(row, counter) or 0.0
         end_ts = _aware_utc(row.ts)
         start_ts = _aware_utc(anchor.ts)
-        if new_value == old_value:
+        kind = reset_type(anchor, row)
+        if kind is not None:
+            start_ts = reset_boundary(row, kind)
+            energy_kwh = new_value
+            pending_corrections.pop(device_id, None)
+            increment(kind)
+        elif new_value == old_value:
             pending_corrections.pop(device_id, None)
             if diagnostics is not None:
                 diagnostics["zero_delta"] = diagnostics.get("zero_delta", 0) + 1
             continue
 
-        if new_value < old_value:
-            kind = reset_type(anchor, row)
+        elif new_value < old_value:
             if kind is None:
                 if device_id in pending_corrections:
                     anchors[device_id] = row
@@ -338,11 +382,6 @@ def iter_counter_change_intervals(
                 if diagnostics is not None:
                     diagnostics["midday_decrease"] = diagnostics.get("midday_decrease", 0) + 1
                 continue
-            start_ts = reset_boundary(row, kind)
-            energy_kwh = new_value
-            pending_corrections.pop(device_id, None)
-            if diagnostics is not None:
-                diagnostics[kind] = diagnostics.get(kind, 0) + 1
         else:
             energy_kwh = new_value - old_value
             pending_corrections.pop(device_id, None)

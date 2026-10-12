@@ -128,10 +128,11 @@ class SignedArtifact:
     path: Path
 
 
-def artifact_path(artifact_hash: str) -> Path:
+def artifact_path(artifact_hash: str, *, resolve_entry: bool = True) -> Path:
     if len(artifact_hash) != 64 or any(char not in "0123456789abcdef" for char in artifact_hash):
         raise ValueError("Invalid artifact hash")
-    return _validate_path(Path(settings.model_dir) / "lifecycle" / f"{artifact_hash}.pkl")
+    path = Path(settings.model_dir) / "lifecycle" / f"{artifact_hash}.pkl"
+    return _validate_path(path) if resolve_entry else _validate_path(path.parent) / path.name
 
 
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:

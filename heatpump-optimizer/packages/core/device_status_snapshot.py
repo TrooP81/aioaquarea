@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+from packages.core.device_data_quality import _as_utc
 from packages.core.heating_evidence import classify_space_heating
 from packages.core.models import DeviceStatusRecord
 from packages.core.panasonic_special_status import optimizer_special_status_supported
@@ -39,9 +40,23 @@ def native_policy_settings(status: Any) -> dict[str, Any]:
 
 
 def build_device_status_record(
-    device: Any, *, timer_provenance: dict[str, Any] | None = None
+    device: Any,
+    *,
+    timer_provenance: dict[str, Any] | None = None,
+    now: dt.datetime | None = None,
 ) -> DeviceStatusRecord:
     """Build a status record without using global action as heating evidence."""
+    now = _as_utc(now) or dt.datetime.now(dt.timezone.utc)
+    observed_at = getattr(device, "status_observed_at", None)
+    retrieved_at = getattr(device, "status_retrieved_at", None)
+    for value in (observed_at, retrieved_at):
+        if value is not None and (_as_utc(value) is None or _as_utc(value) > now):
+            raise ValueError("Device snapshot provenance is unknown or future")
+    timer = timer_provenance if isinstance(timer_provenance, dict) else {"status": "unknown"}
+    if timer.get("status") == "known":
+        fetched_at = _as_utc(timer.get("fetched_at"))
+        if fetched_at is None or fetched_at > now:
+            timer = {"status": "unknown", "reason": "inadmissible_timer_clock"}
     zones = device.zones
     zone1 = zones.get(1)
     zone2 = zones.get(2)
@@ -62,7 +77,7 @@ def build_device_status_record(
         zone2_operation_status=zone2_status,
     )
     record = DeviceStatusRecord(
-        ts=dt.datetime.now(dt.timezone.utc),
+        ts=now,
         device_id=device.long_id,
         mode=str(device.mode),
         operation_status=operation_status,
@@ -104,6 +119,11 @@ def build_device_status_record(
         "schema": "native_unchanged_v1",
         "captured_at": record.ts.isoformat(),
         "settings": native_policy_settings(record),
-        "timer": timer_provenance if isinstance(timer_provenance, dict) else {"status": "unknown"},
+        "timer": timer,
+        "timing": {
+            "schema": "local_snapshot_v1",
+            "observed_at": _as_utc(observed_at).isoformat() if observed_at is not None else None,
+            "retrieved_at": _as_utc(retrieved_at).isoformat() if retrieved_at is not None else None,
+        },
     }
     return record

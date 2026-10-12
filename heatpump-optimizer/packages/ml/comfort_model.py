@@ -36,6 +36,7 @@ from packages.core.config import settings as app_settings
 from packages.core.settings_service import get_all_settings
 from packages.ml.models_common import (
     chronological_fit_holdout,
+    is_finite_number,
     make_monotonic_regressor,
     prune_old_models,
     read_mae_baseline,
@@ -113,6 +114,7 @@ MAX_ZONE_WATER_TEMP = 65.0
 # data is noisy.
 _MONOTONIC_CST = [1, 1, 1, 1, 1, -1, 1, 0, 0, -1, 0, 0, -1, 0]
 _INDOOR_TEMPERATURE_FEATURE_INDEX = 12
+SENSOR_SELECTION_SCHEMA = "selected_indoor_sensors_v2"
 _PASSIVE_MONOTONIC_CST = [1, -1, 1, 0, 0, -1, 0, -1, 0, 0, -1, 0]
 CONTROLLED_FEATURE_NAMES = (
     "mean_supply_lift",
@@ -663,6 +665,12 @@ class ComfortModel:
 
         if not self.is_trained or not self._passive_direct_models:
             return {"ready": False, "reason": "passive_model_unavailable"}
+        if (
+            not is_finite_number(forecast_horizon_minutes)
+            or forecast_horizon_minutes <= 0
+            or int(forecast_horizon_minutes) != forecast_horizon_minutes
+        ):
+            return {"ready": False, "reason": "direct_forecast_horizon_unavailable"}
         horizon = int(forecast_horizon_minutes)
         if horizon not in self._passive_direct_models:
             return {
@@ -673,7 +681,7 @@ class ComfortModel:
         passive_metrics = self._metrics.get("passive_horizons", {})
         metrics = passive_metrics.get(str(horizon), {}) if isinstance(passive_metrics, dict) else {}
         mae = metrics.get("mae") if isinstance(metrics, dict) else None
-        if metrics.get("status") != "trained" or not isinstance(mae, (int, float)):
+        if metrics.get("status") != "trained" or not is_finite_number(mae) or mae < 0:
             return {
                 "ready": False,
                 "reason": "direct_forecast_not_validated",
@@ -688,7 +696,7 @@ class ComfortModel:
                 "maximum_mae": MAX_PASSIVE_DIRECT_MAE_C,
             }
         persistence_mae = metrics.get("persistence_mae")
-        if not isinstance(persistence_mae, (int, float)):
+        if not is_finite_number(persistence_mae) or persistence_mae < 0:
             return {
                 "ready": False,
                 "reason": "direct_forecast_not_compared_to_persistence",
@@ -717,28 +725,33 @@ class ComfortModel:
         cloud_cover: float = 0.5,
         forecast_horizon_minutes: int,
         max_change_c_per_hour: float = 0.5,
+        indoor_trend_c_per_hour: float | None = 0.0,
     ) -> tuple[float | None, dict[str, Any]]:
         """Direct weather-aware indoor forecast with no space heating input."""
 
         readiness = self.passive_forecast_readiness(forecast_horizon_minutes)
         if not readiness["ready"]:
             return None, readiness
-        features = self._passive_window_features(
-            self._make_features(
-                zone_water_temp=outdoor_temp,
-                outdoor_temp=outdoor_temp,
-                wind_speed=wind_speed,
-                irradiance=irradiance,
-                hour=hour,
-                indoor_temp=indoor_temp,
-                precipitation=precipitation,
-                humidity=humidity,
-                cloud_cover=cloud_cover,
-                zone_target_temp=outdoor_temp,
-                space_heating_fraction=0.0,
-                recent_heat_fraction=0.0,
-            )
+        if not is_finite_number(max_change_c_per_hour) or max_change_c_per_hour < 0:
+            return None, {"ready": False, "reason": "invalid_forecast_limit"}
+        controlled = self._serving_window_features(
+            zone_water_temp=indoor_temp,
+            zone_target_temp=indoor_temp,
+            outdoor_temp=outdoor_temp,
+            wind_speed=wind_speed,
+            irradiance=irradiance,
+            hour=hour,
+            indoor_temp=indoor_temp,
+            precipitation=precipitation,
+            humidity=humidity,
+            cloud_cover=cloud_cover,
+            space_heating_fraction=0.0,
+            recent_heat_fraction=0.0,
+            indoor_trend_c_per_hour=indoor_trend_c_per_hour,
         )
+        if controlled is None:
+            return None, {"ready": False, "reason": "invalid_forecast_inputs"}
+        features = self._passive_window_features(controlled)
         horizon = int(readiness["horizon_minutes"])
         model = self._passive_direct_models[horizon]
         delta = self._project_prediction(model, features, indoor_temp, indoor_feature_index=10)
@@ -747,6 +760,8 @@ class ComfortModel:
         elapsed_hours = horizon / 60.0
         delta = self._clamp_passive_change(delta, elapsed_hours, max_change_c_per_hour)
         predicted = indoor_temp + delta
+        if not is_finite_number(predicted):
+            return None, {"ready": False, "reason": "projection_failed"}
         return predicted, readiness
 
     @property
@@ -1024,10 +1039,29 @@ class ComfortModel:
         data_cutoff = data_cutoff or dt.datetime.now(dt.timezone.utc)
         cutoff = data_cutoff - dt.timedelta(days=90)
         values = await get_all_settings()
+        from packages.poller.smartthings import get_selected_device_ids
+
+        selected_ids = await get_selected_device_ids(values=values)
         reference_sensor_id = str(values.get("comfort_reference_sensor_id") or "").strip()
         weather_provider = str(values.get("weather_provider") or "open-meteo")
+        if reference_sensor_id and selected_ids and reference_sensor_id not in selected_ids:
+            empty = {
+                horizon: (np.array([]), np.array([]))
+                for horizon in DIRECT_FORECAST_HORIZONS_MINUTES
+            }
+            return WindowDataset(
+                empty,
+                dict(empty),
+                {
+                    "active_heating_rows": 0,
+                    "blocker": "reference_sensor_not_selected",
+                    "sensor_selection_schema": SENSOR_SELECTION_SCHEMA,
+                    "source_sensor_count": 0,
+                },
+            )
+        query_sensor_ids = [reference_sensor_id] if reference_sensor_id else selected_ids
         async with get_session() as session:
-            reading_result = await session.execute(
+            reading_query = (
                 select(IndoorTempReading)
                 .where(IndoorTempReading.timestamp >= cutoff)
                 .where(IndoorTempReading.timestamp <= data_cutoff)
@@ -1035,11 +1069,16 @@ class ComfortModel:
                 .limit(50_001)
                 .order_by(IndoorTempReading.timestamp)  # noqa: E712
             )
+            if query_sensor_ids:
+                reading_query = reading_query.where(
+                    IndoorTempReading.device_id.in_(query_sensor_ids)
+                )
+            reading_result = await session.execute(reading_query)
             raw_readings = reading_result.scalars().all()
             if len(raw_readings) > 50_000:
                 raise ValueError("Comfort reading materialization overflow")
             readings, strategy, sensor_count = self._select_indoor_observations(
-                raw_readings, reference_sensor_id
+                raw_readings, reference_sensor_id, selected_ids=selected_ids, as_of=data_cutoff
             )
             if not readings:
                 empty = {
@@ -1053,6 +1092,7 @@ class ComfortModel:
                         "active_heating_rows": 0,
                         "sensor_strategy": strategy,
                         "source_sensor_count": sensor_count,
+                        "sensor_selection_schema": SENSOR_SELECTION_SCHEMA,
                     },
                 )
             status_query = (
@@ -1102,6 +1142,8 @@ class ComfortModel:
                 "weather": weather,
                 "sensor_strategy": strategy,
                 "source_sensor_count": sensor_count,
+                "sensor_selection_schema": SENSOR_SELECTION_SCHEMA,
+                "selected_sensor_ids": query_sensor_ids,
             }
         dataset = await asyncio.to_thread(
             build_window_dataset, readings, statuses, weather, DIRECT_FORECAST_HORIZONS_MINUTES
@@ -1109,7 +1151,13 @@ class ComfortModel:
         return WindowDataset(
             dataset.controlled,
             dataset.passive,
-            {**dataset.evidence, "sensor_strategy": strategy, "source_sensor_count": sensor_count},
+            {
+                **dataset.evidence,
+                "sensor_strategy": strategy,
+                "source_sensor_count": sensor_count,
+                "sensor_selection_schema": SENSOR_SELECTION_SCHEMA,
+                "selected_sensor_ids": query_sensor_ids,
+            },
             dataset.controlled_times,
             dataset.passive_times,
         )
@@ -1495,7 +1543,7 @@ class ComfortModel:
         if not self.is_trained:
             return None
 
-        features = self._make_features(
+        features = self._serving_window_features(
             zone_water_temp,
             outdoor_temp,
             wind_speed,
@@ -1510,18 +1558,34 @@ class ComfortModel:
             recent_heat_fraction=recent_heat_fraction,
             indoor_trend_c_per_hour=indoor_trend_c_per_hour,
         )
+        if features is None:
+            return None
         model = self._model
         if forecast_horizon_minutes is not None:
+            if (
+                not is_finite_number(forecast_horizon_minutes)
+                or forecast_horizon_minutes <= 0
+                or int(forecast_horizon_minutes) != forecast_horizon_minutes
+            ):
+                return None
             horizon = int(forecast_horizon_minutes)
             if horizon not in self._direct_models:
                 return None
             model = self._direct_models[horizon]
-        raw = float(model.predict(features.reshape(1, -1))[0])
+        try:
+            raw = float(model.predict(features.reshape(1, -1))[0])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not is_finite_number(raw):
+            return None
         if not self._metrics.get("delta_target"):
             return raw
         issue = float(features[_INDOOR_TEMPERATURE_FEATURE_INDEX])
-        projected = self._project_prediction(model, features, issue)
-        return None if projected is None else issue + projected
+        projected = self._project_prediction(
+            model, features, issue, supply_temp_c=zone_water_temp, target_temp_c=zone_target_temp
+        )
+        prediction = None if projected is None else issue + projected
+        return prediction if is_finite_number(prediction) else None
 
     @classmethod
     def _project_prediction(
@@ -1531,14 +1595,31 @@ class ComfortModel:
         issue_temp: float,
         *,
         indoor_feature_index: int = _INDOOR_TEMPERATURE_FEATURE_INDEX,
+        supply_temp_c: float | None = None,
+        target_temp_c: float | None = None,
     ) -> float | None:
         """Evaluate and project a delta curve once, then interpolate at issue temperature."""
+        if not is_finite_number(issue_temp):
+            return None
+        try:
+            features = np.asarray(features, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not np.isfinite(features).all():
+            return None
         knots = np.arange(COMFORT_MODEL_KNOT_RANGE[0], COMFORT_MODEL_KNOT_RANGE[1] + 1.0)
         rows = np.tile(np.asarray(features, dtype=float), (len(knots), 1))
         rows[:, indoor_feature_index] = knots
+        if indoor_feature_index == _INDOOR_TEMPERATURE_FEATURE_INDEX and supply_temp_c is not None:
+            rows[:, 0] = np.maximum(supply_temp_c - knots, 0.0) * features[2]
+            rows[:, 1] = (
+                np.maximum(target_temp_c - knots, 0.0) * features[2]
+                if target_temp_c is not None
+                else 0.0
+            )
         try:
             curve = cls.project_delta_curve(np.asarray(model.predict(rows), dtype=float))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if curve is None:
             return None
@@ -1601,6 +1682,75 @@ class ComfortModel:
         return None
 
     @staticmethod
+    def _serving_window_features(
+        zone_water_temp: float,
+        outdoor_temp: float,
+        wind_speed: float,
+        irradiance: float,
+        hour: int,
+        *,
+        indoor_temp: float | None,
+        precipitation: float,
+        humidity: float,
+        cloud_cover: float,
+        zone_target_temp: float | None,
+        space_heating_fraction: float,
+        recent_heat_fraction: float,
+        indoor_trend_c_per_hour: float | None,
+    ) -> np.ndarray | None:
+        if not all(
+            is_finite_number(value)
+            for value in (
+                zone_water_temp,
+                outdoor_temp,
+                wind_speed,
+                irradiance,
+                hour,
+                indoor_temp,
+                precipitation,
+                humidity,
+                cloud_cover,
+                space_heating_fraction,
+                recent_heat_fraction,
+                indoor_trend_c_per_hour,
+            )
+        ):
+            return None
+        if (
+            not 0 <= space_heating_fraction <= 1
+            or not 0 <= recent_heat_fraction <= 1
+            or not 0 <= hour < 24
+            or int(hour) != hour
+            or min(wind_speed, irradiance, precipitation) < 0
+            or not 0 <= humidity <= 100
+            or not 0 <= cloud_cover <= 1
+            or not -3 <= indoor_trend_c_per_hour <= 3
+            or (space_heating_fraction > 0 and not is_finite_number(zone_target_temp))
+            or (zone_target_temp is not None and not is_finite_number(zone_target_temp))
+        ):
+            return None
+        features = ComfortModel._controlled_window_features(
+            mean_supply_lift=max(zone_water_temp - indoor_temp, 0.0) * space_heating_fraction,
+            mean_target_lift=(
+                max(zone_target_temp - indoor_temp, 0.0) * space_heating_fraction
+                if zone_target_temp is not None
+                else 0.0
+            ),
+            window_heat_fraction=space_heating_fraction,
+            final_hour_heat_fraction=recent_heat_fraction,
+            outdoor_temp=outdoor_temp,
+            wind_speed=wind_speed,
+            irradiance=irradiance,
+            precipitation=precipitation,
+            humidity=humidity,
+            cloud_cover=cloud_cover,
+            hour=hour,
+            issue_indoor_temp=indoor_temp,
+            issue_indoor_trend=indoor_trend_c_per_hour,
+        )
+        return features if np.isfinite(features).all() else None
+
+    @staticmethod
     def _controlled_window_features(
         *,
         mean_supply_lift: float,
@@ -1659,7 +1809,7 @@ class ComfortModel:
 
         Uses bisection search over ``[MIN_ZONE_WATER_TEMP, MAX_ZONE_WATER_TEMP]``.
         """
-        if not self.is_trained:
+        if not self.is_trained or not is_finite_number(target_indoor):
             return None
 
         lo, hi = MIN_ZONE_WATER_TEMP, MAX_ZONE_WATER_TEMP
@@ -2177,29 +2327,57 @@ class ComfortModel:
     def _select_indoor_observations(
         readings: list[IndoorTempReading],
         reference_sensor_id: str,
+        *,
+        selected_ids: list[str] | None = None,
+        as_of: dt.datetime | None = None,
     ) -> tuple[list[_IndoorObservation], str, int]:
         """Use one configured room or a robust five-minute cross-room median."""
 
+        selected = set(selected_ids or ())
+        if reference_sensor_id and selected and reference_sensor_id not in selected:
+            return [], "reference_sensor_not_selected", 0
+        readings = [
+            row
+            for row in readings
+            if (not selected or row.device_id in selected)
+            and is_finite_number(row.temperature)
+            and 5 <= row.temperature <= 35
+            and not getattr(row, "is_stale", False)
+            and isinstance(row.timestamp, dt.datetime)
+            and (
+                as_of is None
+                or (
+                    row.timestamp.replace(tzinfo=dt.timezone.utc)
+                    if row.timestamp.tzinfo is None
+                    else row.timestamp
+                )
+                <= as_of
+            )
+        ]
         if reference_sensor_id:
             selected = [
                 _IndoorObservation(timestamp=row.timestamp, temperature=float(row.temperature))
                 for row in readings
                 if row.device_id == reference_sensor_id
             ]
-            return selected, "reference_sensor", 1 if selected else 0
+            unique = {row.timestamp: row for row in selected}
+            return [unique[key] for key in sorted(unique)], "reference_sensor", 1 if unique else 0
 
-        buckets: dict[dt.datetime, list[IndoorTempReading]] = {}
+        buckets: dict[dt.datetime, dict[str, IndoorTempReading]] = {}
         for row in readings:
             bucket = row.timestamp.replace(
                 minute=(row.timestamp.minute // 5) * 5,
                 second=0,
                 microsecond=0,
             )
-            buckets.setdefault(bucket, []).append(row)
+            devices = buckets.setdefault(bucket, {})
+            previous = devices.get(row.device_id)
+            if previous is None or row.timestamp >= previous.timestamp:
+                devices[row.device_id] = row
         observations = [
             _IndoorObservation(
-                timestamp=max(row.timestamp for row in rows),
-                temperature=float(np.median([row.temperature for row in rows])),
+                timestamp=max(row.timestamp for row in rows.values()),
+                temperature=float(np.median([row.temperature for row in rows.values()])),
             )
             for _, rows in sorted(buckets.items())
         ]

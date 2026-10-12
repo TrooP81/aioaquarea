@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
+import re
 from dataclasses import dataclass
 
 import defusedxml.ElementTree as ElementTree
 import httpx
 
 from packages.core.config import settings
-from packages.core.settings_service import get_setting, get_string_setting
+from packages.core.settings_service import get_setting, get_setting_spec, get_string_setting
 from packages.core.solar import clear_sky_ghi, estimate_ghi
 
 # ENTSO-E Transparency Platform day-ahead prices
@@ -61,7 +63,8 @@ async def fetch_price_feed() -> PriceFeed:
     elif provider == "tibber":
         prices = await _fetch_prices_tibber()
         return PriceFeed(list(prices), prices.currency, prices.source)
-    return PriceFeed(await _fetch_prices_entsoe(), "EUR", "entsoe")
+    prices = await _fetch_prices_entsoe()
+    return PriceFeed(list(prices), getattr(prices, "currency", "EUR"), "entsoe")
 
 
 async def fetch_prices() -> list[tuple[dt.datetime, float]]:
@@ -71,11 +74,16 @@ async def fetch_prices() -> list[tuple[dt.datetime, float]]:
 
 async def _get_manual_prices() -> list[tuple[dt.datetime, float]]:
     """Generate static price entries for the next 48h using manual price setting."""
-    price_str = await get_setting("manual_price_eur_per_kwh")
+    try:
+        price_str = await get_setting("manual_price_eur_per_kwh")
+    except ValueError:
+        return []
     try:
         price = float(price_str)
     except (ValueError, TypeError):
-        price = 0.25
+        price = float(get_setting_spec("manual_price_eur_per_kwh").serialize_default())
+    if not math.isfinite(price):
+        return []
 
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
     return [(now + dt.timedelta(hours=h), price) for h in range(48)]
@@ -114,37 +122,79 @@ async def _fetch_prices_entsoe() -> list[tuple[dt.datetime, float]]:
     return prices
 
 
-def _parse_entsoe_xml(xml_text: str, period_start: dt.datetime) -> list[tuple[dt.datetime, float]]:
-    """Parse ENTSO-E day-ahead price XML into (timestamp, EUR/kWh) tuples."""
-    results = []
+def _parse_entsoe_xml(xml_text: str, period_start: dt.datetime) -> ProviderPriceList:
+    """Normalize completely covered hours, preserving currency and negative prices."""
     ns = {"ns": "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"}
-
     try:
         root = ElementTree.fromstring(xml_text)
     except ElementTree.ParseError:
-        return results
-
+        return ProviderPriceList([], currency="EUR", source="entsoe")
+    currencies: set[str] = set()
+    segments: dict[dt.datetime, set[tuple[dt.datetime, dt.datetime, float]]] = {}
+    invalid_hours: set[dt.datetime] = set()
     for time_series in root.findall(".//ns:TimeSeries", ns):
-        period = time_series.find(".//ns:Period", ns)
-        if period is None:
-            continue
-
-        start_elem = period.find("ns:timeInterval/ns:start", ns)
-        if start_elem is None:
-            continue
-
-        start = dt.datetime.fromisoformat(start_elem.text.replace("Z", "+00:00"))
-
-        for point in period.findall("ns:Point", ns):
-            position = int(point.find("ns:position", ns).text)
-            # Price is in EUR/MWh, convert to EUR/kWh
-            price_mwh = float(point.find("ns:price.amount", ns).text)
-            price_kwh = price_mwh / 1000.0
-
-            ts = start + dt.timedelta(hours=position - 1)
-            results.append((ts, price_kwh))
-
-    return results
+        currency = time_series.findtext("ns:currency_Unit.name", namespaces=ns)
+        unit = time_series.findtext("ns:price_Measure_Unit.name", namespaces=ns)
+        if not currency or not re.fullmatch(r"[A-Z]{3}", currency) or unit != "MWH":
+            return ProviderPriceList([], currency=currency or "EUR", source="entsoe")
+        currencies.add(currency)
+        for period in time_series.findall("ns:Period", ns):
+            try:
+                start = dt.datetime.fromisoformat(
+                    period.findtext("ns:timeInterval/ns:start", namespaces=ns).replace(
+                        "Z", "+00:00"
+                    )
+                )
+                end = dt.datetime.fromisoformat(
+                    period.findtext("ns:timeInterval/ns:end", namespaces=ns).replace("Z", "+00:00")
+                )
+                resolution = re.fullmatch(
+                    r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+                    period.findtext("ns:resolution", namespaces=ns) or "",
+                )
+                if resolution is None or start.tzinfo is None or end.tzinfo is None:
+                    return ProviderPriceList([], currency=currency, source="entsoe")
+                duration = dt.timedelta(
+                    hours=int(resolution[1] or 0),
+                    minutes=int(resolution[2] or 0),
+                    seconds=int(resolution[3] or 0),
+                )
+                if duration <= dt.timedelta(0) or end <= start:
+                    return ProviderPriceList([], currency=currency, source="entsoe")
+                start = start.astimezone(dt.timezone.utc)
+                end = end.astimezone(dt.timezone.utc)
+                for point in period.findall("ns:Point", ns):
+                    position = int(point.findtext("ns:position", namespaces=ns))
+                    price = float(point.findtext("ns:price.amount", namespaces=ns)) / 1000.0
+                    left = start + duration * (position - 1)
+                    right = left + duration
+                    if position < 1 or right > end:
+                        return ProviderPriceList([], currency=currency, source="entsoe")
+                    while left < right:
+                        hour = left.replace(minute=0, second=0, microsecond=0)
+                        boundary = min(right, hour + dt.timedelta(hours=1))
+                        if math.isfinite(price):
+                            segments.setdefault(hour, set()).add((left, boundary, price))
+                        else:
+                            invalid_hours.add(hour)
+                        left = boundary
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return ProviderPriceList([], currency=currency, source="entsoe")
+    if len(currencies) != 1:
+        return ProviderPriceList([], currency="EUR", source="entsoe")
+    results = []
+    for hour, portions in sorted(segments.items()):
+        cursor, weighted = hour, 0.0
+        valid = hour not in invalid_hours
+        for left, right, price in sorted(portions):
+            if left != cursor:
+                valid = False
+                break
+            weighted += price * (right - left).total_seconds() / 3600.0
+            cursor = right
+        if valid and cursor == hour + dt.timedelta(hours=1):
+            results.append((hour, weighted))
+    return ProviderPriceList(results, currency=next(iter(currencies)), source="entsoe")
 
 
 async def _fetch_prices_tibber() -> ProviderPriceList:
@@ -244,6 +294,9 @@ async def fetch_weather() -> list[dict]:
             "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,direct_radiation,cloud_cover,precipitation",
             "forecast_days": 2,
             "timezone": "UTC",
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "ms",
+            "precipitation_unit": "mm",
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -251,40 +304,66 @@ async def fetch_weather() -> list[dict]:
             resp.raise_for_status()
             data = resp.json()
 
-        hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
-        temps = hourly.get("temperature_2m", [])
-        humidity = hourly.get("relative_humidity_2m", [])
-        wind = hourly.get("wind_speed_10m", [])
-        radiation = hourly.get("direct_radiation", [])
-        cloud = hourly.get("cloud_cover", [])
-        precipitation = hourly.get("precipitation", [])
-
-        result = []
-        for i, time_str in enumerate(times):
-            ts = dt.datetime.fromisoformat(time_str).replace(tzinfo=dt.timezone.utc)
-            result.append(
-                {
-                    "ts": ts,
-                    "temperature": temps[i] if i < len(temps) else None,
-                    "humidity": humidity[i] if i < len(humidity) else None,
-                    "wind_speed": wind[i] if i < len(wind) else None,
-                    "irradiance": radiation[i] if i < len(radiation) else None,
-                    # Open-Meteo reports cloud cover in percent; store as a fraction.
-                    "cloud_cover": (
-                        cloud[i] / 100.0 if i < len(cloud) and cloud[i] is not None else None
-                    ),
-                    # Open-Meteo precipitation is the amount falling during the
-                    # preceding forecast hour, expressed in mm.
-                    "precipitation": precipitation[i] if i < len(precipitation) else None,
-                }
-            )
+        result = _parse_open_meteo_forecast(data)
 
     issued_at = dt.datetime.now(dt.timezone.utc)
     for entry in result:
         entry["source"] = provider
         entry["forecast_issued_at"] = issued_at
+        entry["units_schema"] = "weather_c_mps_wm2_mm_v1"
+        for key in ("temperature", "humidity", "wind_speed", "irradiance", "precipitation"):
+            entry[key] = _finite_provider_number(entry.get(key))
     return result
+
+
+def _finite_provider_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _parse_open_meteo_forecast(data: dict) -> list[dict]:
+    units = data.get("hourly_units")
+    hourly = data.get("hourly")
+    if not isinstance(units, dict) or not isinstance(hourly, dict):
+        return []
+    if (
+        units.get("temperature_2m") != "°C"
+        or units.get("wind_speed_10m") not in {"m/s", "km/h"}
+        or units.get("direct_radiation") != "W/m²"
+        or units.get("precipitation") != "mm"
+    ):
+        return []
+    wind_scale = 1.0 / 3.6 if units["wind_speed_10m"] == "km/h" else 1.0
+    fields = {
+        "temperature": "temperature_2m",
+        "humidity": "relative_humidity_2m",
+        "wind_speed": "wind_speed_10m",
+        "irradiance": "direct_radiation",
+        "cloud_cover": "cloud_cover",
+        "precipitation": "precipitation",
+    }
+    results = []
+    for index, time_str in enumerate(hourly.get("time", [])):
+        try:
+            timestamp = dt.datetime.fromisoformat(time_str)
+        except (TypeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        row = {"ts": timestamp.astimezone(dt.timezone.utc)}
+        for name, field in fields.items():
+            values = hourly.get(field)
+            value = _finite_provider_number(
+                values[index] if isinstance(values, list) and index < len(values) else None
+            )
+            row[name] = value
+        if row["wind_speed"] is not None:
+            row["wind_speed"] *= wind_scale
+        if row["cloud_cover"] is not None:
+            row["cloud_cover"] /= 100.0
+        results.append(row)
+    return results
 
 
 def _parse_smhi_forecast(
@@ -334,12 +413,12 @@ def _parse_smhi_forecast(
     for h in range(hours):
         slot = start + dt.timedelta(hours=h)
         params = _sample_at(slot)
-        temp = params.get("air_temperature")
-        wind = params.get("wind_speed")
-        humidity = params.get("relative_humidity")
-        precipitation = params.get("precipitation")
+        temp = _finite_provider_number(params.get("air_temperature"))
+        wind = _finite_provider_number(params.get("wind_speed"))
+        humidity = _finite_provider_number(params.get("relative_humidity"))
+        precipitation = _finite_provider_number(params.get("precipitation"))
         # Total cloud cover in octas (0–8) → fraction (0–1).
-        octas = params.get("cloud_area_fraction")
+        octas = _finite_provider_number(params.get("cloud_area_fraction"))
         cloud_fraction = max(0.0, min(1.0, float(octas) / 8.0)) if octas is not None else None
         # Reconstruct irradiance from solar geometry, attenuated by cloud cover
         # (assume clear sky when cloud data is missing).

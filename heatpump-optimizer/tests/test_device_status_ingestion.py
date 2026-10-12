@@ -86,3 +86,27 @@ async def test_ingestion_discards_old_fingerprint_state_until_outside_band_recon
     assert row.state is SpaceHeatingGateState.ALLOWED
     assert row.config_fingerprint == config.fingerprint
     assert reconfirmed.state is SpaceHeatingGateState.ALLOWED
+
+
+async def test_SC049_ingestion_marks_future_clock_without_inventing_time():
+    now = dt.datetime.now(dt.timezone.utc)
+    record = DeviceStatusRecord(
+        ts=now + dt.timedelta(hours=1), device_id="future-device", heat_pump_outdoor_temp=12.9
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[SimpleNamespace(), SimpleNamespace(scalar_one_or_none=lambda: None)]
+        ),
+        add=MagicMock(),
+        flush=AsyncMock(),
+    )
+    with patch(
+        "packages.core.device_status_ingestion.get_space_heating_gate_config",
+        AsyncMock(return_value=HeatingGateConfig()),
+    ):
+        evidence = await ingest_device_status(session, record)
+
+    assert evidence.state is SpaceHeatingGateState.UNKNOWN
+    assert evidence.reason_code == "device_status_future"
+    assert record.ts == now + dt.timedelta(hours=1)
+    assert session.add.call_count == 2

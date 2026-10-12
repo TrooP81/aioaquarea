@@ -8,6 +8,7 @@ import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from aioaquarea import (
@@ -65,6 +66,9 @@ def _wrapper() -> AquareaWrapper:
 
 
 async def _dispatch_restore(wrapper, *, zone_id=None, temperature=None):
+    from packages.core.safety_attempts import SafetyAttempt
+    from tests.test_safety_reverts import _S1FenceConnection
+
     payload = {} if zone_id is None else {"zone_id": zone_id, "temperature": temperature}
     source_payload = (
         {} if zone_id is None else {"zone_id": zone_id, "baseline_temperature": temperature}
@@ -74,6 +78,7 @@ async def _dispatch_restore(wrapper, *, zone_id=None, temperature=None):
         device_id="device-a",
         action_type="force_dhw_on" if zone_id is None else "zone_temp_boost",
         payload_json=json.dumps(source_payload),
+        status="executed",
     )
     restore = PlanActionRecord(
         id=2,
@@ -83,8 +88,58 @@ async def _dispatch_restore(wrapper, *, zone_id=None, temperature=None):
         reverts_action_id=source.id,
         status="executing",
         safety_claimed_at=dt.datetime.now(dt.timezone.utc),
+        safety_claim_token=uuid4(),
     )
-    return await wrapper._dispatch_linked_restore(restore, source)
+    for method in (wrapper.get_device, wrapper.refresh_device):
+        if not isinstance(method, AsyncMock):
+            continue
+        devices = [method.return_value]
+        if (
+            method.side_effect is not None
+            and not callable(method.side_effect)
+            and not isinstance(method.side_effect, BaseException)
+        ):
+            devices += list(method.side_effect)
+            method.side_effect = devices[1:]
+        for device in devices:
+            if isinstance(device, SimpleNamespace) and not hasattr(device, "long_id"):
+                device.long_id = "device-a"
+    connection = _S1FenceConnection()
+    owner = await SafetyAttempt.acquire(restore.device_id, connection.context)
+    assert owner is not None
+    owner.bind(
+        restore.id,
+        source.id,
+        restore.safety_claim_token,
+        payload_json=restore.payload_json,
+        source_payload_json=source.payload_json,
+    )
+    owner.authority_check = AsyncMock(side_effect=lambda: owner.assert_live(restore))
+    original_get_device = wrapper.get_device
+    original_refresh = wrapper.refresh_device
+
+    async def identified_result(method, *args, **kwargs):
+        device = await method(*args, **kwargs)
+        if isinstance(device, SimpleNamespace) and not hasattr(device, "long_id"):
+            device.long_id = restore.device_id
+        return device
+
+    try:
+        with (
+            patch.object(
+                wrapper,
+                "get_device",
+                new=lambda *args, **kwargs: identified_result(original_get_device, *args, **kwargs),
+            ),
+            patch.object(
+                wrapper,
+                "refresh_device",
+                new=lambda *args, **kwargs: identified_result(original_refresh, *args, **kwargs),
+            ),
+        ):
+            return await owner.run(wrapper._dispatch_linked_restore(restore, source, attempt=owner))
+    finally:
+        assert await owner.release()
 
 
 @pytest.mark.asyncio

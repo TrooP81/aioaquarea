@@ -1,17 +1,18 @@
-"""Freshness and horizon checks for data that can influence new control plans."""
+"""Frozen provider inputs and explainable planning readiness."""
 
 from __future__ import annotations
 
 import datetime as dt
+import math
+from dataclasses import dataclass
 from typing import Iterable
 
 from sqlalchemy import select
 
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord
-from packages.core.pricing import get_active_price_area
+from packages.core.settings_service import get_all_settings
 from packages.core.time_slots import next_hour_boundary
-
 
 DEFAULT_HORIZON_HOURS = 24
 MINIMUM_CONTROL_HOURS = 6
@@ -26,7 +27,7 @@ def _utc_hour(value: dt.datetime) -> dt.datetime:
 
 
 def _contiguous_horizon_hours(hours: Iterable[dt.datetime], start: dt.datetime, limit: int) -> int:
-    available = {_utc_hour(value) for value in hours}
+    available = set(hours)
     count = 0
     for offset in range(limit):
         if start + dt.timedelta(hours=offset) not in available:
@@ -35,127 +36,230 @@ def _contiguous_horizon_hours(hours: Iterable[dt.datetime], start: dt.datetime, 
     return count
 
 
-async def get_planning_data_quality(
-    *,
-    now: dt.datetime | None = None,
-    horizon_hours: int = DEFAULT_HORIZON_HOURS,
-    minimum_control_hours: int = MINIMUM_CONTROL_HOURS,
-) -> dict[str, object]:
-    """Return explainable input readiness without inventing missing forecasts.
+@dataclass(frozen=True)
+class PriceInput:
+    ts: dt.datetime
+    value: float
+    currency: str
+    source: str
+    fetched_at: dt.datetime | None
+    interval_schema: str | None
 
-    The optimizer may produce a shorter plan when a provider has not published
-    tomorrow yet, but it must have enough contiguous, freshly fetched inputs to
-    make the next decision safely.  Future market timestamps alone do not prove
-    that a price feed was retrieved recently, hence ``PriceRecord.fetched_at``.
-    """
 
-    now = now or dt.datetime.now(dt.timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=dt.timezone.utc)
-    else:
-        now = now.astimezone(dt.timezone.utc)
-    horizon_start = next_hour_boundary(now)
-    horizon_end = horizon_start + dt.timedelta(hours=horizon_hours)
-    area = await get_active_price_area()
+@dataclass(frozen=True)
+class WeatherInput:
+    ts: dt.datetime
+    temperature: float | None
+    wind_speed: float | None
+    irradiance: float | None
+    precipitation: float | None
+    humidity: float | None
+    cloud_cover: float | None
+    source: str
+    forecast_issued_at: dt.datetime | None
+    units_schema: str | None
 
-    async with get_session() as session:
-        price_rows = (
+
+@dataclass(frozen=True)
+class PlanningInputBatch:
+    captured_at: dt.datetime
+    start: dt.datetime
+    end: dt.datetime
+    area: str
+    price_provider: str
+    weather_provider: str
+    prices: tuple[PriceInput, ...]
+    weather: tuple[WeatherInput, ...]
+
+
+async def load_planning_input_batch(session, start, end, *, now=None) -> PlanningInputBatch:
+    """Read settings and both feeds in the caller's consistent read-only transaction."""
+    captured_at = now or dt.datetime.now(dt.timezone.utc)
+    values = await get_all_settings(session=session)
+    provider = values["price_provider"]
+    area = values["entsoe_area"] if provider == "entsoe" else provider
+    weather_provider = values["weather_provider"] or "open-meteo"
+    price_rows = (
+        (
             await session.execute(
-                select(PriceRecord.ts, PriceRecord.fetched_at)
-                .where(
-                    PriceRecord.area == area,
-                    PriceRecord.ts >= horizon_start,
-                    PriceRecord.ts < horizon_end,
-                )
+                select(PriceRecord)
+                .where(PriceRecord.area == area, PriceRecord.ts >= start, PriceRecord.ts < end)
                 .order_by(PriceRecord.ts)
             )
-        ).all()
-        latest_price_fetch = (
+        )
+        .scalars()
+        .all()
+    )
+    weather_rows = (
+        (
             await session.execute(
-                select(PriceRecord.fetched_at)
-                .where(PriceRecord.area == area, PriceRecord.fetched_at.is_not(None))
-                .order_by(PriceRecord.fetched_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        weather_rows = (
-            await session.execute(
-                select(WeatherRecord.ts, WeatherRecord.forecast_issued_at)
-                .where(WeatherRecord.ts >= horizon_start, WeatherRecord.ts < horizon_end)
+                select(WeatherRecord)
+                .where(
+                    WeatherRecord.source == weather_provider,
+                    WeatherRecord.ts >= start,
+                    WeatherRecord.ts < end,
+                )
                 .order_by(WeatherRecord.ts)
             )
-        ).all()
+        )
+        .scalars()
+        .all()
+    )
+    return PlanningInputBatch(
+        captured_at,
+        start,
+        end,
+        area,
+        provider,
+        weather_provider,
+        tuple(
+            PriceInput(
+                row.ts,
+                row.price_eur_per_kwh,
+                row.price_currency,
+                row.price_source,
+                row.fetched_at,
+                row.interval_schema,
+            )
+            for row in price_rows
+        ),
+        tuple(
+            WeatherInput(
+                row.ts,
+                row.temperature,
+                row.wind_speed,
+                row.irradiance,
+                row.precipitation,
+                row.humidity,
+                row.cloud_cover,
+                row.source,
+                row.forecast_issued_at,
+                row.units_schema,
+            )
+            for row in weather_rows
+        ),
+    )
 
+
+def planning_batch_quality(
+    batch: PlanningInputBatch, *, minimum_control_hours=MINIMUM_CONTROL_HOURS
+) -> dict[str, object]:
+    horizon_hours = int((batch.end - batch.start).total_seconds() / 3600)
+    now = batch.captured_at
+
+    def finite(value):
+        return (
+            not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+        )
+
+    def fresh(clock, maximum):
+        return (
+            isinstance(clock, dt.datetime)
+            and clock.tzinfo is not None
+            and dt.timedelta(0) <= now - clock <= maximum
+        )
+
+    currencies = {row.currency for row in batch.prices}
+    price_context_valid = (
+        len(currencies) == 1
+        and all(isinstance(currency, str) and len(currency) == 3 for currency in currencies)
+        and all(row.source == batch.price_provider for row in batch.prices)
+    )
     price_hours = _contiguous_horizon_hours(
-        (row.ts for row in price_rows), horizon_start, horizon_hours
+        (
+            row.ts
+            for row in batch.prices
+            if finite(row.value) and row.interval_schema == "hourly_duration_weighted_v1"
+        ),
+        batch.start,
+        horizon_hours,
     )
     weather_hours = _contiguous_horizon_hours(
-        (row.ts for row in weather_rows), horizon_start, horizon_hours
+        (
+            row.ts
+            for row in batch.weather
+            if row.units_schema == "weather_c_mps_wm2_mm_v1"
+            and row.source == batch.weather_provider
+            and all(finite(value) for value in (row.temperature, row.wind_speed, row.irradiance))
+        ),
+        batch.start,
+        horizon_hours,
     )
-
-    if latest_price_fetch is None:
-        price_age_seconds = None
-        # Older rows predate the provenance field. They can still be displayed,
-        # but are never considered fresh for autonomous re-planning.
-        price_fresh = False
-    else:
-        if latest_price_fetch.tzinfo is None:
-            latest_price_fetch = latest_price_fetch.replace(tzinfo=dt.timezone.utc)
-        price_age_seconds = max(0, round((now - latest_price_fetch).total_seconds()))
-        price_fresh = now - latest_price_fetch <= MAX_PRICE_AGE
-
-    issued_values = [row.forecast_issued_at for row in weather_rows if row.forecast_issued_at]
-    latest_weather_issue = max(issued_values) if issued_values else None
-    if latest_weather_issue is None:
-        weather_issue_age_seconds = None
-        weather_fresh = False
-    else:
-        if latest_weather_issue.tzinfo is None:
-            latest_weather_issue = latest_weather_issue.replace(tzinfo=dt.timezone.utc)
-        weather_issue_age_seconds = max(0, round((now - latest_weather_issue).total_seconds()))
-        weather_fresh = now - latest_weather_issue <= MAX_WEATHER_ISSUE_AGE
-
-    reasons: list[str] = []
+    price_fresh = bool(batch.prices) and all(
+        fresh(row.fetched_at, MAX_PRICE_AGE) for row in batch.prices
+    )
+    weather_fresh = bool(batch.weather) and all(
+        fresh(row.forecast_issued_at, MAX_WEATHER_ISSUE_AGE) for row in batch.weather
+    )
+    weather_coherent = len({row.forecast_issued_at for row in batch.weather}) == 1
+    price_coherent = len({row.fetched_at for row in batch.prices}) == 1
+    prices_unique = len({row.ts for row in batch.prices}) == len(batch.prices)
+    weather_unique = len({row.ts for row in batch.weather}) == len(batch.weather)
+    reasons = []
     if price_hours < minimum_control_hours:
         reasons.append(f"Only {price_hours} contiguous future price hours are available.")
     if not price_fresh:
-        reasons.append("Price feed has not been fetched within the safe freshness window.")
+        reasons.append("Price feed clocks are missing, future or stale.")
+    if not price_context_valid or not price_coherent or not prices_unique:
+        reasons.append("Price provider, currency or retrieval batch is incoherent.")
     if weather_hours < minimum_control_hours:
         reasons.append(f"Only {weather_hours} contiguous future weather hours are available.")
-    if not weather_fresh:
-        reasons.append("Weather forecast issue time is missing or stale.")
+    if not weather_fresh or not weather_coherent or not weather_unique:
+        reasons.append("Weather forecast clocks are missing, future, stale or incoherent.")
+    latest_price = min((row.fetched_at for row in batch.prices if row.fetched_at), default=None)
+    latest_weather = min(
+        (row.forecast_issued_at for row in batch.weather if row.forecast_issued_at), default=None
+    )
 
-    control_allowed = not reasons
-    effective_horizon_hours = min(price_hours, weather_hours)
-    price_horizon_limited = price_hours < horizon_hours
+    def age(clock):
+        return round((now - clock).total_seconds()) if clock and clock.tzinfo is not None else None
+
+    allowed = not reasons
     return {
-        "control_allowed": control_allowed,
-        "status": "ready" if control_allowed else "degraded",
-        "horizon_start": horizon_start.isoformat(),
+        "control_allowed": allowed,
+        "status": "ready" if allowed else "degraded",
+        "horizon_start": batch.start.isoformat(),
         "horizon_hours": horizon_hours,
         "minimum_control_hours": minimum_control_hours,
-        "effective_horizon_hours": effective_horizon_hours,
-        "price_horizon_limited": price_horizon_limited,
-        "reoptimization_when_prices_extend": price_horizon_limited and control_allowed,
+        "effective_horizon_hours": min(price_hours, weather_hours),
+        "price_horizon_limited": price_hours < horizon_hours,
+        "reoptimization_when_prices_extend": price_hours < horizon_hours and allowed,
         "price": {
-            "area": area,
+            "area": batch.area,
+            "source": batch.price_provider,
+            "currency": next(iter(currencies)) if price_context_valid else None,
             "contiguous_hours": price_hours,
             "complete_horizon": price_hours >= horizon_hours,
-            "latest_fetched_at": latest_price_fetch.isoformat() if latest_price_fetch else None,
-            "age_seconds": price_age_seconds,
+            "latest_fetched_at": latest_price.isoformat() if latest_price else None,
+            "age_seconds": age(latest_price),
             "fresh": price_fresh,
-            # Tomorrow's Nordic day-ahead prices may be published after a
-            # partial plan already exists. The poller rechecks this small
-            # endpoint every 15 minutes and queues one reoptimization only
-            # when the horizon genuinely extends.
-            "next_publication_check_seconds": 15 * 60 if price_hours < horizon_hours else None,
+            "next_publication_check_seconds": 900 if price_hours < horizon_hours else None,
         },
         "weather": {
+            "source": batch.weather_provider,
             "contiguous_hours": weather_hours,
             "complete_horizon": weather_hours >= horizon_hours,
-            "latest_issued_at": latest_weather_issue.isoformat() if latest_weather_issue else None,
-            "age_seconds": weather_issue_age_seconds,
+            "latest_issued_at": latest_weather.isoformat() if latest_weather else None,
+            "age_seconds": age(latest_weather),
             "fresh": weather_fresh,
         },
+        "captured_at": now.isoformat(),
         "reasons": reasons,
     }
+
+
+async def get_planning_data_quality(
+    *,
+    now=None,
+    horizon_hours=DEFAULT_HORIZON_HOURS,
+    minimum_control_hours=MINIMUM_CONTROL_HOURS,
+    batch=None,
+) -> dict[str, object]:
+    if batch is None:
+        now = now or dt.datetime.now(dt.timezone.utc)
+        start = next_hour_boundary(now)
+        async with get_session(read_only=True, isolation_level="REPEATABLE READ") as session:
+            batch = await load_planning_input_batch(
+                session, start, start + dt.timedelta(hours=horizon_hours), now=now
+            )
+    return planning_batch_quality(batch, minimum_control_hours=minimum_control_hours)

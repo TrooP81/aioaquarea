@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import math
 import time
@@ -52,13 +51,20 @@ async def _return_scorecard(scorecard: dict[str, Any]) -> dict[str, Any]:
     return scorecard
 
 
+def _observed_tank_temperature(status) -> float:
+    value = getattr(status, "tank_temp", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise DataIncompleteError("Observed finite tank temperature required")
+    return float(value)
+
+
 def _dhw_deadline_offsets(
     comfort_schedule: dict[str, list[int]], horizon_start: dt.datetime, tz_name: str | None
 ) -> list[int]:
     if horizon_start.tzinfo is None:
         horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
     return [
-        round((deadline - horizon_start).total_seconds() / 3600)
+        math.floor((deadline - horizon_start).total_seconds() / 3600)
         for deadline, _ in local_dhw_deadlines_in_horizon(comfort_schedule, horizon_start, tz_name)
     ]
 
@@ -103,10 +109,19 @@ class MILPOptimizer:
         horizon_start = next_hour_boundary(now)
         horizon_end = horizon_start + dt.timedelta(hours=24)
 
-        async with get_session() as session:
+        async with get_session(read_only=True, isolation_level="REPEATABLE READ") as session:
             prices = await self._get_prices(session, horizon_start, horizon_end)
             weather = await self._get_weather(session, horizon_start, horizon_end)
             weather_full = await self._get_weather_full(session, horizon_start, horizon_end)
+            from packages.core.planning_data_quality import (
+                PlanningInputBatch,
+                planning_batch_quality,
+            )
+
+            batch = session.info.get("planning_input_batch")
+            input_quality = (
+                planning_batch_quality(batch) if isinstance(batch, PlanningInputBatch) else None
+            )
             last_status = await self._get_last_status(session)
             gate_row = (
                 (
@@ -122,6 +137,14 @@ class MILPOptimizer:
 
         if not prices:
             raise DataIncompleteError("No price data available for the planning horizon")
+        if input_quality is not None and not input_quality["control_allowed"]:
+            raise DataIncompleteError("Frozen planning provider batch is not coherent and fresh")
+        if input_quality is not None:
+            effective_hours = input_quality["effective_horizon_hours"]
+            prices = prices[:effective_hours]
+            weather = weather[:effective_hours]
+            weather_full = weather_full[:effective_hours]
+            horizon_end = horizon_start + dt.timedelta(hours=effective_hours)
 
         if not weather:
             raise DataIncompleteError("No weather data available for the planning horizon")
@@ -185,9 +208,7 @@ class MILPOptimizer:
 
         await thermal_model.arefresh_if_changed()
 
-        current_tank_temp = (
-            last_status.tank_temp if last_status and last_status.tank_temp is not None else 48.0
-        )
+        current_tank_temp = _observed_tank_temperature(last_status)
 
         # Build COP function: prefer ML model, fall back to default curve
         cop_fn = self._build_cop_function(last_status, weather_full)
@@ -316,7 +337,10 @@ class MILPOptimizer:
             room_overheat_active = False
 
         # Solve synchronously in a thread to avoid blocking the event loop
-        plan = await asyncio.to_thread(
+        from packages.core.runtime_ownership import run_owned_thread
+        from packages.optimizer.represented_strategy import observation_context
+
+        plan = await run_owned_thread(
             self._solve,
             prices,
             weather,
@@ -341,6 +365,9 @@ class MILPOptimizer:
             [evidence.state for evidence in gate_projections],
             [room_overheat_active] * len(prices),
             floor_protection_duty,
+            comfort_temp_max,
+            getattr(last_status, "tank_heat_max", None) if last_status is not None else None,
+            observation_context=await observation_context(last_status, now),
         )
         if plan and isinstance(plan.get("forecast_snapshot"), dict):
             snapshot = plan["forecast_snapshot"]
@@ -407,6 +434,8 @@ class MILPOptimizer:
                 "profile_id": effective_gate.profile_id,
                 "projected_states": [evidence.state for evidence in gate_projections],
             }
+        if plan is not None:
+            plan["planning_data_quality"] = input_quality
         return plan
 
     def _build_cop_function(self, last_status, weather_full: list[dict] | None = None):
@@ -423,9 +452,22 @@ class MILPOptimizer:
         gate_states: list[SpaceHeatingGateState | str] | None = None,
     ) -> list[float]:
         """Return hourly demand estimates (kW) for the horizon."""
+        if (
+            gate_states is None
+            or len(gate_states) != len(weather)
+            or any(
+                state not in {SpaceHeatingGateState.ALLOWED, SpaceHeatingGateState.BLOCKED}
+                for state in gate_states
+            )
+        ):
+            raise DataIncompleteError("Native SH demand requires complete known gate coverage")
 
         def gate_allows(index: int) -> bool:
-            return gate_states is None or gate_states[index] == SpaceHeatingGateState.ALLOWED
+            return (
+                gate_states is not None
+                and index < len(gate_states)
+                and gate_states[index] == SpaceHeatingGateState.ALLOWED
+            )
 
         if self._demand_model and self._demand_model.is_trained:
             logger.info("milp_using_ml_demand_model")
@@ -457,7 +499,7 @@ class MILPOptimizer:
             state = (
                 gate_states[index]
                 if gate_states is not None and index < len(gate_states)
-                else SpaceHeatingGateState.ALLOWED
+                else SpaceHeatingGateState.UNKNOWN
             )
             load_fraction = (
                 max(0.0, min(1.0, (20.0 - temperature) / temperature_span))
@@ -639,6 +681,78 @@ class MILPOptimizer:
 
     def _solve(
         self,
+        prices,
+        weather,
+        cop_fn,
+        demand_per_hour,
+        current_tank_temp,
+        current_indoor_temp=None,
+        dhw_deadlines=None,
+        indoor_targets=None,
+        heat_curve_water_temp=35.0,
+        tank_min_per_hour=None,
+        tank_max_temp_setting=None,
+        indoor_rates=None,
+        weather_full=None,
+        heat_curve_water_temps=None,
+        reported_indoor_targets=None,
+        comfort_margin_c=0.0,
+        operational_indoor_targets=None,
+        forecast_bias_corrections_c=None,
+        condition_uncertainty_margins_c=None,
+        forecast_regimes=None,
+        gate_states=None,
+        room_overheat_active=None,
+        floor_protection_duty=None,
+        indoor_max_temp_setting=None,
+        hardware_tank_ceiling=None,
+        serialized_actions=None,
+        observation_context=None,
+    ):
+        from packages.optimizer.represented_strategy import build_represented_plan
+
+        if not prices:
+            raise DataIncompleteError("Complete priced horizon required")
+        if current_indoor_temp is None:
+            return {
+                "actions": [],
+                "version": self.VERSION,
+                "cost_estimate": None,
+                "diagnostic_status": "unproven",
+                "reason": "actual_initial_indoor_state_missing",
+                "forecast_snapshot": {
+                    "forecast_with_plan": [
+                        {"source": "milp_solution", "predicted_indoor_temp": None}
+                    ],
+                },
+            }
+        if gate_states is None or observation_context is None:
+            raise DataIncompleteError("Complete gate and observed DHW context required")
+        return build_represented_plan(
+            prices=prices,
+            weather=weather,
+            cop_fn=cop_fn,
+            demand_per_hour=demand_per_hour,
+            current_tank_temp=current_tank_temp,
+            current_indoor_temp=current_indoor_temp,
+            gate_states=gate_states,
+            hardware_tank_ceiling=hardware_tank_ceiling,
+            context=observation_context,
+            dhw_deadlines=dhw_deadlines,
+            indoor_targets=indoor_targets,
+            tank_min_per_hour=tank_min_per_hour,
+            tank_max_temp_setting=tank_max_temp_setting,
+            indoor_rates=indoor_rates,
+            indoor_max_temp_setting=indoor_max_temp_setting,
+            forecast_bias_corrections_c=forecast_bias_corrections_c,
+            reported_indoor_targets=reported_indoor_targets,
+            serialized_actions=serialized_actions,
+            timeout_seconds=self.SOLVER_TIMEOUT_SECONDS,
+            version=self.VERSION,
+        )
+
+    def _solve_unrepresented_legacy(
+        self,
         prices: list[tuple[dt.datetime, float]],
         weather: list[tuple[dt.datetime, float]],
         cop_fn,
@@ -667,6 +781,7 @@ class MILPOptimizer:
         Solve the optimization problem (runs in a thread).
         Raises InfeasibleError or SolverTimeoutError on failure.
         """
+        raise DataIncompleteError("Retired unrepresented compressor-duty algorithm is unproven")
         H = len(prices)
 
         price_vals = [p for _, p in prices]

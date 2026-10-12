@@ -58,6 +58,24 @@ interface ResetResult {
   deleted_models: string[];
 }
 
+function resetErrorMessage(data: unknown): string {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return "Reset failed";
+  const detail = (data as Record<string, unknown>).detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (typeof detail !== "object" || detail === null || Array.isArray(detail)) return "Reset failed";
+  const refusal = detail as Record<string, unknown>;
+  if (refusal.code === "unresolved_safety_reverts") {
+    const actionId = refusal.action_id;
+    const action = typeof actionId === "number" && Number.isSafeInteger(actionId) && actionId > 0
+      ? ` (action ${actionId})` : "";
+    return `Reset blocked: an unresolved safety restore${action} must be settled first.`;
+  }
+  if (refusal.code === "ml_lifecycle_unavailable") {
+    return "Reset unavailable: model lifecycle storage could not be reached. Try again later.";
+  }
+  return "Reset failed";
+}
+
 export function ResetDataCard() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
@@ -107,7 +125,7 @@ export function ResetDataCard() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setError(data.detail || "Reset failed");
+        setError(resetErrorMessage(data));
         return;
       }
       setResult(await res.json());

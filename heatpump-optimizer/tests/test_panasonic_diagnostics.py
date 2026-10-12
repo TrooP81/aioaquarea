@@ -77,3 +77,25 @@ def test_provider_error_text_is_reduced_to_stable_reason_code() -> None:
 def test_builder_rejects_unknown_status() -> None:
     with pytest.raises(ValueError, match="Unsupported"):
         build_panasonic_adapter_state(status="broken", device_id=None)
+
+
+@pytest.mark.parametrize("offset", [dt.timedelta(microseconds=1), dt.timedelta(seconds=59)])
+def test_future_diagnostics_are_not_fresh_before_rounding(offset):
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    state = build_panasonic_adapter_state(
+        status="available", device_id="future-device", observed_at=now + offset
+    )
+
+    projected = project_panasonic_adapter_state(state, now=now)
+
+    assert projected["state_fresh"] is False
+    assert projected["age_seconds"] is None
+
+
+def test_future_retry_target_is_not_future_observation_provenance():
+    now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+    state = build_panasonic_adapter_state(
+        status="backoff", device_id="device-a", observed_at=now, retry_after_seconds=300
+    )
+
+    assert project_panasonic_adapter_state(state, now=now)["state_fresh"] is True

@@ -1,4 +1,4 @@
-import { test, expect, modelLifecycleStatus, retiredCopModel } from "./fixtures";
+import { test, expect, modelLifecycleStatus, readinessOptimizerStatus, retiredCopModel } from "./fixtures";
 import type { ModelReportingState } from "../lib/api-types";
 
 const mockDashboard = {
@@ -56,6 +56,34 @@ async function mockCommon(page: import("@playwright/test").Page) {
 }
 
 test.describe("Learning Mode", () => {
+  for (const enabled of [false, true, null]) {
+    for (const preference of ["automatic", "manual", "unknown"] as const) {
+      test(`SR-3 UR5 maintenance ${enabled}/${preference} never promises automatic operation`, async ({ page }) => {
+        await mockCommon(page);
+        const mutations: string[] = [];
+        page.on("request", (request) => {
+          if (request.method() !== "GET" && new URL(request.url()).pathname.startsWith("/api/")) mutations.push(request.url());
+        });
+        await page.route("**/api/optimizer/status", (route) => route.fulfill({
+          contentType: "application/json", body: JSON.stringify(readinessOptimizerStatus({ enabled, preference })),
+        }));
+        await page.goto("/?view=under-the-hood");
+        await page.getByRole("button", { name: "Show diagnostics" }).click();
+        const maintenance = page.getByTestId("readiness-maintenance");
+        await expect(maintenance).toContainText(enabled === null ? "Model maintenance status is unknown." :
+          enabled ? "Model maintenance is enabled." : "Model maintenance is disabled.");
+        await expect(maintenance).toContainText(`Maintenance preference: ${preference}.`);
+        await expect(maintenance).toContainText("Running: Unknown");
+        await expect(maintenance).not.toContainText("Automatic maintenance is selected");
+        await expect(page.getByRole("button", { name: /resume.*automatic|enable.*control/i })).toHaveCount(0);
+        await expect(page.locator("body")).not.toContainText(/approved for control|resume automatic control|ready for control/i);
+        expect(mutations).toEqual([]);
+        expect(await maintenance.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+      });
+    }
+  }
+
   for (const [demandTrained, thermalCalibrated] of [[false, false], [true, false], [false, true], [true, true]] as const) {
     test(`never infers reporting qualification from trained flags: ${demandTrained}/${thermalCalibrated}`, async ({ page }) => {
       await mockCommon(page);

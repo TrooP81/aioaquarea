@@ -1,5 +1,5 @@
 import { expect, test as base, type Page } from "@playwright/test";
-import type { ControlState, ModelLifecycleStatus, ModelReportingProgress, ModelReportingState } from "../lib/api-types";
+import type { ControlState, ModelLifecycleStatus, ModelReportingProgress, ModelReportingState, SeasonalReadiness } from "../lib/api-types";
 
 const jsonResponse = (body: unknown) => ({
     status: 200,
@@ -126,6 +126,73 @@ const optimizerStatus = {
         indoor_heating_samples: 0,
     },
 };
+
+export function readinessOptimizerStatus({ enabled = null, preference = "unknown", available = true }: {
+    enabled?: boolean | null;
+    preference?: SeasonalReadiness["maintenance"]["preference"];
+    available?: boolean;
+} = {}) {
+    const readiness: SeasonalReadiness = {
+        as_of: available ? "2026-10-11T12:00:00Z" : null,
+        generation: available ? "season-readiness-test-generation" : null,
+        context_digest: available ? "c".repeat(64) : null,
+        source_watermarks: available ? { consumption: { copied_rows: 391, first_at: "2026-09-25T06:00:00Z", last_at: "2026-10-11T12:00:00Z", content_digest: "d".repeat(64) } } : {},
+        availability: available ? "assessed" : "unavailable",
+        reason: available ? null : "snapshot_materialization_unavailable",
+        components: {},
+        maintenance: {
+            enabled, preference, queue_count: null, running: null, phase: null,
+            last_attempt_at: null, next_due_at: null, reason: "running_request_proof_unavailable"
+        },
+    };
+    for (const [name, total, train, holdout, minimumTrain, minimumHoldout] of [
+        ["demand", 390, 308, 78, 168, 24], ["indoor_heating", 64, 28, 20, 20, 3],
+        ["indoor_cooling", 50, 19, 15, 20, 3],
+    ] as const) {
+        const fitted = name === "indoor_heating" && available;
+        readiness.components[name] = {
+            collection: {
+                availability: available ? "assessed" : "unavailable",
+                total: available ? total : null, train: available ? train : null, holdout: available ? holdout : null,
+                minimum_train: minimumTrain, minimum_holdout: minimumHoldout,
+                remaining_train: available ? Math.max(0, minimumTrain - train) : null,
+                remaining_holdout: available ? Math.max(0, minimumHoldout - holdout) : null,
+                reason: available ? null : "snapshot_materialization_unavailable"
+            },
+            fit: {
+                availability: fitted ? "persisted" : available ? "not_assessed" : "unavailable",
+                status: fitted ? "validated" : available ? "awaiting_fit" : null,
+                data_cutoff: fitted ? "2026-10-10T12:00:00Z" : null,
+                artifact_hash: fitted ? "a".repeat(64) : null, role: fitted ? "candidate" : null,
+                request_id: fitted ? "sr-indoor-family-request" : null, reason: null
+            },
+            reporting: fitted ? modelLifecycleStatus("candidate") : {
+                counts: null, missing_counts: null, missing_diversity: null, pending_outcomes: null,
+                qualification_expires_at: null, next_decision_checkpoint: null,
+                evidence_reason: "no_selected_reference",
+            },
+            next_step: available ? fitted ? "await_prospective_reporting_qualification" :
+                name === "indoor_cooling" ? "collect_space_heating_evidence" : "await_fit_or_validation" : "readiness_unavailable",
+        };
+    }
+    return {
+        ...optimizerStatus,
+        model_lifecycle: { ...optimizerStatus.model_lifecycle, thermal: modelLifecycleStatus(available ? "candidate" : "unavailable") },
+        demand_model: {
+            ...optimizerStatus.demand_model, source_records: available ? 391 : null,
+            data_quality: {
+                ...demandDataQuality, usable_samples: available ? 390 : null,
+                remaining_samples: available ? 0 : null, ready_to_train: available
+            }
+        },
+        seasonal_calibration: {
+            enabled: true, observe_only_active: true, heating_season_detected: true,
+            reason: "observe_only_seasonal_calibration_active", average_outdoor_c: 5,
+            auto_train: preference === "unknown" ? null : preference === "automatic", auto_exit: false,
+            next_step: available ? "await_successful_demand_training" : "readiness_unavailable", readiness
+        },
+    };
+}
 
 export const controlState: ControlState = {
     state: "observing",

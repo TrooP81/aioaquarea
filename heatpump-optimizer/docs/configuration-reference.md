@@ -237,6 +237,12 @@ Migration `032` creates an ordinary retained table and non-cycling bigint sequen
 
 Warming, missing/failed weather lookup, successful fitting, manual training and reporting qualification do not clear an active campaign. Explicitly disabling `seasonal_calibration_enabled` clears its campaign/deferral state atomically; manual observation, if enabled, stays active. Turning learning mode off leaves seasonal observation active, and exiting both still cannot enable ordinary writes in this build. Unresolved linked restores preserve the existing activation deferral/embargo rules.
 
+Optimizer status, seasonal status/progress, and learning-details GETs only read: they do not initialize lifecycle state, latch a campaign, enqueue maintenance, fit, publish, refresh singleton models, or call Panasonic/timer providers. Only the explicit `run_seasonal_calibration_cycle()` performs activation/deferral writes. Its short transaction rechecks opt-in and genuine linked restore obligations under the existing settings lock and a bounded table lock; lock timeout leaves activation unchanged. Existing enqueue calls run after that transaction commits.
+
+Season readiness reports live scoped collection separately from persisted fit/validation and native prospective reporting qualification. Thermal collection uses the fitting extractor and chronological 70/30 split with the existing six-hour embargo, requiring 20 TRAIN and 3 HOLDOUT intervals. Demand retains its 80/20 split, four-hour embargo, and 168 TRAIN/24 HOLDOUT minima. TOTAL includes embargo-excluded intervals, so it is not TRAIN + HOLDOUT. Collected intervals alone do not establish model quality, and neither collection nor fitting requires a qualified incumbent.
+
+Each status response captures one read-only repeatable-read view, then closes its session before calculation. Its cutoff, generation, context digest, and source watermarks describe that view, not later edits; a subsequent completed flight reads a new view. Completed empty extraction is zero, while unavailable counts/context are null. Maintenance enabled/default state, automatic/manual preference, queue/activity, last attempt, and next due time are independent facts; unknown activity or scheduling never implies automatic operation. Existing defaults, fitting/admission rules, qualification gates, cadence, and ordinary-write containment are unchanged.
+
 ### Equipment and comfort bounds
 
 | Key | Type | Default | Description |
@@ -301,6 +307,63 @@ Warming, missing/failed weather lookup, successful fitting, manual training and 
 | `outdoor_temperature_weather_max_age_minutes` | int | `180` | Weather age before falling back to the heat-pump sensor. |
 | `latitude` / `longitude` | float | env `LATITUDE` / `LONGITUDE` | Weather location. |
 | `timezone` | str | `Europe/Amsterdam` | IANA timezone for schedules and local hours. |
+
+New feed records carry nullable provenance introduced by migration 035:
+consumption source timezone, normalized weather units, and hourly price interval
+schema. ENTSO-E intervals are duration-weighted only when an hour is fully covered;
+provider currency and negative prices are preserved. Weather wind speed is stored
+in m/s, including conversion of responses explicitly declaring km/h. Historical
+records are not rescaled or backfilled. Planning readiness checks the selected
+provider's frozen, coherent input batch, not a newer unrelated feed timestamp;
+legacy rows without the required provenance cannot certify a planning horizon.
+
+Rules plans do not claim command-specific electricity costs without supported
+serialized-strategy replay: `cost_estimate` is nullable, and `cost_accounting`
+states that limitation. Its separately labelled unshifted baseline uses confirmed
+per-device counter deltas and their elapsed duration, not cumulative-counter
+averages or a default daily consumption. Tariff allocation in measured outcomes
+is explicitly estimated uniformly across each confirmed interval's duration;
+missing tariffs remain unpriced, and negative tariffs are retained.
+
+Manual heat-curve advice requires fresh selected-room observations and fresh
+device status within the configured status-age limit. Future, stale, missing,
+or nonfinite evidence cannot yield a suggested curve. Advice remains manual-only
+and does not authorize ordinary device writes.
+Viewing advice derives verification progress and eligible audit recovery without
+persisting settings or completing a durable transition. The GET is read-only;
+existing observation thresholds and recommendation gates still apply.
+
+Represented diagnostic planning uses `native_sh_trace_v1`: unchanged hourly
+native space-heating demand with explicitly **assumed** provenance, plus integer
+DHW timing. ECO, quiet and target-to-compressor effects remain `unproven`.
+The trace binds the cached device/status identity and aware observation/capture
+clocks (using the existing configured status/polling freshness policy), observed tank target, and
+known inactive forced-DHW state. Unknown context refuses certification. Pulses
+at or crossing the observed target-minus-0.5 °C command threshold remain
+unproven: the replay does not invent heating after command suppression or target
+termination. No tank target writes are generated. Rules build and replay this
+trace without importing or constructing the optional PuLP solver.
+Saved price/weather/target fields retain their public snapshot contract;
+`forecast_no_heating` explicitly represents a fully passive, no-SH/no-DHW
+counterfactual, not an inferred native-controller trajectory.
+Unknown/incomplete controller gates or hardware tank ceilings cannot certify
+a horizon. Tank/room initial states are observed, not clamped; any initial
+violations are disclosed. Hard modeled floors, ceilings, deadlines and pulse
+extrema are checked by a separate serialized-event replay, including SH diversion
+while DHW owns the shared plant. Replay prices electrical kW × elapsed hours
+exactly once. Feasibility/cost are conditional on the declared model, not physical
+comfort guarantees or globally optimal household costs. Rules fallback is accepted
+only after its actual DHW commands pass the same independent replay. Both invalid
+strategies refuse planning. Published diagnostics remain non-active with no
+executable actions; modeled commands are retained only as diagnostic evidence.
+
+Service entrypoints own startup cleanup from their first await and track all
+scheduled coroutine jobs until their cleanup ends. A cancelled solver await waits
+for its owned thread to finish. Scheduled jobs drain before maintenance, then
+ordinary logs drain within their five-second budget, then wrapper resources close.
+An unsettled log writer blocks disposal and retains ownership rather than claiming
+successful shutdown. Cancellation-resistant teardown does not relax restore
+attempt deadlines or grant ordinary-write permission.
 
 ### Panasonic
 

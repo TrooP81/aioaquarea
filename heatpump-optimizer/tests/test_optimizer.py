@@ -80,7 +80,7 @@ def sample_weather():
 
 class TestRulesOptimizer:
     @pytest.mark.asyncio
-    async def test_estimate_cost_falls_back_and_logs_when_consumption_lookup_fails(self):
+    async def test_estimate_cost_is_nullable_without_serialized_strategy_replay(self):
         optimizer = RulesOptimizer()
 
         with (
@@ -91,10 +91,8 @@ class TestRulesOptimizer:
         ):
             cost = await optimizer._estimate_cost([], [(dt.datetime.now(dt.timezone.utc), 0.20)])
 
-        assert cost == 3.0
-        warning.assert_called_once_with(
-            "failed to estimate average daily consumption", exc_info=True
-        )
+        assert cost is None
+        warning.assert_not_called()
 
     def test_zone_boost_requires_live_headroom(self):
         optimizer = RulesOptimizer()

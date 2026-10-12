@@ -70,6 +70,52 @@ class Sessions:
         ]
 
 
+async def test_UR2_SR1_lifecycle_reads_borrow_snapshot_session(state):
+    from packages.ml.forecast_quality import native_scope
+
+    session = AsyncMock()
+    result = {
+        "pairs": 0,
+        "device_day_clusters": 0,
+        "issue_cohorts": 0,
+        "last_valid_outcome_at": None,
+        "pending_outcomes": 0,
+        "horizons": {},
+        "outdoor_bins": {},
+        "exclusions": {},
+    }
+    session.execute.return_value = SimpleNamespace(
+        mappings=lambda: SimpleNamespace(one=lambda: result)
+    )
+    factory = Mock(side_effect=AssertionError("independent lifecycle session"))
+    authority = Lifecycle(factory)
+    authority._read = AsyncMock(return_value=state)
+    now = TestR06ThermalQualificationRoute.NOW
+    inputs = TestR06ThermalQualificationRoute.native_inputs(now)
+    reference = ArtifactReference(
+        "a" * 64,
+        state.epoch,
+        "thermal",
+        "thermal_v5",
+        {
+            "frozen_at": now.isoformat(),
+            "device_id": "audit-device",
+            "scope": native_scope(inputs),
+            "horizons": [15, 30, 60],
+            "capabilities": ["indoor_heating", "indoor_cooling"],
+        },
+        "candidate",
+        state.revision,
+    )
+    assert await authority.read(session=session) is state
+    evidence = await authority.reporting_evidence(reference, now=now, session=session)
+    assert evidence["counts"]["pairs"] == 0 and evidence["as_of"] == now.isoformat()
+    assert "ml_forecast_issues" in str(session.execute.await_args.args[0])
+    factory.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.close.assert_not_awaited()
+
+
 async def test_evidence_page_progress_is_atomic_and_retries_are_fenced(state, lease):
     reference = ArtifactReference(
         "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
@@ -363,12 +409,102 @@ def request_row(status="queued"):
         epoch="epoch",
         component="demand",
         source="api",
+        dedup_key="manual",
         status=status,
         requested_at=module._now(),
         attempted_at=None,
         finished_at=None,
         details={},
     )
+
+
+@pytest.mark.parametrize("family", ["tank_", "indoor_"])
+@pytest.mark.parametrize("identity", ["legacy-dedup", "structured"])
+async def test_R06_enqueue_and_claim_preserve_family_dto(state, lease, family, identity):
+    from packages.core.models import MLMaintenanceRequestRecord
+
+    dedup_key = f"thermal-family:{family}:{'a' * 64}" if identity == "legacy-dedup" else "opaque"
+    details = {"family": family}
+    row_values = {
+        "id": "r06-persisted-request",
+        "epoch": state.epoch,
+        "component": "thermal",
+        "source": "scheduled",
+        "requested_at": module._now(),
+        "dedup_key": dedup_key,
+        "details": details,
+    }
+    row = MLMaintenanceRequestRecord(**row_values, status="queued")
+    sessions = Sessions([Mock(), scalar(state.epoch), scalar(row)])
+    authority = Lifecycle(sessions)
+    options = {"family": family} if identity == "structured" else {}
+
+    queued = await authority.enqueue("thermal", "scheduled", dedup_key=dedup_key, **options)
+
+    assert isinstance(queued, module.MaintenanceRequest)
+    assert queued.details == details and queued.dedup_key == dedup_key
+    assert (
+        sessions.session.execute.call_args_list[-1].args[0].compile().params["details"] == details
+    )
+    claimed_row = MLMaintenanceRequestRecord(
+        **row_values, status="running", fence=lease.fence, attempted_at=module._now()
+    )
+    sessions.session.execute.side_effect = [scalar(row), scalar(claimed_row)]
+    authority._lock = AsyncMock()
+    authority._read = AsyncMock(return_value=state)
+
+    claimed = await authority.claim_request(lease, "thermal")
+
+    assert isinstance(claimed, module.MaintenanceRequest)
+    assert claimed.status == "running" and claimed.dedup_key == dedup_key
+    assert claimed.details == details
+    assert (
+        sessions.session.execute.call_args_list[-1].args[0].compile().params["details"] == details
+    )
+
+
+@pytest.mark.parametrize("family", ["unknown", "", True, 1, ["indoor_"]])
+async def test_R06_invalid_enqueue_family_is_rejected_before_storage(family):
+    sessions = Sessions([])
+    with pytest.raises(ValueError, match="family"):
+        await Lifecycle(sessions).enqueue("thermal", "scheduled", family=family)
+    sessions.session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "details,dedup_key",
+    [
+        ({"family": "unknown"}, "opaque"),
+        ({"family": True}, "opaque"),
+        ({"family": ["indoor_"]}, "opaque"),
+        ({"family": None}, "opaque"),
+        ({}, "thermal-family:unknown:fit"),
+        ({}, "thermal-family:indoor_"),
+        ({"family": "indoor_"}, "thermal-family:tank_:fit"),
+    ],
+)
+async def test_R06_unknown_or_conflicting_request_family_never_materializes(
+    monkeypatch, details, dedup_key
+):
+    from packages.ml import forecast_quality as quality
+
+    inputs = AsyncMock(return_value=None)
+    monkeypatch.setattr(quality, "materialize_native_inputs", inputs)
+    runner = SimpleNamespace(lifecycle=Mock(), _enabled=AsyncMock(return_value=True))
+    hook = module.native_component_hooks(runner, None)["thermal"]
+    request = module.MaintenanceRequest(
+        "r06-invalid",
+        "epoch",
+        "thermal",
+        "scheduled",
+        "running",
+        module._now(),
+        details=details,
+        dedup_key=dedup_key,
+    )
+
+    assert await hook.materialize(request) is None
+    inputs.assert_not_awaited()
 
 
 async def test_explicit_disabled_request_is_durable_and_deduplicated():
@@ -640,6 +776,628 @@ def hooks(*, fit=None, commit=None, review=None):
     )
 
 
+class TestR06ThermalQualificationRoute:
+    NOW = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+
+    @classmethod
+    def cohort(cls):
+        from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+
+        records, readings, weather = [], [], []
+        temperature = 21.0
+        start = cls.NOW - dt.timedelta(hours=96)
+        for index in range(96 * 12 + 1):
+            timestamp = start + dt.timedelta(minutes=5 * index)
+            heating = (index * 5 // 60) % 6 < 3
+            records.append(
+                DeviceStatusRecord(
+                    ts=timestamp,
+                    device_id="audit-device",
+                    space_heating_active=heating,
+                    operation_status=1,
+                    mode="1",
+                    direction="PUMP",
+                    pump_duty=1,
+                    device_action="HEATING" if heating else "IDLE",
+                    defrost_active=False,
+                    zone1_operation_status=1,
+                    zone2_operation_status=0,
+                    zone1_temp=35.0,
+                    zone1_target_temp=40.0,
+                    outdoor_temp=5.0,
+                    tank_temp=45.0,
+                    native_policy_provenance={},
+                    tank_target_temp=50.0,
+                )
+            )
+            readings.append(
+                IndoorTempReading(
+                    timestamp=timestamp,
+                    temperature=round(temperature, 4),
+                    device_id="selected-room",
+                    is_stale=False,
+                )
+            )
+            temperature += (0.6 if heating else -0.4) * 5 / 60
+            if index % 12 == 0:
+                weather.append(
+                    WeatherRecord(
+                        ts=timestamp,
+                        source="open-meteo",
+                        temperature=5.0,
+                        wind_speed=3.0,
+                        irradiance=0.0,
+                        precipitation=0.0,
+                        humidity=60.0,
+                        cloud_cover=0.5,
+                        forecast_issued_at=timestamp - dt.timedelta(hours=1),
+                    )
+                )
+        return records, readings, weather
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_UR3_SR2_rejection_counts_preserved_by_existing_owner(self, state, enabled):
+        from packages.ml import thermal
+
+        records, readings, weather = self.cohort()
+        data = {
+            "records": records[:40],
+            "readings": readings[:40],
+            "weather": weather,
+            "device_id": "audit-device",
+            "data_cutoff": self.NOW,
+        }
+        materialized = {
+            "data": data,
+            "inputs": self.native_inputs(self.NOW),
+            "requested_family": "indoor_",
+            "diagnostics": {},
+        }
+        database = MemoryLifecycle(state)
+        owner = module.MaintenanceRunner(database, enabled_reader=AsyncMock(return_value=enabled))
+        real_fit = owner.hooks["thermal"].fit
+        fit = Mock(wraps=real_fit)
+        commit = AsyncMock(side_effect=AssertionError("rejected/disabled candidate publication"))
+        materialize = AsyncMock(return_value=materialized)
+        owner.hooks = {"thermal": module.ComponentHooks(materialize, fit, commit)}
+        try:
+            result = await owner.run()
+        finally:
+            await owner.close()
+        commit.assert_not_awaited()
+        if not enabled:
+            assert result["status"] == "disabled"
+            fit.assert_not_called()
+            materialize.assert_not_awaited()
+            assert database.finished == []
+        else:
+            fit.assert_called_once_with(materialized)
+            assert result["components"]["thermal"] == "queued"
+            status, details = database.finished[0]
+            assert status == "queued" and details["reason"] == "insufficient_training_data"
+            diagnostics = details["readiness_rejection"]
+            assert diagnostics["requested_family"] == "indoor_"
+            measured = diagnostics["components"]["indoor_heating"]
+            expected = thermal._rate_sample_counts(
+                thermal._extract_indoor_rate_samples(readings[:40], records[:40], weather)[0]
+            )
+            assert (measured["total"], measured["train"], measured["holdout"]) == (
+                expected["total"],
+                expected["train"],
+                expected["holdout"],
+            )
+            assert measured["train"] < 20 and measured["holdout"] >= 3
+            assert "holdout_targets" not in measured["validation"]
+
+    async def test_SC006_complete_indoor_cohort_has_automatic_qualification_route(
+        self, state, monkeypatch
+    ):
+        import pickle
+        from packages.core import settings_service
+        from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+        from packages.ml import forecast_quality, thermal
+
+        records, readings, weather = self.cohort()
+        future = WeatherRecord(
+            ts=self.NOW + dt.timedelta(hours=1),
+            source="open-meteo",
+            temperature=99.0,
+            forecast_issued_at=self.NOW + dt.timedelta(minutes=1),
+        )
+
+        async def execute(statement):
+            entity = statement.column_descriptions[0]["entity"]
+            timestamps = [
+                value
+                for value in statement.compile().params.values()
+                if isinstance(value, dt.datetime)
+            ]
+            lower, upper = min(timestamps), max(timestamps)
+            if entity is DeviceStatusRecord:
+                rows = [row for row in records if lower <= row.ts <= upper]
+            elif entity is IndoorTempReading:
+                rows = [row for row in readings if lower <= row.timestamp <= upper]
+            elif entity is WeatherRecord:
+                rows = [
+                    row
+                    for row in weather + [future]
+                    if lower <= row.ts <= upper and row.forecast_issued_at <= self.NOW
+                ]
+            else:
+                rows = []
+            result = Mock()
+            result.scalars.return_value.all.return_value = rows
+            return result
+
+        sessions = Sessions([])
+        sessions.session.execute.side_effect = execute
+        monkeypatch.setattr(thermal, "get_session", sessions)
+        monkeypatch.setattr(forecast_quality, "get_session", sessions)
+        monkeypatch.setattr(
+            settings_service,
+            "get_all_settings",
+            AsyncMock(
+                return_value={
+                    "comfort_reference_sensor_id": "selected-room",
+                    "smartthings_device_ids": "selected-room",
+                    "weather_provider": "open-meteo",
+                    "price_provider": "manual",
+                    "timezone": "UTC",
+                }
+            ),
+        )
+        monkeypatch.setattr(module, "_now", lambda: self.NOW)
+        owner = module.MaintenanceRunner(
+            MemoryLifecycle(state), enabled_reader=AsyncMock(return_value=True)
+        )
+        try:
+            hook = owner.hooks["thermal"]
+            materialized = await hook.materialize(None)
+            assert materialized is not None
+            payload = thermal.build_thermal_candidate(materialized["data"])
+            assert payload is not None
+            assert set(payload["declared_components"]) == {"indoor_heating", "indoor_cooling"}
+            forecast_quality.check_exact_fit("thermal", pickle.loads(pickle.dumps(payload)))
+            assert all(row.temperature != 99.0 for row in materialized["data"]["weather"])
+            assert (
+                thermal.build_thermal_candidate({**materialized["data"], "records": records[:2]})
+                is None
+            )
+            fitted = hook.fit(materialized)
+            assert fitted is not None, "validated indoor heads must reach automatic publication"
+            assert set(fitted["capabilities"]) == {"indoor_heating", "indoor_cooling"}
+            assert fitted["inputs"]["sensor_basis"]["sensor_ids"] == ["selected-room"]
+            assert fitted["inputs"]["schemas"]["input"] == "frozen_native_inputs_v2"
+        finally:
+            await owner.close()
+
+    @pytest.mark.parametrize("rejection", ["records", "partition", "no_benefit", "family"])
+    async def test_UR3_SR2_rejection_counts_preserved(self, state, monkeypatch, rejection):
+        from packages.ml import thermal
+
+        records, readings, weather = self.cohort()
+        if rejection == "records":
+            records = records[:2]
+        elif rejection == "partition":
+            records, readings = records[:40], readings[:40]
+        elif rejection == "no_benefit":
+            for row in readings:
+                row.temperature = 20.0
+        data = {
+            "records": records,
+            "readings": readings,
+            "weather": weather,
+            "data_cutoff": self.NOW,
+            "device_id": "audit-device",
+        }
+        diagnostics = {}
+        payload = thermal.build_thermal_candidate(data, diagnostics=diagnostics)
+        expected = thermal.ThermalModel._extract_indoor_rate_samples(readings, records, weather)[0]
+        counts = diagnostics["components"]["indoor_heating"]
+        train, holdout = thermal.ThermalModel._partition_rate_samples(expected)
+        assert (counts["total"], counts["train"], counts["holdout"]) == (
+            len(expected),
+            len(train),
+            len(holdout),
+        )
+        assert diagnostics["source_records"] == len(records)
+        if rejection == "family":
+            assert payload is not None
+            owner = module.MaintenanceRunner(
+                MemoryLifecycle(state), enabled_reader=AsyncMock(return_value=True)
+            )
+            materialized = {
+                "data": data,
+                "inputs": self.native_inputs(self.NOW),
+                "requested_family": "tank_",
+                "input_families": {"indoor_": self.native_inputs(self.NOW)},
+            }
+            try:
+                assert owner.hooks["thermal"].fit(materialized) is None
+            finally:
+                await owner.close()
+            assert materialized["diagnostics"]["reason"] == "requested_family_unvalidated"
+            assert materialized["diagnostics"]["requested_family"] == "tank_"
+        else:
+            assert payload is None
+            assert (
+                diagnostics["reason"]
+                == {
+                    "records": "insufficient_status_records",
+                    "partition": "insufficient_training_data",
+                    "no_benefit": "rejected_no_skill_over_baseline",
+                }[rejection]
+            )
+            if rejection == "no_benefit":
+                assert counts["train"] >= 20 and counts["holdout"] >= 3
+                assert counts["fit_status"] == "rejected_no_skill_over_baseline"
+                assert "holdout_targets" not in counts["validation"]
+
+    async def test_UR3_SR2_native_dto_to_qualification_no_incumbent(self, state, monkeypatch):
+        from packages.core.models import MLMaintenanceRequestRecord
+        from packages.ml import thermal
+
+        records, readings, weather = self.cohort()
+        heating, cooling = thermal.ThermalModel._extract_indoor_rate_samples(
+            readings, records, weather
+        )
+        assert all(
+            thermal._rate_sample_counts(samples)["remaining_train"] == 0
+            for samples in (heating, cooling)
+        )
+        assert state.reference("thermal") is None
+        row = MLMaintenanceRequestRecord(
+            id="ur3-family",
+            epoch=state.epoch,
+            component="thermal",
+            source="seasonal",
+            status="running",
+            fence=state.fence,
+            requested_at=self.NOW,
+            attempted_at=self.NOW,
+            details={"family": "indoor_"},
+            dedup_key="ur3-scoped-family",
+        )
+        request = module._request(row)
+        assert module._thermal_request_family(request.details, request.dedup_key) == "indoor_"
+        await self.test_signed_indoor_candidate_issues_and_evaluates_each_head(state, monkeypatch)
+
+    @classmethod
+    def native_inputs(cls, now, family="indoor_"):
+        from packages.ml.comfort_model import SENSOR_SELECTION_SCHEMA
+        from tests.test_forecast_quality import TestProspectiveNativeEvidence
+
+        inputs = TestProspectiveNativeEvidence._inputs()
+        shift = now - TestProspectiveNativeEvidence.BASE
+        for row in inputs["status_history"]:
+            row["ts"] = (dt.datetime.fromisoformat(row["ts"]) + shift).isoformat()
+            row["device_id"] = "audit-device"
+        for row in inputs["weather"]:
+            row["ts"] = (dt.datetime.fromisoformat(row["ts"]) + shift).isoformat()
+            row["forecast_issued_at"] = now.isoformat()
+        basis = (
+            {
+                "kind": "heatpump_temperature",
+                "sensor_ids": ["audit-device"],
+                "field": "tank_temp",
+                "resolution_c": 1.0,
+            }
+            if family == "tank_"
+            else {
+                "kind": "reference",
+                "sensor_ids": ["selected-room"],
+                "resolution_c": 0.1,
+                "selection_schema": SENSOR_SELECTION_SCHEMA,
+                "selected_sensor_ids": ["selected-room"],
+            }
+        )
+        inputs.update(
+            {
+                "issued_at": now.isoformat(),
+                "device_id": "audit-device",
+                "capability": family + "cooling",
+                "sensor_basis": basis,
+                "sensor_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "temperature": 45.0 if family == "tank_" else 21.0,
+                    }
+                ],
+                "indoor_temperature": 21.0,
+                "indoor_trend": 0.0,
+                "tank_temperature": 45.0,
+                "reference_sensor_id": "selected-room",
+                "configured_sensor_ids": ["selected-room"],
+                "weather_provider": "open-meteo",
+                "timezone": "UTC",
+                "schemas": {
+                    "input": "frozen_native_inputs_v1"
+                    if family == "tank_"
+                    else "frozen_native_inputs_v2",
+                    "artifact": module.LIFECYCLE_SCHEMAS["thermal"],
+                    "weather_provider": "open-meteo",
+                    "price_provider": "manual",
+                },
+            }
+        )
+        inputs["timer"]["fetched_at"] = now.isoformat()
+        return inputs
+
+    @classmethod
+    def prospective_pairs(cls, candidate_hash, scope):
+        pairs = []
+        for day in range(14):
+            for cohort in range(4):
+                issued = cls.NOW + dt.timedelta(days=day, hours=cohort * 6)
+                observed = 20.0 + (day % 4) * 0.6 + cohort * 0.5
+                capability = "indoor_heating" if cohort % 2 == 0 else "indoor_cooling"
+                for horizon in (15, 30, 60):
+                    target = issued + dt.timedelta(minutes=horizon)
+                    pairs.append(
+                        {
+                            "device_id": "audit-device",
+                            "canonical_key": f"{day}:{cohort}",
+                            "cohort_key": f"{day}:{cohort}",
+                            "horizon_minutes": horizon,
+                            "issued_at": issued.isoformat(),
+                            "target_at": target.isoformat(),
+                            "observed_at": target.isoformat(),
+                            "status": "valid",
+                            "candidate_hash": candidate_hash,
+                            "incumbent_hash": None,
+                            "issue_kind": "prospective_native",
+                            "policy_schema": "native_unchanged_v1",
+                            "capability": capability,
+                            "scope": scope,
+                            "outdoor_bin": (8, 10, 12)[day % 3],
+                            "observed": observed,
+                            "candidate": observed + 0.10 + 0.01 * ((day + cohort) % 4),
+                            "incumbent": observed + 1.0 + 0.02 * day + 0.03 * cohort,
+                            "baseline": observed + 1.2 + 0.03 * day + 0.02 * cohort,
+                        }
+                    )
+        return pairs
+
+    async def test_signed_indoor_candidate_issues_and_evaluates_each_head(self, state, monkeypatch):
+        import math
+        from packages.ml import forecast_quality as quality, thermal
+
+        records, readings, weather = self.cohort()
+        raw = {
+            "records": records,
+            "readings": readings,
+            "weather": weather,
+            "device_id": "audit-device",
+            "data_cutoff": self.NOW,
+        }
+        monkeypatch.setattr(thermal, "materialize_thermal_inputs", AsyncMock(return_value=raw))
+        clock = [self.NOW]
+        monkeypatch.setattr(module, "_now", lambda: clock[0])
+
+        async def inputs(component, *, now, capabilities=(), **_options):
+            family = (
+                "indoor_" if capabilities and capabilities[0].startswith("indoor_") else "tank_"
+            )
+            return self.native_inputs(now, family)
+
+        monkeypatch.setattr(quality, "materialize_native_inputs", AsyncMock(side_effect=inputs))
+        database = MemoryLifecycle(state)
+
+        async def publish(lease, artifact, **options):
+            assert options["expected_revision"] == database.state.revision
+            reference = ArtifactReference(
+                artifact.artifact_hash,
+                lease.epoch,
+                "thermal",
+                module.LIFECYCLE_SCHEMAS["thermal"],
+                artifact.manifest,
+                options.get("role", "candidate"),
+                database.state.revision + 1,
+            )
+            database.state = replace(
+                database.state, revision=reference.committed_revision, references=(reference,)
+            )
+            return module.PublicationResult(True, reference.committed_revision)
+
+        database.publish = AsyncMock(side_effect=publish)
+        database.load_committed = AsyncMock(
+            side_effect=lambda component, **options: module.safe_persistence.load_signed_artifact(
+                options["expected_hash"],
+                component=component,
+                schema_version=module.LIFECYCLE_SCHEMAS[component],
+            )
+        )
+        database.record_native_issues = AsyncMock()
+        database.begin_evidence_scan = AsyncMock()
+        database.evidence_page = AsyncMock(return_value={"checkpoint": {"complete": True}})
+        database.claim_decision = AsyncMock(return_value=True)
+        database.finish_decision = AsyncMock()
+        owner = module.MaintenanceRunner(database, enabled_reader=AsyncMock(return_value=True))
+        try:
+            hook = owner.hooks["thermal"]
+            fitted = hook.fit(await hook.materialize(None))
+            assert fitted is not None and fitted["capabilities"] == (
+                "indoor_heating",
+                "indoor_cooling",
+            )
+            lease = await database.acquire("r06-unit-owner")
+            assert (await hook.commit_candidate(lease, fitted, database.state)).committed
+            reference = database.state.reference("thermal", "candidate")
+            assert reference is not None and not module.reference_is_qualified(reference)
+            await hook.review_candidate(lease, reference)
+            rows = database.record_native_issues.await_args.args[2]
+            assert len(rows) == 3 and {row["horizon_minutes"] for row in rows} == {15, 30, 60}
+            assert all(row["input_snapshot"]["capability"] == "indoor_cooling" for row in rows)
+            assert all(
+                row["input_snapshot"]["scope"] == reference.manifest["scope"] for row in rows
+            )
+            assert all(
+                math.isfinite(value) for row in rows for value in row["predictions"].values()
+            )
+            assert all(
+                set(row["predictions"]) == {"candidate", "incumbent", "baseline"} for row in rows
+            )
+            database.claim_decision.assert_not_awaited()
+            assert database.publish.await_count == 1
+            pairs = self.prospective_pairs(reference.artifact_hash, reference.manifest["scope"])
+            database.decision_evidence = AsyncMock(return_value=(pairs, True))
+            clock[0] += dt.timedelta(hours=360)
+            await hook.review_candidate(lease, reference)
+            database.finish_decision.assert_awaited_once()
+            result = database.finish_decision.await_args.args[3]
+            assert result["qualified"] is True and result["reason"] == "qualified_for_reporting"
+            assert result["counts"]["pairs"] == 168
+            assert result["control_ready"] is False
+            assert result["ordinary_writes_allowed"] is False
+            assert {"indoor_heating", "indoor_cooling"} <= set(result["evidence"])
+            assert set(result["scope"]["capabilities"]) == {"indoor_heating", "indoor_cooling"}
+            assert database.publish.await_count == 2
+            promoted = database.publish.await_args.kwargs
+            assert (
+                promoted["role"] == "incumbent"
+                and promoted["qualification"].scope == result["scope"]
+            )
+            assert database.state.reference("thermal").artifact_hash == reference.artifact_hash
+        finally:
+            await owner.close()
+
+    @pytest.mark.parametrize("identity", ["legacy-dedup", "structured"])
+    async def test_supported_families_are_queued_serially_after_publication(
+        self, state, monkeypatch, identity
+    ):
+        from dataclasses import asdict
+        from packages.core.models import MLMaintenanceRequestRecord
+        from packages.ml import forecast_quality as quality, thermal
+
+        records, readings, weather = self.cohort()
+        raw = {
+            "records": records,
+            "readings": readings,
+            "weather": weather,
+            "device_id": "audit-device",
+            "data_cutoff": self.NOW,
+        }
+        payload = thermal.build_thermal_candidate(raw)
+        model = thermal.ThermalModel()
+        model.params = model._decode_params(payload["params"])
+        for head, rate in (("tank_heating", 12.0), ("tank_cooling", -1.5)):
+            model._validate_rate_component(head, [(rate, 5.0, 0.25)] * 40)
+            assert model.params.calibration_status[head] == "validated"
+        payload = {
+            **payload,
+            "params": asdict(model.params),
+            "validation": {**payload["validation"], **model.validation},
+            "declared_components": [
+                *payload["declared_components"],
+                "tank_heating",
+                "tank_cooling",
+            ],
+        }
+        quality.check_exact_fit("thermal", payload)
+        monkeypatch.setattr(thermal, "build_thermal_candidate", Mock(return_value=payload))
+        monkeypatch.setattr(thermal, "materialize_thermal_inputs", AsyncMock(return_value=raw))
+
+        async def inputs(component, *, now, capabilities=(), **_options):
+            return self.native_inputs(
+                now,
+                "indoor_" if capabilities and capabilities[0].startswith("indoor_") else "tank_",
+            )
+
+        monkeypatch.setattr(quality, "materialize_native_inputs", AsyncMock(side_effect=inputs))
+        monkeypatch.setattr(module, "_now", lambda: self.NOW)
+        database = MemoryLifecycle(state)
+        database.publish = AsyncMock(return_value=module.PublicationResult(True, 9))
+        database.enqueue = AsyncMock()
+        owner = module.MaintenanceRunner(database, enabled_reader=AsyncMock(return_value=True))
+        try:
+            hook = owner.hooks["thermal"]
+            fitted = hook.fit(await hook.materialize(None))
+            assert fitted["capabilities"] == ("tank_heating", "tank_cooling")
+            assert fitted["remaining_families"] == ("indoor_",)
+            lease = await database.acquire("r06-family-owner")
+            assert (await hook.commit_candidate(lease, fitted, database.state)).committed
+            database.enqueue.assert_awaited_once()
+            request = database.enqueue.await_args
+            assert request.args == ("thermal", "scheduled") and request.kwargs["lease"] == lease
+            assert request.kwargs["family"] == "indoor_"
+            row_values = {
+                "id": "r06-family-request",
+                "epoch": lease.epoch,
+                "component": "thermal",
+                "source": "scheduled",
+                "requested_at": self.NOW,
+                "dedup_key": (
+                    request.kwargs["dedup_key"] if identity == "legacy-dedup" else "opaque"
+                ),
+                "details": {} if identity == "legacy-dedup" else {"family": "indoor_"},
+            }
+            row = MLMaintenanceRequestRecord(**row_values, status="queued")
+            queued = module._request(row)
+            assert isinstance(queued, module.MaintenanceRequest)
+            assert request.kwargs["dedup_key"].startswith("thermal-family:indoor_:")
+            assert queued.details == row_values["details"] and queued.dedup_key == row.dedup_key
+            claimed_row = MLMaintenanceRequestRecord(
+                **row_values, status="running", fence=lease.fence, attempted_at=self.NOW
+            )
+            sessions = Sessions([scalar(row), scalar(claimed_row)])
+            authority = Lifecycle(sessions)
+            authority._lock = AsyncMock()
+            authority._read = AsyncMock(return_value=database.state)
+            claimed = await authority.claim_request(lease, "thermal")
+            assert isinstance(claimed, module.MaintenanceRequest) and claimed.status == "running"
+            assert claimed.details == row_values["details"] and claimed.dedup_key == row.dedup_key
+            assert (
+                sessions.session.execute.call_args_list[-1].args[0].compile().params["details"]
+                == (row_values["details"])
+            )
+            next_fit = hook.fit(await hook.materialize(claimed))
+            assert next_fit["capabilities"] == ("indoor_heating", "indoor_cooling")
+            assert next_fit["inputs"]["sensor_basis"]["sensor_ids"] == ["selected-room"]
+            assert next_fit["remaining_families"] == ()
+            assert (await hook.commit_candidate(lease, next_fit, database.state)).committed
+            assert database.publish.await_args.args[1].manifest["capabilities"] == [
+                "indoor_heating",
+                "indoor_cooling",
+            ]
+            database.enqueue.assert_awaited_once()
+            tank_row = MLMaintenanceRequestRecord(
+                **{**row_values, "details": {"family": "tank_"}, "dedup_key": "tank-opaque"},
+                status="running",
+                fence=lease.fence,
+                attempted_at=self.NOW,
+            )
+            tank_fit = hook.fit(await hook.materialize(module._request(tank_row)))
+            assert tank_fit["capabilities"] == ("tank_heating", "tank_cooling")
+            assert tank_fit["remaining_families"] == ()
+            database.publish.return_value = module.PublicationResult(
+                False, reason="revision_conflict"
+            )
+            assert not (await hook.commit_candidate(lease, next_fit, database.state)).committed
+            database.enqueue.assert_awaited_once()
+        finally:
+            await owner.close()
+
+    def test_changed_exact_fit_cannot_enter_family_publication(self, state, monkeypatch):
+        from packages.ml import thermal
+
+        records, readings, weather = self.cohort()
+        raw = {
+            "records": records,
+            "readings": readings,
+            "weather": weather,
+            "device_id": "audit-device",
+            "data_cutoff": self.NOW,
+        }
+        payload = thermal.build_thermal_candidate(raw)
+        payload["validation"]["indoor_heating"]["holdout_predictions"][0] += 0.5
+        monkeypatch.setattr(thermal, "build_thermal_candidate", Mock(return_value=payload))
+        runner = SimpleNamespace(lifecycle=Mock(), _enabled=AsyncMock(return_value=True))
+        hook = module.native_component_hooks(runner, None)["thermal"]
+        with pytest.raises(ValueError, match="evaluated-fit round trip mismatch"):
+            hook.fit({"data": raw, "inputs": self.native_inputs(self.NOW)})
+        runner.lifecycle.assert_not_called()
+
+
 def availability_database(state):
     database = MemoryLifecycle(state)
     sessions = Sessions([])
@@ -897,6 +1655,226 @@ async def test_database_connectivity_outage_preserves_candidate_authority(state,
         await owner.close()
 
 
+def test_R13_actual_directory_artifact_is_permanent_malformed_storage(tmp_path, monkeypatch):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, "epoch", "demand", "demand_lifecycle_v1", {}, "candidate", 1
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.mkdir(parents=True)
+
+    with pytest.raises(module.ArtifactIntegrityError):
+        module.verify_reference(reference)
+
+
+@pytest.mark.parametrize("failure", [PermissionError, IsADirectoryError])
+def test_R13_nonfile_error_variants_require_same_entry_confirmation(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, "epoch", "demand", "demand_lifecycle_v1", {}, "candidate", 1
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.mkdir(parents=True)
+    monkeypatch.setattr(
+        module.safe_persistence, "verify_signed_artifact", Mock(side_effect=failure("s2 nonfile"))
+    )
+
+    with pytest.raises(module.ArtifactIntegrityError):
+        module.verify_reference(reference)
+
+
+def test_R13_entry_swap_during_failed_read_is_transient(tmp_path, monkeypatch):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, "epoch", "demand", "demand_lifecycle_v1", {}, "candidate", 1
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.mkdir(parents=True)
+
+    def swapped(*_args, **_kwargs):
+        path.rmdir()
+        path.write_bytes(b"replacement entry not yet admitted")
+        raise PermissionError("s2 atomic entry replacement")
+
+    monkeypatch.setattr(module.safe_persistence, "verify_signed_artifact", swapped)
+    with pytest.raises(module.ArtifactUnavailableError):
+        module.verify_reference(reference)
+    assert path.is_file()
+
+
+def test_R13_real_file_permissions_remain_transient(tmp_path, monkeypatch):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, "epoch", "demand", "demand_lifecycle_v1", {}, "candidate", 1
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"unreadable control")
+    monkeypatch.setattr(
+        module.safe_persistence,
+        "verify_signed_artifact",
+        Mock(side_effect=PermissionError("s2 real permissions")),
+    )
+
+    with pytest.raises(module.ArtifactUnavailableError):
+        module.verify_reference(reference)
+
+
+def test_R13_inaccessible_entry_type_cannot_prove_integrity(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, "epoch", "demand", "demand_lifecycle_v1", {}, "candidate", 1
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.mkdir(parents=True)
+    original = Path.lstat
+
+    def inaccessible(current):
+        if current == path:
+            raise PermissionError("s2 metadata unavailable")
+        return original(current)
+
+    monkeypatch.setattr(Path, "lstat", inaccessible)
+    monkeypatch.setattr(
+        module.safe_persistence,
+        "verify_signed_artifact",
+        Mock(side_effect=PermissionError("s2 unreadable entry")),
+    )
+    with pytest.raises(module.ArtifactUnavailableError):
+        module.verify_reference(reference)
+
+
+async def test_R13_confirmed_directory_fences_candidate_without_retry_and_allows_repair(
+    state, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    candidate = ArtifactReference(
+        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+    )
+    incumbent = replace(qualified_reference("demand", ("demand",)), artifact_hash="b" * 64)
+    progress = {"cursor": 17, "processed_rows": 17, "complete": False}
+    database = availability_database(
+        replace(
+            state,
+            references=(incumbent, candidate),
+            checkpoints={"scan:" + candidate.artifact_hash: progress},
+        )
+    )
+    monkeypatch.setattr(module, "_now", lambda: database.clock)
+    path = module.safe_persistence.artifact_path(candidate.artifact_hash)
+    path.mkdir(parents=True)
+
+    async def invalidate(lease, reference, reason):
+        assert reference == candidate and lease.epoch == candidate.epoch
+        assert lease.fence == database.state.fence
+        assert reason == "artifact_integrity_failure"
+        database.state = replace(
+            database.state,
+            revision=database.state.revision + 1,
+            references=(incumbent, replace(candidate, role="retained")),
+        )
+
+    database.invalidate_component.side_effect = invalidate
+
+    async def review(lease, reference):
+        if reference.role == "candidate":
+            module.verify_reference(reference)
+
+    demand = hooks(review=review)
+    comfort = hooks()
+    owner = module.MaintenanceRunner(
+        database,
+        hooks={"demand": demand, "comfort": comfort},
+        enabled_reader=AsyncMock(return_value=True),
+    )
+    try:
+        result = await owner.run()
+        assert result["components"]["demand"] == "failed"
+        assert result["components"]["comfort"] == "succeeded"
+        database.invalidate_component.assert_awaited_once()
+        database.record_artifact_unavailability.assert_not_awaited()
+        assert database.state.reference("demand") == incumbent
+        assert database.state.reference("demand", "candidate") is None
+        assert database.state.checkpoints["scan:" + candidate.artifact_hash] == progress
+        demand.materialize.assert_not_awaited()
+        path.rmdir()
+        database.clock += dt.timedelta(hours=6)
+        assert (await owner.run())["components"]["demand"] == "succeeded"
+        demand.materialize.assert_awaited_once()
+        demand.commit_candidate.assert_awaited_once()
+        assert database.state.reference("demand") == incumbent
+        assert database.state.checkpoints["scan:" + candidate.artifact_hash] == progress
+    finally:
+        await owner.close()
+    assert database.released is True and owner._active is None
+
+
+async def test_R13_entry_swap_preserves_candidate_progress_until_successful_retry(
+    state, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    candidate = ArtifactReference(
+        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+    )
+    incumbent = replace(qualified_reference("demand", ("demand",)), artifact_hash="b" * 64)
+    progress = {"cursor": 17, "processed_rows": 17, "complete": False}
+    database = availability_database(
+        replace(
+            state,
+            references=(incumbent, candidate),
+            checkpoints={"scan:" + candidate.artifact_hash: progress},
+        )
+    )
+    monkeypatch.setattr(module, "_now", lambda: database.clock)
+    path = module.safe_persistence.artifact_path(candidate.artifact_hash)
+    path.mkdir(parents=True)
+
+    def swapped(*_args, **_kwargs):
+        path.rmdir()
+        path.write_bytes(b"entry replaced during unavailable verification")
+        raise PermissionError("s2 entry replacement")
+
+    verification = Mock(side_effect=swapped)
+    monkeypatch.setattr(module.safe_persistence, "verify_signed_artifact", verification)
+
+    async def review(lease, reference):
+        if reference.role == "candidate":
+            module.verify_reference(reference)
+
+    demand = hooks(review=review)
+    owner = module.MaintenanceRunner(
+        database, hooks={"demand": demand}, enabled_reader=AsyncMock(return_value=True)
+    )
+    try:
+        assert (await owner.run())["components"]["demand"] == "unavailable"
+        database.invalidate_component.assert_not_awaited()
+        assert database.state.reference("demand") == incumbent
+        assert database.state.reference("demand", "candidate") == candidate
+        assert database.state.checkpoints["scan:" + candidate.artifact_hash] == progress
+        availability = database.state.checkpoints["availability:" + candidate.artifact_hash]
+        assert availability["attempts"] == 1 and availability["status"] == "unavailable"
+        database.clock += dt.timedelta(hours=6)
+        verification.side_effect = None
+        verification.return_value = (SimpleNamespace(manifest={}), b"fit")
+        assert (await owner.run())["components"]["demand"] == "candidate_frozen"
+        assert (
+            database.state.checkpoints["availability:" + candidate.artifact_hash]["status"]
+            == "available"
+        )
+        assert database.state.reference("demand") == incumbent
+        assert database.state.reference("demand", "candidate") == candidate
+        assert database.state.checkpoints["scan:" + candidate.artifact_hash] == progress
+        assert verification.call_count == 2
+        demand.materialize.assert_not_awaited()
+        demand.commit_candidate.assert_not_awaited()
+        database.invalidate_component.assert_not_awaited()
+    finally:
+        await owner.close()
+    assert database.released is True and owner._active is None
+
+
 async def test_candidate_storage_outage_preserves_progress_and_recovers(state, monkeypatch):
     reference = ArtifactReference(
         "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
@@ -950,8 +1928,9 @@ async def test_candidate_storage_outage_preserves_progress_and_recovers(state, m
 
 @pytest.mark.parametrize("storage_available", [False, True])
 async def test_missing_candidate_requires_bounded_retries_and_storage_confirmation(
-    state, monkeypatch, storage_available
+    state, tmp_path, monkeypatch, storage_available
 ):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
     reference = ArtifactReference(
         "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
     )
@@ -998,10 +1977,27 @@ async def test_missing_candidate_requires_bounded_retries_and_storage_confirmati
         await owner.close()
 
 
-async def test_damaged_invalidation_records_reason_and_advances_revision(state, lease, monkeypatch):
+@pytest.mark.parametrize("damage", ["directory", "bytes", "schema"])
+@pytest.mark.parametrize("stale_reference", ["retained", "republished"])
+async def test_R13_damaged_invalidation_records_reason_and_advances_revision(
+    state, lease, tmp_path, monkeypatch, stale_reference, damage
+):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
     candidate = ArtifactReference(
-        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+        "a" * 64,
+        state.epoch,
+        "demand",
+        "wrong_schema" if damage == "schema" else "demand_lifecycle_v1",
+        {},
+        "candidate",
+        state.revision,
     )
+    path = module.safe_persistence.artifact_path(candidate.artifact_hash)
+    if damage == "directory":
+        path.mkdir(parents=True)
+    else:
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"stable damaged artifact")
     sessions = Sessions([scalar(9), Mock(rowcount=1)])
     lifecycle = Lifecycle(sessions)
     lifecycle._lock = AsyncMock()
@@ -1026,11 +2022,214 @@ async def test_damaged_invalidation_records_reason_and_advances_revision(state, 
         reason="artifact_integrity_failure",
     )
     lifecycle._read = AsyncMock(
-        return_value=replace(state, references=(replace(candidate, role="retained"),))
+        return_value=replace(
+            state,
+            references=(
+                replace(candidate, role="retained")
+                if stale_reference == "retained"
+                else replace(candidate, committed_revision=candidate.committed_revision + 1),
+            ),
+        )
     )
     with pytest.raises(module.CASConflict, match="invalidation_reference_changed"):
         await lifecycle.invalidate_component(lease, candidate, "artifact_integrity_failure")
     assert sessions.session.execute.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "condition", ["healthy", "entry_replaced", "permissions", "missing_storage"]
+)
+async def test_R13_revalidation_preserves_authority_without_DML(
+    state, lease, tmp_path, monkeypatch, condition
+):
+    import pickle
+
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    if condition != "missing_storage":
+        path.parent.mkdir(parents=True)
+        if condition == "entry_replaced":
+            path.mkdir()
+        else:
+            path.write_bytes(b"admission fixture")
+    if condition == "healthy":
+        monkeypatch.setattr(
+            module.safe_persistence,
+            "verify_signed_artifact",
+            Mock(return_value=(SimpleNamespace(manifest={}), pickle.dumps({"fit": "healthy"}))),
+        )
+    elif condition == "permissions":
+        monkeypatch.setattr(
+            module.safe_persistence,
+            "verify_signed_artifact",
+            Mock(side_effect=PermissionError("real-file admission outage")),
+        )
+
+    async def admission(session, attempt):
+        assert attempt == lease
+        if condition == "entry_replaced":
+            path.rmdir()
+            path.write_bytes(b"different entry still cannot authorize earlier confirmation")
+
+    sessions = Sessions([])
+    lifecycle = Lifecycle(sessions)
+    before = replace(state, references=(reference,), checkpoints={"scan": {"cursor": 17}})
+    lifecycle._lock = AsyncMock(side_effect=admission)
+    lifecycle._read = AsyncMock(return_value=before)
+    expected_error = (
+        module.CASConflict
+        if condition in {"healthy", "entry_replaced"}
+        else module.ArtifactUnavailableError
+    )
+
+    with pytest.raises(expected_error):
+        await lifecycle.invalidate_component(lease, reference, "artifact_integrity_failure")
+
+    assert sessions.session.execute.await_count == 0 and sessions.committed is False
+    assert await lifecycle._read(sessions.session) == before
+
+
+async def test_R13_symlink_replacement_at_admission_has_zero_DML(
+    state, lease, tmp_path, monkeypatch
+):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(model_dir))
+    reference = ArtifactReference(
+        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+    )
+    path = model_dir / "lifecycle" / (reference.artifact_hash + ".pkl")
+    path.parent.mkdir()
+    first = tmp_path / "first-untrusted-target"
+    second = tmp_path / "second-untrusted-target"
+    first.mkdir()
+    second.mkdir()
+    path.symlink_to(first, target_is_directory=True)
+    with pytest.raises(module.ArtifactIntegrityError):
+        module.verify_reference(reference)
+
+    async def admission(session, attempt):
+        assert attempt == lease
+        path.unlink()
+        path.symlink_to(second, target_is_directory=True)
+
+    sessions = Sessions([scalar(9), Mock(rowcount=1)])
+    lifecycle = Lifecycle(sessions)
+    before = replace(state, references=(reference,))
+    lifecycle._lock = AsyncMock(side_effect=admission)
+    lifecycle._read = AsyncMock(return_value=before)
+    try:
+        await lifecycle.invalidate_component(lease, reference, "artifact_integrity_failure")
+    except (module.CASConflict, module.ArtifactUnavailableError):
+        pass
+
+    assert sessions.session.execute.await_count == 0
+    assert await lifecycle._read(sessions.session) == before
+
+
+async def test_R13_stable_payload_corruption_remains_fenced_after_revalidation(
+    state, lease, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    reference = ArtifactReference(
+        "a" * 64, state.epoch, "demand", "demand_lifecycle_v1", {}, "candidate", state.revision
+    )
+    path = module.safe_persistence.artifact_path(reference.artifact_hash)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"stable payload corruption fixture")
+    verification = Mock(return_value=(SimpleNamespace(manifest={}), b""))
+    monkeypatch.setattr(module.safe_persistence, "verify_signed_artifact", verification)
+    with pytest.raises(module.ArtifactIntegrityError):
+        module._load_reference(reference)
+    verification.reset_mock()
+    sessions = Sessions([scalar(9), Mock(rowcount=1)])
+    lifecycle = Lifecycle(sessions)
+    lifecycle._lock = AsyncMock()
+    lifecycle._read = AsyncMock(return_value=replace(state, references=(reference,)))
+
+    await lifecycle.invalidate_component(lease, reference, "artifact_integrity_failure")
+
+    assert sessions.committed and sessions.session.execute.await_count == 2
+    verification.assert_called_once_with(
+        reference.artifact_hash,
+        component=reference.component,
+        schema_version=reference.schema_version,
+    )
+
+
+@pytest.mark.parametrize(
+    "condition", ["restored_file", "new_directory", "storage_outage", "stable_missing"]
+)
+async def test_R13_missing_confirmation_is_rechecked_at_invalidation_admission(
+    state, lease, tmp_path, monkeypatch, condition
+):
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    manifest = {
+        "fit_id": "missing-admission",
+        "data_cutoff": module._now().isoformat(),
+        "input_schema": "test_inputs",
+        "output_schema": "test_outputs",
+        "runtime_versions": {"python": "test"},
+        "evidence_hashes": [],
+    }
+    artifact = module.safe_persistence.publish_signed_artifact(
+        {"fit": "healthy"},
+        component="demand",
+        schema_version="demand_lifecycle_v1",
+        manifest=manifest,
+    )
+    reference = ArtifactReference(
+        artifact.artifact_hash,
+        state.epoch,
+        "demand",
+        artifact.schema_version,
+        manifest,
+        "candidate",
+        state.revision,
+    )
+    path = artifact.path
+    signed_bytes = path.read_bytes()
+    path.unlink()
+    if condition == "storage_outage":
+        path.parent.rmdir()
+
+    async def admission(session, attempt):
+        assert attempt == lease
+        if condition == "restored_file":
+            path.write_bytes(signed_bytes)
+            module.verify_reference(reference)
+        elif condition == "new_directory":
+            path.mkdir()
+
+    sessions = Sessions([scalar(9), Mock(rowcount=1)])
+    lifecycle = Lifecycle(sessions)
+    before = replace(
+        state,
+        references=(reference,),
+        checkpoints={
+            "availability:" + reference.artifact_hash: {
+                "status": "confirmed_missing",
+                "attempts": 3,
+                "fence": lease.fence,
+            }
+        },
+    )
+    lifecycle._lock = AsyncMock(side_effect=admission)
+    lifecycle._read = AsyncMock(return_value=before)
+    try:
+        await lifecycle.invalidate_component(lease, reference, "artifact_missing_confirmed")
+    except module.ArtifactUnavailableError:
+        assert condition == "storage_outage"
+    except module.CASConflict:
+        assert condition in {"restored_file", "new_directory"}
+
+    expected_writes = 2 if condition == "stable_missing" else 0
+    assert sessions.session.execute.await_count == expected_writes
+    assert sessions.committed is (condition == "stable_missing")
+    assert await lifecycle._read(sessions.session) == before
 
 
 async def test_maintenance_cycle_schedules_retention_under_its_lease(state):
@@ -1256,7 +2455,7 @@ async def test_disabled_poller_job_and_seasonal_cycle_do_not_queue(monkeypatch):
     seasonal_job.assert_not_awaited()
     monkeypatch.setattr(
         seasonal_learning,
-        "get_seasonal_calibration_status",
+        "_transition_seasonal_campaign",
         AsyncMock(return_value={"observe_only_active": True}),
     )
     monkeypatch.setattr(seasonal_learning, "get_bool_setting", AsyncMock(return_value=False))

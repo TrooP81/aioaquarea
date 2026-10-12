@@ -114,6 +114,59 @@ class TestDhwDeadlines:
         assert dhw_deadlines_from_schedule(schedule, ts, tz_name=TZ) == [7]
 
 
+class TestReadinessSessions:
+    async def test_UR2_SR1_borrowed_settings_session_is_never_replaced_or_committed(self):
+        from packages.core import settings_service
+
+        row = SimpleNamespace(key="ml_maintenance_enabled", value="true")
+        session = AsyncMock()
+        session.execute.return_value = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [row], __iter__=lambda: iter([row])),
+            scalar_one_or_none=lambda: row,
+        )
+        with patch.object(
+            settings_service, "get_session", side_effect=AssertionError("new session")
+        ):
+            assert (await settings_service.get_all_settings(session=session))[row.key] == "true"
+            assert await settings_service.get_setting(row.key, session=session) == "true"
+            assert await settings_service.get_bool_setting(row.key, session=session) is True
+            session.execute.return_value = SimpleNamespace(scalars=lambda: [row])
+            await settings_service.set_settings_bulk(
+                {"_seasonal_calibration_campaign_since": ""}, session=session
+            )
+        session.commit.assert_not_awaited()
+        session.rollback.assert_not_awaited()
+        session.close.assert_not_awaited()
+
+    @pytest.mark.parametrize("read_only", [True, False])
+    async def test_UR2_SR1_session_isolation_and_ownership(self, read_only):
+        from packages.core import database
+
+        session = AsyncMock()
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(database, "async_session_factory", return_value=context) as factory:
+            async with database.get_session(
+                read_only=read_only, isolation_level="REPEATABLE READ" if read_only else None
+            ) as borrowed:
+                assert borrowed is session
+        factory.assert_called_once_with(autoflush=not read_only)
+        if read_only:
+            session.connection.assert_awaited_once_with(
+                execution_options={
+                    "isolation_level": "REPEATABLE READ",
+                    "postgresql_readonly": True,
+                }
+            )
+            session.commit.assert_not_awaited()
+            session.rollback.assert_awaited_once()
+            assert "statement_timeout" in str(session.execute.await_args.args[0])
+        else:
+            session.commit.assert_awaited_once()
+            session.rollback.assert_not_awaited()
+
+
 class TestLearningModeSettings:
     def test_maintenance_defaults_off(self):
         spec = SETTING_SPECS["ml_maintenance_enabled"]
@@ -288,6 +341,114 @@ class TestValidateSettingValue:
     def test_fraction_rejects_negative_above_one_nonnumeric_and_nonfinite(self, value):
         with pytest.raises(ValueError):
             validate_setting_value("space_heating_default_fraction", value)
+
+
+class TestR04NumericSettings:
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "NaN"])
+    def test_all_float_settings_reject_nonfinite(self, raw):
+        for key, spec in SETTING_SPECS.items():
+            if spec.value_type == "float":
+                with pytest.raises(ValueError, match="finite"):
+                    validate_setting_value(key, raw)
+                with pytest.raises(ValueError, match="finite"):
+                    spec.parse(raw)
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+    def test_numeric_default_serialization_rejects_nonfinite(self, raw):
+        from packages.core.settings_service import SettingSpec
+
+        spec = SettingSpec("s2-unbounded", "float", "test", default=raw)
+        with pytest.raises(ValueError, match="finite"):
+            spec.serialize_default()
+
+    def test_float_parser_does_not_treat_bool_as_number(self):
+        with pytest.raises(ValueError):
+            SETTING_SPECS["manual_price_eur_per_kwh"].parse(True)
+
+    @pytest.mark.parametrize(
+        ("key", "raw"),
+        [
+            ("comfort_temp_target", "nan"),
+            ("sh_max_power_kw", "inf"),
+            ("manual_price_eur_per_kwh", "-inf"),
+            ("space_heating_default_fraction", "1.5"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "getter", ["get_typed_setting", "get_float_setting", "get_all_settings"]
+    )
+    async def test_persisted_invalid_numeric_reads_are_unusable(
+        self, monkeypatch, key, raw, getter
+    ):
+        from packages.core import settings_service
+
+        record = SimpleNamespace(key=key, value=raw)
+        result = SimpleNamespace(
+            scalar_one_or_none=lambda: record,
+            scalars=lambda: SimpleNamespace(all=lambda: [record]),
+        )
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(
+            return_value=SimpleNamespace(execute=AsyncMock(return_value=result))
+        )
+        context.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(settings_service, "get_session", lambda: context)
+
+        with pytest.raises(ValueError):
+            await getattr(settings_service, getter)(
+                *(() if getter == "get_all_settings" else (key,))
+            )
+
+    @pytest.mark.parametrize("raw", [float("nan"), float("inf"), float("-inf")])
+    async def test_nonfinite_environment_default_cannot_be_read(self, monkeypatch, raw):
+        from dataclasses import replace
+
+        from packages.core import settings_service
+
+        key = "comfort_temp_target"
+        monkeypatch.setitem(
+            SETTING_SPECS,
+            key,
+            replace(SETTING_SPECS[key], default_env="s2_invalid_default"),
+        )
+        monkeypatch.setattr(
+            settings_service, "env_settings", SimpleNamespace(s2_invalid_default=raw)
+        )
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(
+            return_value=SimpleNamespace(
+                execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None))
+            )
+        )
+        context.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(settings_service, "get_session", lambda: context)
+
+        with pytest.raises(ValueError, match="finite"):
+            await settings_service.get_float_setting(key)
+
+    @pytest.mark.parametrize("writer", ["set_setting", "set_settings_bulk"])
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+    async def test_numeric_writes_validate_before_session(self, monkeypatch, writer, raw):
+        from packages.core import settings_service
+
+        session = MagicMock(side_effect=AssertionError("invalid setting opened a database session"))
+        monkeypatch.setattr(settings_service, "get_session", session)
+
+        with pytest.raises(ValueError, match="finite"):
+            if writer == "set_setting":
+                await settings_service.set_setting("manual_price_eur_per_kwh", raw)
+            else:
+                await settings_service.set_settings_bulk({"manual_price_eur_per_kwh": raw})
+        session.assert_not_called()
+
+    @pytest.mark.parametrize(("raw", "expected"), [("-0.2", -0.2), ("0", 0.0), ("", 0.25)])
+    async def test_finite_negative_zero_and_clear_sentinel_remain_valid(
+        self, monkeypatch, raw, expected
+    ):
+        from packages.core import settings_service
+
+        monkeypatch.setattr(settings_service, "get_setting", AsyncMock(return_value=raw))
+        assert await settings_service.get_float_setting("manual_price_eur_per_kwh") == expected
 
 
 class TestIsMaskedSecret:
