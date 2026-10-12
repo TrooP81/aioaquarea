@@ -29,6 +29,14 @@ class ManualCOPPut(ManualCOPRevision):
 
 
 class ManualCOPObservationResponse(BaseModel):
+    """A user-entered controller estimate for a local calendar day or month.
+
+    ``period_start``/``period_end`` are derived from the local period and the
+    confirmed timezone; they are not stored. The measurement scope is unknown:
+    any domestic-hot-water inclusion is user-reported and unverified, so no
+    whole-system or measured COP is claimed.
+    """
+
     device_id: str
     granularity: Literal["day", "month"]
     period_date: dt.date
@@ -43,7 +51,7 @@ class ManualCOPObservationResponse(BaseModel):
     revision: str = Field(strict=True, pattern=r"^[1-9][0-9]*$", max_length=19)
     source: Literal["controller_estimate"] = "controller_estimate"
     acquisition: Literal["manual_entry"] = "manual_entry"
-    scope: Literal["total"] = "total"
+    scope: Literal["unknown"] = "unknown"
     measured: Literal[False] = False
     accuracy: Literal["approximate"] = "approximate"
     energy_boundary: Literal["unknown"] = "unknown"

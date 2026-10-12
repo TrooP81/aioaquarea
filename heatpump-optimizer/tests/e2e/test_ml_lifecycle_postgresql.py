@@ -133,7 +133,7 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
             async with control.begin() as connection:
                 await guard_owned_database(connection)
                 head, _ = migration_targets()
-                assert head == "035"
+                assert head == "036"
                 assert (
                     await connection.execute(text("SELECT version_num FROM public.alembic_version"))
                 ).scalar_one() == head

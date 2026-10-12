@@ -3267,8 +3267,6 @@ class TestManualCOPAPI:
             granularity="day",
             period_date=start.date(),
             timezone="UTC",
-            period_start=start,
-            period_end=start + dt.timedelta(days=1),
             value=9.7,
             observed_at=now,
             completeness="partial",
@@ -3321,7 +3319,7 @@ class TestManualCOPAPI:
         } == {
             "source": "controller_estimate",
             "acquisition": "manual_entry",
-            "scope": "total",
+            "scope": "unknown",
             "measured": False,
             "accuracy": "approximate",
             "energy_boundary": "unknown",
@@ -3492,8 +3490,8 @@ class TestManualCOPAPI:
         row.granularity = granularity
         row.period_date = dt.date(2026, 9, 1)
         row.timezone = timezone
-        row.period_start, row.period_end = period_bounds(granularity, row.period_date, timezone)
-        row.observed_at = row.period_end + dt.timedelta(hours=2)
+        period_start, period_end = period_bounds(granularity, row.period_date, timezone)
+        row.observed_at = period_end + dt.timedelta(hours=2)
         row.completeness = "closed"
         session = SimpleNamespace(
             execute=AsyncMock(
@@ -3512,11 +3510,27 @@ class TestManualCOPAPI:
         assert response.json()["timezone"] == timezone
         assert response.json()["value"] == 9.7
         assert response.json()["completeness"] == "closed"
+        assert dt.datetime.fromisoformat(response.json()["period_start"]) == period_start
+        assert dt.datetime.fromisoformat(response.json()["period_end"]) == period_end
         assert session.execute.await_count == 2
-        parameters = session.execute.call_args_list[1].args[0].compile().params
+        statement = session.execute.call_args_list[1].args[0]
+        compiled = statement.compile()
+        parameters = compiled.params
+        assert "period_start" not in str(compiled) and "period_end" not in str(compiled)
+        assert not any("period_start" in key or "period_end" in key for key in parameters)
         assert parameters["timezone"] == timezone
-        assert parameters["period_start"] == row.period_start
-        assert parameters["period_end"] == row.period_end
+        identity = {"fixture-device", granularity, row.period_date}
+        if revision == "0":
+            assert statement.is_insert
+            assert {
+                parameters["device_id"],
+                parameters["granularity"],
+                parameters["period_date"],
+            } == identity
+        else:
+            assert statement.is_update
+            predicates = set(statement.whereclause.compile().params.values())
+            assert predicates == identity | {int(revision)}
 
     @pytest.mark.parametrize(("known", "status"), [(False, 404), (True, 409)])
     async def test_valid_timezone_put_preserves_unknown_device_and_stale_revision(

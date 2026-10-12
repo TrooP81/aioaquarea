@@ -116,6 +116,7 @@ test.describe("Reset data card", () => {
 
     await expect(page.getByText(/Deleted 0 record\(s\)/)).toBeVisible();
     expect(resetBody.scopes.sort()).toEqual(["device_status", "energy", "indoor_temp", "logs", "plans", "prices", "weather"]);
+    expect(resetBody.scopes).not.toContain("manual_cop");
     expect(confirmation).toContain("COP history, COP artifacts and all model baselines are kept");
     expect(confirmation).not.toContain("ALL collected data");
   });
@@ -130,4 +131,84 @@ test.describe("Reset data card", () => {
     await expect(page.getByText(/Retained models \(demand, comfort, thermal\)/)).toBeVisible();
     await expect(page.getByText("Energy & COP history", { exact: true })).toHaveCount(0);
   });
+
+  test("manual COP ledger reset is separate and posts only its own scope", async ({ page }) => {
+    await mockSettings(page);
+    const bodies: unknown[] = [];
+    await page.route("**/api/admin/reset", async (route) => {
+      bodies.push(route.request().postDataJSON());
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          scopes: ["manual_cop"],
+          deleted_rows: { manual_cop_observations: 182 },
+          total_rows_deleted: 182,
+          manual_cop_monitoring_enabled: false,
+          models_reset: false,
+          deleted_models: [],
+          model_lifecycle: null,
+        }),
+      });
+    });
+    let confirmation = "";
+    page.on("dialog", (dialog) => {
+      confirmation = dialog.message();
+      return dialog.accept();
+    });
+
+    await page.goto("/settings");
+    await page.getByRole("tab", { name: "System" }).click();
+    const manual = page.getByTestId("manual-cop-reset");
+    await expect(manual).toContainText("never included in \"Select all\"");
+    await expect(page.locator("label", { hasText: "Manual controller-COP" })).toHaveCount(0);
+
+    await manual.getByRole("button", { name: "Reset manual COP readings" }).click();
+
+    await expect(manual.getByRole("status")).toHaveText(
+      "Deleted 182 manual reading(s); experimental COP forecasting is off.",
+    );
+    expect(bodies).toEqual([{ scopes: ["manual_cop"] }]);
+    expect(confirmation).toContain("for all devices");
+    expect(confirmation).toContain("turn experimental COP forecasting off");
+    expect(confirmation).toContain("pending safety restores are kept");
+    await expect(page.getByRole("button", { name: "Reset Selected Data" })).toBeDisabled();
+  });
+
+  test("declined manual COP confirmation sends nothing", async ({ page }) => {
+    await mockSettings(page);
+    let requests = 0;
+    await page.route("**/api/admin/reset", async (route) => {
+      requests += 1;
+      await route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+    });
+    page.on("dialog", (dialog) => dialog.dismiss());
+    await page.goto("/settings");
+    await page.getByRole("tab", { name: "System" }).click();
+    await page.getByRole("button", { name: "Reset manual COP readings" }).click();
+    await expect(page.getByTestId("manual-cop-reset").getByRole("status")).toHaveCount(0);
+    expect(requests).toBe(0);
+  });
+
+  for (const refusal of [
+    { status: 503, body: { detail: { code: "manual_cop_reset_unavailable" } }, message: "Manual COP reset unavailable: nothing was deleted. Try again later." },
+    { status: 400, body: { detail: "The manual_cop reset scope must be requested alone" }, message: "The manual_cop reset scope must be requested alone" },
+    { status: 200, body: { status: "ok", total_rows_deleted: "182" }, message: "Manual COP reset response is invalid" },
+  ]) {
+    test(`manual COP reset renders safe outcome for ${refusal.status} ${JSON.stringify(refusal.body)}`, async ({ page }) => {
+      await mockSettings(page);
+      await page.route("**/api/admin/reset", (route) => route.fulfill({
+        status: refusal.status, contentType: "application/json", body: JSON.stringify(refusal.body),
+      }));
+      page.on("dialog", (dialog) => dialog.accept());
+      await page.goto("/settings");
+      await page.getByRole("tab", { name: "System" }).click();
+      const manual = page.getByTestId("manual-cop-reset");
+      await manual.getByRole("button", { name: "Reset manual COP readings" }).click();
+      await expect(manual.getByRole("alert")).toHaveText(refusal.message);
+      await expect(manual.getByRole("status")).toHaveCount(0);
+      await expect(manual.getByRole("button", { name: "Reset manual COP readings" })).toBeEnabled();
+    });
+  }
 });

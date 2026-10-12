@@ -41,7 +41,8 @@ from packages.optimizer.shower_mode import ShowerDetector, reconcile_shower_expi
 
 ROOT = Path(__file__).parents[2]
 MIGRATION_UNDER_TEST = "034"
-CURRENT_HEAD = "035"
+CURRENT_HEAD = "036"
+HISTORICAL_HEAD = "035"
 
 
 class _FrozenDateTime(dt.datetime):
@@ -61,12 +62,16 @@ def _alembic_config(database_url: str) -> Config:
     return config
 
 
-def _current_head(database_url: str) -> str:
-    scripts = ScriptDirectory.from_config(_alembic_config(database_url))
-    heads = scripts.get_heads()
-    assert heads == [CURRENT_HEAD], "migration fixture requires the reviewed single head"
-    assert scripts.get_revision(CURRENT_HEAD).down_revision == MIGRATION_UNDER_TEST
-    return CURRENT_HEAD
+def _historical_ancestry() -> str:
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "migrations"))
+    scripts = ScriptDirectory.from_config(config)
+    assert scripts.get_heads() == [CURRENT_HEAD], "migration fixture requires the reviewed head"
+    assert {
+        revision: scripts.get_revision(revision).down_revision
+        for revision in (MIGRATION_UNDER_TEST, HISTORICAL_HEAD, CURRENT_HEAD)
+    } == {MIGRATION_UNDER_TEST: "033", HISTORICAL_HEAD: MIGRATION_UNDER_TEST, CURRENT_HEAD: "035"}
+    return HISTORICAL_HEAD
 
 
 def _run_alembic(database_url: str, operation: str, revision: str) -> None:
@@ -130,6 +135,14 @@ async def migration_case(phase2_migration_database):
     await _clear_migration_data(migration_engine)
     await _migration_version(migration_engine, "028")
     yield migration_engine, database_url
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def legacy_restore_migration_database():
+    from tests.e2e import test_manual_cop_postgresql as owned_sql
+
+    async with owned_sql.owned_migration_child("restore") as child:
+        yield child
 
 
 def _plan(now: dt.datetime, version: str, status: str = "active") -> PlanRecord:
@@ -1828,24 +1841,18 @@ class TestS1OwnedAttempts:
     @pytest.mark.asyncio(loop_scope="session")
     @pytest.mark.parametrize("unresolved_status", ["pending", "executing", "dispatched"])
     async def test_migration_034_roundtrip_preserves_legacy_rows_and_sequences(
-        self, phase2_migration_database, unresolved_status
+        self, legacy_restore_migration_database, unresolved_status
     ):
-        from tests.e2e import test_manual_cop_postgresql as owned_sql
+        # Every parameterization owns a new child database and never reaches forward-only 036.
+        from tests.e2e.test_manual_cop_postgresql import GuardedChildEngine
 
-        database_engine, database_url = phase2_migration_database
-        owned_sql.owned_test_environment()
-        url = make_url(database_url)
-        assert url.database.startswith("phase2_e2e_")
-        assert url.set(database="heatpump_test") == make_url(owned_sql.TEST_DATABASE_URL)
-        head = _current_head(database_url)
-        version = await _migration_version(database_engine)
-        await _clear_migration_data(database_engine)
-        if version == "028":
-            await asyncio.to_thread(_run_alembic, database_url, "upgrade", "033")
-        else:
-            # Reused session database: earlier cases restore the current head.
-            assert version in {MIGRATION_UNDER_TEST, head}
-            await asyncio.to_thread(_run_alembic, database_url, "downgrade", "033")
+        child = legacy_restore_migration_database
+        # Every child mutation below, including _migration_sql, runs through the guard that
+        # re-proves the original parent receipt/services and the child OID per connection.
+        database_engine = child.engine
+        assert isinstance(database_engine, GuardedChildEngine)
+        head = _historical_ancestry()
+        await child.alembic("upgrade", "033")
         await _migration_version(database_engine, "033")
 
         async def rows():
@@ -1935,7 +1942,7 @@ class TestS1OwnedAttempts:
         )
         before_upgrade = await rows()
         sequence_before = await sequences()
-        await asyncio.to_thread(_run_alembic, database_url, "upgrade", MIGRATION_UNDER_TEST)
+        await child.alembic("upgrade", MIGRATION_UNDER_TEST)
         await _migration_version(database_engine, MIGRATION_UNDER_TEST)
         before = await rows()
         assert {
@@ -1949,64 +1956,61 @@ class TestS1OwnedAttempts:
         assert len(before["actions"]) == 2 and len(before["plans"]) == 1
         assert all(row["safety_claim_token"] is None for row in before["actions"])
         assert before["actions"][1]["reverts_action_id"] == source_id
-        try:
-            with pytest.raises(RuntimeError, match="unresolved safety obligations"):
-                await asyncio.to_thread(_run_alembic, database_url, "downgrade", "033")
-            await _migration_version(database_engine, MIGRATION_UNDER_TEST)
+        with pytest.raises(RuntimeError, match="unresolved safety obligations"):
+            await child.alembic("downgrade", "033")
+        await _migration_version(database_engine, MIGRATION_UNDER_TEST)
+        assert await rows() == before
+        assert await sequences() == sequence_before
+        await _migration_sql(
+            database_engine,
+            "UPDATE plan_actions SET status='executed' WHERE id=:id",
+            {"id": restore_id},
+        )
+        before = await rows()
+        legacy = {
+            **before,
+            "actions": [
+                {key: value for key, value in row.items() if key != "safety_claim_token"}
+                for row in before["actions"]
+            ],
+        }
+        await child.alembic("downgrade", "033")
+        await _migration_version(database_engine, "033")
+        assert await rows() == legacy
+        assert await sequences() == sequence_before
+        for target in (MIGRATION_UNDER_TEST, head):
+            await child.alembic("upgrade", target)
+            await _migration_version(database_engine, target)
             assert await rows() == before
-            assert await sequences() == sequence_before
-            await _migration_sql(
-                database_engine,
-                "UPDATE plan_actions SET status='executed' WHERE id=:id",
-                {"id": restore_id},
-            )
-            before = await rows()
-            legacy = {
-                **before,
-                "actions": [
-                    {key: value for key, value in row.items() if key != "safety_claim_token"}
-                    for row in before["actions"]
-                ],
-            }
-            await asyncio.to_thread(_run_alembic, database_url, "downgrade", "033")
-            await _migration_version(database_engine, "033")
-            assert await rows() == legacy
-            assert await sequences() == sequence_before
-            await asyncio.to_thread(_run_alembic, database_url, "upgrade", "head")
-            await _migration_version(database_engine, head)
-            assert await rows() == before
-            assert await sequences() == sequence_before
-            async with database_engine.connect() as connection:
-                column = (
-                    await connection.execute(
-                        text(
-                            "SELECT udt_name,is_nullable,column_default "
-                            "FROM information_schema.columns WHERE table_schema='public' "
-                            "AND table_name='plan_actions' AND column_name='safety_claim_token'"
-                        )
+        assert await sequences() == sequence_before
+        async with database_engine.connect() as connection:
+            column = (
+                await connection.execute(
+                    text(
+                        "SELECT udt_name,is_nullable,column_default "
+                        "FROM information_schema.columns WHERE table_schema='public' "
+                        "AND table_name='plan_actions' AND column_name='safety_claim_token'"
                     )
-                ).one()
-                assert tuple(column) == ("uuid", "YES", None)
-                provenance = (
-                    await connection.execute(
-                        text(
-                            "SELECT table_name,column_name,is_nullable "
-                            "FROM information_schema.columns WHERE table_schema='public' "
-                            "AND (table_name,column_name) IN (('consumption','source_timezone'),"
-                            "('weather','units_schema'),('prices','interval_schema')) "
-                            "ORDER BY table_name"
-                        )
+                )
+            ).one()
+            assert tuple(column) == ("uuid", "YES", None)
+            provenance = (
+                await connection.execute(
+                    text(
+                        "SELECT table_name,column_name,is_nullable "
+                        "FROM information_schema.columns WHERE table_schema='public' "
+                        "AND (table_name,column_name) IN (('consumption','source_timezone'),"
+                        "('weather','units_schema'),('prices','interval_schema')) "
+                        "ORDER BY table_name"
                     )
-                ).all()
-                assert [tuple(row) for row in provenance] == [
-                    ("consumption", "source_timezone", "YES"),
-                    ("prices", "interval_schema", "YES"),
-                    ("weather", "units_schema", "YES"),
-                ]
-            await asyncio.to_thread(command.check, _alembic_config(database_url))
-        finally:
-            await asyncio.to_thread(_run_alembic, database_url, "upgrade", "head")
-            await _clear_migration_data(database_engine)
+                )
+            ).all()
+            assert [tuple(row) for row in provenance] == [
+                ("consumption", "source_timezone", "YES"),
+                ("prices", "interval_schema", "YES"),
+                ("weather", "units_schema", "YES"),
+            ]
+        await _migration_version(database_engine, HISTORICAL_HEAD)
 
 
 class TestPhase2MigrationAcceptance:

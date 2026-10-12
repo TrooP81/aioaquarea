@@ -15,14 +15,16 @@ import importlib.metadata
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import uuid
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -38,10 +40,15 @@ from packaging.utils import canonicalize_name
 from sqlalchemy import MetaData, event, insert, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from packages.core.cop_monitoring import local_instants, period_bounds
+from packages.core.cop_monitoring import (
+    InvalidStoredPeriod,
+    local_instants,
+    period_bounds,
+    snapshot_from_stored,
+)
 from packages.core.models import (
     COPRecord,
     ConsumptionRecord,
@@ -140,13 +147,55 @@ def migration_targets():
     return head, predecessor
 
 
+LEGACY_MANUAL_REVISIONS = ("032", "033", "034", "035")
+LOCAL_PERIOD_REVISION = "036"
+HISTORICAL_HEAD = LEGACY_MANUAL_REVISIONS[-1]
+LEGACY_BOUNDARY_COLUMNS = ("period_start", "period_end")
+LEGACY_CALENDAR_CONSTRAINTS = ("ck_manual_cop_calendar", "ck_manual_cop_period_order")
+LOCAL_PERIOD_CONSTRAINTS = {
+    "ck_manual_cop_observed_at": "CHECK ((observed_at <= CURRENT_TIMESTAMP))",
+    "ck_manual_cop_completeness": (
+        "CHECK (((completeness)::text = ANY ((ARRAY['partial'::character varying, "
+        "'closed'::character varying, 'unknown'::character varying])::text[])))"
+    ),
+}
+HELPER_SIGNATURE = "public.manual_cop_calendar_midnight(timestamp,text)"
+
+
 async def retained_storage_state(connection):
+    # The marker decides the expected physical shape; rows are read from the actual
+    # table columns so historical (032-035) and local-period (036) states compare exactly.
+    marker = tuple(
+        (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalars().all()
+    )
+    assert len(marker) == 1, "retained storage requires exactly one Alembic marker"
+    revision = marker[0]
+    assert revision in (*LEGACY_MANUAL_REVISIONS, LOCAL_PERIOD_REVISION), (
+        "unknown manual ledger revision"
+    )
+    helper_oid = (
+        await connection.execute(text(f"SELECT to_regprocedure('{HELPER_SIGNATURE}')::oid"))
+    ).scalar_one()
+    if revision == LOCAL_PERIOD_REVISION:
+        assert helper_oid is None, "036 must not retain the SQL calendar helper"
+        helper = None
+    else:
+        assert helper_oid is not None, "historical manual ledger requires the calendar helper"
+        helper = (
+            await connection.execute(
+                text(
+                    "SELECT pg_get_functiondef(oid),prosrc,proacl,pg_get_userbyid(proowner) "
+                    f"FROM pg_proc WHERE oid='{HELPER_SIGNATURE}'::regprocedure"
+                )
+            )
+        ).one()
     state = {
         "rows": tuple(
             (
                 await connection.execute(
-                    select(ManualCOPObservationRecord.__table__).order_by(
-                        *ManualCOPObservationRecord.__table__.primary_key.columns
+                    text(
+                        "SELECT * FROM public.manual_cop_observations "
+                        "ORDER BY device_id, granularity, period_date"
                     )
                 )
             ).all()
@@ -165,24 +214,8 @@ async def retained_storage_state(connection):
                 )
             )
         ).one(),
-        "helper": (
-            await connection.execute(
-                text(
-                    "SELECT pg_get_functiondef(oid),prosrc,proacl,pg_get_userbyid(proowner) "
-                    "FROM pg_proc WHERE oid="
-                    "'public.manual_cop_calendar_midnight(timestamp,text)'::regprocedure"
-                )
-            )
-        ).one(),
-        "marker": tuple(
-            (
-                await connection.execute(
-                    text("SELECT version_num FROM alembic_version ORDER BY version_num")
-                )
-            )
-            .scalars()
-            .all()
-        ),
+        "helper": helper,
+        "marker": marker,
     }
     assert state["sequence_configuration"].cycle is False
     queries = {
@@ -213,6 +246,18 @@ async def retained_storage_state(connection):
     }
     for key, query in queries.items():
         state[key] = tuple((await connection.execute(text(query))).all())
+    columns = {row[0] for row in state["columns"]}
+    constraints = dict(state["constraints"])
+    if revision == LOCAL_PERIOD_REVISION:
+        assert columns.isdisjoint(LEGACY_BOUNDARY_COLUMNS), "036 must not store boundaries"
+        assert set(constraints).isdisjoint(LEGACY_CALENDAR_CONSTRAINTS), "036 SQL calendar"
+        for name, definition in LOCAL_PERIOD_CONSTRAINTS.items():
+            assert constraints.get(name) == definition, f"036 replacement {name} mismatch"
+    else:
+        assert columns.issuperset(LEGACY_BOUNDARY_COLUMNS), "historical boundaries missing"
+        assert set(constraints).issuperset(LEGACY_CALENDAR_CONSTRAINTS), "historical checks"
+        for name in LOCAL_PERIOD_CONSTRAINTS:
+            assert "period_" in constraints.get(name, ""), f"historical {name} mismatch"
     return state
 
 
@@ -483,7 +528,29 @@ def verification_source_binding():
         "heatpump-optimizer/README.md",
         "heatpump-optimizer/migrations/versions/032_manual_cop_observations.py",
         "heatpump-optimizer/tests/conftest.py",
+        "heatpump-optimizer/migrations/versions/036_manual_cop_local_periods.py",
+        "heatpump-optimizer/packages/core/models/__init__.py",
+        "heatpump-optimizer/packages/core/cop_monitoring.py",
+        "heatpump-optimizer/packages/api/routers/feeds.py",
+        "heatpump-optimizer/packages/api/schemas.py",
+        "heatpump-optimizer/packages/api/routers/admin.py",
+        "heatpump-optimizer/packages/core/version.py",
+        "heatpump-optimizer/web/components/ManualCOPMonitoring.tsx",
+        "heatpump-optimizer/web/components/ResetDataCard.tsx",
+        "heatpump-optimizer/tests/test_ml.py",
+        "heatpump-optimizer/tests/test_admin.py",
+        "heatpump-optimizer/tests/test_manual_cop_api_contracts.py",
+        "heatpump-optimizer/tests/test_app_version.py",
+        "heatpump-optimizer/tests/e2e/test_ml_lifecycle_postgresql.py",
+        "heatpump-optimizer/tests/e2e/test_phase2_safety_reverts.py",
+        "heatpump-optimizer/web/e2e/manual-cop-monitoring.spec.ts",
+        "heatpump-optimizer/web/e2e/reset-data.spec.ts",
+        "heatpump-optimizer/docs/configuration-reference.md",
+        "heatpump-optimizer/docs/manual-cop-schema-reset-runbook.md",
+        "heatpump-optimizer/tests/test_optimizer_api_contracts.py",
+        "heatpump-optimizer/web/e2e/fixtures.ts",
     )
+    assert len(paths) == len(set(paths)) == 28, "verification source binding must list 28 files"
     return {path: hashlib.sha256((checkout / path).read_bytes()).hexdigest() for path in paths}
 
 
@@ -830,11 +897,26 @@ def seal_verification_evidence():
 
 
 class TestOwnedResourceGuard:
+    @pytest.fixture(autouse=True)
+    def owned_temp_parents(self):
+        self.temp_parents = []
+        yield
+        for parent in self.temp_parents:
+            shutil.rmtree(parent)
+
     def environment(self, tmp_path, provider):
         now = dt.datetime.now(dt.timezone.utc)
         lease = uuid.uuid4().hex
         token = "cop-manual-mon-123-2" if provider == "github" else "cop-manual-mon-" + lease
-        root = tmp_path / token
+        if provider == "temp":
+            # The TEMP provider is only valid below the real temporary directory, never
+            # below pytest's basetemp (which CI places under RUNNER_TEMP).
+            system_temp = Path(tempfile.gettempdir()).resolve(strict=True)
+            parent = Path(tempfile.mkdtemp(prefix="cop-manual-guard-", dir=system_temp))
+            self.temp_parents.append(parent)
+        else:
+            parent = tmp_path
+        root = parent / token
         root.mkdir()
         (root / "models").mkdir()
         (root / "evidence").mkdir()
@@ -960,6 +1042,127 @@ class TestOwnedResourceGuard:
         )
 
     @pytest.mark.parametrize("provider", ["github", "temp"])
+    @pytest.mark.parametrize(
+        "replace",
+        [
+            ("services", "postgres", "id"),
+            ("services", "redis", "id"),
+            ("namespace", "id"),
+            ("namespace", "name"),
+            ("namespace", "created_at"),
+            ("lease_id",),
+            ("revision",),
+            ("expires_at",),
+        ],
+    )
+    async def test_migration_child_binding_covers_original_parent_identity(
+        self, tmp_path, provider, replace
+    ):
+        _, receipt, _ = self.environment(tmp_path, provider)
+        original = _migration_child_parent_identity(receipt)
+        assert original == _migration_child_parent_identity(copy.deepcopy(receipt))
+        changed = copy.deepcopy(receipt)
+        target = changed
+        for key in replace[:-1]:
+            target = target[key]
+        target[replace[-1]] = "f" * 64 if replace[-1] == "id" else "replaced-" + replace[-1]
+        assert _migration_child_parent_identity(changed) != original
+
+    def child_engine_fake(self, identity):
+        calls = []
+
+        class Transaction:
+            async def __aenter__(self):
+                calls.append("begin")
+
+            async def __aexit__(self, kind, error, traceback):
+                calls.append("rollback" if kind else "commit")
+                return False
+
+        class Connection:
+            async def execute(self, statement, parameters=None):
+                calls.append(str(statement))
+                return SimpleNamespace(one=lambda: identity)
+
+            async def rollback(self):
+                calls.append("identity-rollback")
+
+            def begin(self):
+                return Transaction()
+
+        @asynccontextmanager
+        async def connect():
+            calls.append("connect")
+            try:
+                yield Connection()
+            finally:
+                calls.append("close")
+
+        return SimpleNamespace(connect=connect), calls
+
+    @pytest.mark.parametrize("provider", ["github", "temp"])
+    @pytest.mark.parametrize(
+        "change", ["none", "parent_service", "parent_namespace", "parent_receipt", "child_oid"]
+    )
+    async def test_guarded_child_engine_refuses_mutation_after_identity_change(
+        self, tmp_path, provider, change, monkeypatch
+    ):
+        _, receipt, _ = self.environment(tmp_path, provider)
+        record = {
+            "database": "cop_manual_migration_forward_child",
+            "oid": 41,
+            "binding": "{}",
+            "parent": _migration_child_parent_identity(receipt),
+        }
+        expected = (record["database"], "heatpump", 5432, 41, "{}")
+        current = copy.deepcopy(receipt)
+        identity = expected
+        if change == "parent_service":
+            current["services"]["postgres"]["id"] = "f" * 64
+        elif change == "parent_namespace":
+            current["namespace"]["id"] = "e" * 64
+        elif change == "parent_receipt":
+            current["expires_at"] = "2099-01-01T00:00:00+00:00"
+        elif change == "child_oid":
+            identity = (*expected[:3], 42, expected[4])
+        monkeypatch.setitem(globals(), "owned_test_environment", lambda: current)
+        engine, calls = self.child_engine_fake(identity)
+        guarded = GuardedChildEngine(engine, record, expected)
+        mutation = "UPDATE settings SET value = 'mutated'"
+        if change == "none":
+            async with guarded.begin() as connection:
+                await connection.execute(text(mutation))
+            assert calls == [
+                "connect",
+                MIGRATION_CHILD_IDENTITY_SQL,
+                "identity-rollback",
+                "begin",
+                mutation,
+                "commit",
+                "close",
+            ]
+            return
+        message = "child identity mismatch" if change == "child_oid" else "parent identity changed"
+        for surface in (guarded.begin, guarded.connect):
+            with pytest.raises(AssertionError, match=message):
+                async with surface() as connection:
+                    await connection.execute(text(mutation))
+        assert mutation not in calls and "begin" not in calls and "commit" not in calls
+        if change == "child_oid":
+            assert (
+                calls
+                == [
+                    "connect",
+                    MIGRATION_CHILD_IDENTITY_SQL,
+                    "identity-rollback",
+                    "close",
+                ]
+                * 2
+            )
+        else:
+            assert calls == []
+
+    @pytest.mark.parametrize("provider", ["github", "temp"])
     async def test_owned_resource_receipt_is_accepted(self, tmp_path, provider):
         environment, receipt, actual = self.environment(tmp_path, provider)
         self.bind(environment, receipt)
@@ -1081,7 +1284,7 @@ class TestOwnedResourceGuard:
             )
         )
         mutation = AsyncMock()
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError) as refused:
             await guard_owned_database(
                 connection,
                 require_empty=True,
@@ -1090,6 +1293,8 @@ class TestOwnedResourceGuard:
             )
             await mutation()
         mutation.assert_not_awaited()
+        if case == "published_temp_port":
+            assert "TEMP service must not publish ports" in str(refused.value)
         for call in connection.execute.await_args_list:
             statement = str(call.args[0]).upper()
             assert statement.startswith("SELECT ")
@@ -1150,6 +1355,7 @@ async def calendar_database(request):
     owned_test_environment()
     url = make_url(os.environ["DATABASE_URL"])
     head, _ = migration_targets()
+    assert head == LOCAL_PERIOD_REVISION
     engine = create_async_engine(url, poolclass=NullPool, echo=False)
     try:
         async with engine.connect() as connection:
@@ -1162,11 +1368,6 @@ async def calendar_database(request):
                 await connection.execute(text("SET LOCAL TIME ZONE 'Asia/Tokyo'"))
                 table_name = "manual_cop_observations"
                 if request.param == "metadata":
-                    helper_query = text(
-                        "SELECT prosrc FROM pg_proc WHERE oid = "
-                        "'public.manual_cop_calendar_midnight(timestamp,text)'::regprocedure"
-                    )
-                    migration_helper = (await connection.execute(helper_query)).scalar_one()
                     table_name = "manual_cop_orm_" + uuid.uuid4().hex
                     table = ManualCOPObservationRecord.__table__.to_metadata(
                         MetaData(), name=table_name
@@ -1189,13 +1390,12 @@ async def calendar_database(request):
                         event.remove(
                             connection.sync_connection, "before_cursor_execute", capture_statement
                         )
-                    assert any(
-                        "CREATE OR REPLACE FUNCTION public.manual_cop_calendar_midnight"
-                        in statement
-                        for statement in statements
+                    assert not any("FUNCTION" in statement.upper() for statement in statements)
+                assert (
+                    await connection.execute(
+                        text(f"SELECT to_regprocedure('{HELPER_SIGNATURE}')::oid")
                     )
-                    metadata_helper = (await connection.execute(helper_query)).scalar_one()
-                    assert migration_helper.split() == metadata_helper.split()
+                ).scalar_one() is None
                 yield connection, table_name
             finally:
                 await transaction.rollback()
@@ -1204,14 +1404,12 @@ async def calendar_database(request):
 
 
 def observation_values(granularity, period_date, timezone):
-    start, end = period_bounds(granularity, period_date, timezone)
+    _, end = period_bounds(granularity, period_date, timezone)
     return {
         "device_id": "calendar-" + uuid.uuid4().hex,
         "granularity": granularity,
         "period_date": period_date,
         "timezone": timezone,
-        "period_start": start,
-        "period_end": end,
         "value": 9.7,
         "observed_at": end + dt.timedelta(days=2),
         "completeness": "closed",
@@ -1223,58 +1421,111 @@ async def insert_observation(connection, table_name, values):
     await connection.execute(
         text(
             f"INSERT INTO {identifier} "
-            "(device_id, granularity, period_date, timezone, period_start, "
-            "period_end, value, observed_at, completeness) VALUES "
-            "(:device_id, :granularity, :period_date, :timezone, :period_start, "
-            ":period_end, :value, :observed_at, :completeness)"
+            "(device_id, granularity, period_date, timezone, value, observed_at, completeness) "
+            "VALUES (:device_id, :granularity, :period_date, :timezone, :value, "
+            ":observed_at, :completeness)"
         ),
         values,
     )
 
 
-async def canonical_midnight(connection, local_midnight, timezone):
+async def insert_legacy_observation(connection, values):
+    # Genuine 032-035 schemas still persist the derived boundaries.
+    start, end = period_bounds(values["granularity"], values["period_date"], values["timezone"])
+    await connection.execute(
+        text(
+            "INSERT INTO public.manual_cop_observations (device_id, granularity, period_date, "
+            "timezone, period_start, period_end, value, observed_at, completeness) VALUES "
+            "(:device_id, :granularity, :period_date, :timezone, :period_start, :period_end, "
+            ":value, :observed_at, :completeness)"
+        ),
+        values | {"period_start": start, "period_end": end},
+    )
+
+
+async def stored_observation(connection, table_name, device_id):
+    identifier = connection.dialect.identifier_preparer.quote(table_name)
     return (
         await connection.execute(
-            text("SELECT public.manual_cop_calendar_midnight(:local_midnight, :timezone)"),
-            {"local_midnight": local_midnight, "timezone": timezone},
+            text(f"SELECT * FROM {identifier} WHERE device_id=:device_id"),
+            {"device_id": device_id},
         )
-    ).scalar_one()
+    ).one()
+
+
+CURRENT_COLUMNS_SQL = (
+    "SELECT a.attname FROM pg_attribute a WHERE a.attrelid=CAST(:table AS regclass) "
+    "AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"
+)
+CHECK_CONSTRAINTS_SQL = (
+    "SELECT conname,pg_get_constraintdef(oid) FROM pg_constraint "
+    "WHERE conrelid=CAST(:table AS regclass) AND contype='c'"
+)
 
 
 class TestManualCOPPostgreSQLCalendar:
-    @pytest.mark.parametrize(
-        ("period_date", "boundary"),
-        [
-            (dt.date(2025, 11, 2), "period_start"),
-            (dt.date(2025, 11, 1), "period_end"),
-        ],
-    )
-    async def test_sql_rejects_later_ambiguous_midnight(
-        self, calendar_database, period_date, boundary
+    async def test_catalog_queries_bind_table_through_regclass_cast(self):
+        from sqlalchemy.dialects import postgresql
+
+        for statement in (CURRENT_COLUMNS_SQL, CHECK_CONSTRAINTS_SQL):
+            assert "::regclass" not in statement
+            clause = text(statement)
+            assert set(clause._bindparams) == {"table"}
+            compiled = clause.bindparams(table="public.synthetic").compile(
+                dialect=postgresql.asyncpg.dialect()
+            )
+            assert compiled.params == {"table": "public.synthetic"}
+            rendered = str(compiled)
+            assert "CAST($1" in rendered and "AS regclass)" in rendered
+            assert ":table" not in rendered
+
+    async def test_current_schema_stores_local_identity_without_sql_calendar(
+        self, calendar_database
     ):
         connection, table_name = calendar_database
-        timezone = "America/Havana"
-        start, end = period_bounds("day", period_date, timezone)
-        values = {
-            "device_id": "ambiguous-" + uuid.uuid4().hex,
-            "granularity": "day",
-            "period_date": period_date,
-            "timezone": timezone,
-            "period_start": start,
-            "period_end": end,
-            "value": 9.7,
-            "observed_at": end + dt.timedelta(hours=1),
-            "completeness": "closed",
+        columns = (
+            (
+                await connection.execute(
+                    text(CURRENT_COLUMNS_SQL),
+                    {"table": "public." + table_name},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert columns == [
+            "device_id",
+            "granularity",
+            "period_date",
+            "timezone",
+            "value",
+            "observed_at",
+            "completeness",
+            "created_at",
+            "updated_at",
+            "revision",
+        ]
+        constraints = dict(
+            (
+                await connection.execute(
+                    text(CHECK_CONSTRAINTS_SQL),
+                    {"table": "public." + table_name},
+                )
+            ).all()
+        )
+        assert set(constraints) == {
+            "ck_manual_cop_granularity",
+            "ck_manual_cop_month_start",
+            "ck_manual_cop_timezone",
+            "ck_manual_cop_value",
+            "ck_manual_cop_revision",
+            "ck_manual_cop_observed_at",
+            "ck_manual_cop_completeness",
+            "ck_manual_cop_server_times",
         }
-        assert values[boundary].astimezone(ZoneInfo(timezone)).fold == 0
-        values[boundary] += dt.timedelta(hours=1)
-        later_midnight = values[boundary].astimezone(ZoneInfo(timezone))
-        assert later_midnight.fold == 1
-        assert later_midnight.time() == dt.time()
-        with pytest.raises(IntegrityError, match="ck_manual_cop_calendar") as rejected:
-            async with connection.begin_nested():
-                await insert_observation(connection, table_name, values)
-        assert rejected.value.orig.sqlstate == "23514"
+        for name, definition in LOCAL_PERIOD_CONSTRAINTS.items():
+            assert constraints[name] == definition
+        assert "manual_cop_calendar_midnight" not in " ".join(constraints.values())
 
     @pytest.mark.parametrize(
         ("granularity", "period_date", "timezone"),
@@ -1298,48 +1549,31 @@ class TestManualCOPPostgreSQLCalendar:
             ("day", dt.date(2020, 10, 3), "US/Eastern"),
         ],
     )
-    async def test_sql_accepts_only_canonical_start_and_end(
+    async def test_application_derives_earliest_local_midnights_from_stored_identity(
         self, calendar_database, granularity, period_date, timezone
     ):
         connection, table_name = calendar_database
         values = observation_values(granularity, period_date, timezone)
+        start, end = period_bounds(granularity, period_date, timezone)
         zone = ZoneInfo(timezone)
         expected_hours = {
             ("day", dt.date(1969, 9, 30), "Pacific/Kwajalein"): 47,
             ("day", dt.date(1892, 7, 4), "Pacific/Apia"): 48,
         }.get((granularity, period_date, timezone))
         if expected_hours is not None:
-            assert (values["period_end"] - values["period_start"]).total_seconds() == (
-                expected_hours * 3600
-            )
-        for boundary in ("period_start", "period_end"):
-            local_midnight = values[boundary].astimezone(zone).replace(tzinfo=None)
-            assert (
-                await canonical_midnight(connection, local_midnight, timezone) == values[boundary]
-            )
-            instants = local_instants(local_midnight, zone)
-            assert instants[0] == values[boundary]
-            if len(instants) == 2:
-                invalid = values | {
-                    "device_id": "later-" + uuid.uuid4().hex,
-                    boundary: instants[1],
-                }
-                with pytest.raises(IntegrityError, match="ck_manual_cop_calendar") as rejected:
-                    async with connection.begin_nested():
-                        await insert_observation(connection, table_name, invalid)
-                assert rejected.value.orig.sqlstate == "23514"
+            assert (end - start).total_seconds() == expected_hours * 3600
+        for boundary in (start, end):
+            local_midnight = boundary.astimezone(zone).replace(tzinfo=None)
+            assert local_midnight.time() == dt.time()
+            assert local_instants(local_midnight, zone)[0] == boundary
         async with connection.begin_nested():
             await insert_observation(connection, table_name, values)
-        identifier = connection.dialect.identifier_preparer.quote(table_name)
-        stored = (
-            await connection.execute(
-                text(
-                    f"SELECT period_start, period_end FROM {identifier} WHERE device_id=:device_id"
-                ),
-                {"device_id": values["device_id"]},
-            )
-        ).one()
-        assert stored == (values["period_start"], values["period_end"])
+        stored = await stored_observation(connection, table_name, values["device_id"])
+        assert stored.observed_at == values["observed_at"]
+        snapshot = snapshot_from_stored(stored)
+        assert (snapshot.period_start, snapshot.period_end) == (start, end)
+        assert snapshot.observed_at == values["observed_at"]
+        assert snapshot.period_date == period_date and snapshot.timezone == timezone
 
     @pytest.mark.parametrize(
         ("granularity", "period_date", "timezone"),
@@ -1353,48 +1587,26 @@ class TestManualCOPPostgreSQLCalendar:
             ("day", dt.date(1993, 8, 20), "Pacific/Kwajalein"),
         ],
     )
-    async def test_sql_rejects_nonexistent_start_or_end(
+    async def test_nonexistent_midnight_rows_are_refused_by_the_application(
         self, calendar_database, granularity, period_date, timezone
     ):
         connection, table_name = calendar_database
-        zone = ZoneInfo(timezone)
-        end_date = (
-            period_date + dt.timedelta(days=1)
-            if granularity == "day"
-            else dt.date(period_date.year, period_date.month + 1, 1)
-        )
-        local_boundaries = [
-            dt.datetime.combine(boundary, dt.time()) for boundary in (period_date, end_date)
-        ]
-        assert any(not local_instants(boundary, zone) for boundary in local_boundaries)
-        for local_midnight in local_boundaries:
-            instants = local_instants(local_midnight, zone)
-            assert await canonical_midnight(connection, local_midnight, timezone) == (
-                instants[0] if instants else None
-            )
         with pytest.raises(ValueError, match="nonexistent local midnight"):
             period_bounds(granularity, period_date, timezone)
-        start, end = [
-            boundary.replace(tzinfo=zone, fold=0).astimezone(dt.timezone.utc)
-            for boundary in local_boundaries
-        ]
-        if start >= end:
-            start = end - dt.timedelta(days=1)
         values = {
             "device_id": "nonexistent-" + uuid.uuid4().hex,
             "granularity": granularity,
             "period_date": period_date,
             "timezone": timezone,
-            "period_start": start,
-            "period_end": end,
             "value": 9.7,
-            "observed_at": end + dt.timedelta(days=2),
+            "observed_at": dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
             "completeness": "closed",
         }
-        with pytest.raises(IntegrityError, match="ck_manual_cop_calendar") as rejected:
-            async with connection.begin_nested():
-                await insert_observation(connection, table_name, values)
-        assert rejected.value.orig.sqlstate == "23514"
+        async with connection.begin_nested():
+            await insert_observation(connection, table_name, values)
+        stored = await stored_observation(connection, table_name, values["device_id"])
+        with pytest.raises(InvalidStoredPeriod, match="^invalid_stored_period$"):
+            snapshot_from_stored(stored)
 
     @pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), -float("inf")])
     async def test_sql_rejects_nonpositive_and_nonfinite_values(self, calendar_database, value):
@@ -1405,95 +1617,60 @@ class TestManualCOPPostgreSQLCalendar:
                 await insert_observation(connection, table_name, values)
         assert rejected.value.orig.sqlstate == "23514"
 
-    async def test_sql_rejects_invalid_timezone(self, calendar_database):
+    @pytest.mark.parametrize(
+        ("changes", "constraint"),
+        [
+            ({"timezone": ""}, "ck_manual_cop_timezone"),
+            ({"completeness": "total"}, "ck_manual_cop_completeness"),
+            (
+                {"observed_at": dt.datetime(2999, 1, 1, tzinfo=dt.timezone.utc)},
+                "ck_manual_cop_observed_at",
+            ),
+            ({"granularity": "month", "period_date": dt.date(2020, 10, 3)}, "month_start"),
+        ],
+    )
+    async def test_sql_retains_calendar_independent_checks(
+        self, calendar_database, changes, constraint
+    ):
         connection, table_name = calendar_database
-        values = observation_values("day", dt.date(2020, 10, 3), "UTC") | {
-            "timezone": "Invalid/Manual"
-        }
-        with pytest.raises(DBAPIError, match='time zone "Invalid/Manual" not recognized'):
+        values = observation_values("day", dt.date(2020, 10, 3), "UTC") | changes
+        with pytest.raises(IntegrityError, match=constraint) as rejected:
             async with connection.begin_nested():
                 await insert_observation(connection, table_name, values)
+        assert rejected.value.orig.sqlstate == "23514"
 
     @pytest.mark.parametrize(
-        "timezone", ["UTC+03", "europe/stockholm", "europe/Stockholm", "us/Eastern"]
+        "timezone",
+        [
+            "Invalid/Manual",
+            "UTC+03",
+            "europe/stockholm",
+            "europe/Stockholm",
+            "us/Eastern",
+            "utc",
+            "US/eastern",
+        ],
     )
-    async def test_sql_rejects_postgresql_timezone_strings_unloadable_by_zoneinfo(
+    async def test_unsupported_timezone_strings_are_refused_by_application_authority(
         self, calendar_database, timezone
     ):
-        from zoneinfo import ZoneInfoNotFoundError
-
         connection, table_name = calendar_database
-        period = dt.date(2020, 10, 3)
-        with pytest.raises(ZoneInfoNotFoundError):
-            ZoneInfo(timezone)
         with pytest.raises(ValueError, match="Invalid timezone"):
-            period_bounds("day", period, timezone)
-        local_start = dt.datetime.combine(period, dt.time())
-        local_end = local_start + dt.timedelta(days=1)
-        start, end = (
-            await connection.execute(
-                text(
-                    "SELECT :local_start AT TIME ZONE :timezone, :local_end AT TIME ZONE :timezone"
-                ),
-                {"local_start": local_start, "local_end": local_end, "timezone": timezone},
-            )
-        ).one()
-        assert start < end
+            period_bounds("day", dt.date(2020, 10, 3), timezone)
         values = {
             "device_id": "non-iana-" + uuid.uuid4().hex,
             "granularity": "day",
-            "period_date": period,
+            "period_date": dt.date(2020, 10, 3),
             "timezone": timezone,
-            "period_start": start,
-            "period_end": end,
             "value": 9.7,
-            "observed_at": end + dt.timedelta(days=1),
+            "observed_at": dt.datetime(2020, 10, 5, tzinfo=dt.timezone.utc),
             "completeness": "closed",
         }
-        with pytest.raises(IntegrityError) as rejected:
-            async with connection.begin_nested():
-                await insert_observation(connection, table_name, values)
-        assert rejected.value.orig.sqlstate == "23514"
-
-    @pytest.mark.parametrize("timezone", ["utc", "US/eastern"])
-    async def test_sql_rejects_non_catalog_case_spellings(self, calendar_database, timezone):
-        connection, table_name = calendar_database
-        assert (
-            await connection.execute(
-                text(
-                    'SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name COLLATE "C" = :timezone COLLATE "C")'
-                ),
-                {"timezone": timezone},
-            )
-        ).scalar_one() is False
-        period = dt.date(2020, 10, 3)
-        local_start = dt.datetime.combine(period, dt.time())
-        local_end = local_start + dt.timedelta(days=1)
-        start, end = (
-            await connection.execute(
-                text(
-                    "SELECT :local_start AT TIME ZONE :timezone, :local_end AT TIME ZONE :timezone"
-                ),
-                {"local_start": local_start, "local_end": local_end, "timezone": timezone},
-            )
-        ).one()
-        assert start < end
-        assert await canonical_midnight(connection, local_start, timezone) is None
-        values = {
-            "device_id": "non-catalog-" + uuid.uuid4().hex,
-            "granularity": "day",
-            "period_date": period,
-            "timezone": timezone,
-            "period_start": start,
-            "period_end": end,
-            "value": 9.7,
-            "observed_at": end + dt.timedelta(days=1),
-            "completeness": "closed",
-        }
-        with pytest.raises(IntegrityError, match="ck_manual_cop_calendar") as rejected:
-            async with connection.begin_nested():
-                await insert_observation(connection, table_name, values)
-        assert rejected.value.orig.sqlstate == "23514"
+        async with connection.begin_nested():
+            await insert_observation(connection, table_name, values)
+        stored = await stored_observation(connection, table_name, values["device_id"])
+        with pytest.raises(InvalidStoredPeriod, match="^invalid_stored_period$"):
+            snapshot_from_stored(stored)
 
     async def test_supported_catalog_keys_load_exactly_in_zoneinfo(self, calendar_database):
         connection, _ = calendar_database
@@ -1515,8 +1692,10 @@ class TestManualCOPPostgreSQLCalendar:
         for timezone in names:
             assert ZoneInfo(timezone).key == timezone
 
-    async def test_sql_rejects_catalog_pseudozones(self, calendar_database):
-        connection, table_name = calendar_database
+    async def test_catalog_pseudozones_are_refused_by_application_authority(
+        self, calendar_database
+    ):
+        connection, _ = calendar_database
         names = (
             (
                 await connection.execute(
@@ -1530,36 +1709,531 @@ class TestManualCOPPostgreSQLCalendar:
             .scalars()
             .all()
         )
-        period = dt.date(2020, 10, 3)
-        local_start = dt.datetime.combine(period, dt.time())
-        local_end = local_start + dt.timedelta(days=1)
         for timezone in names:
-            start, end = (
+            with pytest.raises(ValueError, match="Invalid timezone"):
+                period_bounds("day", dt.date(2020, 10, 3), timezone)
+
+
+MIGRATION_CHILD_PREFIX = "cop_manual_child_"
+# Exactly the nullable columns genuine 034 and 035 add on the forward route.
+FORWARD_ADDED_COLUMNS = {
+    "034": {"plan_actions": (("safety_claim_token", "uuid"),)},
+    "035": {
+        "consumption": (("source_timezone", "character varying(64)"),),
+        "prices": (("interval_schema", "character varying(64)"),),
+        "weather": (("units_schema", "character varying(64)"),),
+    },
+}
+
+
+MIGRATION_CHILD_IDENTITY_SQL = (
+    "SELECT current_database(), current_user, inet_server_port(), "
+    "d.oid::bigint, shobj_description(d.oid, 'pg_database') "
+    "FROM pg_database d WHERE d.datname = current_database()"
+)
+
+
+async def _migration_child_identity(connection):
+    return tuple((await connection.execute(text(MIGRATION_CHILD_IDENTITY_SQL))).one())
+
+
+async def _parent_relations(connection):
+    return tuple(
+        (
+            await connection.execute(
+                text(
+                    "SELECT c.relname, c.relkind::text FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' ORDER BY 1, 2"
+                )
+            )
+        ).all()
+    )
+
+
+def _migration_child_parent_identity(receipt):
+    """Parent ownership facts a child is bound to; any later difference refuses it."""
+    return {
+        "provider": receipt["provider"],
+        "lease": receipt.get("lease_id") or f"{receipt['run_id']}-{receipt['run_attempt']}",
+        "revision": receipt["revision"],
+        "token": receipt["token"],
+        "endpoints": receipt["endpoints"],
+        "namespace": receipt["namespace"],
+        "services": receipt["services"],
+        "receipt_sha256": hashlib.sha256(
+            json.dumps(receipt, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _require_original_parent(child):
+    current = _migration_child_parent_identity(owned_test_environment())
+    assert current == child["parent"], "migration child parent identity changed"
+
+
+class GuardedChildEngine:
+    """The only migration-child database surface handed to tests and fixtures.
+
+    Every connection first re-proves the originally approved parent receipt and
+    services, then proves on that same connection the child's name, user, port, OID
+    and binding before any caller SQL can run.
+    """
+
+    def __init__(self, engine, record, expected_identity):
+        self._engine = engine
+        self._record = record
+        self._expected = expected_identity
+
+    @property
+    def expected_identity(self):
+        return self._expected
+
+    def expecting(self, identity):
+        """Same child connection source bound to a different expected identity."""
+        return GuardedChildEngine(self._engine, self._record, identity)
+
+    @asynccontextmanager
+    async def connect(self):
+        _require_original_parent(self._record)
+        async with self._engine.connect() as connection:
+            identity = await _migration_child_identity(connection)
+            # End the identity read so callers can begin their own transaction.
+            await connection.rollback()
+            assert identity == self._expected, "migration child identity mismatch"
+            _require_original_parent(self._record)
+            yield connection
+
+    @asynccontextmanager
+    async def begin(self):
+        async with self.connect() as connection:
+            async with connection.begin():
+                yield connection
+
+
+async def _release_retained_blockers(workers, retained):
+    """Close resources retained for a child user only once every child user has settled."""
+    if all(worker.done() for worker in workers):
+        while retained:
+            await retained.pop().aclose()
+
+
+async def _drop_migration_child(parent, child, workers, parent_before):
+    try:
+        assert child["oid"] is not None, "migration child OID was not recorded"
+        assert all(worker.done() for worker in workers), "migration worker did not settle"
+        _require_original_parent(child)
+        async with parent.connect() as connection:
+            connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            await guard_owned_database(connection)
+            _require_original_parent(child)
+            for _attempt in range(100):
+                current = (
+                    await connection.execute(
+                        text(
+                            "SELECT d.oid::bigint, shobj_description(d.oid, 'pg_database'), "
+                            "(SELECT count(*) FROM pg_stat_activity a WHERE a.datid = d.oid) "
+                            "FROM pg_database d WHERE d.datname = :name"
+                        ),
+                        {"name": child["database"]},
+                    )
+                ).one_or_none()
+                assert current is not None, "migration child disappeared"
+                assert (current[0], current[1]) == (child["oid"], child["binding"]), (
+                    "migration child ownership uncertain"
+                )
+                if current[2] == 0:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise AssertionError("migration child still has sessions")
+            await connection.execute(text(f'DROP DATABASE "{child["database"]}"'))
+            assert await _parent_relations(connection) == parent_before, "parent state changed"
+    except BaseException as error:
+        receipt = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) / (
+            "migration-child-cleanup-" + child["database"] + ".json"
+        )
+        receipt.write_text(json.dumps(child | {"error": type(error).__name__}), encoding="utf-8")
+        raise AssertionError(f"migration child cleanup refused; receipt {receipt.name}") from error
+
+
+@asynccontextmanager
+async def owned_migration_child(purpose):
+    """Own one new disposable migration database bound to the parent receipt; drop only it."""
+    from packages.core.config import settings
+
+    receipt = owned_test_environment()
+    assert re.fullmatch(r"[a-z]{1,16}", purpose), "invalid migration child purpose"
+    parent_url = make_url(os.environ["DATABASE_URL"])
+    assert parent_url == make_url(TEST_DATABASE_URL), "migration child parent is not owned"
+    name = f"{MIGRATION_CHILD_PREFIX}{purpose}_{uuid.uuid4().hex}"
+    # The child is bound to the parent's service IDs, namespace and exact receipt as
+    # first approved, not merely to whatever receipt is current later.
+    parent_identity = _migration_child_parent_identity(receipt)
+    binding = json.dumps({"database": name, "parent": parent_identity}, sort_keys=True)
+    assert "'" not in binding, "unsafe migration child binding"
+    child_url = parent_url.set(database=name)
+    # Child connections differ from the approved parent URL only by the recorded name.
+    assert child_url.set(database=parent_url.database) == parent_url
+    expected_port = 5432 if receipt["provider"] == "github" else 5433
+    record = {"database": name, "oid": None, "binding": binding, "parent": parent_identity}
+    previous_url = settings.database_url
+    parent = create_async_engine(
+        parent_url, poolclass=NullPool, connect_args={"command_timeout": 20}
+    )
+    child_engine = None
+    created = False
+    workers = []
+    retained = []
+    parent_before = None
+    try:
+        async with parent.connect() as connection:
+            connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            await guard_owned_database(connection)
+            _require_original_parent(record)
+            parent_before = await _parent_relations(connection)
+            assert (
+                await connection.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": name}
+                )
+            ).first() is None, "migration child name is already allocated"
+            await connection.execute(text(f'CREATE DATABASE "{name}"'))
+            created = True
+            record["oid"] = (
+                await connection.execute(
+                    text("SELECT oid::bigint FROM pg_database WHERE datname = :name"),
+                    {"name": name},
+                )
+            ).scalar_one()
+            await connection.execute(text(f"COMMENT ON DATABASE \"{name}\" IS '{binding}'"))
+        expected_identity = (name, "heatpump", expected_port, record["oid"], binding)
+        child_engine = create_async_engine(
+            child_url, poolclass=NullPool, connect_args={"command_timeout": 20}
+        )
+        guarded = GuardedChildEngine(child_engine, record, expected_identity)
+
+        async def verify():
+            async with guarded.connect():
+                pass
+
+        async def alembic(operation, target):
+            await verify()
+            settings.database_url = child_url.render_as_string(hide_password=False)
+            worker = asyncio.ensure_future(
+                asyncio.to_thread(getattr(command, operation), Config("alembic.ini"), target)
+            )
+            workers.append(worker)
+            try:
+                await asyncio.shield(worker)
+            finally:
+                # Cancelling the await does not stop the thread: drain before restoring.
+                if not worker.done():
+                    await asyncio.wait({worker}, timeout=60)
+                if worker.done():
+                    settings.database_url = previous_url
+
+        @asynccontextmanager
+        async def session_context():
+            async with (
+                guarded.connect() as connection,
+                AsyncSession(bind=connection, expire_on_commit=False) as session,
+            ):
+                try:
+                    yield session
+                    await session.commit()
+                except BaseException:
+                    await session.rollback()
+                    raise
+
+        def retain(task, resources):
+            # An unsettled reset keeps its blocker: teardown neither releases nor drops.
+            workers.append(task)
+            retained.append(resources)
+
+        yield SimpleNamespace(
+            engine=guarded,
+            name=name,
+            oid=record["oid"],
+            alembic=alembic,
+            verify=verify,
+            session_context=session_context,
+            retain=retain,
+        )
+    finally:
+        try:
+            unsettled = [worker for worker in workers if not worker.done()]
+            if unsettled:
+                await asyncio.wait(unsettled, timeout=60)
+            settings.database_url = previous_url
+            await _release_retained_blockers(workers, retained)
+            if child_engine is not None:
+                await child_engine.dispose()
+            if created:
+                await _drop_migration_child(parent, record, workers, parent_before)
+        finally:
+            await parent.dispose()
+
+
+@pytest.fixture
+async def forward_manual_database():
+    async with owned_migration_child("forward") as child:
+        yield child
+
+
+def canonical_rows(rows):
+    return tuple(sorted(rows, key=lambda row: json.dumps(row, sort_keys=True)))
+
+
+async def migration_child_snapshot(connection):
+    """Capture every public table's columns and rows plus every sequence state."""
+    tables = (
+        (
+            await connection.execute(
+                text(
+                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n "
+                    "ON n.oid = c.relnamespace WHERE n.nspname = 'public' "
+                    "AND c.relkind IN ('r', 'p') AND c.relname <> 'alembic_version' "
+                    "ORDER BY c.relname"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    snapshot = {
+        "marker": (
+            await connection.execute(text("SELECT version_num FROM alembic_version"))
+        ).scalar_one(),
+        "columns": {},
+        "rows": {},
+        "sequences": {},
+    }
+    for table in tables:
+        identifier = connection.dialect.identifier_preparer.quote(table)
+        snapshot["columns"][table] = tuple(
+            tuple(column)
+            for column in (
                 await connection.execute(
                     text(
-                        "SELECT :local_start AT TIME ZONE :timezone, "
-                        ":local_end AT TIME ZONE :timezone"
+                        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) "
+                        "FROM pg_attribute a WHERE a.attrelid = to_regclass(:name) "
+                        "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
                     ),
-                    {"local_start": local_start, "local_end": local_end, "timezone": timezone},
+                    {"name": "public." + identifier},
+                )
+            ).all()
+        )
+        snapshot["rows"][table] = canonical_rows(
+            json.loads(value)
+            for value in (
+                await connection.execute(
+                    text(f"SELECT to_jsonb(record)::text FROM public.{identifier} record")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    names = (
+        (
+            await connection.execute(
+                text(
+                    "SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' "
+                    "ORDER BY sequencename"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for name in names:
+        identifier = connection.dialect.identifier_preparer.quote(name)
+        snapshot["sequences"][name] = tuple(
+            (
+                await connection.execute(
+                    text(f"SELECT last_value, is_called FROM public.{identifier}")
                 )
             ).one()
-            assert start < end
-            assert await canonical_midnight(connection, local_start, timezone) is None
-            values = {
-                "device_id": "pseudozone-" + uuid.uuid4().hex,
-                "granularity": "day",
-                "period_date": period,
-                "timezone": timezone,
-                "period_start": start,
-                "period_end": end,
-                "value": 9.7,
-                "observed_at": end + dt.timedelta(days=1),
-                "completeness": "closed",
-            }
-            with pytest.raises(IntegrityError, match="ck_manual_cop_calendar") as rejected:
-                async with connection.begin_nested():
-                    await insert_observation(connection, table_name, values)
-            assert rejected.value.orig.sqlstate == "23514"
+        )
+    snapshot["sequence_configuration"] = tuple(
+        tuple(row)
+        for row in (
+            await connection.execute(
+                text(
+                    "SELECT sequencename, sequenceowner, data_type::text, start_value, "
+                    "min_value, max_value, increment_by, cycle, cache_size FROM pg_sequences "
+                    "WHERE schemaname = 'public' ORDER BY sequencename"
+                )
+            )
+        ).all()
+    )
+    return snapshot
+
+
+def expected_forward_additions(snapshot, revision):
+    expected = copy.deepcopy(snapshot) | {"marker": revision}
+    for table, added in FORWARD_ADDED_COLUMNS[revision].items():
+        expected["columns"][table] = (*expected["columns"][table], *added)
+        expected["rows"][table] = canonical_rows(
+            row | {name: None for name, _sql_type in added} for row in expected["rows"][table]
+        )
+    return expected
+
+
+def expected_local_periods(snapshot):
+    expected = copy.deepcopy(snapshot) | {"marker": LOCAL_PERIOD_REVISION}
+    table = "manual_cop_observations"
+    expected["columns"][table] = tuple(
+        column for column in expected["columns"][table] if column[0] not in LEGACY_BOUNDARY_COLUMNS
+    )
+    expected["rows"][table] = canonical_rows(
+        {key: value for key, value in row.items() if key not in LEGACY_BOUNDARY_COLUMNS}
+        for row in expected["rows"][table]
+    )
+    return expected
+
+
+async def seed_forward_records(connection):
+    """Seed genuine pre-036 authority, restore links and manual entries via explicit columns."""
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    devices = tuple(f"forward-{side}-{uuid.uuid4().hex}" for side in ("a", "b"))
+
+    async def returning(statement, values):
+        return (await connection.execute(text(statement), values)).scalar_one()
+
+    plan_id = await returning(
+        "INSERT INTO plans (horizon_start,horizon_end,plan_json,optimizer_version,status) "
+        "VALUES (:start,:end,'{}','forward-fixture','superseded') RETURNING id",
+        {"start": now - dt.timedelta(hours=3), "end": now + dt.timedelta(hours=3)},
+    )
+    action = (
+        "INSERT INTO plan_actions (plan_id,scheduled_ts,action_type,payload_json,device_id,"
+        "status,executed_at,reverts_action_id,safety_attempt_count,safety_next_retry_at,"
+        "safety_claimed_at) VALUES (:plan,:scheduled,:type,:payload,:device,:status,"
+        ":executed,:source,:attempts,:retry,:claimed) RETURNING id"
+    )
+    pairs = (
+        ("force_dhw_on", "force_dhw_off", "{}", "{}", "pending", None),
+        (
+            "zone_temp_boost",
+            "zone_temp_restore",
+            '{"zone_id":1,"baseline_temperature":35,"temperature":37}',
+            '{"zone_id":1,"temperature":35}',
+            "executing",
+            now - dt.timedelta(minutes=1),
+        ),
+        (
+            "zone_temp_boost",
+            "zone_temp_restore",
+            '{"zone_id":2,"baseline_temperature":30,"temperature":32}',
+            '{"zone_id":2,"temperature":30}',
+            "dispatched",
+            None,
+        ),
+    )
+    links = {}
+    for index, (source_type, restore_type, source_payload, payload, status, claimed) in enumerate(
+        pairs
+    ):
+        scheduled = now - dt.timedelta(hours=2, minutes=index)
+        source = await returning(
+            action,
+            {
+                "plan": plan_id,
+                "scheduled": scheduled,
+                "type": source_type,
+                "payload": source_payload,
+                "device": devices[0],
+                "status": "executed",
+                "executed": scheduled,
+                "source": None,
+                "attempts": 0,
+                "retry": None,
+                "claimed": None,
+            },
+        )
+        restore = await returning(
+            action,
+            {
+                "plan": plan_id,
+                "scheduled": scheduled + dt.timedelta(hours=1),
+                "type": restore_type,
+                "payload": payload,
+                "device": devices[0],
+                "status": status,
+                "executed": None,
+                "source": source,
+                "attempts": index + 1,
+                "retry": now + dt.timedelta(minutes=5 + index),
+                "claimed": claimed,
+            },
+        )
+        links[restore] = source
+    restores = tuple(links)
+    await connection.execute(
+        text(
+            "INSERT INTO shower_events (started_at,pre_shower_temp,status,peak_price_skipped,"
+            "device_id,expires_at,activation_action_id) VALUES (:started,42.5,'active',false,"
+            ":device,:expires,:source)"
+        ),
+        {
+            "started": now - dt.timedelta(hours=2),
+            "device": devices[0],
+            "expires": now + dt.timedelta(hours=1),
+            "source": links[restores[0]],
+        },
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO executor_verification_reads (reserved_at,device_id,lane,action_id,"
+            "phase,checkpoint_seconds) VALUES (:reserved,:device,'safety',:action,'safety',60)"
+        ),
+        {"reserved": now - dt.timedelta(minutes=2), "device": devices[0], "action": restores[1]},
+    )
+    for device in devices:
+        await connection.execute(
+            text(
+                "INSERT INTO device_status (ts,device_id,zone1_target_temp,"
+                "native_policy_provenance) VALUES (:ts,:device,35,CAST(:provenance AS jsonb))"
+            ),
+            {
+                "ts": now - dt.timedelta(minutes=30),
+                "device": device,
+                "provenance": json.dumps({"fixture": "forward", "policy": "native"}),
+            },
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO consumption (ts,device_id,source_date,heat_kwh,cool_kwh,tank_kwh) "
+                "VALUES (:ts,:device,:day,12.5,0,2.25)"
+            ),
+            {"ts": now - dt.timedelta(days=1), "device": device, "day": (now.date())},
+        )
+    await connection.execute(
+        text(
+            "INSERT INTO settings (key,value) VALUES ('manual_cop_monitoring_enabled','true'),"
+            "('optimizer_layer','rules_only') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"
+        )
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO audit_log (actor,action,target_device,payload_json,result) "
+            "VALUES ('fixture','forward_seed',:device,'{}','ok')"
+        ),
+        {"device": devices[0]},
+    )
+    month = (now - dt.timedelta(days=62)).date().replace(day=1)
+    manual = (
+        (devices[0], "day", (now - dt.timedelta(days=3)).date(), "Europe/Stockholm"),
+        (devices[0], "month", month, "America/Havana"),
+        (devices[1], "day", (now - dt.timedelta(days=4)).date(), "Europe/Stockholm"),
+    )
+    for device, granularity, period_date, timezone in manual:
+        values = observation_values(granularity, period_date, timezone)
+        values.update(
+            device_id=device, observed_at=period_bounds(granularity, period_date, timezone)[1]
+        )
+        await insert_legacy_observation(connection, values)
+    return SimpleNamespace(devices=devices, links=links, manual=len(manual))
 
 
 class TestManualCOPPostgreSQLMigration:
@@ -1853,8 +2527,8 @@ class TestManualCOPPostgreSQLMigration:
                 ).scalar_one() == 0
                 values = observation_values("day", stamp.date(), "Europe/Stockholm")
                 values["device_id"] = device
-                values["observed_at"] = values["period_end"]
-                await insert_observation(connection, "manual_cop_observations", values)
+                values["observed_at"] = period_bounds("day", stamp.date(), "Europe/Stockholm")[1]
+                await insert_legacy_observation(connection, values)
                 await connection.execute(
                     text(
                         "UPDATE settings SET value='false' WHERE key='manual_cop_monitoring_enabled'"
@@ -1890,8 +2564,14 @@ class TestManualCOPPostgreSQLMigration:
                     tokens.append(token)
             async with engine.connect() as connection:
                 retained = await retained_storage_state(connection)
+            # Historical qualification stops at genuine 035: 036 is forward-only, and the
+            # workflow's upgrade-head phase then upgrades this populated database to 036.
+            assert head == LOCAL_PERIOD_REVISION
+            assert (
+                ScriptDirectory.from_config(config).get_revision(head).down_revision
+                == HISTORICAL_HEAD
+            )
             # Exactly the nullable, default-free columns 033-035 add to retained legacy tables.
-            assert head == "035", "update the exact legacy projection for migrations after 035"
             additions = {
                 "device_status": (("native_policy_provenance", "jsonb"),),
                 "plan_actions": (("safety_claim_token", "uuid"),),
@@ -1907,9 +2587,9 @@ class TestManualCOPPostgreSQLMigration:
                 for table in additions
             }
             for operation, target in (
-                (command.upgrade, head),
+                (command.upgrade, HISTORICAL_HEAD),
                 (command.downgrade, "032"),
-                (command.upgrade, head),
+                (command.upgrade, HISTORICAL_HEAD),
             ):
                 await asyncio.to_thread(operation, config, target)
                 async with engine.connect() as connection:
@@ -1917,7 +2597,7 @@ class TestManualCOPPostgreSQLMigration:
                         "marker": (target,)
                     }
                     expected_legacy = copy.deepcopy(retained_legacy)
-                    if target == head:
+                    if target == HISTORICAL_HEAD:
                         added = tuple(
                             (table, name, next_positions[table] + offset, sql_type, False, None)
                             for table, columns in additions.items()
@@ -1935,13 +2615,609 @@ class TestManualCOPPostgreSQLMigration:
                                 for row in expected_legacy["raw_rows"][table]
                             )
                     assert await legacy_state(connection) == expected_legacy
-                    if target == head:
+                    if target == HISTORICAL_HEAD:
                         for table, columns in additions.items():
                             next_positions[table] += len(columns)
-                if target == head:
-                    await asyncio.to_thread(command.check, config)
+            # No historical `alembic check`: 035 differs from the current 036 metadata by
+            # design. The explicit catalog, row and sequence comparisons above replace it.
         finally:
             await engine.dispose()
+
+    async def test_033_to_036_forward_only_preserves_restore_authority_and_scoped_reset(
+        self, forward_manual_database, monkeypatch
+    ):
+        from packages.api.routers import admin
+
+        child = forward_manual_database
+        scripts = ScriptDirectory.from_config(Config("alembic.ini"))
+        assert scripts.get_heads() == [LOCAL_PERIOD_REVISION]
+        assert {
+            revision: scripts.get_revision(revision).down_revision
+            for revision in ("034", "035", "036")
+        } == {"034": "033", "035": "034", "036": "035"}
+        await child.alembic("upgrade", "033")
+        async with child.engine.begin() as connection:
+            seeded = await seed_forward_records(connection)
+        async with child.engine.connect() as connection:
+            stage = await migration_child_snapshot(connection)
+            retained = await retained_storage_state(connection)
+        assert stage["marker"] == "033"
+        assert len(stage["rows"]["manual_cop_observations"]) == seeded.manual
+        for revision in ("034", HISTORICAL_HEAD):
+            await child.alembic("upgrade", revision)
+            async with child.engine.connect() as connection:
+                current = await migration_child_snapshot(connection)
+                assert await retained_storage_state(connection) == retained | {
+                    "marker": (revision,)
+                }
+            assert current == expected_forward_additions(stage, revision)
+            stage = current
+        # Representative 035 provenance is captured before the forward-only step.
+        async with child.engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE consumption SET source_timezone = 'Europe/Stockholm'")
+            )
+        async with child.engine.connect() as connection:
+            provenance = await migration_child_snapshot(connection)
+            legacy = await retained_storage_state(connection)
+        assert {row["source_timezone"] for row in provenance["rows"]["consumption"]} == {
+            "Europe/Stockholm"
+        }
+        await child.alembic("upgrade", LOCAL_PERIOD_REVISION)
+        async with child.engine.connect() as connection:
+            current = await migration_child_snapshot(connection)
+            local = await retained_storage_state(connection)
+        assert current == expected_local_periods(provenance)
+        for key in ("sequence", "sequence_configuration", "indexes", "permissions", "hypertables"):
+            assert local[key] == legacy[key], key
+        assert legacy["helper"] is not None and local["helper"] is None
+        assert local["columns"] == tuple(
+            column for column in legacy["columns"] if column[0] not in LEGACY_BOUNDARY_COLUMNS
+        )
+        assert (
+            dict(local["constraints"])
+            == {
+                name: definition
+                for name, definition in dict(legacy["constraints"]).items()
+                if name not in LEGACY_CALENDAR_CONSTRAINTS
+            }
+            | LOCAL_PERIOD_CONSTRAINTS
+        )
+        for before, after in zip(legacy["rows"], local["rows"], strict=True):
+            snapshot = snapshot_from_stored(after)
+            assert (snapshot.period_start, snapshot.period_end) == (
+                before.period_start,
+                before.period_end,
+            )
+            assert snapshot.revision == str(before.revision)
+        actions = {row["id"]: row for row in current["rows"]["plan_actions"]}
+        assert {restore: actions[restore]["reverts_action_id"] for restore in seeded.links} == (
+            seeded.links
+        )
+        assert all(row["safety_claim_token"] is None for row in actions.values())
+
+        monkeypatch.setattr(admin, "get_session", child.session_context)
+        result = await admin.reset_manual_cop_ledger()
+        assert result == {
+            "status": "ok",
+            "scopes": ["manual_cop"],
+            "deleted_rows": {"manual_cop_observations": seeded.manual},
+            "total_rows_deleted": seeded.manual,
+            "manual_cop_monitoring_enabled": False,
+            "models_reset": False,
+            "deleted_models": [],
+            "model_lifecycle": None,
+        }
+        async with child.engine.connect() as connection:
+            after_reset = await migration_child_snapshot(connection)
+            retained_reset = await retained_storage_state(connection)
+        added = [
+            row
+            for row in after_reset["rows"]["audit_log"]
+            if row not in current["rows"]["audit_log"]
+        ]
+        assert len(added) == 1
+        audit = added[0]
+        assert (audit["actor"], audit["action"], audit["target_device"], audit["result"]) == (
+            "user",
+            "reset_data",
+            None,
+            "ok",
+        )
+        assert json.loads(audit["payload_json"]) == {
+            "scopes": ["manual_cop"],
+            "deleted_rows": {"manual_cop_observations": seeded.manual},
+            "settings": {"manual_cop_monitoring_enabled": "false"},
+            "models_reset": False,
+            "deleted_models": [],
+            "model_lifecycle": None,
+        }
+        assert audit["id"] > max(row["id"] for row in current["rows"]["audit_log"])
+        expected = copy.deepcopy(current)
+        expected["rows"]["manual_cop_observations"] = ()
+        expected["rows"]["settings"] = canonical_rows(
+            row | {"value": "false"} if row["key"] == "manual_cop_monitoring_enabled" else row
+            for row in expected["rows"]["settings"]
+        )
+        expected["rows"]["audit_log"] = canonical_rows((*expected["rows"]["audit_log"], audit))
+        # Normal audit_log.id allocation is the only permitted sequence-state change.
+        assert "audit_log_id_seq" in expected["sequences"]
+        expected["sequences"]["audit_log_id_seq"] = (audit["id"], True)
+        assert after_reset == expected
+        assert retained_reset == local | {"rows": ()}
+
+        with pytest.raises(RuntimeError, match="^manual_cop_local_periods_forward_only"):
+            await child.alembic("downgrade", HISTORICAL_HEAD)
+        async with child.engine.connect() as connection:
+            assert await migration_child_snapshot(connection) == after_reset
+            assert await retained_storage_state(connection) == retained_reset
+
+    async def test_blocked_036_upgrade_keeps_genuine_035_and_retry_completes(
+        self, forward_manual_database
+    ):
+        child = forward_manual_database
+        await child.alembic("upgrade", HISTORICAL_HEAD)
+        async with child.engine.begin() as connection:
+            seeded = await seed_forward_records(connection)
+        async with child.engine.connect() as connection:
+            before = await migration_child_snapshot(connection)
+            retained = await retained_storage_state(connection)
+        assert before["marker"] == HISTORICAL_HEAD
+        assert len(before["rows"]["manual_cop_observations"]) == seeded.manual
+        async with child.engine.connect() as blocker:
+            transaction = await blocker.begin()
+            try:
+                # ACCESS SHARE blocks the ACCESS EXCLUSIVE DDL until 036's lock timeout.
+                await blocker.execute(text("SELECT count(*) FROM manual_cop_observations"))
+                with pytest.raises(DBAPIError, match="lock timeout"):
+                    await child.alembic("upgrade", LOCAL_PERIOD_REVISION)
+            finally:
+                await transaction.rollback()
+        async with child.engine.connect() as connection:
+            assert await migration_child_snapshot(connection) == before
+            assert await retained_storage_state(connection) == retained
+        await child.alembic("upgrade", LOCAL_PERIOD_REVISION)
+        async with child.engine.connect() as connection:
+            assert await migration_child_snapshot(connection) == expected_local_periods(before)
+            assert (await retained_storage_state(connection))["helper"] is None
+
+    async def test_guarded_child_blocks_mutation_on_changed_parent_or_child(
+        self, forward_manual_database, monkeypatch
+    ):
+        child = forward_manual_database
+        assert isinstance(child.engine, GuardedChildEngine)
+        async with child.engine.begin() as connection:
+            await connection.execute(text("CREATE TABLE guard_probe (id integer)"))
+        mutation = text("INSERT INTO guard_probe (id) VALUES (1)")
+        changed = copy.deepcopy(owned_test_environment())
+        changed["services"]["postgres"]["id"] = "f" * 64
+        with monkeypatch.context() as patched:
+            patched.setitem(globals(), "owned_test_environment", lambda: changed)
+            for surface in (child.engine.begin, child.session_context):
+                with pytest.raises(AssertionError, match="parent identity changed"):
+                    async with surface() as handle:
+                        await handle.execute(mutation)
+            with pytest.raises(AssertionError, match="parent identity changed"):
+                await child.verify()
+        name, user, port, oid, binding = child.engine.expected_identity
+        for identity in ((name, user, port, oid + 1, binding), (name, user, port, oid, "{}")):
+            with pytest.raises(AssertionError, match="child identity mismatch"):
+                async with child.engine.expecting(identity).begin() as connection:
+                    await connection.execute(mutation)
+        async with child.engine.connect() as connection:
+            count = await connection.execute(text("SELECT count(*) FROM guard_probe"))
+            assert count.scalar_one() == 0
+
+    async def reset_ready_child(self, child):
+        await child.alembic("upgrade", HISTORICAL_HEAD)
+        async with child.engine.begin() as connection:
+            seeded = await seed_forward_records(connection)
+        await child.alembic("upgrade", LOCAL_PERIOD_REVISION)
+        async with child.engine.connect() as connection:
+            before = await migration_child_snapshot(connection)
+            retained = await retained_storage_state(connection)
+        assert before["marker"] == LOCAL_PERIOD_REVISION
+        assert len(before["rows"]["manual_cop_observations"]) == seeded.manual
+        settings_rows = {row["key"]: row["value"] for row in before["rows"]["settings"]}
+        assert settings_rows["manual_cop_monitoring_enabled"] == "true"
+        assert "audit_log_id_seq" in before["sequences"]
+        return seeded, before, retained
+
+    async def assert_reset_rolled_back(self, child, before, retained):
+        async with child.engine.connect() as connection:
+            after = await migration_child_snapshot(connection)
+            assert await retained_storage_state(connection) == retained
+        expected = copy.deepcopy(before)
+        # A rolled-back audit INSERT may only consume normal audit_log.id values.
+        allocated = after["sequences"]["audit_log_id_seq"]
+        assert allocated[0] >= before["sequences"]["audit_log_id_seq"][0]
+        expected["sequences"]["audit_log_id_seq"] = allocated
+        assert after == expected
+
+    async def test_manual_reset_audit_failure_rolls_back_ledger_preference_and_audit(
+        self, forward_manual_database, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        from packages.api.routers import admin
+
+        child = forward_manual_database
+        _seeded, before, retained = await self.reset_ready_child(child)
+        monkeypatch.setattr(admin, "get_session", child.session_context)
+        async with child.engine.connect() as blocker:
+            transaction = await blocker.begin()
+            try:
+                # SHARE conflicts only with the audit INSERT, after the delete and upsert ran.
+                await blocker.execute(text("LOCK TABLE public.audit_log IN SHARE MODE"))
+                with pytest.raises(HTTPException) as refused:
+                    await admin.reset_data(admin.ResetRequest(scopes=["manual_cop"]))
+            finally:
+                await transaction.rollback()
+        assert refused.value.status_code == 503
+        assert refused.value.detail == {"code": "manual_cop_reset_unavailable"}
+        assert isinstance(refused.value.__cause__, DBAPIError)
+        assert "lock timeout" in str(refused.value.__cause__)
+        await self.assert_reset_rolled_back(child, before, retained)
+
+    async def test_manual_reset_cancellation_rolls_back_ledger_preference_and_audit(
+        self, forward_manual_database, monkeypatch
+    ):
+        from packages.api.routers import admin
+
+        child = forward_manual_database
+        _seeded, before, retained = await self.reset_ready_child(child)
+        monkeypatch.setattr(admin, "get_session", child.session_context)
+        waiting_sql = text(
+            "SELECT count(*) FROM pg_locks WHERE relation = 'public.audit_log'::regclass "
+            "AND NOT granted"
+        )
+        async with AsyncExitStack() as stack:
+            blocker = await stack.enter_async_context(child.engine.connect())
+            observer = await stack.enter_async_context(child.engine.connect())
+
+            async def waiting():
+                blocked = (await observer.execute(waiting_sql)).scalar_one() == 1
+                await observer.rollback()
+                return blocked
+
+            transaction = await blocker.begin()
+            await blocker.execute(text("LOCK TABLE public.audit_log IN SHARE MODE"))
+            # Releases the blocker only after the reset settled as cancelled; an unsettled
+            # reset keeps both connections held and is handed to the child fixture, whose
+            # teardown then refuses to release them or drop the child.
+            await cancel_blocked_reset(
+                admin.reset_manual_cop_ledger,
+                waiting,
+                transaction.rollback,
+                lambda task: child.retain(task, stack.pop_all()),
+            )
+        await self.assert_reset_rolled_back(child, before, retained)
+
+    @pytest.mark.parametrize(
+        "exit_path",
+        [
+            "cancelled_as_expected",
+            "polling_error",
+            "polling_exhausted",
+            "test_cancelled",
+            "cancel_during_drain",
+            "release_error",
+            "cancel_during_drain_and_release_error",
+            "drain_timeout",
+        ],
+    )
+    async def test_cancel_blocked_reset_settles_reset_before_release(self, exit_path):
+        lock = asyncio.Event()
+        events = []
+        cancel_during_drain = exit_path.startswith("cancel_during_drain")
+        resist = None if exit_path == "drain_timeout" else int(cancel_during_drain)
+        control = {"resist": resist}
+        retained = []
+
+        @asynccontextmanager
+        async def session_context():
+            try:
+                yield
+                # Committing flushes the audit INSERT, which waits on the blocker's lock.
+                await flush()
+                events.append("reset_committed")
+            except BaseException:
+                events.append("reset_rolled_back")
+                raise
+
+        async def flush():
+            events.append("flush_blocked")
+            ignored = 0
+            while True:
+                try:
+                    await lock.wait()
+                    break
+                except asyncio.CancelledError:
+                    resist = control["resist"]
+                    if resist is not None and ignored >= resist:
+                        raise
+                    ignored += 1
+                    events.append("cancel_ignored")
+            events.append("flush_done")
+
+        async def reset():
+            async with session_context():
+                events.append("reset_body")
+
+        async def waiting():
+            events.append("poll")
+            if exit_path == "polling_error":
+                raise RuntimeError("synthetic polling failure")
+            return exit_path != "polling_exhausted" and "flush_blocked" in events
+
+        async def release():
+            events.append("blocker_released")
+            lock.set()
+            if exit_path.endswith("release_error"):
+                raise OSError("synthetic release failure")
+
+        def retain(task):
+            events.append("retained")
+            retained.append(task)
+
+        async def scenario():
+            await cancel_blocked_reset(
+                reset, waiting, release, retain, attempts=3, interval=0.01, limit=0.05
+            )
+
+        expected = {
+            "cancelled_as_expected": None,
+            "polling_error": RuntimeError,
+            "polling_exhausted": AssertionError,
+            "test_cancelled": asyncio.CancelledError,
+            "cancel_during_drain": asyncio.CancelledError,
+            "release_error": OSError,
+            "cancel_during_drain_and_release_error": AssertionError,
+            "drain_timeout": AssertionError,
+        }[exit_path]
+        before = asyncio.all_tasks()
+        runner = asyncio.ensure_future(scenario())
+        if exit_path == "test_cancelled":
+            while "poll" not in events:
+                await asyncio.sleep(0)
+            runner.cancel()
+        elif cancel_during_drain:
+            while "cancel_ignored" not in events:
+                await asyncio.sleep(0)
+            runner.cancel()
+        if expected is None:
+            await runner
+        else:
+            with pytest.raises(expected) as raised:
+                await runner
+        if exit_path == "cancel_during_drain_and_release_error":
+            # Neither the drain's cancellation nor the release failure is lost.
+            assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+            assert isinstance(raised.value.__context__, OSError)
+        # Give any wrongly surviving reset the chance to run after the exit.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert events[:2] == ["reset_body", "flush_blocked"]
+        assert "reset_committed" not in events and "flush_done" not in events
+        if exit_path == "drain_timeout":
+            # Fail closed: the unsettled reset is retained, and the blocker is never released.
+            assert "did not settle" in str(raised.value)
+            assert [task.done() for task in retained] == [False]
+            assert "blocker_released" not in events and events[-1] == "retained"
+            assert asyncio.all_tasks() - before == set(retained)
+            control["resist"] = 0
+            retained[0].cancel()
+            await asyncio.wait(retained, timeout=1)
+            assert retained[0].cancelled() and events[-1] == "reset_rolled_back"
+            assert "reset_committed" not in events
+            return
+        assert not asyncio.all_tasks() - before, "reset task survived the exit path"
+        assert retained == [] and events.count("blocker_released") == 1
+        # Settled before release: nothing of the reset runs once the blocker is released.
+        assert events[-2:] == ["reset_rolled_back", "blocker_released"]
+
+    async def test_child_teardown_refuses_while_a_retained_reset_is_unsettled(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("COP_MANUAL_TEST_EVIDENCE", str(tmp_path))
+        pending = asyncio.get_running_loop().create_future()
+        closed = []
+
+        class Resources:
+            async def aclose(self):
+                closed.append(True)
+
+        class Parent:
+            def connect(self):
+                raise AssertionError("cleanup contacted the parent despite an unsettled reset")
+
+        retained = [Resources()]
+        await _release_retained_blockers([pending], retained)
+        assert closed == [] and len(retained) == 1
+        child = {"database": "manual_cop_child_x", "oid": 1, "binding": "{}", "parent": {}}
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(Parent(), child, [pending], None)
+        assert "did not settle" in str(refused.value.__cause__)
+        receipt = json.loads(
+            (tmp_path / "migration-child-cleanup-manual_cop_child_x.json").read_text()
+        )
+        assert receipt["error"] == "AssertionError"
+        pending.cancel()
+        await _release_retained_blockers([pending], retained)
+        assert closed == [True] and retained == []
+
+    async def test_manual_reset_recreate_rejects_stale_pre_reset_revision(
+        self, forward_manual_database, monkeypatch
+    ):
+        from fastapi import HTTPException, Response
+
+        from packages.api.routers import admin, feeds
+        from packages.api.schemas import ManualCOPPut
+
+        child = forward_manual_database
+        seeded, before, _retained = await self.reset_ready_child(child)
+        manual = before["rows"]["manual_cop_observations"]
+        stale = next(
+            row
+            for row in manual
+            if row["device_id"] == seeded.devices[0] and row["granularity"] == "day"
+        )
+        period_date = dt.date.fromisoformat(stale["period_date"])
+        observed_at = period_bounds("day", period_date, stale["timezone"])[1]
+        monkeypatch.setattr(admin, "get_session", child.session_context)
+        monkeypatch.setattr(feeds, "get_session", child.session_context)
+        result = await admin.reset_manual_cop_ledger()
+        assert result["deleted_rows"] == {"manual_cop_observations": seeded.manual}
+
+        async def put(revision):
+            response = Response()
+            body = ManualCOPPut(
+                expected_revision=str(revision),
+                value=4.2,
+                observed_at=observed_at,
+                completeness="closed",
+                timezone=stale["timezone"],
+            )
+            row = await feeds.put_manual_cop(stale["device_id"], "day", period_date, body, response)
+            return response.status_code, row
+
+        with pytest.raises(HTTPException) as conflict:
+            await put(stale["revision"])
+        assert conflict.value.status_code == 409
+        status, created = await put(0)
+        assert status == 201
+        # The recreated row's opaque revision continues the sequence; never rewound.
+        assert int(created.revision) > max(row["revision"] for row in manual)
+        with pytest.raises(HTTPException) as conflict:
+            await put(stale["revision"])
+        assert conflict.value.status_code == 409
+        status, updated = await put(created.revision)
+        assert status == 200 and int(updated.revision) > int(created.revision)
+        async with child.engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT device_id, granularity, period_date, revision, value "
+                        "FROM manual_cop_observations"
+                    )
+                )
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            (stale["device_id"], "day", period_date, int(updated.revision), 4.2)
+        ]
+
+
+RESET_SETTLE_LIMIT_SECONDS = 30
+
+
+async def drain_reset_task(task, limit):
+    """Cancel and wait, bounded, for the reset task; outlast further cancellation.
+
+    Returns the cancellation that interrupted the wait, if any, for re-raising later.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + limit
+    interrupted = None
+    if not task.done():
+        task.cancel()
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError as error:
+            interrupted = interrupted or error
+            task.cancel()
+    return interrupted
+
+
+def _raise_unless_reset_cancelled(task):
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        raise AssertionError("reset task completed instead of being cancelled")
+    raise AssertionError("reset task failed instead of being cancelled") from error
+
+
+async def cancel_blocked_reset(
+    start, waiting, release, retain, *, attempts=60, interval=0.05, limit=RESET_SETTLE_LIMIT_SECONDS
+):
+    """Start a reset and prove it is blocked; on every exit cancel and drain it while the
+    blocker still holds, and release the blocker only once the reset has settled.
+
+    A reset still unsettled after the bounded drain is never released: it is handed to
+    ``retain`` with the blocker, so the child fixture's teardown refuses cleanup.
+    """
+    task = asyncio.ensure_future(start())
+    try:
+        blocked = False
+        # Poll well inside the reset's 5 s lock timeout.
+        for _attempt in range(attempts):
+            await asyncio.sleep(interval)
+            blocked = await waiting()
+            if blocked or task.done():
+                break
+        assert blocked and not task.done(), "reset did not reach the audit insert"
+    finally:
+        interrupted = await drain_reset_task(task, limit)
+        if not task.done():
+            retain(task)
+            failure = AssertionError("reset task did not settle; its blocker stays held")
+            failure.__cause__ = interrupted
+            raise failure
+        try:
+            try:
+                await release()
+            except BaseException:
+                # The release error stays attached as the context of any outcome failure.
+                _raise_unless_reset_cancelled(task)
+                raise
+            _raise_unless_reset_cancelled(task)
+        except BaseException as error:
+            if interrupted is None:
+                raise
+            # A release error may already carry its own cause (e.g. the driver error), so
+            # the drain's cancellation is kept as the cause of a new failure instead.
+            raise AssertionError(
+                f"{type(error).__name__} after the reset drain was cancelled"
+            ) from interrupted
+        if interrupted is not None:
+            raise interrupted
+
+
+SINGLE_INSERT_LIMIT_SECONDS = 20
+
+
+def single_insert_rows(device, now):
+    """91 day plus 91 month rows for one device, inserted by one unchanged statement."""
+    values = []
+    for index in range(91):
+        period_date = dt.date(2026, 10, 3) - dt.timedelta(days=index)
+        day = observation_values("day", period_date, "UTC")
+        day.update(device_id=device, observed_at=period_bounds("day", period_date, "UTC")[1])
+        month_index = 2026 * 12 + 9 - index
+        year, zero_month = divmod(month_index, 12)
+        month_date = dt.date(year, zero_month + 1, 1)
+        month_start, month_end = period_bounds("month", month_date, "UTC")
+        month = observation_values("month", month_date, "UTC")
+        month.update(device_id=device, value=3.9, observed_at=month_end)
+        if month_end > now:
+            month.update(completeness="partial", observed_at=month_start)
+        values.extend((day, month))
+    return values
+
+
+async def timed_single_insert(engine, values):
+    """Run the single multi-row INSERT; return execution and commit durations."""
+    async with engine.connect() as connection:
+        started = time.perf_counter()
+        await connection.execute(insert(ManualCOPObservationRecord), values)
+        executed = time.perf_counter()
+        await connection.commit()
+        committed = time.perf_counter()
+    return executed - started, committed - executed
 
 
 @pytest.fixture
@@ -2059,7 +3335,9 @@ class TestManualCOPPostgreSQLAPI:
                 )
             ).one()
         assert stored.timezone == timezone
-        assert (stored.period_start, stored.period_end) == period_bounds(
+        assert not {"period_start", "period_end"} & set(stored._fields)
+        snapshot = snapshot_from_stored(stored)
+        assert (snapshot.period_start, snapshot.period_end) == period_bounds(
             granularity, period_date, timezone
         )
         assert str(stored.revision) == updated.json()["revision"]
@@ -2134,7 +3412,8 @@ class TestManualCOPPostgreSQLAPI:
                 )
             ).one()
             assert stored.timezone == "US/Eastern"
-            assert (stored.period_start, stored.period_end) == period_bounds(
+            snapshot = snapshot_from_stored(stored)
+            assert (snapshot.period_start, snapshot.period_end) == period_bounds(
                 "day", period_date, "US/Eastern"
             )
         unknown = await database.client.put(
@@ -2148,21 +3427,41 @@ class TestManualCOPPostgreSQLAPI:
         from packages.api.routers import feeds
 
         database = manual_api_database
-        values = []
         now = dt.datetime.now(dt.timezone.utc)
-        for index in range(91):
-            period_date = dt.date(2026, 10, 3) - dt.timedelta(days=index)
-            day = observation_values("day", period_date, "UTC")
-            day.update(device_id=database.device, observed_at=day["period_end"])
-            month_index = 2026 * 12 + 9 - index
-            year, zero_month = divmod(month_index, 12)
-            month = observation_values("month", dt.date(year, zero_month + 1, 1), "UTC")
-            month.update(device_id=database.device, value=3.9, observed_at=month["period_end"])
-            if month["period_end"] > now:
-                month.update(completeness="partial", observed_at=month["period_start"])
-            values.extend((day, month))
-        async with database.engine.begin() as connection:
-            await connection.execute(insert(ManualCOPObservationRecord), values)
+        # DBNEW3: one cold then three fresh-device trials of the same single 182-row
+        # INSERT, with execution and commit timed separately. The first trial's rows
+        # are the ones paginated below.
+        trials = []
+        evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) / (
+            f"dbnew3-single-insert-{database.device}.json"
+        )
+        try:
+            for trial in range(4):
+                device = database.device if trial == 0 else f"{database.device}-trial{trial}"
+                values = single_insert_rows(device, now)
+                assert len(values) == 182
+                execute_seconds, commit_seconds = await timed_single_insert(database.engine, values)
+                trials.append(
+                    {
+                        "trial": trial,
+                        "kind": "cold" if trial == 0 else "fresh-device",
+                        "device": device,
+                        "rows": len(values),
+                        "execute_seconds": execute_seconds,
+                        "commit_seconds": commit_seconds,
+                    }
+                )
+        finally:
+            evidence.write_text(
+                json.dumps(
+                    {"limit_seconds": SINGLE_INSERT_LIMIT_SECONDS, "trials": trials}, indent=2
+                ),
+                encoding="utf-8",
+            )
+        assert [record["trial"] for record in trials] == [0, 1, 2, 3]
+        for record in trials:
+            total = record["execute_seconds"] + record["commit_seconds"]
+            assert total < SINGLE_INSERT_LIMIT_SECONDS, record
         read_clock = Mock(wraps=dt.datetime)
         read_clock.now.return_value = dt.datetime(2026, 10, 5, 12, tzinfo=dt.timezone.utc)
         monkeypatch.setattr(feeds, "dt", SimpleNamespace(**(vars(dt) | {"datetime": read_clock})))

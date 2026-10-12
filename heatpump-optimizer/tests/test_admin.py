@@ -8,6 +8,7 @@ import pytest
 
 from packages.api.routers import admin
 from packages.api.routers.admin import (
+    MANUAL_COP_SCOPE,
     MODEL_FEEDING_SCOPES,
     RESET_SCOPES,
     ResetRequest,
@@ -232,6 +233,182 @@ class TestResetEndpoint:
         assert error.value.detail == {"code": "ml_lifecycle_unavailable"}
         assert session.deleted == []
         memory_reset.assert_not_called()
+
+
+class _ManualResetSession:
+    """Records every statement of the standalone manual-ledger reset transaction."""
+
+    def __init__(self, count=182, fail_on=None):
+        self.statements = []
+        self.added = []
+        self.count = count
+        self.fail_on = fail_on
+
+    async def execute(self, statement):
+        from sqlalchemy.dialects import postgresql
+
+        compiled = str(statement.compile(dialect=postgresql.dialect()))
+        if self.fail_on and self.fail_on in compiled:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError(compiled, {}, Exception("lock timeout"))
+        self.statements.append(compiled)
+        return MagicMock()
+
+    async def scalar(self, statement):
+        from sqlalchemy.dialects import postgresql
+
+        self.statements.append(str(statement.compile(dialect=postgresql.dialect())))
+        return self.count
+
+    def add(self, obj):
+        self.added.append(obj)
+
+
+class TestManualCOPReset:
+    def manual_sessions(self, session, events):
+        @asynccontextmanager
+        async def sessions():
+            events.append("begin")
+            yield session
+            events.append("commit")
+
+        return sessions
+
+    async def test_manual_scope_deletes_all_devices_disables_forecast_and_audits_atomically(self):
+        import json
+
+        session = _ManualResetSession(count=182)
+        events = []
+        with (
+            patch.object(admin, "get_session", self.manual_sessions(session, events)),
+            patch.object(admin, "invalidate_lifecycle", AsyncMock()) as lifecycle,
+            patch.object(admin, "reset_ml_models") as memory_reset,
+        ):
+            result = await reset_data(ResetRequest(scopes=[MANUAL_COP_SCOPE]))
+
+        assert events == ["begin", "commit"]
+        assert session.statements[:3] == [
+            "SET LOCAL lock_timeout = '5s'",
+            "SET LOCAL statement_timeout = '20s'",
+            "LOCK TABLE public.manual_cop_observations IN SHARE ROW EXCLUSIVE MODE",
+        ]
+        assert "FROM manual_cop_observations" in session.statements[3]
+        assert session.statements[4] == "DELETE FROM manual_cop_observations"
+        assert session.statements[5].startswith("INSERT INTO settings (key, value")
+        assert "ON CONFLICT (key) DO UPDATE SET value = %(param_1)s" in session.statements[5]
+        assert len(session.statements) == 6
+        joined = "\n".join(session.statements).lower()
+        for forbidden in ("sequence", "setval", "restart", "truncate", "where", "plan", "audit"):
+            assert forbidden not in joined
+        assert len(session.added) == 1
+        audit = session.added[0]
+        assert (audit.actor, audit.action, audit.result) == ("user", "reset_data", "ok")
+        assert json.loads(audit.payload_json) == {
+            "scopes": ["manual_cop"],
+            "deleted_rows": {"manual_cop_observations": 182},
+            "settings": {"manual_cop_monitoring_enabled": "false"},
+            "models_reset": False,
+            "deleted_models": [],
+            "model_lifecycle": None,
+        }
+        lifecycle.assert_not_called()
+        memory_reset.assert_not_called()
+        assert result == {
+            "status": "ok",
+            "scopes": ["manual_cop"],
+            "deleted_rows": {"manual_cop_observations": 182},
+            "total_rows_deleted": 182,
+            "manual_cop_monitoring_enabled": False,
+            "models_reset": False,
+            "deleted_models": [],
+            "model_lifecycle": None,
+        }
+
+    async def test_manual_setting_upsert_binds_false_only(self):
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.dialects.postgresql.dml import Insert
+
+        captured = []
+
+        class Capture(_ManualResetSession):
+            async def execute(self, statement):
+                if isinstance(statement, Insert):
+                    captured.append(statement.compile(dialect=postgresql.dialect()).params)
+                return await super().execute(statement)
+
+        session = Capture(count=0)
+        with patch.object(admin, "get_session", self.manual_sessions(session, [])):
+            result = await reset_data(ResetRequest(scopes=["manual_cop"]))
+        assert captured == [
+            {"key": "manual_cop_monitoring_enabled", "value": "false", "param_1": "false"}
+        ]
+        assert result["total_rows_deleted"] == 0
+
+    @pytest.mark.parametrize(
+        "scopes",
+        [
+            ["manual_cop", "energy"],
+            ["logs", "manual_cop"],
+            ["manual_cop", "manual_cop"],
+            ["manual_cop", *RESET_SCOPES],
+        ],
+    )
+    async def test_manual_scope_must_be_requested_alone(self, scopes):
+        sessions = MagicMock(side_effect=AssertionError("no storage access"))
+        with patch.object(admin, "get_session", sessions), pytest.raises(HTTPException) as error:
+            await reset_data(ResetRequest(scopes=scopes))
+        assert error.value.status_code == 400
+        assert error.value.detail == "The manual_cop reset scope must be requested alone"
+        sessions.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fail_on", ["LOCK TABLE", "DELETE FROM manual_cop", "INSERT INTO settings"]
+    )
+    async def test_manual_reset_storage_failure_rolls_back_without_audit(self, fail_on):
+        session = _ManualResetSession(fail_on=fail_on)
+        events = []
+
+        @asynccontextmanager
+        async def sessions():
+            events.append("begin")
+            try:
+                yield session
+            except BaseException:
+                events.append("rollback")
+                raise
+            events.append("commit")
+
+        with (
+            patch.object(admin, "get_session", sessions),
+            patch.object(admin, "reset_ml_models") as memory_reset,
+            pytest.raises(HTTPException) as error,
+        ):
+            await reset_data(ResetRequest(scopes=["manual_cop"]))
+        assert error.value.status_code == 503
+        assert error.value.detail == {"code": "manual_cop_reset_unavailable"}
+        assert events == ["begin", "rollback"]
+        assert session.added == []
+        memory_reset.assert_not_called()
+
+    async def test_manual_reset_commit_failure_is_not_reported_as_success(self):
+        session = _ManualResetSession()
+
+        @asynccontextmanager
+        async def failed_commit():
+            yield session
+            raise OSError("commit acknowledgement failed")
+
+        with (
+            patch.object(admin, "get_session", failed_commit),
+            pytest.raises(OSError, match="commit acknowledgement"),
+        ):
+            await reset_data(ResetRequest(scopes=["manual_cop"]))
+
+    def test_broad_scopes_and_select_all_never_include_manual_ledger(self):
+        assert MANUAL_COP_SCOPE == "manual_cop"
+        assert MANUAL_COP_SCOPE not in RESET_SCOPES
+        assert MANUAL_COP_SCOPE not in MODEL_FEEDING_SCOPES
 
 
 class TestModelResetMethods:

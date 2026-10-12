@@ -99,7 +99,7 @@ export function manualCOPObservation(periodDate = "2026-10-04", value = 9.7, rev
         period_end: granularity === "month" ? "2026-10-31T23:00:00Z" : periodDate === "2026-10-03" ? "2026-10-03T22:00:00Z" : "2026-10-04T22:00:00Z",
         value, observed_at: "2026-10-04T08:00:00Z", completeness: "partial",
         created_at: "2026-10-04T08:00:00Z", updated_at: "2026-10-04T08:00:00Z", revision,
-        source: "controller_estimate", acquisition: "manual_entry", scope: "total",
+        source: "controller_estimate", acquisition: "manual_entry", scope: "unknown",
         measured: false, accuracy: "approximate", energy_boundary: "unknown",
     };
 }

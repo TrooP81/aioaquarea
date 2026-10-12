@@ -97,6 +97,57 @@ class ManualCOPObservation:
         return max(self.observed_at, self.created_at, self.updated_at)
 
 
+class InvalidStoredPeriod(ValueError):
+    """A persisted ledger row no longer forms a valid local calendar observation."""
+
+
+def snapshot_from_stored(row) -> ManualCOPObservation:
+    """Derive calendar boundaries for a stored row and re-check its attestation.
+
+    Boundaries are never persisted: they come from the local period identity and
+    the confirmed IANA timezone. Rows that cannot be derived or whose stored
+    observation time contradicts the derived period are refused rather than
+    given invented boundaries.
+    """
+    try:
+        if row.completeness not in {"partial", "closed", "unknown"}:
+            raise ValueError("completeness")
+        value = float(row.value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("value")
+        timestamps = (row.observed_at, row.created_at, row.updated_at)
+        if any(
+            not isinstance(moment, dt.datetime) or moment.utcoffset() is None
+            for moment in timestamps
+        ):
+            raise ValueError("timestamps")
+        observed_at, created_at, updated_at = (
+            moment.astimezone(dt.timezone.utc) for moment in timestamps
+        )
+        start, end = period_bounds(row.granularity, row.period_date, row.timezone)
+        if observed_at < start or (row.completeness == "closed" and observed_at < end):
+            raise ValueError("attestation")
+        revision = int(row.revision)
+        if revision <= 0:
+            raise ValueError("revision")
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise InvalidStoredPeriod("invalid_stored_period") from exc
+    return ManualCOPObservation(
+        device_id=row.device_id,
+        granularity=row.granularity,
+        period_date=row.period_date,
+        timezone=row.timezone,
+        period_start=start,
+        period_end=end,
+        value=value,
+        observed_at=observed_at,
+        completeness=row.completeness,
+        created_at=created_at,
+        updated_at=updated_at,
+        revision=str(revision),
+    )
+
+
 def historical_issue_at(target_date: dt.date, issue_at: dt.datetime, timezone: str) -> dt.datetime:
     zone = ZoneInfo(timezone)
     live_local = issue_at.astimezone(zone)

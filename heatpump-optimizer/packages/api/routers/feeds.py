@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,8 +23,11 @@ from packages.api.schemas import (
     WeatherResponse,
 )
 from packages.core.cop_monitoring import (
+    InvalidStoredPeriod,
     ManualCOPObservation,
     forecast_snapshot,
+    monitoring_result,
+    snapshot_from_stored,
     validate_observation_period,
 )
 from packages.core.database import get_session
@@ -172,9 +175,10 @@ async def _validate_manual_json(request: Request) -> None:
 
 
 def _manual_snapshot(row: ManualCOPObservationRecord) -> ManualCOPObservation:
-    values = {field.name: getattr(row, field.name) for field in fields(ManualCOPObservation)}
-    values["revision"] = str(values["revision"])
-    return ManualCOPObservation(**values)
+    return snapshot_from_stored(row)
+
+
+_INVALID_STORED_DETAIL = "Manual COP stored period is invalid"
 
 
 async def _known_manual_device(session, device_id: str) -> None:
@@ -204,6 +208,7 @@ async def get_manual_cop(
         enabled = await get_bool_setting("manual_cop_monitoring_enabled")
         default_timezone = await get_user_tz()
         candidates = ()
+        invalid_snapshot = False
         observations = []
         next_before = None
         async with get_session() as session:
@@ -226,10 +231,14 @@ async def get_manual_cop(
                     page = page.where(model.period_date < before)
                 result = await session.execute(page.order_by(model.period_date.desc()).limit(91))
                 rows = result.scalars().all()
-                observations = [
-                    ManualCOPObservationResponse(**asdict(_manual_snapshot(row)))
-                    for row in rows[:90]
-                ]
+                try:
+                    observations = [
+                        ManualCOPObservationResponse(**asdict(_manual_snapshot(row)))
+                        for row in rows[:90]
+                    ]
+                except InvalidStoredPeriod:
+                    logger.warning("manual_cop_invalid_stored_period", outcome="page_refused")
+                    raise HTTPException(status_code=503, detail=_INVALID_STORED_DETAIL) from None
                 if len(rows) > 90:
                     next_before = rows[89].period_date
                 available_at = func.greatest(model.observed_at, model.created_at, model.updated_at)
@@ -261,12 +270,13 @@ async def get_manual_cop(
                             ).order_by(model.period_date)
                         )
                         snapshot_rows += list(result.scalars().all())
+                        # Closed attestation (observed at or after the derived period
+                        # end) is re-validated for every candidate by the application.
                         result = await session.execute(
                             daily.where(
                                 model.completeness == "closed",
                                 model.timezone == latest.timezone,
                                 model.period_date < today,
-                                model.observed_at >= model.period_end,
                                 available_at <= issue_at,
                             )
                             .order_by(model.period_date.desc())
@@ -275,12 +285,27 @@ async def get_manual_cop(
                         latest_closed = result.scalar_one_or_none()
                         if latest_closed is not None:
                             snapshot_rows.append(latest_closed)
-                    candidates = tuple(
-                        {row.period_date: _manual_snapshot(row) for row in snapshot_rows}.values()
-                    )
+                    try:
+                        candidates = tuple(
+                            {
+                                row.period_date: _manual_snapshot(row) for row in snapshot_rows
+                            }.values()
+                        )
+                    except InvalidStoredPeriod:
+                        logger.warning(
+                            "manual_cop_invalid_stored_period", outcome="forecast_refused"
+                        )
+                        candidates = ()
+                        invalid_snapshot = True
     except SQLAlchemyError:
         raise HTTPException(status_code=503, detail="Manual COP storage unavailable") from None
-    monitoring = await forecast_snapshot(candidates, issue_at, enabled)
+    if invalid_snapshot and enabled:
+        monitoring = monitoring_result((), issue_at) | {
+            "status": "unavailable",
+            "reason": "invalid_stored_period",
+        }
+    else:
+        monitoring = await forecast_snapshot(candidates, issue_at, enabled)
     return ManualCOPListResponse(
         devices=devices,
         default_timezone=default_timezone,
@@ -307,7 +332,7 @@ async def put_manual_cop(
     response: Response,
 ):
     try:
-        start, end = validate_observation_period(
+        validate_observation_period(
             granularity,
             period_date,
             body.timezone,
@@ -325,8 +350,6 @@ async def put_manual_cop(
     }
     values = {
         "timezone": body.timezone,
-        "period_start": start,
-        "period_end": end,
         "value": body.value,
         "observed_at": body.observed_at.astimezone(dt.timezone.utc),
         "completeness": body.completeness,
@@ -370,7 +393,11 @@ async def put_manual_cop(
             if row is None:
                 logger.info("manual_cop_mutation", **mutation, outcome="conflict")
                 raise HTTPException(status_code=409, detail="Manual observation revision conflict")
-            committed = ManualCOPObservationResponse(**asdict(_manual_snapshot(row)))
+            try:
+                committed = ManualCOPObservationResponse(**asdict(_manual_snapshot(row)))
+            except InvalidStoredPeriod:
+                logger.warning("manual_cop_mutation", **mutation, outcome="invalid_stored_period")
+                raise HTTPException(status_code=503, detail=_INVALID_STORED_DETAIL) from None
     except SQLAlchemyError:
         logger.warning("manual_cop_mutation", **mutation, outcome="storage_unavailable")
         raise HTTPException(status_code=503, detail="Manual COP storage unavailable") from None

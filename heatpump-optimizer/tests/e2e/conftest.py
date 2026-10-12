@@ -127,6 +127,10 @@ async def setup_database():
                 head, _ = manual_sql.migration_targets()
                 retained = await manual_sql.retained_storage_state(connection)
                 assert retained["marker"] == (head,)
+                # Current-head storage keeps local periods only: no stored boundaries,
+                # SQL calendar checks or helper (retained_storage_state checks the shape).
+                assert head == manual_sql.LOCAL_PERIOD_REVISION
+                assert retained["helper"] is None
                 existing = await connection.run_sync(
                     lambda current: set(inspect(current).get_table_names(schema="public"))
                 )

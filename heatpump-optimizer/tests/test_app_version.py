@@ -13,6 +13,12 @@ from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_api_contract_identifies_local_calendar_manual_cop_contract():
+    """Unknown manual-COP scope and derived period boundaries are a new API contract."""
+    assert API_CONTRACT_VERSION == "2026-10-12.1"
+    assert APP_VERSION == "0.15.0"
+
+
 def test_release_version_is_consistent_across_services():
     """The dashboard and API must report the same release version."""
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))

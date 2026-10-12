@@ -75,8 +75,27 @@ class TestManualCOPCalendar:
         assert not table.foreign_keys
         assert "id" not in table.columns
         ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
-        assert "ck_manual_cop_calendar" in ddl
         assert "value > 0 AND value < 'Infinity'" in ddl
+        assert "period_start" not in table.columns
+        assert "period_end" not in table.columns
+        for removed in ("ck_manual_cop_calendar", "ck_manual_cop_period_order", "period_start"):
+            assert removed not in ddl
+        assert "manual_cop_calendar_midnight" not in ddl
+        assert {
+            constraint.name: str(constraint.sqltext)
+            for constraint in table.constraints
+            if constraint.name and constraint.name.startswith("ck_")
+        } == {
+            "ck_manual_cop_granularity": "granularity IN ('day', 'month')",
+            "ck_manual_cop_month_start": "granularity <> 'month' OR EXTRACT(DAY FROM period_date) = 1",
+            "ck_manual_cop_timezone": "timezone <> ''",
+            "ck_manual_cop_value": "value > 0 AND value < 'Infinity'::double precision",
+            "ck_manual_cop_revision": "revision > 0",
+            "ck_manual_cop_observed_at": "observed_at <= CURRENT_TIMESTAMP",
+            "ck_manual_cop_completeness": "completeness IN ('partial', 'closed', 'unknown')",
+            "ck_manual_cop_server_times": "created_at <= updated_at",
+        }
+        assert not table.dispatch.before_create
         sequence = str(
             CreateSequence(manual_cop_revision_seq).compile(dialect=postgresql.dialect())
         )
@@ -168,6 +187,104 @@ class TestManualCOPCalendar:
         for field in ("source", "acquisition", "scope", "measured", "accuracy", "energy_boundary"):
             with pytest.raises(ValidationError):
                 ManualCOPPut(value=9.7, **(body | {field: "override"}))
+
+    @staticmethod
+    def stored(**changes):
+        from types import SimpleNamespace
+
+        row = {
+            "device_id": "fixture-device",
+            "granularity": "day",
+            "period_date": dt.date(2026, 10, 25),
+            "timezone": "Europe/Stockholm",
+            "value": 9.7,
+            "observed_at": dt.datetime(2026, 10, 25, 23, 30, tzinfo=dt.timezone.utc),
+            "completeness": "closed",
+            "created_at": dt.datetime(2026, 10, 25, 23, 31, tzinfo=dt.timezone.utc),
+            "updated_at": dt.datetime(2026, 10, 25, 23, 31, tzinfo=dt.timezone.utc),
+            "revision": 9007199254740993,
+        }
+        return SimpleNamespace(**(row | changes))
+
+    def test_stored_row_derives_local_boundaries_and_keeps_actual_utc_times(self):
+        from packages.core.cop_monitoring import snapshot_from_stored
+
+        snapshot = snapshot_from_stored(self.stored())
+        assert snapshot.period_start == dt.datetime(2026, 10, 24, 22, tzinfo=dt.timezone.utc)
+        assert snapshot.period_end == dt.datetime(2026, 10, 25, 23, tzinfo=dt.timezone.utc)
+        assert (snapshot.period_end - snapshot.period_start) == dt.timedelta(hours=25)
+        assert snapshot.observed_at == dt.datetime(2026, 10, 25, 23, 30, tzinfo=dt.timezone.utc)
+        assert snapshot.revision == "9007199254740993"
+        offset = dt.timezone(dt.timedelta(hours=2))
+        shifted = snapshot_from_stored(
+            self.stored(observed_at=dt.datetime(2026, 10, 26, 1, 30, tzinfo=offset))
+        )
+        assert shifted.observed_at == snapshot.observed_at
+        assert shifted.observed_at.tzinfo == dt.timezone.utc
+        month = snapshot_from_stored(
+            self.stored(
+                granularity="month",
+                period_date=dt.date(2026, 10, 1),
+                observed_at=dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc),
+                created_at=dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc),
+                updated_at=dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc),
+            )
+        )
+        assert (month.period_start, month.period_end) == (
+            dt.datetime(2026, 9, 30, 22, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 10, 31, 23, tzinfo=dt.timezone.utc),
+        )
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"timezone": "Mars/Olympus"},
+            {"timezone": "posix/Europe/Stockholm"},
+            {"timezone": "localtime"},
+            {"timezone": ""},
+            {"granularity": "week"},
+            {"granularity": "month", "period_date": dt.date(2026, 10, 4)},
+            {"period_date": dt.date(2011, 12, 30), "timezone": "Pacific/Apia"},
+            {"observed_at": dt.datetime(2026, 10, 24, 21, 59, tzinfo=dt.timezone.utc)},
+            {"observed_at": dt.datetime(2026, 10, 25, 22, 59, tzinfo=dt.timezone.utc)},
+            {"observed_at": dt.datetime(2026, 10, 25, 23, 30)},
+            {"created_at": None},
+            {"completeness": "total"},
+            {"value": float("nan")},
+            {"value": 0.0},
+            {"revision": 0},
+            {"revision": None},
+        ],
+    )
+    def test_invalid_stored_rows_fail_closed_without_invented_boundaries(self, changes):
+        from packages.core.cop_monitoring import InvalidStoredPeriod, snapshot_from_stored
+
+        with pytest.raises(InvalidStoredPeriod, match="^invalid_stored_period$"):
+            snapshot_from_stored(self.stored(**changes))
+
+    def test_partial_and_unknown_rows_need_only_start_attestation(self):
+        from packages.core.cop_monitoring import snapshot_from_stored
+
+        during = dt.datetime(2026, 10, 25, 8, tzinfo=dt.timezone.utc)
+        for completeness in ("partial", "unknown"):
+            snapshot = snapshot_from_stored(
+                self.stored(completeness=completeness, observed_at=during)
+            )
+            assert snapshot.observed_at == during
+            assert snapshot.completeness == completeness
+
+    def test_ambiguous_stored_midnight_uses_earliest_instant(self):
+        from packages.core.cop_monitoring import snapshot_from_stored
+
+        snapshot = snapshot_from_stored(
+            self.stored(
+                period_date=dt.date(2026, 11, 1),
+                timezone="America/Havana",
+                completeness="partial",
+                observed_at=dt.datetime(2026, 11, 1, 4, tzinfo=dt.timezone.utc),
+            )
+        )
+        assert snapshot.period_start == dt.datetime(2026, 11, 1, 4, tzinfo=dt.timezone.utc)
 
 
 class TestManualCOPForecast:

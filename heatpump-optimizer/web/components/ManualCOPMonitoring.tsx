@@ -10,6 +10,7 @@ interface Observation {
     granularity: Granularity;
     period_date: string;
     timezone: string;
+    /** Derived by the API from the local period and timezone; not stored. */
     period_start: string;
     period_end: string;
     value: number;
@@ -20,7 +21,7 @@ interface Observation {
     revision: string;
     source: "controller_estimate";
     acquisition: "manual_entry";
-    scope: "total";
+    scope: "unknown";
     measured: false;
     accuracy: "approximate";
     energy_boundary: "unknown";
@@ -261,8 +262,9 @@ export function ManualCOPMonitoring() {
         <section className="manual-cop-monitoring" aria-labelledby="manual-cop-heading" aria-busy={loading || busy}>
             <h3 id="manual-cop-heading">Manual controller COP</h3>
             <div className="manual-provenance text-muted">
-                <span>Controller estimate</span><span>Total</span><span>Approximate</span><span>Manual entry</span>
+                <span>Controller estimate</span><span>Scope: unknown</span><span>Approximate</span><span>Manual entry</span>
                 <span>Measured: no</span><span>Energy boundary: unknown</span>
+                <span>Hot-water inclusion: user-reported, unverified</span>
             </div>
             <div className="manual-toolbar">
                 <label className="manual-field">Device

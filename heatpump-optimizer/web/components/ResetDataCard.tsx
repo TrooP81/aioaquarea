@@ -73,14 +73,25 @@ function resetErrorMessage(data: unknown): string {
   if (refusal.code === "ml_lifecycle_unavailable") {
     return "Reset unavailable: model lifecycle storage could not be reached. Try again later.";
   }
+  if (refusal.code === "manual_cop_reset_unavailable") {
+    return "Manual COP reset unavailable: nothing was deleted. Try again later.";
+  }
   return "Reset failed";
 }
+
+const MANUAL_COP_RESET_MESSAGE =
+  "Delete every manual controller-COP reading for all devices and turn experimental COP forecasting off? " +
+  "Revision tokens are never reused. All other data, settings, models, COP history and pending safety restores are kept. " +
+  "This cannot be undone.";
 
 export function ResetDataCard() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ResetResult | null>(null);
+  const [manualSubmitting, setManualSubmitting] = useState(false);
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [manualDeleted, setManualDeleted] = useState<number | null>(null);
 
   const allSelected = selected.size === SCOPES.length;
 
@@ -134,6 +145,37 @@ export function ResetDataCard() {
       setError(err instanceof Error ? err.message : "Reset failed");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleManualReset = async () => {
+    if (!confirm(MANUAL_COP_RESET_MESSAGE)) return;
+    setManualSubmitting(true);
+    setManualError(null);
+    setManualDeleted(null);
+    try {
+      const res = await fetch("/api/admin/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scopes: ["manual_cop"] }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setManualError(resetErrorMessage(data));
+        return;
+      }
+      const data: unknown = await res.json();
+      const deleted = typeof data === "object" && data !== null
+        ? (data as Record<string, unknown>).total_rows_deleted : undefined;
+      if (typeof deleted !== "number" || !Number.isSafeInteger(deleted) || deleted < 0) {
+        setManualError("Manual COP reset response is invalid");
+        return;
+      }
+      setManualDeleted(deleted);
+    } catch (err: unknown) {
+      setManualError(err instanceof Error ? err.message : "Reset failed");
+    } finally {
+      setManualSubmitting(false);
     }
   };
 
@@ -226,6 +268,35 @@ export function ResetDataCard() {
       >
         {submitting ? "Resetting..." : "Reset Selected Data"}
       </button>
+
+      <div
+        data-testid="manual-cop-reset"
+        style={{ marginTop: "1.5rem", paddingTop: "1rem", borderTop: "1px solid var(--border)" }}
+      >
+        <h3 style={{ fontSize: "0.95rem", margin: "0 0 0.5rem" }}>Manual controller-COP ledger</h3>
+        <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
+          Separate from the scopes above and never included in &quot;Select all&quot;. Deletes the
+          manual COP readings of every device and turns experimental COP forecasting off.
+          Revision tokens are never reused; other data, settings, models and pending safety
+          restores are kept.
+        </p>
+        {manualError && (
+          <p role="alert" style={{ color: "var(--danger)", fontSize: "0.8rem" }}>{manualError}</p>
+        )}
+        {manualDeleted !== null && (
+          <p role="status" style={{ color: "var(--success)", fontSize: "0.85rem" }}>
+            Deleted {manualDeleted} manual reading(s); experimental COP forecasting is off.
+          </p>
+        )}
+        <button
+          className="btn"
+          onClick={handleManualReset}
+          disabled={manualSubmitting || submitting}
+          style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+        >
+          {manualSubmitting ? "Resetting..." : "Reset manual COP readings"}
+        </button>
+      </div>
     </div>
   );
 }
