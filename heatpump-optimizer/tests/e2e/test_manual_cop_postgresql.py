@@ -1976,15 +1976,20 @@ def _diagnostic_value(kind, value, known=MIGRATION_CHILD_KNOWN_LABELS):
     return value if allowed else _diagnostic_digest(value)
 
 
-def _diagnostic_identity(row, child):
-    """Parent-scoped identity facts; the binding comment is reported only as match and hash."""
-    if row is None:
-        return {"owned": False, "child": "missing"}
-    parent_sql = (
+def _migration_child_parent_sql(child):
+    """The parent database, role and port every cleanup connection must report."""
+    return (
         "heatpump_test",
         "heatpump",
         5432 if child["parent"]["provider"] == "github" else 5433,
     )
+
+
+def _diagnostic_identity(row, child):
+    """Parent-scoped identity facts; the binding comment is reported only as match and hash."""
+    if row is None:
+        return {"owned": False, "child": "missing"}
+    parent_sql = _migration_child_parent_sql(child)
     try:
         pairs = json.loads(row[9])
     except (TypeError, ValueError):
@@ -2047,7 +2052,9 @@ async def _capture_migration_child_diagnostics(
     """At most three child-scoped SELECTs of evidence; never authorizes DROP or termination.
 
     A server-returned SELECT error on a still usable AUTOCOMMIT connection is recorded and
-    polling continues; any other failure, including cancellation, is terminal.
+    polling continues; any other failure, including cancellation, is terminal. Returns the
+    raw captured rows (None when not captured); they only gate whether the independent
+    scheduler admission recheck runs at all.
     """
     snapshot = {
         "stage": stage,
@@ -2090,6 +2097,7 @@ async def _capture_migration_child_diagnostics(
         )
         snapshot["activity"] = [_diagnostic_activity(row[1:], child) for row in rows]
         snapshot["status"] = "captured"
+        return rows
     except BaseException as error:
         snapshot["error"] = type(error).__name__
         if snapshot["status"] == "incomplete":
@@ -2155,8 +2163,143 @@ async def _exit_migration_child_connection(context, primary, diagnostics):
     raise failure
 
 
+# TimescaleDB 2.26.4's loader intercepts an ordinary DROP DATABASE before it executes and stops
+# that database's scheduler (src/loader/loader.c 416-432, 523-533; bgw_launcher.c 686-715).
+# PostgreSQL 16.13 then still counts every remaining backend under the exclusive database lock
+# and refuses after about five seconds (dbcommands.c 1583-1705, procarray.c 3699-3763): the
+# server, not this classification, makes the final decision. backend_type comes from the
+# server's worker registration (pgstatfuncs.c 551-564); application_name is never authority.
+MIGRATION_CHILD_SCHEDULER = "TimescaleDB Background Worker Scheduler"
+MIGRATION_CHILD_SCHEDULER_SERVER_VERSION_NUM = 160013
+MIGRATION_CHILD_SCHEDULER_TIMESCALEDB = "2.26.4"
+MIGRATION_CHILD_SCHEDULER_PROFILE_SQL = (
+    "SELECT current_database(), current_user, inet_server_port(), d.oid::bigint, "
+    "shobj_description(d.oid, 'pg_database'), d.datdba::bigint, "
+    "pg_get_userbyid(d.datdba)::text, current_setting('server_version_num')::integer, "
+    "(SELECT e.extversion FROM pg_extension e WHERE e.extname = 'timescaledb'), "
+    "current_setting('shared_preload_libraries') "
+    "FROM pg_database d WHERE d.datname = :name"
+)
+# Raw, complete, child-scoped facts: two rows suffice to prove the total is exactly one.
+MIGRATION_CHILD_SCHEDULER_ACTIVITY_SQL = (
+    "SELECT count(*) OVER (), a.datid::bigint, a.datname::text, a.usesysid::bigint, "
+    "a.usename::text, a.backend_type, a.state, host(a.client_addr), a.client_port, "
+    "a.xact_start FROM pg_stat_activity a "
+    "WHERE a.datid = CAST(:child_oid AS oid) ORDER BY a.pid LIMIT 2"
+)
+MIGRATION_CHILD_SCHEDULER_RESIDUE = (
+    "the DROP hook may have stopped and disabled the owned child's Timescale scheduler; "
+    "the child is retained and is not retried, re-enabled or adopted"
+)
+
+
+def _is_scheduler_candidate(count, rows):
+    """Gate only: whether raw capture rows justify running the admission recheck at all."""
+    return (
+        count == 1
+        and rows is not None
+        and len(rows) == 1
+        and rows[0][0] == 1
+        and rows[0][6] == MIGRATION_CHILD_SCHEDULER
+    )
+
+
+def _preloads_timescaledb(value):
+    """Exact `timescaledb` token in a plain comma list; any other representation refuses."""
+    if not isinstance(value, str):
+        return False
+    tokens = [token.strip() for token in value.split(",")]
+    return all(re.fullmatch(r"[A-Za-z0-9_]+", token) for token in tokens) and (
+        "timescaledb" in tokens
+    )
+
+
+def _owned_scheduler_profile(row, child):
+    return (
+        row is not None
+        and tuple(row[:3]) == _migration_child_parent_sql(child)
+        and row[3] == child["oid"]
+        and row[4] == child["binding"]
+    )
+
+
+def _scheduler_admission_facts(profile, sessions, child, diagnostics):
+    """Every fact must be True; raw SQL NULL is None, never the diagnostics' "unknown"."""
+    total = sessions[0][0] if sessions else 0
+    single = type(total) is int and total == 1 and len(sessions) == 1
+    facts = {
+        "complete": (total == 0 and not sessions) or single,
+        "server_version_num": type(profile[7]) is int
+        and profile[7] == MIGRATION_CHILD_SCHEDULER_SERVER_VERSION_NUM,
+        "timescaledb_version": profile[8] == MIGRATION_CHILD_SCHEDULER_TIMESCALEDB,
+        "preload_timescaledb": _preloads_timescaledb(profile[9]),
+        "workers_settled": all(worker["done"] for worker in diagnostics["workers"]),
+        "no_retained_resources": diagnostics["retained_resources"] == 0,
+    }
+    if single:
+        _total, datid, datname, usesysid, usename, backend_type, state, *client, xact = sessions[0]
+        facts |= {
+            "child_scoped": datid == child["oid"] and datname == child["database"],
+            "scheduler": backend_type == MIGRATION_CHILD_SCHEDULER,
+            "owner": usename == "heatpump"
+            and profile[6] == "heatpump"
+            and type(usesysid) is int
+            and usesysid == profile[5],
+            "idle": state == "idle",
+            "no_client": client == [None, None],
+            "no_transaction": xact is None,
+        }
+    return facts
+
+
+async def _admit_migration_child_scheduler(connection, child, diagnostics, stage, count, rows):
+    """Recheck, immediately before DROP, that at most the child's own scheduler remains.
+
+    Uses fresh raw server rows only, never the redacted diagnostics. Unqualified sessions
+    return False and keep the existing bounded refusal; ownership drift or any error is
+    terminal. Never terminates a session, uses FORCE, reconnects or changes configuration.
+    """
+    if not _is_scheduler_candidate(count, rows):
+        return False
+    attempt = {"stage": stage, "queries": 0, "eligible": False}
+    diagnostics.setdefault("scheduler_admissions", []).append(attempt)
+    parameters = {"name": child["database"]}
+    try:
+        _require_original_parent(child)
+        attempt["queries"] += 1
+        before = (
+            await connection.execute(text(MIGRATION_CHILD_SCHEDULER_PROFILE_SQL), parameters)
+        ).one_or_none()
+        if not _owned_scheduler_profile(before, child):
+            raise AssertionError("migration child ownership uncertain")
+        attempt["queries"] += 1
+        sessions = (
+            await connection.execute(
+                text(MIGRATION_CHILD_SCHEDULER_ACTIVITY_SQL), {"child_oid": child["oid"]}
+            )
+        ).all()
+        attempt["queries"] += 1
+        after = (
+            await connection.execute(text(MIGRATION_CHILD_SCHEDULER_PROFILE_SQL), parameters)
+        ).one_or_none()
+        _require_original_parent(child)
+        if after != before:
+            raise AssertionError("migration child ownership uncertain")
+    except BaseException as error:
+        attempt["error"] = type(error).__name__
+        attempt["terminal"] = True
+        raise
+    facts = _scheduler_admission_facts(before, sessions, child, diagnostics)
+    attempt["sessions"] = len(sessions) if facts["complete"] else "unknown"
+    attempt["facts"] = facts
+    attempt["eligible"] = all(facts.values())
+    return attempt["eligible"]
+
+
 async def _drain_and_drop_migration_child(connection, child, parent_before, diagnostics):
+    """Ordinary DROP once no session, or only the qualified owned scheduler, remains."""
     usable = None
+    admitted = False
     for attempt in range(MIGRATION_CHILD_POLLS):
         current = (
             await connection.execute(
@@ -2176,21 +2319,42 @@ async def _drain_and_drop_migration_child(connection, child, parent_before, diag
             break
         if usable is None:
             usable = _diagnostic_connection_probe(connection)
-            await _capture_migration_child_diagnostics(
+            rows = await _capture_migration_child_diagnostics(
                 connection, child, diagnostics, "first_nonzero", attempt, current[2], usable
             )
+            admitted = await _admit_migration_child_scheduler(
+                connection, child, diagnostics, "first_nonzero", current[2], rows
+            )
+            if admitted:
+                break
         await asyncio.sleep(MIGRATION_CHILD_POLL_SECONDS)
     else:
         # Created before collection: no collector, exit or receipt failure replaces it.
         refusal = AssertionError("migration child still has sessions")
         try:
-            await _capture_migration_child_diagnostics(
+            rows = await _capture_migration_child_diagnostics(
                 connection, child, diagnostics, "final_refusal", attempt, current[2], usable
+            )
+            admitted = await _admit_migration_child_scheduler(
+                connection, child, diagnostics, "final_refusal", current[2], rows
             )
         except BaseException as failure:
             raise refusal from failure
-        raise refusal
-    await connection.execute(text(f'DROP DATABASE "{child["database"]}"'))
+        if not admitted:
+            raise refusal
+    try:
+        await connection.execute(text(f'DROP DATABASE "{child["database"]}"'))
+    except BaseException as error:
+        if admitted:
+            # Exactly one DROP: its failure or uncertainty is final and reported, never retried.
+            admission = diagnostics["scheduler_admissions"][-1]
+            admission["drop"] = "not_confirmed"
+            admission["drop_error"] = type(error).__name__
+            admission["residue"] = MIGRATION_CHILD_SCHEDULER_RESIDUE
+            error.add_note(f"scheduler-admitted DROP not confirmed: {admission['residue']}")
+        raise
+    if admitted:
+        diagnostics["scheduler_admissions"][-1]["drop"] = "completed"
     assert await _parent_relations(connection) == parent_before, "parent state changed"
 
 
@@ -2238,6 +2402,21 @@ async def _drop_migration_child(parent, child, workers, parent_before, retained_
             error.add_note(f"migration child cleanup receipt not written: {type(failure).__name__}")
             receipt += " (unwritten)"
         raise AssertionError(f"migration child cleanup refused; receipt {receipt}") from error
+    admissions = diagnostics.get("scheduler_admissions", ())
+    if any(admission.get("drop") == "completed" for admission in admissions):
+        receipt = "migration-child-cleanup-" + child["database"] + ".json"
+        try:
+            (Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) / receipt).write_text(
+                json.dumps(
+                    child | {"outcome": "scheduler_admitted_drop", "diagnostics": diagnostics}
+                ),
+                encoding="utf-8",
+            )
+        except Exception as failure:
+            # The DROP already completed: qualification fails, nothing is dropped again.
+            raise AssertionError(
+                f"migration child dropped; admission receipt {receipt} not written"
+            ) from failure
 
 
 @asynccontextmanager
@@ -2632,6 +2811,10 @@ class _DiagnosticDriver:
 
 
 def _diagnostic_statement_kind(sql):
+    if sql == MIGRATION_CHILD_SCHEDULER_PROFILE_SQL:
+        return "profile"
+    if sql == MIGRATION_CHILD_SCHEDULER_ACTIVITY_SQL:
+        return "eligibility"
     if sql.startswith("DROP DATABASE"):
         return "drop"
     if "FROM pg_class" in sql:
@@ -2659,12 +2842,16 @@ class _DiagnosticParent:
         blocks=None,
         exit_gate=None,
         exit_error=None,
+        eligibility=None,
     ):
         self.child = child
         self.counts = list(counts)
         self.rows = list(rows)
         self.total = len(self.rows) if total is None else total
         self.identities = []
+        self.profiles = []
+        # Raw scheduler-admission result sets; the last one repeats.
+        self.eligibility = list(eligibility or [[_scheduler_session(child)]])
         self.failures = dict(failures or {})
         self.blocks = dict(blocks or {})
         self.exit_gate = exit_gate
@@ -2714,6 +2901,20 @@ class _DiagnosticParent:
             '[["plpgsql", "1.0"], ["timescaledb", "2.17.2"]]',
         )
 
+    def scheduler_profile(self):
+        return (
+            "heatpump_test",
+            "heatpump",
+            5432,
+            self.child["oid"],
+            self.child["binding"],
+            SCHEDULER_OWNER_OID,
+            "heatpump",
+            160013,
+            "2.26.4",
+            "timescaledb",
+        )
+
     async def execute(self, statement, parameters=None):
         assert not self.closed and not self.invalidated, "SQL on a closed or invalidated connection"
         sql = str(statement)
@@ -2731,6 +2932,10 @@ class _DiagnosticParent:
             rows = [self.identities.pop(0) if self.identities else self.owned_identity()]
         elif kind == "activity":
             rows = [(self.total, *row) for row in self.rows]
+        elif kind == "profile":
+            rows = [self.profiles.pop(0) if self.profiles else self.scheduler_profile()]
+        elif kind == "eligibility":
+            rows = self.eligibility.pop(0) if len(self.eligibility) > 1 else self.eligibility[0]
         else:
             rows = []
         return SimpleNamespace(one_or_none=lambda: rows[0] if rows else None, all=lambda: rows)
@@ -2781,6 +2986,50 @@ def _diagnostic_receipt(tmp_path, child):
 
 
 DIAGNOSTIC_CAPTURE = ["identity", "activity", "identity"]
+SCHEDULER_ADMISSION = ["profile", "eligibility", "profile"]
+# Deliberately not 10: the owner OID is read from the server, never assumed.
+SCHEDULER_OWNER_OID = 16385
+SCHEDULER_FACTS = (
+    "complete",
+    "server_version_num",
+    "timescaledb_version",
+    "preload_timescaledb",
+    "workers_settled",
+    "no_retained_resources",
+    "child_scoped",
+    "scheduler",
+    "owner",
+    "idle",
+    "no_client",
+    "no_transaction",
+)
+
+
+def _scheduler_session(child, **changes):
+    """One raw admission row for the owned child's scheduler; SQL NULL stays None."""
+    row = {
+        "total": 1,
+        "datid": child["oid"],
+        "datname": child["database"],
+        "usesysid": SCHEDULER_OWNER_OID,
+        "usename": "heatpump",
+        "backend_type": MIGRATION_CHILD_SCHEDULER,
+        "state": "idle",
+        "client_addr": None,
+        "client_port": None,
+        "xact_start": None,
+    }
+    return tuple((row | changes).values())
+
+
+def _scheduler_capture_rows(child, backend_type=MIGRATION_CHILD_SCHEDULER):
+    """Diagnostic activity rows as observed in CI run 38318192441 (application name spoofable)."""
+    start = dt.datetime(2026, 10, 12, 22, 43, tzinfo=dt.timezone.utc)
+    return [
+        (232, child["oid"], child["database"], SCHEDULER_OWNER_OID, "heatpump", backend_type)
+        + (MIGRATION_CHILD_SCHEDULER, None, None, start, None, None, start, "idle")
+        + ("Extension", "Extension")
+    ]
 
 
 def _adapted_asyncpg_error(name, *, invalidated=False):
@@ -4131,6 +4380,349 @@ class TestManualCOPPostgreSQLMigration:
         assert _diagnostic_value("event_type", "Lock") == "Lock"
         assert _diagnostic_value("event", "Extension") == "Extension"
         assert _diagnostic_value("event", "transactionid") == "transactionid"
+
+    @pytest.mark.parametrize("case", ["zero_sessions", "qualified", "receipt_unwritten"])
+    async def test_clean_zero_or_qualified_scheduler_drops_once(self, tmp_path, monkeypatch, case):
+        calls = _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        if case == "receipt_unwritten":
+            monkeypatch.setenv("COP_MANUAL_TEST_EVIDENCE", str(tmp_path / "missing"))
+        child = _diagnostic_child()
+        zero = case == "zero_sessions"
+        parent = _DiagnosticParent(child, [0] if zero else [1], rows=_scheduler_capture_rows(child))
+        if zero:
+            # The zero-session path never probes the raw connection nor issues a new query.
+            parent.sync_connection = None
+        if case == "receipt_unwritten":
+            with pytest.raises(AssertionError, match="dropped; admission receipt") as raised:
+                await _drop_migration_child(parent, child, [], (), 0)
+            assert isinstance(raised.value.__cause__, FileNotFoundError)
+        else:
+            await _drop_migration_child(parent, child, [], (), 0)
+        admission = [] if zero else [*DIAGNOSTIC_CAPTURE, *SCHEDULER_ADMISSION]
+        # Exactly one ordinary DROP; no retry, FORCE, termination or reconnect.
+        assert parent.kinds() == ["poll", *admission, "drop", "relations"]
+        assert parent.connects == 1 and parent.exits == [None]
+        assert calls.count("guard") == 1
+        drop = 'DROP DATABASE "' + child["database"] + '"'
+        for kind, sql, parameters in parent.statements:
+            assert not re.search(r"(?i)\(\s*force|pg_terminate|pg_cancel|\bSET\b|\bALTER\b", sql)
+            if kind == "drop":
+                assert sql == drop
+            if kind == "eligibility":
+                assert parameters == {"child_oid": child["oid"]}
+        if zero:
+            assert list(tmp_path.iterdir()) == []
+            return
+        if case == "receipt_unwritten":
+            return
+        receipt = json.loads(
+            (tmp_path / f"migration-child-cleanup-{child['database']}.json").read_text()
+        )
+        assert receipt["outcome"] == "scheduler_admitted_drop" and "error" not in receipt
+        diagnostics = receipt["diagnostics"]
+        assert diagnostics["scheduler_admissions"] == [
+            {
+                "stage": "first_nonzero",
+                "queries": 3,
+                "eligible": True,
+                "sessions": 1,
+                "facts": dict.fromkeys(SCHEDULER_FACTS, True),
+                "drop": "completed",
+            }
+        ]
+        assert diagnostics["connection_exit"] == {"cancelled": False, "status": "closed"}
+        assert [s["stage"] for s in diagnostics["snapshots"]] == ["first_nonzero"]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "client_backend",
+            "mixed",
+            "application_spoof",
+            "unknown_type",
+            "raw_unknown_string",
+            "wrong_role",
+            "owner_oid_mismatch",
+            "client_present",
+            "transaction_present",
+            "not_idle",
+            "server_version",
+            "timescaledb_version",
+            "preload_missing",
+            "profile_incomplete",
+            "retained_resource",
+        ],
+    )
+    async def test_clean_unqualified_sessions_keep_bounded_refusal(
+        self, tmp_path, monkeypatch, case
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        start = dt.datetime(2026, 10, 12, 21, tzinfo=dt.timezone.utc)
+        session = {
+            "client_backend": {"backend_type": "client backend"},
+            "unknown_type": {"backend_type": None},
+            "raw_unknown_string": {"client_addr": "unknown", "xact_start": "unknown"},
+            "wrong_role": {"usename": "postgres"},
+            "owner_oid_mismatch": {"usesysid": 10},
+            "client_present": {"client_addr": "127.0.0.1", "client_port": 50000},
+            "transaction_present": {"xact_start": start},
+            "not_idle": {"state": "active"},
+        }.get(case, {})
+        eligibility = [[_scheduler_session(child, **session)]]
+        if case == "mixed":
+            eligibility = [
+                [
+                    _scheduler_session(child, total=2),
+                    _scheduler_session(child, total=2, backend_type="client backend"),
+                ]
+            ]
+        # A client may set any application name; only the server's backend_type can qualify.
+        spoof = case == "application_spoof"
+        parent = _DiagnosticParent(
+            child,
+            [1],
+            rows=_scheduler_capture_rows(child, "client backend")
+            if spoof
+            else _scheduler_capture_rows(child),
+            eligibility=eligibility,
+        )
+        profile = {
+            "server_version": {7: 160004},
+            "timescaledb_version": {8: "2.17.2"},
+            "preload_missing": {9: "pg_stat_statements"},
+            "profile_incomplete": {8: None, 9: None},
+        }.get(case)
+        if profile:
+            row = list(parent.scheduler_profile())
+            for index, value in profile.items():
+                row[index] = value
+            parent.profiles = [tuple(row)] * 4
+        retained = 1 if case == "retained_resource" else 0
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), retained)
+        refusal = refused.value.__cause__
+        assert str(refusal) == "migration child still has sessions" and refusal.__cause__ is None
+        admission = [] if spoof else SCHEDULER_ADMISSION
+        # The existing bounded poll is unchanged and nothing is ever dropped.
+        assert parent.kinds() == [
+            "poll",
+            *DIAGNOSTIC_CAPTURE,
+            *admission,
+            "poll",
+            "poll",
+            *DIAGNOSTIC_CAPTURE,
+            *admission,
+        ]
+        assert parent.connects == 1 and parent.exits == [AssertionError]
+        attempts = _diagnostic_receipt(tmp_path, child).get("scheduler_admissions", [])
+        if spoof:
+            assert attempts == []
+            return
+        assert [a["stage"] for a in attempts] == ["first_nonzero", "final_refusal"]
+        failing = {
+            "client_backend": "scheduler",
+            "mixed": "complete",
+            "unknown_type": "scheduler",
+            "raw_unknown_string": "no_client",
+            "wrong_role": "owner",
+            "owner_oid_mismatch": "owner",
+            "client_present": "no_client",
+            "transaction_present": "no_transaction",
+            "not_idle": "idle",
+            "server_version": "server_version_num",
+            "timescaledb_version": "timescaledb_version",
+            "preload_missing": "preload_timescaledb",
+            "profile_incomplete": "preload_timescaledb",
+            "retained_resource": "no_retained_resources",
+        }[case]
+        for attempt in attempts:
+            assert attempt["eligible"] is False and attempt["facts"][failing] is False
+            assert "drop" not in attempt and "terminal" not in attempt
+        if case == "mixed":
+            assert attempts[0]["sessions"] == "unknown"
+        if case == "preload_missing":
+            assert _preloads_timescaledb("pg_stat_statements, timescaledb")
+            for value in ('"timescaledb"', "$libdir/timescaledb", "timescaledb-2.26.4", "", None):
+                assert not _preloads_timescaledb(value)
+
+    @pytest.mark.parametrize(
+        "drift",
+        [
+            "oid_swap",
+            "comment",
+            "parent_sql",
+            "final_swap",
+            "parent_receipt_start",
+            "parent_receipt_final",
+        ],
+    )
+    async def test_clean_ownership_drift_before_drop_is_terminal(
+        self, tmp_path, monkeypatch, drift
+    ):
+        # Parent receipt checks: two in cleanup, two per capture, then admission start/end.
+        failure_at = {"parent_receipt_start": 5, "parent_receipt_final": 6}.get(drift)
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3, parent_failure_at=failure_at)
+        child = _diagnostic_child()
+        parent = _DiagnosticParent(child, [1], rows=_scheduler_capture_rows(child))
+        owned = parent.scheduler_profile()
+        swapped = {
+            "oid_swap": owned[:3] + (9999,) + owned[4:],
+            "comment": owned[:4] + ("another binding",) + owned[5:],
+            "parent_sql": ("postgres",) + owned[1:],
+            "final_swap": owned[:3] + (9999,) + owned[4:],
+        }.get(drift)
+        if drift == "final_swap":
+            parent.profiles = [owned, swapped]
+        elif swapped is not None:
+            parent.profiles = [swapped]
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        receipt_drift = drift.startswith("parent_receipt")
+        expected = (
+            "migration child parent identity changed"
+            if receipt_drift
+            else "migration child ownership uncertain"
+        )
+        # The first actual terminal cause is primary; no later count refusal is invented.
+        assert str(refused.value.__cause__) == expected
+        assert parent.kinds() == ["poll", *DIAGNOSTIC_CAPTURE] + {
+            "parent_receipt_start": [],
+            "final_swap": SCHEDULER_ADMISSION,
+            "parent_receipt_final": SCHEDULER_ADMISSION,
+        }.get(drift, ["profile"])
+        assert parent.connects == 1 and len(parent.exits) == 1
+        [attempt] = _diagnostic_receipt(tmp_path, child)["scheduler_admissions"]
+        assert attempt["terminal"] is True and attempt["eligible"] is False
+        assert attempt["error"] == "AssertionError" and "drop" not in attempt
+
+    async def test_clean_unsettled_worker_never_reaches_admission(self, tmp_path, monkeypatch):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        parent = _DiagnosticParent(child, [1], rows=_scheduler_capture_rows(child))
+        pending = asyncio.get_running_loop().create_future()
+        try:
+            with pytest.raises(AssertionError, match="cleanup refused") as refused:
+                await _drop_migration_child(parent, child, [pending], (), 0)
+        finally:
+            pending.cancel()
+        assert "did not settle" in str(refused.value.__cause__)
+        assert parent.connects == 0 and parent.statements == []
+        assert "scheduler_admissions" not in _diagnostic_receipt(tmp_path, child)
+
+    @pytest.mark.parametrize(
+        "failure", ["server_refusal", "timeout", "invalidation", "cancellation"]
+    )
+    async def test_clean_admitted_drop_failure_is_final_and_reports_residue(
+        self, tmp_path, monkeypatch, failure
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+        raised = []
+
+        def fail(fake):
+            if failure == "server_refusal":
+                # A client raced in: PostgreSQL's own count refuses (55006); nothing is killed.
+                raised.append(_adapted_asyncpg_error("ObjectInUseError"))
+            elif failure == "timeout":
+                raised.append(TimeoutError("synthetic DROP timeout"))
+            else:
+                raised.append(
+                    _adapted_asyncpg_error("ConnectionDoesNotExistError", invalidated=True)
+                )
+            return raised[-1]
+
+        key = ("eligibility", 1) if failure == "invalidation" else ("drop", 1)
+        blocked = asyncio.Event()
+        parent = _DiagnosticParent(
+            child,
+            [1],
+            rows=_scheduler_capture_rows(child),
+            failures=None if failure == "cancellation" else {key: fail},
+            blocks={key: blocked} if failure == "cancellation" else None,
+        )
+        if failure == "cancellation":
+            runner = asyncio.ensure_future(_drop_migration_child(parent, child, [], (), 0))
+            while "drop" not in parent.kinds():
+                await asyncio.sleep(0)
+            runner.cancel()
+            with pytest.raises(AssertionError, match="cleanup refused") as refused:
+                await runner
+            cause = refused.value.__cause__
+            assert isinstance(cause, asyncio.CancelledError) and not blocked.is_set()
+        else:
+            with pytest.raises(AssertionError, match="cleanup refused") as refused:
+                await _drop_migration_child(parent, child, [], (), 0)
+            cause = refused.value.__cause__
+            assert cause is raised[0]
+        admission = ["profile", "eligibility"]
+        if failure != "invalidation":
+            admission = [*SCHEDULER_ADMISSION, "drop"]
+        # One DROP at most, never retried; nothing reconnects.
+        assert parent.kinds() == ["poll", *DIAGNOSTIC_CAPTURE, *admission]
+        assert parent.connects == 1 and parent.exits == [type(cause)]
+        [attempt] = _diagnostic_receipt(tmp_path, child)["scheduler_admissions"]
+        notes = getattr(cause, "__notes__", [])
+        if failure == "invalidation":
+            assert attempt["terminal"] is True and "drop" not in attempt and notes == []
+            return
+        assert attempt["eligible"] is True and attempt["drop"] == "not_confirmed"
+        assert attempt["drop_error"] == type(cause).__name__
+        assert attempt["residue"] == MIGRATION_CHILD_SCHEDULER_RESIDUE
+        assert notes == [
+            f"scheduler-admitted DROP not confirmed: {MIGRATION_CHILD_SCHEDULER_RESIDUE}"
+        ]
+
+    @pytest.mark.parametrize("evidence", ["redacted_values", "incomplete_capture"])
+    async def test_clean_redacted_or_incomplete_evidence_cannot_authorize(
+        self, tmp_path, monkeypatch, evidence
+    ):
+        _diagnostic_guards(monkeypatch, tmp_path, polls=3)
+        child = _diagnostic_child()
+
+        def server_error(fake):
+            return _adapted_asyncpg_error("InsufficientPrivilegeError")
+
+        redacted = _scheduler_session(
+            child,
+            backend_type=_diagnostic_digest(MIGRATION_CHILD_SCHEDULER),
+            state=_diagnostic_value("label", None),
+        )
+        parent = _DiagnosticParent(
+            child,
+            [1],
+            rows=_scheduler_capture_rows(child),
+            eligibility=[[redacted]],
+            failures=(
+                {("activity", 1): server_error, ("activity", 2): server_error}
+                if evidence == "incomplete_capture"
+                else None
+            ),
+        )
+        with pytest.raises(AssertionError, match="cleanup refused") as refused:
+            await _drop_migration_child(parent, child, [], (), 0)
+        assert str(refused.value.__cause__) == "migration child still has sessions"
+        diagnostics = _diagnostic_receipt(tmp_path, child)
+        if evidence == "incomplete_capture":
+            # Without complete raw capture rows the admission recheck never even runs.
+            assert parent.kinds() == ["poll", "identity", "activity", "poll", "poll"] + [
+                "identity",
+                "activity",
+            ]
+            assert "scheduler_admissions" not in diagnostics
+            return
+        assert parent.kinds() == [
+            "poll",
+            *DIAGNOSTIC_CAPTURE,
+            *SCHEDULER_ADMISSION,
+            "poll",
+            "poll",
+            *DIAGNOSTIC_CAPTURE,
+            *SCHEDULER_ADMISSION,
+        ]
+        for attempt in diagnostics["scheduler_admissions"]:
+            assert attempt["eligible"] is False
+            assert attempt["facts"]["scheduler"] is False and attempt["facts"]["idle"] is False
 
     async def test_manual_reset_recreate_rejects_stale_pre_reset_revision(
         self, forward_manual_database, monkeypatch
