@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 from packages.core.database import get_session
 from packages.core.models import ExecutorVerificationReadRecord, PlanActionRecord
 from packages.core.operational_alerts import get_operational_alerts
-from packages.optimizer.executor_core import PlanExecutor
+from packages.optimizer.executor_core import PlanExecutor, _SafetyAuthorityLost
 
 
 async def _seed_actions(db_session, count: int) -> list[PlanActionRecord]:
@@ -32,6 +32,11 @@ async def _seed_actions(db_session, count: int) -> list[PlanActionRecord]:
     return actions
 
 
+# At most this many contenders (each holding an owned safety attempt connection plus one
+# transient session) run at once, so the real 5+10 pool is never exhausted.
+MAX_CONCURRENT_CONTENDERS = 5
+
+
 async def _reserve(action: PlanActionRecord, lane: str) -> bool:
     executor = PlanExecutor(AsyncMock(), session_factory=get_session)
     return await executor._reserve_verification_read(
@@ -42,53 +47,202 @@ async def _reserve(action: PlanActionRecord, lane: str) -> bool:
     )
 
 
+async def _seed_restores(count: int, label: str) -> list[int]:
+    """Seed settled source/restore pairs, one per distinct device, oldest first."""
+    now = dt.datetime.now(dt.timezone.utc)
+    async with get_session() as session:
+        sources = [
+            PlanActionRecord(
+                plan_id=1,
+                scheduled_ts=now - dt.timedelta(minutes=10),
+                action_type="force_dhw_on",
+                payload_json="{}",
+                device_id=f"quota-{label}-{index}",
+                status="executed",
+            )
+            for index in range(count)
+        ]
+        session.add_all(sources)
+        await session.flush()
+        restores = [
+            PlanActionRecord(
+                plan_id=1,
+                reverts_action_id=source.id,
+                scheduled_ts=now - dt.timedelta(minutes=5) + dt.timedelta(seconds=index),
+                action_type="force_dhw_off",
+                payload_json="{}",
+                device_id=source.device_id,
+                status="pending",
+            )
+            for index, source in enumerate(sources)
+        ]
+        session.add_all(restores)
+        await session.flush()
+        return [restore.id for restore in restores]
+
+
+async def _release_claim(executor: PlanExecutor, action: PlanActionRecord) -> None:
+    attempt = executor._attempt_for(action)
+    try:
+        assert await attempt.drain()
+        await executor._requeue_safety_action(action, "test_quota_cleanup")
+    finally:
+        assert await attempt.release()
+        executor._safety_attempts.pop(attempt.token, None)
+
+
+class _Contenders:
+    """Run whole claim/reserve/requeue/drain/release lifetimes with bounded concurrency."""
+
+    def __init__(self, restore_ids: list[int]):
+        self.restore_ids = set(restore_ids)
+        self.slots = asyncio.Semaphore(MAX_CONCURRENT_CONTENDERS)
+        self.claim_lock = asyncio.Lock()
+        self.active = 0
+        self.peak = 0
+        self.claimed: list[int] = []
+
+    async def _enter(self):
+        await self.slots.acquire()
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+
+    def _exit(self):
+        self.active -= 1
+        self.slots.release()
+
+    async def ordinary(self, action: PlanActionRecord) -> bool:
+        await self._enter()
+        try:
+            return await _reserve(action, "ordinary")
+        finally:
+            self._exit()
+
+    async def safety(self) -> bool:
+        await self._enter()
+        try:
+            executor = PlanExecutor(AsyncMock(), session_factory=get_session)
+            # Only the claim step is ordered: the executor claims the OLDEST eligible
+            # restore, so the reservation targets whichever restore was actually claimed.
+            async with self.claim_lock:
+                action = await executor._claim_due_safety_action(dt.datetime.now(dt.timezone.utc))
+            assert action is not None
+            assert action.id in self.restore_ids and action.id not in self.claimed
+            assert action.status == "executing" and action.safety_claim_token is not None
+            self.claimed.append(action.id)
+            try:
+                return await executor._reserve_verification_read(action, "safety", "safety", 15)
+            finally:
+                await _release_claim(executor, action)
+        finally:
+            self._exit()
+
+
+async def _reservation_rows(db_session) -> list[ExecutorVerificationReadRecord]:
+    db_session.expire_all()
+    return list((await db_session.execute(select(ExecutorVerificationReadRecord))).scalars().all())
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_concurrent_admission_never_exceeds_total_or_ordinary_caps(db_session):
-    actions = await _seed_actions(db_session, 16)
+    actions = await _seed_actions(db_session, 8)
+    restore_ids = await _seed_restores(8, "mixed")
+    contenders = _Contenders(restore_ids)
 
     results = await asyncio.gather(
         *(
-            _reserve(action, "ordinary" if index % 2 == 0 else "safety")
-            for index, action in enumerate(actions)
+            contender
+            for pair in zip(
+                (contenders.ordinary(action) for action in actions),
+                (contenders.safety() for _ in restore_ids),
+            )
+            for contender in pair
         )
     )
 
-    admitted = [action for action, admitted in zip(actions, results) if admitted]
-    ordinary_count = sum(index % 2 == 0 for index, admitted in enumerate(results) if admitted)
-    assert len(admitted) <= 5
-    assert ordinary_count <= 3
-
-    rows = (await db_session.execute(select(ExecutorVerificationReadRecord))).scalars().all()
-    assert len(rows) == len(admitted)
-    assert sum(row.lane == "ordinary" for row in rows) <= 3
+    assert len(results) == 16
+    assert contenders.peak <= MAX_CONCURRENT_CONTENDERS
+    assert sorted(contenders.claimed) == sorted(restore_ids)
+    rows = await _reservation_rows(db_session)
+    ordinary = [row for row in rows if row.lane == "ordinary"]
+    safety = [row for row in rows if row.lane == "safety"]
+    assert sum(results) == len(rows) == 5
+    assert len(ordinary) <= 3
+    assert {row.action_id for row in ordinary} <= {action.id for action in actions}
+    assert {row.action_id for row in safety} <= set(restore_ids)
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_safety_gets_reserved_capacity_after_ordinary_lane_is_exhausted(db_session):
-    actions = await _seed_actions(db_session, 8)
+    actions = await _seed_actions(db_session, 4)
+    restore_ids = await _seed_restores(4, "reserved")
+    contenders = _Contenders(restore_ids)
 
-    ordinary_results = [await _reserve(action, "ordinary") for action in actions[:4]]
-    safety_results = await asyncio.gather(*(_reserve(action, "safety") for action in actions[4:]))
+    ordinary_results = [await _reserve(action, "ordinary") for action in actions]
+    safety_results = await asyncio.gather(*(contenders.safety() for _ in restore_ids))
 
-    assert sum(ordinary_results) == 3
+    assert ordinary_results == [True, True, True, False]
     assert sum(safety_results) == 2
-
-    rows = (await db_session.execute(select(ExecutorVerificationReadRecord))).scalars().all()
+    assert contenders.peak <= MAX_CONCURRENT_CONTENDERS
+    assert sorted(contenders.claimed) == sorted(restore_ids)
+    rows = await _reservation_rows(db_session)
     assert len(rows) == 5
     assert sum(row.lane == "ordinary" for row in rows) == 3
     assert sum(row.lane == "safety" for row in rows) == 2
+    assert {row.action_id for row in rows if row.lane == "safety"} <= set(restore_ids)
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_safety_borrows_unused_ordinary_capacity_up_to_total_limit(db_session):
-    actions = await _seed_actions(db_session, 8)
+    actions = await _seed_actions(db_session, 1)
+    restore_ids = await _seed_restores(7, "borrow")
+    contenders = _Contenders(restore_ids)
 
     assert await _reserve(actions[0], "ordinary")
-    safety_results = await asyncio.gather(*(_reserve(action, "safety") for action in actions[1:]))
+    safety_results = await asyncio.gather(*(contenders.safety() for _ in restore_ids))
 
     assert sum(safety_results) == 4
-    rows = (await db_session.execute(select(ExecutorVerificationReadRecord))).scalars().all()
+    assert contenders.peak <= MAX_CONCURRENT_CONTENDERS
+    assert sorted(contenders.claimed) == sorted(restore_ids)
+    rows = await _reservation_rows(db_session)
     assert len(rows) == 5
+    assert sum(row.lane == "safety" for row in rows) == 4
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_stale_or_unowned_safety_claim_writes_no_reservation(db_session):
+    restore_ids = await _seed_restores(1, "unowned")
+    owner = PlanExecutor(AsyncMock(), session_factory=get_session)
+    action = await owner._claim_due_safety_action(dt.datetime.now(dt.timezone.utc))
+    assert action is not None and action.id == restore_ids[0]
+    claimed_result = action.result_json
+    try:
+        intruder = PlanExecutor(AsyncMock(), session_factory=get_session)
+        with pytest.raises(_SafetyAuthorityLost):
+            await intruder._reserve_verification_read(action, "safety", "safety", 15)
+        with pytest.raises(_SafetyAuthorityLost):
+            await owner._reserve_verification_read(
+                SimpleNamespace(
+                    id=action.id,
+                    device_id=action.device_id,
+                    reverts_action_id=action.reverts_action_id,
+                ),
+                "safety",
+                "safety",
+                15,
+            )
+        with pytest.raises(_SafetyAuthorityLost):
+            await owner._reserve_verification_read(action, "ordinary", "initial", 15)
+        assert await _reservation_rows(db_session) == []
+        db_session.expire_all()
+        stored = await db_session.get(PlanActionRecord, action.id)
+        assert stored.result_json == claimed_result
+    finally:
+        await _release_claim(owner, action)
+
+    with pytest.raises(_SafetyAuthorityLost):
+        await owner._reserve_verification_read(action, "safety", "safety", 15)
+    assert await _reservation_rows(db_session) == []
 
 
 @pytest.mark.asyncio(loop_scope="session")

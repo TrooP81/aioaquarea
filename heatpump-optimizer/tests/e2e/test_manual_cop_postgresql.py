@@ -19,13 +19,18 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
+from collections import Counter
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -311,6 +316,11 @@ def owned_test_environment(environment=None, platform_reader=None):
         assert receipt["token"] == environment["COP_MANUAL_TEST_OWNED"], "ownership token mismatch"
         assert receipt["revision"] == environment["COP_MANUAL_TEST_REVISION"], "source mismatch"
         assert re.fullmatch(r"[0-9a-f]{40}(?:\+[0-9a-f]{64})?", receipt["revision"])
+        commit = receipt["commit"]
+        digest = receipt["source_manifest_sha256"]
+        assert re.fullmatch(r"[0-9a-f]{40}", commit), "malformed tested commit"
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), "malformed source manifest digest"
+        assert digest == environment[SOURCE_MANIFEST_DIGEST_ENV], "source manifest digest mismatch"
         now = dt.datetime.now(dt.timezone.utc)
         created = _utc_timestamp(receipt["created_at"])
         expires = _utc_timestamp(receipt["expires_at"])
@@ -318,6 +328,10 @@ def owned_test_environment(environment=None, platform_reader=None):
         assert 0 < (expires - created).total_seconds() <= 1800, "unbounded ownership lease"
         provider = receipt["provider"]
         assert provider in {"github", "temp"}, "unknown ownership provider"
+        # GitHub binds the checked-out merge SHA; TEMP binds the genuine commit+digest.
+        assert receipt["revision"] == (commit if provider == "github" else f"{commit}+{digest}"), (
+            "source revision mismatch"
+        )
         if provider == "github":
             assert environment["GITHUB_ACTIONS"] == "true", "missing GitHub platform context"
             assert receipt["run_id"] == environment["GITHUB_RUN_ID"], "run mismatch"
@@ -356,6 +370,10 @@ def owned_test_environment(environment=None, platform_reader=None):
             "model_inode": model_root.stat().st_ino,
         }, "TEMP directory identity mismatch"
         assert Path(environment["COP_MANUAL_TEST_EVIDENCE"]) == root / "evidence"
+        manifest = root / "evidence" / SOURCE_MANIFEST_NAME
+        assert hashlib.sha256(manifest.read_bytes()).hexdigest() == digest, (
+            "source manifest file mismatch"
+        )
         namespace = receipt["namespace"]
         assert re.fullmatch(r"[0-9a-f]{64}", namespace["id"]), "unknown namespace"
         services = receipt["services"]
@@ -519,40 +537,261 @@ def owned_test_network():
         yield
 
 
-def verification_source_binding():
-    checkout = Path(__file__).resolve().parents[3]
-    paths = (
-        ".github/workflows/optimizer-ci.yml",
-        "heatpump-optimizer/tests/e2e/conftest.py",
-        "heatpump-optimizer/tests/e2e/test_manual_cop_postgresql.py",
-        "heatpump-optimizer/tests/test_verify_backup.py",
-        "heatpump-optimizer/README.md",
-        "heatpump-optimizer/migrations/versions/032_manual_cop_observations.py",
-        "heatpump-optimizer/tests/conftest.py",
-        "heatpump-optimizer/migrations/versions/036_manual_cop_local_periods.py",
-        "heatpump-optimizer/packages/core/models/__init__.py",
-        "heatpump-optimizer/packages/core/cop_monitoring.py",
-        "heatpump-optimizer/packages/api/routers/feeds.py",
-        "heatpump-optimizer/packages/api/schemas.py",
-        "heatpump-optimizer/packages/api/routers/admin.py",
-        "heatpump-optimizer/packages/core/version.py",
-        "heatpump-optimizer/web/components/ManualCOPMonitoring.tsx",
-        "heatpump-optimizer/web/components/ResetDataCard.tsx",
-        "heatpump-optimizer/tests/test_ml.py",
-        "heatpump-optimizer/tests/test_admin.py",
-        "heatpump-optimizer/tests/test_manual_cop_api_contracts.py",
-        "heatpump-optimizer/tests/test_app_version.py",
-        "heatpump-optimizer/tests/e2e/test_ml_lifecycle_postgresql.py",
-        "heatpump-optimizer/tests/e2e/test_phase2_safety_reverts.py",
-        "heatpump-optimizer/web/e2e/manual-cop-monitoring.spec.ts",
-        "heatpump-optimizer/web/e2e/reset-data.spec.ts",
-        "heatpump-optimizer/docs/configuration-reference.md",
-        "heatpump-optimizer/docs/manual-cop-schema-reset-runbook.md",
-        "heatpump-optimizer/tests/test_optimizer_api_contracts.py",
-        "heatpump-optimizer/web/e2e/fixtures.ts",
+# Canonical tested-source proof. One producer; preparation writes it once and every
+# consumer validates (never regenerates) it against the explicit tested commit.
+SOURCE_MANIFEST_SCHEMA = "hpo-verification-source-manifest/1"
+SOURCE_MANIFEST_NAME = "source-manifest.json"
+SOURCE_MANIFEST_DIGEST_ENV = "COP_MANUAL_TEST_SOURCE_MANIFEST_SHA256"
+VERIFICATION_BINDING_PATHS = (
+    ".github/workflows/optimizer-ci.yml",
+    "heatpump-optimizer/tests/e2e/conftest.py",
+    "heatpump-optimizer/tests/e2e/test_manual_cop_postgresql.py",
+    "heatpump-optimizer/tests/test_verify_backup.py",
+    "heatpump-optimizer/README.md",
+    "heatpump-optimizer/migrations/versions/032_manual_cop_observations.py",
+    "heatpump-optimizer/tests/conftest.py",
+    "heatpump-optimizer/migrations/versions/036_manual_cop_local_periods.py",
+    "heatpump-optimizer/packages/core/models/__init__.py",
+    "heatpump-optimizer/packages/core/cop_monitoring.py",
+    "heatpump-optimizer/packages/api/routers/feeds.py",
+    "heatpump-optimizer/packages/api/schemas.py",
+    "heatpump-optimizer/packages/api/routers/admin.py",
+    "heatpump-optimizer/packages/core/version.py",
+    "heatpump-optimizer/web/components/ManualCOPMonitoring.tsx",
+    "heatpump-optimizer/web/components/ResetDataCard.tsx",
+    "heatpump-optimizer/tests/test_ml.py",
+    "heatpump-optimizer/tests/test_admin.py",
+    "heatpump-optimizer/tests/test_manual_cop_api_contracts.py",
+    "heatpump-optimizer/tests/test_app_version.py",
+    "heatpump-optimizer/tests/e2e/test_ml_lifecycle_postgresql.py",
+    "heatpump-optimizer/tests/e2e/test_phase2_safety_reverts.py",
+    "heatpump-optimizer/web/e2e/manual-cop-monitoring.spec.ts",
+    "heatpump-optimizer/web/e2e/reset-data.spec.ts",
+    "heatpump-optimizer/docs/configuration-reference.md",
+    "heatpump-optimizer/docs/manual-cop-schema-reset-runbook.md",
+    "heatpump-optimizer/tests/test_optimizer_api_contracts.py",
+    "heatpump-optimizer/web/e2e/fixtures.ts",
+)
+VERIFICATION_REPAIR_PATHS = (
+    "heatpump-optimizer/tests/e2e/test_ml_lifecycle_verification.py",
+    "heatpump-optimizer/tests/e2e/test_api_indoor_forecast.py",
+    "heatpump-optimizer/tests/e2e/test_api_panasonic.py",
+    "heatpump-optimizer/tests/e2e/test_executor_verification_reads.py",
+    "heatpump-optimizer/tests/e2e/test_price_providers.py",
+)
+SOURCE_MANIFEST_PREFIXES = (
+    "aioaquarea/",
+    "heatpump-optimizer/packages/",
+    "heatpump-optimizer/migrations/",
+    "heatpump-optimizer/tests/",
+)
+SOURCE_MANIFEST_DECLARATIONS = (
+    "pyproject.toml",
+    "heatpump-optimizer/pyproject.toml",
+    "heatpump-optimizer/constraints.txt",
+)
+SOURCE_MANIFEST_MODES = frozenset({"100644", "100755"})
+assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 28
+assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 33
+
+
+def _source_checkout():
+    return Path(__file__).resolve().parents[3]
+
+
+def _source_git(checkout, *arguments, data=None):
+    result = subprocess.run(
+        ["git", "-C", str(checkout), *arguments],
+        input=data,
+        capture_output=True,
+        timeout=120,
+        check=False,
     )
-    assert len(paths) == len(set(paths)) == 28, "verification source binding must list 28 files"
-    return {path: hashlib.sha256((checkout / path).read_bytes()).hexdigest() for path in paths}
+    assert result.returncode == 0, (
+        f"git {arguments[0]} failed: {result.stderr.decode('utf-8', 'replace').strip()}"
+    )
+    return result.stdout
+
+
+def _safe_manifest_path(path):
+    assert isinstance(path, str) and path, "empty source manifest path"
+    assert "\\" not in path and ":" not in path and not path.startswith("/"), (
+        "unsafe source manifest path"
+    )
+    assert not any(ord(character) < 32 for character in path), "unsafe source manifest path"
+    parts = path.split("/")
+    assert all(part not in {"", ".", ".."} for part in parts), "unsafe source manifest path"
+    return parts
+
+
+def canonical_source_manifest(document):
+    return json.dumps(document, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def validate_source_manifest_document(document):
+    """Structural validation; returns the path -> SHA-256 mapping."""
+    assert isinstance(document, dict) and set(document) == {"schema", "commit", "entries"}, (
+        "malformed source manifest"
+    )
+    assert document["schema"] == SOURCE_MANIFEST_SCHEMA, "unknown source manifest schema"
+    assert isinstance(document["commit"], str) and re.fullmatch(
+        r"[0-9a-f]{40}", document["commit"]
+    ), "malformed source manifest commit"
+    entries = document["entries"]
+    assert isinstance(entries, list) and entries, "empty source manifest"
+    paths = []
+    for entry in entries:
+        assert isinstance(entry, dict) and set(entry) == {"path", "sha256"}, (
+            "malformed source manifest entry"
+        )
+        _safe_manifest_path(entry["path"])
+        assert isinstance(entry["sha256"], str) and re.fullmatch(
+            r"[0-9a-f]{64}", entry["sha256"]
+        ), "malformed source manifest hash"
+        paths.append(entry["path"])
+    assert len(paths) == len(set(paths)), "duplicate source manifest path"
+    assert paths == sorted(paths), "unsorted source manifest"
+    return {entry["path"]: entry["sha256"] for entry in entries}
+
+
+def _tested_tree(checkout, commit):
+    tree = {}
+    for record in _source_git(checkout, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+        if not record:
+            continue
+        metadata, _, raw_path = record.partition(b"\t")
+        mode, kind, name = metadata.decode("ascii").split(" ")
+        path = raw_path.decode("utf-8")
+        assert path not in tree, "duplicate tracked source path"
+        tree[path] = (mode, kind, name)
+    return tree
+
+
+def _git_blobs(checkout, names):
+    output = _source_git(
+        checkout, "cat-file", "--batch", data="".join(name + "\n" for name in names).encode()
+    )
+    blobs = {}
+    offset = 0
+    for expected in names:
+        header_end = output.index(b"\n", offset)
+        name, kind, size = output[offset:header_end].decode("ascii").split(" ")
+        assert (name, kind) == (expected, "blob"), "unexpected tested Git object"
+        start = header_end + 1
+        finish = start + int(size)
+        assert output[finish : finish + 1] == b"\n", "truncated tested Git object"
+        blobs[name] = output[start:finish]
+        offset = finish + 1
+    assert offset == len(output), "unexpected tested Git output"
+    return blobs
+
+
+def _worktree_source_bytes(checkout, path):
+    current = checkout
+    for part in _safe_manifest_path(path):
+        current = current / part
+        status = os.lstat(current)
+        assert not stat.S_ISLNK(status.st_mode), f"symlinked source path: {path}"
+        assert not getattr(status, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT, (
+            f"reparse-point source path: {path}"
+        )
+    assert stat.S_ISREG(status.st_mode), f"non-regular source path: {path}"
+    assert current.resolve(strict=True).is_relative_to(checkout), f"source escapes checkout: {path}"
+    return current.read_bytes()
+
+
+def build_verification_source_manifest(
+    checkout=None,
+    commit=None,
+    *,
+    literal_paths=VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS,
+    prefixes=SOURCE_MANIFEST_PREFIXES,
+    declarations=SOURCE_MANIFEST_DECLARATIONS,
+):
+    """The single canonical source manifest of the explicit tested commit."""
+    checkout = Path(checkout or _source_checkout()).resolve(strict=True)
+    assert isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), (
+        "malformed tested commit"
+    )
+    head = _source_git(checkout, "rev-parse", "--verify", "HEAD^{commit}").decode("ascii").strip()
+    assert head == commit, "checkout is not the explicit tested commit"
+    tree = _tested_tree(checkout, commit)
+    required = set(literal_paths) | set(declarations)
+    assert len(required) == len(literal_paths) + len(declarations), "duplicate required source"
+    missing = sorted(required - set(tree))
+    assert not missing, f"required source is not tracked: {missing[0]}"
+    selected = sorted(
+        required
+        | {path for path in tree if path.endswith(".py") and path.startswith(tuple(prefixes))}
+    )
+    for path in selected:
+        _safe_manifest_path(path)
+        mode, kind, _ = tree[path]
+        assert kind == "blob" and mode in SOURCE_MANIFEST_MODES, (
+            f"non-regular tracked source: {path}"
+        )
+    blobs = _git_blobs(checkout, sorted({tree[path][2] for path in selected}))
+    entries = []
+    for path in selected:
+        committed = blobs[tree[path][2]]
+        assert b"\0" not in committed and b"\r" not in committed, (
+            f"unsupported source representation: {path}"
+        )
+        try:
+            committed.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"unsupported source encoding: {path}") from error
+        # Only worktree CRLF -> LF is normalized; no BOM, whitespace or content exclusions.
+        current = _worktree_source_bytes(checkout, path).replace(b"\r\n", b"\n")
+        assert current == committed, f"source drift from tested commit: {path}"
+        entries.append({"path": path, "sha256": hashlib.sha256(committed).hexdigest()})
+    document = {"schema": SOURCE_MANIFEST_SCHEMA, "commit": commit, "entries": entries}
+    validate_source_manifest_document(document)
+    return document
+
+
+def write_verification_source_manifest(evidence, commit, checkout=None, selection=None):
+    """Preparation writes the canonical manifest exactly once; returns its digest."""
+    raw = canonical_source_manifest(
+        build_verification_source_manifest(checkout, commit, **(selection or {}))
+    )
+    with (Path(evidence) / SOURCE_MANIFEST_NAME).open("xb") as manifest:
+        manifest.write(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def current_verification_source_proof(environment=None, checkout=None, selection=None):
+    """Validate the prepared manifest against the tested commit and current source bytes."""
+    environment = os.environ if environment is None else environment
+    path = Path(environment["COP_MANUAL_TEST_EVIDENCE"]) / SOURCE_MANIFEST_NAME
+    digest = environment[SOURCE_MANIFEST_DIGEST_ENV]
+    assert re.fullmatch(r"[0-9a-f]{64}", digest), "malformed source manifest digest"
+    raw = path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == digest, "source manifest digest mismatch"
+    document = json.loads(raw.decode("utf-8"))
+    binding = validate_source_manifest_document(document)
+    assert canonical_source_manifest(document) == raw, "non-canonical source manifest"
+    commit = document["commit"]
+    assert environment["COP_MANUAL_TEST_REVISION"] in {commit, f"{commit}+{digest}"}, (
+        "source revision mismatch"
+    )
+    expected = validate_source_manifest_document(
+        build_verification_source_manifest(checkout, commit, **(selection or {}))
+    )
+    missing = sorted(set(expected) - set(binding))
+    assert not missing, f"source manifest omits required path: {missing[0]}"
+    extra = sorted(set(binding) - set(expected))
+    assert not extra, f"source manifest has unexpected path: {extra[0]}"
+    changed = sorted(path for path in expected if expected[path] != binding[path])
+    assert not changed, f"source manifest hash mismatch: {changed[0]}"
+    return {"commit": commit, "digest": digest, "path": path, "binding": binding}
+
+
+def verification_source_binding():
+    """Compatibility view: the validated canonical manifest's path -> SHA-256 mapping."""
+    return current_verification_source_proof()["binding"]
 
 
 def prepare_owned_test_profile():
@@ -564,11 +803,23 @@ def prepare_owned_test_profile():
     if provider == "github":
         token = f"cop-manual-mon-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
         temporary_parent = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
-        revision = os.environ["GITHUB_SHA"]
+        commit = os.environ["GITHUB_SHA"]
     else:
         token = "cop-manual-mon-" + os.environ["COP_MANUAL_TEST_LEASE_ID"]
         temporary_parent = Path(tempfile.gettempdir()).resolve(strict=True)
-        revision = os.environ["COP_MANUAL_TEST_REVISION"]
+        commit = (
+            _source_git(_source_checkout(), "rev-parse", "--verify", "HEAD^{commit}")
+            .decode("ascii")
+            .strip()
+        )
+        requested = os.environ.get("COP_MANUAL_TEST_REVISION")
+        assert requested is None or requested.split("+", 1)[0] == commit, (
+            "TEMP revision is not the tested checkout"
+        )
+    # Built before any owned root exists, so source refusal leaves nothing behind.
+    manifest = canonical_source_manifest(build_verification_source_manifest(None, commit))
+    digest = hashlib.sha256(manifest).hexdigest()
+    revision = commit if provider == "github" else f"{commit}+{digest}"
     root = temporary_parent / token
     assert os.environ["COP_MANUAL_TEST_OWNED"] == token
     assert Path(os.environ["MODEL_DIR"]) == root / "models", "model root must be set before imports"
@@ -577,6 +828,8 @@ def prepare_owned_test_profile():
     root.mkdir(mode=0o700)
     (root / "models").mkdir(mode=0o700)
     (root / "evidence").mkdir(mode=0o700)
+    with (root / "evidence" / SOURCE_MANIFEST_NAME).open("xb") as manifest_file:
+        manifest_file.write(manifest)
     now = dt.datetime.now(dt.timezone.utc)
     actual = _inspect_owned_resources(
         [context[role]["id"] for role in ("postgres", "redis")],
@@ -589,6 +842,8 @@ def prepare_owned_test_profile():
         "provider": provider,
         "token": token,
         "revision": revision,
+        "commit": commit,
+        "source_manifest_sha256": digest,
         "created_at": now.isoformat(),
         "expires_at": (now + dt.timedelta(minutes=30)).isoformat(),
         "temp_root": str(root),
@@ -621,6 +876,7 @@ def prepare_owned_test_profile():
     updates = {
         "COP_MANUAL_TEST_RECEIPT": json.dumps(receipt, separators=(",", ":")),
         "COP_MANUAL_TEST_REVISION": revision,
+        SOURCE_MANIFEST_DIGEST_ENV: digest,
         "COP_MANUAL_TEST_SERVICE_CONTEXT": json.dumps(context, separators=(",", ":")),
         "COP_MANUAL_TEST_EVIDENCE": str(root / "evidence"),
     }
@@ -647,10 +903,24 @@ async def verify_owned_sql_identity():
         await engine.dispose()
 
 
+# Owned schema fixture whose teardown writes one cleanup receipt per using node.
+LIFECYCLE_RESOURCE_FIXTURE = "lifecycle_database"
+
+
+def lifecycle_receipt_obligations(items):
+    """Nodes whose pytest fixture closure (direct or transitive) owns a lifecycle schema."""
+    return sorted(
+        item.nodeid
+        for item in items
+        if LIFECYCLE_RESOURCE_FIXTURE in tuple(getattr(item, "fixturenames", ()))
+    )
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(session, config, items):
     if os.environ.get("COP_MANUAL_TEST_PHASE"):
         config._cop_verification_nodes = [item.nodeid for item in items]
+        config._cop_receipt_required = lifecycle_receipt_obligations(items)
 
 
 def pytest_collection_finish(session):
@@ -684,6 +954,9 @@ def pytest_sessionfinish(session, exitstatus):
                     "phase": os.environ["COP_MANUAL_TEST_PHASE"],
                     "collected": getattr(session.config, "_cop_verification_nodes", []),
                     "selected": getattr(session.config, "_cop_verification_selected", []),
+                    "receipt_fixture": LIFECYCLE_RESOURCE_FIXTURE,
+                    "receipt_required": getattr(session.config, "_cop_receipt_required", []),
+                    "source_manifest_sha256": os.environ.get(SOURCE_MANIFEST_DIGEST_ENV),
                     "exit": int(exitstatus),
                 }
             ),
@@ -696,6 +969,8 @@ def run_verification_phase(name, arguments, *, limit=600, owned_sql=True):
     assert 0 < limit <= 600
     if owned_sql:
         asyncio.run(verify_owned_sql_identity())
+    # Source drift refuses before any phase directory or child process exists.
+    proof = current_verification_source_proof()
     evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"])
     phase = evidence / name
     phase.mkdir()
@@ -726,7 +1001,9 @@ def run_verification_phase(name, arguments, *, limit=600, owned_sql=True):
         "deadline": deadline.isoformat(),
         "command": arguments,
         "cwd": str(Path.cwd()),
-        "source": verification_source_binding(),
+        "source": proof["binding"],
+        "commit": proof["commit"],
+        "source_manifest_sha256": proof["digest"],
         "revision": os.environ.get("COP_MANUAL_TEST_REVISION"),
         "timed_out": False,
     }
@@ -827,12 +1104,15 @@ def verification_preflight(root, *, owned_sql=True):
     probe.chmod(0o700)
     run_verification_phase("tmp-probe", [str(probe)], limit=2, owned_sql=owned_sql)
     probe.unlink()
+    proof = current_verification_source_proof()
     (root / "evidence" / "preflight.json").write_text(
         json.dumps(
             {
                 "python": sys.version,
                 "versions": versions,
-                "source": verification_source_binding(),
+                "source": proof["binding"],
+                "commit": proof["commit"],
+                "source_manifest_sha256": proof["digest"],
                 "tzdata": importlib.metadata.version("tzdata"),
                 "executable_tmp": True,
             }
@@ -841,59 +1121,514 @@ def verification_preflight(root, *, owned_sql=True):
     )
 
 
-def seal_verification_evidence():
-    evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"])
-    inventory = json.loads((evidence / "manual-inventory/nodes.json").read_text(encoding="utf-8"))
-    expected = set(inventory["collected"])
-    phases = []
-    for name in ("migration", "manual", "exhaustion"):
-        nodes = json.loads((evidence / name / "nodes.json").read_text(encoding="utf-8"))
-        process = json.loads((evidence / name / "process.json").read_text(encoding="utf-8"))
-        assert nodes["exit"] == process["exit"] == 0 and not process["alive"]
-        selected = set(nodes["selected"])
-        assert selected and not any(selected & previous for previous in phases)
-        reports = [
-            json.loads(line)
-            for line in (evidence / name / "reports.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        assert all(
-            report["outcome"] == "passed" and not report["wasxfail"] for report in reports
-        ), "manual skip/failure is forbidden"
-        assert {report["nodeid"] for report in reports if report["when"] == "call"} == selected
-        phases.append(selected)
-    assert set.union(*phases) == expected, "manual phase inventory is incomplete"
-    ordinary = json.loads((evidence / "ordinary/nodes.json").read_text(encoding="utf-8"))
-    ordinary_process = json.loads((evidence / "ordinary/process.json").read_text(encoding="utf-8"))
-    assert set(ordinary["selected"]) == set(ordinary["collected"])
-    assert not expected & set(ordinary["selected"])
-    assert ordinary["exit"] == ordinary_process["exit"] == 0 and not ordinary_process["alive"]
+MANUAL_MODULE = "tests/e2e/test_manual_cop_postgresql.py"
+LIFECYCLE_MODULE = "tests/e2e/test_ml_lifecycle_postgresql.py"
+LIFECYCLE_VERIFICATION_MODULE = "tests/e2e/test_ml_lifecycle_verification.py"
+# Ordinary E2E keeps conftest and ignores exactly these coordinator-owned modules.
+COORDINATOR_MODULES = (MANUAL_MODULE, LIFECYCLE_MODULE, LIFECYCLE_VERIFICATION_MODULE)
+REAL_MIGRATION_CLASS = LIFECYCLE_VERIFICATION_MODULE + "::TestOBS5RealMigration"
+SEALED_TEST_PHASES = (
+    "migration",
+    "manual",
+    "exhaustion",
+    "obs5-real-migration",
+    "obs5-pg-original",
+    "obs5-pg-supplement",
+    "ordinary",
+)
+OBS5_TEST_PHASES = ("obs5-real-migration", "obs5-pg-original", "obs5-pg-supplement")
+REQUIRED_SCHEMA_PHASES = (
+    "heads",
+    "upgrade-head",
+    "check-migration",
+    "check-manual",
+    "check-exhaustion",
+    "obs5-primary-upgrade",
+    "obs5-primary-check",
+    "check-obs5",
+    "check-ordinary",
+)
+
+
+def _verification_phase_owns(name, nodeid):
+    module = nodeid.split("::", 1)[0]
+    real_migration = nodeid.startswith(REAL_MIGRATION_CLASS + "::")
+    owners = {
+        "migration": module == MANUAL_MODULE,
+        "manual": module == MANUAL_MODULE,
+        "exhaustion": module == MANUAL_MODULE,
+        "obs5-real-migration": real_migration,
+        "obs5-pg-original": module == LIFECYCLE_MODULE,
+        "obs5-pg-supplement": module == LIFECYCLE_VERIFICATION_MODULE and not real_migration,
+        "ordinary": module not in COORDINATOR_MODULES,
+    }
+    assert name in owners, f"unknown verification phase {name}"
+    return owners[name]
+
+
+def _successful_process(evidence, name):
+    path = evidence / name / "process.json"
+    assert path.is_file(), f"verification phase {name} did not succeed"
+    process = json.loads(path.read_text(encoding="utf-8"))
+    assert process["exit"] == 0 and not process["alive"] and not process["timed_out"], (
+        f"verification phase {name} did not succeed"
+    )
+    return process
+
+
+def _reconcile_verification_phase(evidence, name):
+    """Exactly one passed setup/call/teardown per selected, phase-owned node."""
+    process = _successful_process(evidence, name)
+    nodes = json.loads((evidence / name / "nodes.json").read_text(encoding="utf-8"))
+    assert nodes["phase"] == name and nodes["exit"] == process["exit"] == 0, (
+        f"verification phase {name} did not succeed"
+    )
+    selected = nodes["selected"]
+    assert selected and len(selected) == len(set(selected)), f"phase {name} selection is invalid"
+    foreign = [node for node in selected if not _verification_phase_owns(name, node)]
+    assert not foreign, f"phase {name} selected a node it does not own"
     reports = [
         json.loads(line)
-        for line in (evidence / "ordinary/reports.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (evidence / name / "reports.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert all(report["outcome"] == "passed" and not report["wasxfail"] for report in reports), (
-        "ordinary E2E skip/failure is forbidden"
+        f"phase {name} skip/xfail/failure is forbidden"
     )
-    assert {report["nodeid"] for report in reports if report["when"] == "call"} == set(
-        ordinary["selected"]
+    assert {report["nodeid"] for report in reports} == set(selected), (
+        f"phase {name} reports differ from its selection"
     )
+    counts = Counter((report["nodeid"], report["when"]) for report in reports)
+    assert len(reports) == 3 * len(selected) and all(
+        counts[(node, when)] == 1 for node in selected for when in ("setup", "call", "teardown")
+    ), f"phase {name} lacks exactly one setup/call/teardown per node"
+    return set(selected)
+
+
+def reconcile_verification_partitions(evidence, inventory, names):
+    """Disjoint, complete execution ownership of an actual collected inventory."""
+    evidence = Path(evidence)
+    _successful_process(evidence, inventory)
+    collected = json.loads((evidence / inventory / "nodes.json").read_text(encoding="utf-8"))
+    expected = collected["collected"]
+    assert collected["exit"] == 0 and expected and len(expected) == len(set(expected)), (
+        "verification inventory is invalid"
+    )
+    partitions = {}
+    for name in names:
+        selected = _reconcile_verification_phase(evidence, name)
+        for other, previous in partitions.items():
+            assert not selected & previous, f"verification phases {other} and {name} overlap"
+        partitions[name] = selected
+    assert set().union(*partitions.values()) == set(expected), (
+        "verification inventory is not completely partitioned"
+    )
+    return set(expected), partitions
+
+
+async def _primary_marker():
+    owned_test_environment()
+    engine = create_async_engine(
+        TEST_DATABASE_URL, poolclass=NullPool, connect_args={"command_timeout": 20, "timeout": 20}
+    )
+    try:
+        with owned_test_network():
+            async with engine.connect() as connection:
+                await guard_owned_database(connection)
+                if (
+                    await connection.execute(text("SELECT to_regclass('public.alembic_version')"))
+                ).scalar_one() is None:
+                    return None
+                markers = (
+                    (
+                        await connection.execute(
+                            text("SELECT version_num FROM public.alembic_version")
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert len(markers) <= 1, "primary has multiple Alembic markers"
+                return markers[0] if markers else None
+    finally:
+        await engine.dispose()
+
+
+def run_primary_head_upgrade(label, *, evidence=None, read_marker=None, run_phase=None):
+    """Explicit guarded primary upgrade/check; never inferred from a child migration."""
+    assert re.fullmatch(r"[a-z0-9-]+", label)
+    evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"] if evidence is None else evidence)
+    read_marker = read_marker or (lambda: asyncio.run(_primary_marker()))
+    run_phase = run_phase or run_verification_phase
+    head, _ = migration_targets()
+    assert head == LOCAL_PERIOD_REVISION, "reviewed primary head changed"
+    before = read_marker()
+    assert before in {None, head}, "unexpected primary migration state"
+    run_phase(label + "-upgrade", [sys.executable, "-m", "alembic", "upgrade", "head"])
+    run_phase(label + "-check", [sys.executable, "-m", "alembic", "check"])
+    after = read_marker()
+    assert after == head, "primary is not at the reviewed head"
+    (evidence / (label + "-head.json")).write_text(
+        json.dumps({"before": before, "after": after, "head": head}), encoding="utf-8"
+    )
+    return after
+
+
+OBS5_SCHEMA_PHASES = ("obs5-primary-upgrade", "obs5-primary-check", "check-obs5")
+LIFECYCLE_RECEIPT_PHASES = ("obs5-pg-original", "obs5-pg-supplement")
+_SEAL_SNAPSHOT = ContextVar("lifecycle_seal_snapshot", default=None)
+_SEAL_PUBLICATIONS = ContextVar("lifecycle_seal_publications", default=None)
+
+
+def _revoke_lifecycle_seals():
+    """Revoke only this invocation's published inode, never an earlier/replaced seal."""
+    for path, identity in _SEAL_PUBLICATIONS.get() or ():
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            continue
+        assert (current.st_dev, current.st_ino) == identity, (
+            "lifecycle receipt seal replacement prevents revocation"
+        )
+        path.unlink()
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+
+@contextmanager
+def lifecycle_evidence_lock(evidence):
+    """Nonblocking cross-process lock; crash releases it, contention fails closed.
+
+    The owned, private evidence directory is a cooperative test-process boundary,
+    not protection against an attacker running as the same OS user. Never unlink
+    the lock inode: all receipt writers and sealers must use this protocol.
+    """
+    evidence = Path(evidence)
+    info = evidence.lstat()
+    assert stat.S_ISDIR(info.st_mode) and not (
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    ), "lifecycle receipt evidence root is unsafe"
+    if os.name != "nt":
+        assert info.st_mode & 0o077 == 0, "lifecycle receipt evidence root is not private"
+    path = evidence / ".lifecycle-evidence.lock"
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as error:
+        raise AssertionError("lifecycle receipt lock unavailable") from error
+    acquired = False
+    try:
+        opened, named = os.fstat(descriptor), path.lstat()
+        assert (
+            stat.S_ISREG(opened.st_mode)
+            and opened.st_nlink == 1
+            and opened.st_size == 0
+            and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+            and not (
+                getattr(named, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            )
+        ), "lifecycle receipt lock is unsafe"
+        if os.name != "nt":
+            assert opened.st_mode & 0o077 == 0 and opened.st_uid == info.st_uid, (
+                "lifecycle receipt lock is not private"
+            )
+        if os.name == "nt":
+            import msvcrt
+
+            # Byte-range locking works beyond EOF; the stable lock file stays empty.
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = True
+        current_root, current_lock = evidence.lstat(), path.lstat()
+        assert (current_root.st_dev, current_root.st_ino) == (info.st_dev, info.st_ino) and (
+            current_lock.st_dev,
+            current_lock.st_ino,
+        ) == (named.st_dev, named.st_ino), "lifecycle receipt lock identity changed"
+        yield
+    except OSError as error:
+        raise AssertionError("lifecycle receipt lock unavailable") from error
+    finally:
+        original = sys.exception()
+        errors = []
+        try:
+            if acquired:
+                if os.name == "nt":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as error:
+            errors.append(error)
+            try:
+                _revoke_lifecycle_seals()
+            except BaseException as revoke_error:
+                errors.append(revoke_error)
+        finally:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            if original is not None:
+                errors.insert(0, original)
+            raise AssertionError(
+                "lifecycle receipt lock settlement failed"
+            ) from BaseExceptionGroup("lifecycle lock body/cleanup failures", errors)
+
+
+def _lifecycle_evidence_snapshot(evidence):
+    records = {}
+    for name, path in (
+        ("root", Path(evidence)),
+        ("lock", Path(evidence) / ".lifecycle-evidence.lock"),
+    ):
+        info = path.lstat()
+        records[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+    paths = set(Path(evidence).glob("obs5-receipt*")) | set(Path(evidence).glob("obs5-*.json"))
+    for path in paths:
+        if path.name == "obs5-scope-seal.json":
+            continue
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode) and not (
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ), "lifecycle receipt snapshot contains unsafe file"
+        records[path.name] = (
+            (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns),
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    return records
+
+
+def _publish_lifecycle_json(path, record):
+    """Exclusive atomic publication under the lifecycle lock, never overwrite."""
+    path = Path(path)
+    snapshot = _SEAL_SNAPSHOT.get()
+    if path.name in {"seal.json", "obs5-scope-seal.json"} and record.get("passed") is not False:
+        assert snapshot is not None and snapshot == _lifecycle_evidence_snapshot(path.parent), (
+            "lifecycle receipt store changed before seal publication"
+        )
+    pending = path.parent / (".lifecycle-pending-" + uuid.uuid4().hex)
+    try:
+        with pending.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(record))
+            stream.flush()
+            os.fsync(stream.fileno())
+        publications = _SEAL_PUBLICATIONS.get()
+        if publications is not None and path.name in {"seal.json", "obs5-scope-seal.json"}:
+            identity = pending.stat()
+            publications.append((path, (identity.st_dev, identity.st_ino)))
+        os.link(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def write_lifecycle_receipt(evidence, receipt):
+    evidence = Path(evidence)
+    with lifecycle_evidence_lock(evidence):
+        assert not any(
+            (evidence / name).exists() for name in ("seal.json", "obs5-scope-seal.json")
+        ), "lifecycle receipt store is sealed"
+        node = receipt["test"]
+        assert isinstance(node, str) and node, "lifecycle receipt node is missing"
+        name = "obs5-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json"
+        _publish_lifecycle_json(evidence / name, receipt)
+
+
+def atomic_lifecycle_seal(function):
+    """Hold the writer lock from validation through atomic seal publication.
+
+    Snapshot checks additionally reject observed non-protocol changes during
+    validation/publication. No retry or stale-lock deletion is permitted.
+    """
+
+    @wraps(function)
+    def locked(evidence=None, *args, **kwargs):
+        evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"] if evidence is None else evidence)
+        publications_token = _SEAL_PUBLICATIONS.set([])
+        try:
+            with lifecycle_evidence_lock(evidence):
+                assert not any(
+                    (evidence / name).exists() for name in ("seal.json", "obs5-scope-seal.json")
+                ), "lifecycle receipt store is already sealed"
+                before = _lifecycle_evidence_snapshot(evidence)
+                token = _SEAL_SNAPSHOT.set(before)
+                try:
+                    result = function(evidence, *args, **kwargs)
+                    assert before == _lifecycle_evidence_snapshot(evidence), (
+                        "lifecycle receipt store changed during sealing"
+                    )
+                except BaseException:
+                    _revoke_lifecycle_seals()
+                    raise
+                finally:
+                    _SEAL_SNAPSHOT.reset(token)
+            return result
+        except BaseException as error:
+            try:
+                _revoke_lifecycle_seals()
+            except BaseException as revoke_error:
+                raise AssertionError(
+                    "lifecycle receipt seal revocation failed"
+                ) from BaseExceptionGroup("lifecycle seal/rollback failures", [error, revoke_error])
+            raise
+        finally:
+            _SEAL_PUBLICATIONS.reset(publications_token)
+
+    return locked
+
+
+def lifecycle_receipt_requirements(evidence, inventory, partitions, digest):
+    """Exact lifecycle-receipt obligations from the source-bound collection inventory.
+
+    The inventory's pytest fixture closure decides which nodes own a lifecycle schema;
+    each executing lifecycle phase must have collected the identical obligation subset.
+    """
+    collected = json.loads((evidence / inventory / "nodes.json").read_text(encoding="utf-8"))
+    required = collected.get("receipt_required")
+    assert (
+        collected.get("receipt_fixture") == LIFECYCLE_RESOURCE_FIXTURE
+        and collected.get("source_manifest_sha256") == digest
+        and isinstance(required, list)
+        and required
+        and len(required) == len(set(required))
+        and set(required) <= set(collected["collected"])
+    ), "lifecycle receipt inventory is missing or unbound"
+    required = set(required)
+    executed = set().union(*(partitions.get(name, set()) for name in LIFECYCLE_RECEIPT_PHASES))
+    assert required <= executed, "lifecycle receipt obligation ran outside a lifecycle phase"
+    for name in LIFECYCLE_RECEIPT_PHASES:
+        nodes = json.loads((evidence / name / "nodes.json").read_text(encoding="utf-8"))
+        assert (
+            nodes.get("receipt_fixture") == LIFECYCLE_RESOURCE_FIXTURE
+            and nodes.get("source_manifest_sha256") == digest
+            and set(nodes.get("receipt_required", ())) & partitions[name]
+            == required & partitions[name]
+        ), f"phase {name} lifecycle receipt inventory drifted"
+    return required
+
+
+def validate_bound_verification_evidence(evidence, proof, partitions, schema_phases, inventory):
+    """Shared full/OBS-only seal validation: every bound receipt, before any seal is written.
+
+    Requires successful, source-identical process receipts; preflight/ownership source;
+    the explicit primary-head receipt; and exactly one schema-ownership/cleanup receipt,
+    bound to the owned profile token, per executed lifecycle-resource node.
+    """
+    evidence = Path(evidence)
+    digest, commit, binding = proof["digest"], proof["commit"], proof["binding"]
+    for name in schema_phases:
+        _successful_process(evidence, name)
+    head = json.loads((evidence / "obs5-primary-head.json").read_text(encoding="utf-8"))
+    assert (
+        head["before"] in {None, LOCAL_PERIOD_REVISION}
+        and head["after"] == head["head"] == LOCAL_PERIOD_REVISION
+    ), "primary head was not proven"
     processes = [
         json.loads(path.read_text(encoding="utf-8")) for path in evidence.glob("*/process.json")
     ]
-    assert all(process["exit"] == 0 and not process["alive"] for process in processes)
-    binding = verification_source_binding()
-    assert all(process["source"] == binding for process in processes), "verification source drift"
-    (evidence / "seal.json").write_text(
-        json.dumps(
-            {
-                "manual_nodes": sorted(expected),
-                "ordinary_nodes": ordinary["selected"],
-                "source": binding,
-                "phases": processes,
-                "sealed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            }
-        ),
-        encoding="utf-8",
+    assert all(
+        process["exit"] == 0 and not process["alive"] and not process["timed_out"]
+        for process in processes
+    ), "verification process failed or survived"
+    assert all(
+        (process["commit"], process["source_manifest_sha256"], process["source"])
+        == (commit, digest, binding)
+        for process in processes
+    ), "verification source drift"
+    ownership = json.loads((evidence.parent / "ownership.json").read_text(encoding="utf-8"))
+    for receipt in (
+        json.loads((evidence / "preflight.json").read_text(encoding="utf-8")),
+        ownership,
+    ):
+        assert (receipt["commit"], receipt["source_manifest_sha256"]) == (commit, digest), (
+            "receipt source digest mismatch"
+        )
+    required = lifecycle_receipt_requirements(evidence, inventory, partitions, digest)
+    expected_receipts = {
+        "obs5-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json": node
+        for node in required
+    }
+    # These are coordinator records, not lifecycle receipts. Everything else in the
+    # receipt namespace must match an inventory obligation, even without an owner field.
+    coordinator_records = {
+        "obs5-primary-head.json",
+        "obs5-readiness-postgres.json",
+        "obs5-readiness-redis.json",
+        "obs5-scope-seal.json",
+    }
+    receipt_paths = set(evidence.glob("obs5-receipt*")) | {
+        path for path in evidence.glob("obs5-*.json") if path.name not in coordinator_records
+    }
+    assert len(expected_receipts) == len(required) and {path.name for path in receipt_paths} == set(
+        expected_receipts
+    ), "lifecycle receipt coverage mismatch"
+    lifecycle = []
+    for path in sorted(receipt_paths):
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and not (
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ), "lifecycle receipt is not a regular file"
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise AssertionError("lifecycle receipt is unreadable or malformed") from error
+        assert isinstance(receipt, dict) and receipt.get("test") == expected_receipts[path.name], (
+            "lifecycle receipt coverage mismatch"
+        )
+        lifecycle.append(receipt)
+    assert {receipt["test"] for receipt in lifecycle} == required, (
+        "lifecycle receipt coverage mismatch"
+    )
+    assert all(
+        receipt.get("ownership_token") == ownership["token"]
+        and (receipt.get("commit"), receipt.get("source_manifest_sha256")) == (commit, digest)
+        and receipt.get("schema_owned") is True
+        and receipt.get("schema_removed") is True
+        and receipt.get("public_manual_storage_unchanged") is True
+        for receipt in lifecycle
+    ), "lifecycle receipt source/cleanup mismatch"
+    return head, processes
+
+
+@atomic_lifecycle_seal
+def seal_verification_evidence(evidence=None, proof=None):
+    evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"] if evidence is None else evidence)
+    proof = current_verification_source_proof() if proof is None else proof
+    digest, commit, binding = proof["digest"], proof["commit"], proof["binding"]
+    expected, partitions = reconcile_verification_partitions(
+        evidence, "e2e-inventory", SEALED_TEST_PHASES
+    )
+    outside = sorted(
+        {node.split("::", 1)[0] for node in expected}
+        - {path.removeprefix("heatpump-optimizer/") for path in binding}
+    )
+    assert not outside, f"inventoried test source is outside the source manifest: {outside[0]}"
+    manual = json.loads((evidence / "manual-inventory/nodes.json").read_text(encoding="utf-8"))
+    _successful_process(evidence, "manual-inventory")
+    manual_nodes = partitions["migration"] | partitions["manual"] | partitions["exhaustion"]
+    assert manual_nodes == set(manual["collected"]), "manual phase inventory is incomplete"
+    head, processes = validate_bound_verification_evidence(
+        evidence, proof, partitions, REQUIRED_SCHEMA_PHASES, "e2e-inventory"
+    )
+    _publish_lifecycle_json(
+        evidence / "seal.json",
+        {
+            "commit": commit,
+            "source_manifest_sha256": digest,
+            "source": binding,
+            "partitions": {name: sorted(nodes) for name, nodes in partitions.items()},
+            "primary_head": head,
+            "phases": processes,
+            "sealed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
     )
 
 
@@ -921,6 +1656,17 @@ class TestOwnedResourceGuard:
         root.mkdir()
         (root / "models").mkdir()
         (root / "evidence").mkdir()
+        commit = "4" * 40
+        # Synthetic canonical manifest; guard tests prove binding, not repository content.
+        manifest = canonical_source_manifest(
+            {
+                "schema": SOURCE_MANIFEST_SCHEMA,
+                "commit": commit,
+                "entries": [{"path": "pkg/module.py", "sha256": "5" * 64}],
+            }
+        )
+        (root / "evidence" / SOURCE_MANIFEST_NAME).write_bytes(manifest)
+        digest = hashlib.sha256(manifest).hexdigest()
         namespace = {
             "id": "3" * 64,
             "name": "github_network_" + "3" * 32 if provider == "github" else lease,
@@ -931,7 +1677,9 @@ class TestOwnedResourceGuard:
             "version": 1,
             "provider": provider,
             "token": token,
-            "revision": "4" * 40,
+            "revision": commit if provider == "github" else f"{commit}+{digest}",
+            "commit": commit,
+            "source_manifest_sha256": digest,
             "created_at": now.isoformat(),
             "expires_at": (now + dt.timedelta(minutes=30)).isoformat(),
             "run_id": "123",
@@ -976,13 +1724,14 @@ class TestOwnedResourceGuard:
             "MODEL_DIR": receipt["model_root"],
             "COP_MANUAL_TEST_OWNED": token,
             "COP_MANUAL_TEST_REVISION": receipt["revision"],
+            SOURCE_MANIFEST_DIGEST_ENV: digest,
             "COP_MANUAL_TEST_LEASE_ID": lease,
             "COP_MANUAL_TEST_EVIDENCE": str(root / "evidence"),
             "GITHUB_ACTIONS": "true",
             "GITHUB_RUN_ID": "123",
             "GITHUB_RUN_ATTEMPT": "2",
             "GITHUB_JOB": "backend-e2e",
-            "GITHUB_SHA": receipt["revision"],
+            "GITHUB_SHA": commit,
             "RUNNER_TEMP": str(tmp_path),
             "COP_MANUAL_TEST_SERVICE_CONTEXT": json.dumps(context),
         }
@@ -1212,10 +1961,14 @@ class TestOwnedResourceGuard:
             "published_temp_port",
             "foreign_namespace",
             "wrong_receipt_endpoints",
+            "wrong_source_digest",
+            "drifted_source_manifest",
+            "temp_revision_without_digest",
         ],
     )
     async def test_guard_refuses_before_mutation(self, tmp_path, case):
-        provider = "temp" if case == "published_temp_port" else "github"
+        temp_cases = {"published_temp_port", "temp_revision_without_digest"}
+        provider = "temp" if case in temp_cases else "github"
         environment, receipt, actual = self.environment(tmp_path, provider)
         identity = ("heatpump_test", "heatpump", 5432 if provider == "github" else 5433)
         objects = []
@@ -1274,6 +2027,15 @@ class TestOwnedResourceGuard:
             environment["COP_MANUAL_TEST_SERVICE_CONTEXT"] = json.dumps(context)
         elif case == "wrong_receipt_endpoints":
             receipt["endpoints"]["postgres"]["port"] = 5432
+        elif case == "wrong_source_digest":
+            environment[SOURCE_MANIFEST_DIGEST_ENV] = "0" * 64
+        elif case == "drifted_source_manifest":
+            (Path(environment["COP_MANUAL_TEST_EVIDENCE"]) / SOURCE_MANIFEST_NAME).write_bytes(
+                b"{}"
+            )
+        elif case == "temp_revision_without_digest":
+            receipt["revision"] = receipt["commit"]
+            environment["COP_MANUAL_TEST_REVISION"] = receipt["commit"]
         self.bind(environment, receipt)
         if case == "missing_receipt":
             environment.pop("COP_MANUAL_TEST_RECEIPT")
@@ -1296,6 +2058,14 @@ class TestOwnedResourceGuard:
         mutation.assert_not_awaited()
         if case == "published_temp_port":
             assert "TEMP service must not publish ports" in str(refused.value)
+        expected_refusal = {
+            "wrong_source_digest": "source manifest digest mismatch",
+            "drifted_source_manifest": "source manifest file mismatch",
+            "temp_revision_without_digest": "source revision mismatch",
+        }.get(case)
+        if expected_refusal:
+            assert expected_refusal in str(refused.value)
+            assert connection.execute.await_count == 0
         for call in connection.execute.await_args_list:
             statement = str(call.args[0]).upper()
             assert statement.startswith("SELECT ")
@@ -1309,6 +2079,8 @@ class TestOwnedResourceGuard:
         self.bind(environment, receipt)
         for key, value in environment.items():
             monkeypatch.setenv(key, value)
+        proof = {"commit": receipt["commit"], "digest": "5" * 64, "binding": {"a.py": "6" * 64}}
+        monkeypatch.setitem(globals(), "current_verification_source_proof", lambda: proof)
         child = SimpleNamespace(pid=4242, returncode=None, waits=[])
 
         def wait(timeout):
@@ -1349,6 +2121,1191 @@ class TestOwnedResourceGuard:
             *((((child.pid, signal.SIGKILL),),) if needs_kill else ()),
         ]
         assert launch.call_args.kwargs["start_new_session"] is True
+
+
+class TestVerificationSourceManifest:
+    """Canonical tested-source proof on a synthetic Git checkout (never the tested one)."""
+
+    SELECTION = {
+        "literal_paths": ("pkg/required.py", "docs/readme.md"),
+        "prefixes": ("pkg/",),
+        "declarations": ("pyproject.toml",),
+    }
+    FILES = {
+        "pkg/required.py": b"A = 1\n",
+        "pkg/extra.py": b"B = 2\n",
+        "pkg/data.txt": b"not python\n",
+        "docs/readme.md": b"readme\n",
+        "pyproject.toml": b"[project]\n",
+        "other/outside.py": b"C = 3\n",
+    }
+
+    @staticmethod
+    def git(root, *arguments):
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=verification",
+                "-c",
+                "user.email=verification@example.invalid",
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "commit.gpgsign=false",
+                *arguments,
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.decode("utf-8").strip()
+
+    def repository(self, tmp_path, changes=None):
+        root = tmp_path / "checkout"
+        root.mkdir()
+        self.git(root, "init", "-q")
+        for path, content in {**self.FILES, **(changes or {})}.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(content)
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-q", "-m", "fixture")
+        return root, self.git(root, "rev-parse", "HEAD")
+
+    def prepare(self, tmp_path, root, commit, document=None):
+        evidence = tmp_path / "evidence"
+        evidence.mkdir(exist_ok=True)
+        document = document or build_verification_source_manifest(root, commit, **self.SELECTION)
+        raw = canonical_source_manifest(document)
+        (evidence / SOURCE_MANIFEST_NAME).write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        environment = {
+            "COP_MANUAL_TEST_EVIDENCE": str(evidence),
+            SOURCE_MANIFEST_DIGEST_ENV: digest,
+            "COP_MANUAL_TEST_REVISION": commit,
+        }
+        return environment, raw
+
+    def proof(self, environment, root):
+        return current_verification_source_proof(environment, root, self.SELECTION)
+
+    async def test_manifest_is_canonical_exact_and_lf_equivalent(self, tmp_path):
+        root, commit = self.repository(tmp_path)
+        document = build_verification_source_manifest(root, commit, **self.SELECTION)
+        assert document["schema"] == SOURCE_MANIFEST_SCHEMA and document["commit"] == commit
+        assert [entry["path"] for entry in document["entries"]] == [
+            "docs/readme.md",
+            "pkg/extra.py",
+            "pkg/required.py",
+            "pyproject.toml",
+        ]
+        assert all(
+            entry["sha256"] == hashlib.sha256(self.FILES[entry["path"]]).hexdigest()
+            for entry in document["entries"]
+        )
+        environment, raw = self.prepare(tmp_path, root, commit, document)
+        assert not raw.endswith(b"\n") and b" " not in raw
+        # A CRLF worktree checkout of an LF blob is the same tested source.
+        (root / "pkg/required.py").write_bytes(b"A = 1\r\n")
+        proof = self.proof(environment, root)
+        assert proof["commit"] == commit
+        assert proof["binding"] == validate_source_manifest_document(document)
+        environment["COP_MANUAL_TEST_REVISION"] = f"{commit}+{proof['digest']}"
+        assert self.proof(environment, root)["digest"] == proof["digest"]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "extra_field",
+            "wrong_schema",
+            "short_commit",
+            "empty_entries",
+            "entry_field",
+            "uppercase_hash",
+            "duplicate",
+            "unsorted",
+            "traversal",
+            "absolute",
+            "backslash",
+            "empty_component",
+            "dot_component",
+            "drive",
+            "control",
+            "non_string_path",
+        ],
+    )
+    async def test_document_validation_refuses_malformed_manifests(self, case):
+        entries = [{"path": "a.py", "sha256": "1" * 64}, {"path": "b.py", "sha256": "2" * 64}]
+        document = {"schema": SOURCE_MANIFEST_SCHEMA, "commit": "3" * 40, "entries": entries}
+        unsafe = {
+            "traversal": "../a.py",
+            "absolute": "/a.py",
+            "backslash": "pkg\\a.py",
+            "empty_component": "pkg//a.py",
+            "dot_component": "./a.py",
+            "drive": "c:a.py",
+            "control": "a\n.py",
+            "non_string_path": 7,
+        }
+        if case == "extra_field":
+            document["extra"] = True
+        elif case == "wrong_schema":
+            document["schema"] = "other/1"
+        elif case == "short_commit":
+            document["commit"] = "3" * 39
+        elif case == "empty_entries":
+            document["entries"] = []
+        elif case == "entry_field":
+            entries[0]["mode"] = "100644"
+        elif case == "uppercase_hash":
+            entries[0]["sha256"] = "A" * 64
+        elif case == "duplicate":
+            entries[1]["path"] = "a.py"
+        elif case == "unsorted":
+            entries.reverse()
+        else:
+            entries[0]["path"] = unsafe[case]
+        with pytest.raises(AssertionError):
+            validate_source_manifest_document(document)
+
+    @pytest.mark.parametrize(
+        ("case", "message"),
+        [
+            ("omitted", "source manifest omits required path"),
+            ("unexpected", "source manifest has unexpected path"),
+            ("hash", "source manifest hash mismatch"),
+            ("digest", "source manifest digest mismatch"),
+            ("non_canonical", "non-canonical source manifest"),
+            ("worktree_drift", "source drift from tested commit"),
+            ("byte_order_mark", "source drift from tested commit"),
+            ("commit_moved", "checkout is not the explicit tested commit"),
+            ("foreign_revision", "source revision mismatch"),
+        ],
+    )
+    async def test_proof_refuses_drift_and_tampering(self, tmp_path, case, message):
+        root, commit = self.repository(tmp_path)
+        document = build_verification_source_manifest(root, commit, **self.SELECTION)
+        if case == "omitted":
+            document["entries"].pop(1)
+        elif case == "unexpected":
+            document["entries"].append({"path": "pkg/zz.py", "sha256": "4" * 64})
+            document["entries"].sort(key=lambda entry: entry["path"])
+        elif case == "hash":
+            document["entries"][1]["sha256"] = "4" * 64
+        environment, raw = self.prepare(tmp_path, root, commit, document)
+        if case == "digest":
+            environment[SOURCE_MANIFEST_DIGEST_ENV] = "4" * 64
+        elif case == "non_canonical":
+            pretty = json.dumps(document, indent=1).encode("utf-8")
+            (Path(environment["COP_MANUAL_TEST_EVIDENCE"]) / SOURCE_MANIFEST_NAME).write_bytes(
+                pretty
+            )
+            environment[SOURCE_MANIFEST_DIGEST_ENV] = hashlib.sha256(pretty).hexdigest()
+        elif case == "worktree_drift":
+            (root / "pkg/extra.py").write_bytes(b"B = 3\n")
+        elif case == "byte_order_mark":
+            (root / "pkg/extra.py").write_bytes(b"\xef\xbb\xbf" + self.FILES["pkg/extra.py"])
+        elif case == "commit_moved":
+            (root / "pkg/extra.py").write_bytes(b"B = 3\n")
+            self.git(root, "commit", "-q", "-am", "moved")
+        elif case == "foreign_revision":
+            environment["COP_MANUAL_TEST_REVISION"] = "5" * 40
+        with pytest.raises(AssertionError, match=message):
+            self.proof(environment, root)
+
+    @pytest.mark.parametrize(
+        ("case", "message"),
+        [
+            ("untracked_literal", "required source is not tracked"),
+            ("binary", "unsupported source representation"),
+            ("committed_cr", "unsupported source representation"),
+            ("invalid_utf8", "unsupported source encoding"),
+            ("non_regular_entry", "non-regular tracked source"),
+            ("worktree_symlink", "symlinked source path"),
+            ("foreign_commit", "checkout is not the explicit tested commit"),
+            ("malformed_commit", "malformed tested commit"),
+        ],
+    )
+    async def test_build_refuses_unsupported_sources(self, tmp_path, case, message):
+        changes = {
+            "binary": {"pkg/blob.py": b"A\0B\n"},
+            "committed_cr": {"pkg/crlf.py": b"A = 1\r\n"},
+            "invalid_utf8": {"pkg/latin.py": b"A = '\xff'\n"},
+        }.get(case)
+        root, commit = self.repository(tmp_path, changes)
+        selection = dict(self.SELECTION)
+        if case == "untracked_literal":
+            selection["literal_paths"] += ("pkg/missing.py",)
+        elif case == "non_regular_entry":
+            blob = self.git(root, "hash-object", "-w", "pkg/required.py")
+            self.git(root, "update-index", "--add", "--cacheinfo", f"120000,{blob},pkg/link.py")
+            self.git(root, "commit", "-q", "-m", "link")
+            commit = self.git(root, "rev-parse", "HEAD")
+        elif case == "worktree_symlink":
+            (root / "pkg/extra.py").unlink()
+            os.symlink(root / "pkg/required.py", root / "pkg/extra.py")
+        elif case == "foreign_commit":
+            commit = "6" * 40
+        elif case == "malformed_commit":
+            commit = commit.upper()
+        with pytest.raises(AssertionError, match=message):
+            build_verification_source_manifest(root, commit, **selection)
+
+    async def test_preparation_writes_the_manifest_exactly_once(self, tmp_path):
+        root, commit = self.repository(tmp_path)
+        evidence = tmp_path / "evidence"
+        evidence.mkdir()
+        digest = write_verification_source_manifest(evidence, commit, root, self.SELECTION)
+        raw = (evidence / SOURCE_MANIFEST_NAME).read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == digest
+        with pytest.raises(FileExistsError):
+            write_verification_source_manifest(evidence, commit, root, self.SELECTION)
+        assert (evidence / SOURCE_MANIFEST_NAME).read_bytes() == raw
+
+    async def test_child_alembic_invocation_contract(self):
+        function, arguments = _migration_child_alembic_invocation("check")
+        assert function is command.check and len(arguments) == 1
+        assert isinstance(arguments[0], Config)
+        for operation, target in (("upgrade", "033"), ("downgrade", "032")):
+            function, arguments = _migration_child_alembic_invocation(operation, target)
+            assert function is getattr(command, operation) and arguments[1] == target
+        for operation, target in (
+            ("check", "036"),
+            ("upgrade", None),
+            ("downgrade", ""),
+            ("stamp", "036"),
+            ("revision", None),
+        ):
+            with pytest.raises(AssertionError, match="unsupported migration child Alembic"):
+                _migration_child_alembic_invocation(operation, target)
+
+    @pytest.mark.parametrize("before", [None, LOCAL_PERIOD_REVISION])
+    async def test_primary_head_upgrade_runs_upgrade_then_check(self, tmp_path, before):
+        markers = iter([before, LOCAL_PERIOD_REVISION])
+        calls = []
+        assert (
+            run_primary_head_upgrade(
+                "obs5-primary",
+                evidence=tmp_path,
+                read_marker=lambda: next(markers),
+                run_phase=lambda name, arguments: calls.append((name, arguments[1:])),
+            )
+            == LOCAL_PERIOD_REVISION
+        )
+        assert calls == [
+            ("obs5-primary-upgrade", ["-m", "alembic", "upgrade", "head"]),
+            ("obs5-primary-check", ["-m", "alembic", "check"]),
+        ]
+        assert json.loads((tmp_path / "obs5-primary-head.json").read_text(encoding="utf-8")) == {
+            "before": before,
+            "after": LOCAL_PERIOD_REVISION,
+            "head": LOCAL_PERIOD_REVISION,
+        }
+
+    @pytest.mark.parametrize(
+        ("markers", "message", "phases"),
+        [
+            (["035"], "unexpected primary migration state", 0),
+            ([None, "035"], "primary is not at the reviewed head", 2),
+        ],
+    )
+    async def test_primary_head_upgrade_refuses_unproven_state(
+        self, tmp_path, markers, message, phases
+    ):
+        values = iter(markers)
+        calls = []
+        with pytest.raises(AssertionError, match=message):
+            run_primary_head_upgrade(
+                "obs5-primary",
+                evidence=tmp_path,
+                read_marker=lambda: next(values),
+                run_phase=lambda name, arguments: calls.append(name),
+            )
+        assert len(calls) == phases
+        assert not (tmp_path / "obs5-primary-head.json").exists()
+
+
+class SyntheticVerificationEvidence:
+    """Unit fixture only: a synthetic evidence tree, never tested-checkout authority."""
+
+    COMMIT = "a" * 40
+    DIGEST = "b" * 64
+    TOKEN = "cop-manual-mon-1-1"
+    NODES = {
+        "migration": [MANUAL_MODULE + "::TestManualCOPPostgreSQLMigration::test_migrate"],
+        "manual": [MANUAL_MODULE + "::TestOwnedResourceGuard::test_guard"],
+        "exhaustion": [
+            MANUAL_MODULE
+            + "::TestManualCOPPostgreSQLAPI::test_sequence_exhaustion_is_503_and_never_wraps"
+        ],
+        "obs5-real-migration": [REAL_MIGRATION_CLASS + "::test_round_trip"],
+        "obs5-pg-original": [
+            LIFECYCLE_MODULE + "::test_lifecycle",
+            LIFECYCLE_MODULE + "::test_lifecycle_second[a]",
+        ],
+        "obs5-pg-supplement": [
+            LIFECYCLE_VERIFICATION_MODULE + "::test_supplement",
+            LIFECYCLE_VERIFICATION_MODULE + "::TestOBS5ScopeSeal::test_resource_free",
+        ],
+        "ordinary": [
+            "tests/e2e/test_price_providers.py::test_entsoe",
+            "tests/e2e/test_api_panasonic.py::test_capabilities[a]",
+        ],
+    }
+
+    # Inventory fixture-closure obligations; the resource-free supplement node has none.
+    RECEIPT_REQUIRED = (
+        LIFECYCLE_MODULE + "::test_lifecycle",
+        LIFECYCLE_MODULE + "::test_lifecycle_second[a]",
+        LIFECYCLE_VERIFICATION_MODULE + "::test_supplement",
+    )
+
+    def binding(self):
+        modules = {node.split("::", 1)[0] for nodes in self.NODES.values() for node in nodes}
+        return {"heatpump-optimizer/" + module: "c" * 64 for module in sorted(modules)}
+
+    def process(self, evidence, name, **changes):
+        (evidence / name).mkdir(exist_ok=True)
+        process = {
+            "exit": 0,
+            "alive": False,
+            "timed_out": False,
+            "commit": self.COMMIT,
+            "source_manifest_sha256": self.DIGEST,
+            "source": self.binding(),
+        } | changes
+        (evidence / name / "process.json").write_text(json.dumps(process), encoding="utf-8")
+
+    def phase(self, evidence, name, selected, collected=None):
+        self.process(evidence, name)
+        collected = selected if collected is None else collected
+        (evidence / name / "nodes.json").write_text(
+            json.dumps(
+                {
+                    "phase": name,
+                    "collected": collected,
+                    "selected": selected,
+                    "receipt_fixture": LIFECYCLE_RESOURCE_FIXTURE,
+                    "receipt_required": [
+                        node for node in collected if node in self.RECEIPT_REQUIRED
+                    ],
+                    "source_manifest_sha256": self.DIGEST,
+                    "exit": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (evidence / name / "reports.jsonl").write_text(
+            "".join(
+                json.dumps({"nodeid": node, "when": when, "outcome": "passed", "wasxfail": False})
+                + "\n"
+                for node in selected
+                for when in ("setup", "call", "teardown")
+            ),
+            encoding="utf-8",
+        )
+
+    def evidence(self, tmp_path):
+        evidence = tmp_path / "owned" / "evidence"
+        evidence.mkdir(parents=True, mode=0o700)
+        source = {"commit": self.COMMIT, "source_manifest_sha256": self.DIGEST}
+        (evidence.parent / "ownership.json").write_text(
+            json.dumps(source | {"token": self.TOKEN}), encoding="utf-8"
+        )
+        (evidence / "preflight.json").write_text(json.dumps(source), encoding="utf-8")
+        every = [node for nodes in self.NODES.values() for node in nodes]
+        manual = self.NODES["migration"] + self.NODES["manual"] + self.NODES["exhaustion"]
+        self.phase(evidence, "e2e-inventory", [], every)
+        self.phase(evidence, "manual-inventory", [], manual)
+        obs5 = [node for name in OBS5_TEST_PHASES for node in self.NODES[name]]
+        self.phase(evidence, "obs5-inventory", [], obs5)
+        for name, nodes in self.NODES.items():
+            self.phase(evidence, name, nodes)
+        for name in REQUIRED_SCHEMA_PHASES:
+            self.process(evidence, name)
+        (evidence / "obs5-primary-head.json").write_text(
+            json.dumps({"before": None, "after": "036", "head": "036"}), encoding="utf-8"
+        )
+        for node in self.RECEIPT_REQUIRED:
+            self.write_receipt(evidence, node)
+        proof = {"commit": self.COMMIT, "digest": self.DIGEST, "binding": self.binding()}
+        return evidence, proof
+
+    def reports(self, evidence, name):
+        path = evidence / name / "reports.jsonl"
+        return path, [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def receipt_path(self, evidence, node, suffix=""):
+        name = hashlib.sha256(node.encode()).hexdigest()[:32]
+        return evidence / ("obs5-receipt-" + name + suffix + ".json")
+
+    def write_receipt(self, evidence, node, suffix=""):
+        self.receipt_path(evidence, node, suffix).write_text(
+            json.dumps(
+                {
+                    "test": node,
+                    "commit": self.COMMIT,
+                    "source_manifest_sha256": self.DIGEST,
+                    "ownership_token": self.TOKEN,
+                    "schema_owned": True,
+                    "schema_removed": True,
+                    "public_manual_storage_unchanged": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def lifecycle_receipt(self, evidence, name):
+        return self.receipt_path(evidence, self.NODES[name][0])
+
+    def edit_nodes(self, evidence, name, **changes):
+        path = evidence / name / "nodes.json"
+        nodes = json.loads(path.read_text(encoding="utf-8")) | changes
+        path.write_text(json.dumps(nodes), encoding="utf-8")
+        return nodes
+
+    def mutate(self, evidence, case):
+        """Shared bound-receipt mutations for the full and OBS-only seals."""
+
+        def edit(path, **changes):
+            path.write_text(
+                json.dumps(json.loads(path.read_text(encoding="utf-8")) | changes),
+                encoding="utf-8",
+            )
+
+        original = self.lifecycle_receipt(evidence, "obs5-pg-original")
+        supplement = self.lifecycle_receipt(evidence, "obs5-pg-supplement")
+        head = evidence / "obs5-primary-head.json"
+        if case == "process_digest":
+            self.process(evidence, "obs5-pg-supplement", source_manifest_sha256="d" * 64)
+        elif case == "process_source":
+            self.process(evidence, "check-obs5", source={"other.py": "e" * 64})
+        elif case == "schema_check_failed":
+            self.process(evidence, "check-obs5", exit=1)
+        elif case == "primary_check_missing":
+            (evidence / "obs5-primary-check" / "process.json").unlink()
+        elif case == "primary_not_head":
+            edit(head, after="035")
+        elif case == "primary_unexpected_before":
+            edit(head, before="032")
+        elif case == "preflight_digest":
+            edit(evidence / "preflight.json", source_manifest_sha256="f" * 64)
+        elif case == "ownership_commit":
+            edit(evidence.parent / "ownership.json", commit="f" * 40)
+        elif case == "lifecycle_cleanup":
+            edit(original, schema_removed=False)
+        elif case == "lifecycle_public_drift":
+            edit(supplement, public_manual_storage_unchanged=False)
+        elif case == "lifecycle_digest":
+            edit(original, source_manifest_sha256="f" * 64)
+        elif case == "no_lifecycle_receipt":
+            original.unlink()
+            supplement.unlink()
+        elif case == "missing_supplement_receipt":
+            supplement.unlink()
+        elif case == "lifecycle_foreign_test":
+            edit(supplement, test=self.NODES["ordinary"][0])
+        elif case == "lifecycle_duplicate_test":
+            edit(supplement, test=self.NODES["obs5-pg-original"][0])
+        elif case == "lifecycle_foreign_token":
+            edit(original, ownership_token="cop-manual-mon-9-9")
+        elif case == "lifecycle_truthy_flag":
+            edit(original, schema_owned="yes")
+        elif case == "missing_original_second_receipt":
+            self.receipt_path(evidence, self.NODES["obs5-pg-original"][1]).unlink()
+        elif case == "duplicate_receipt":
+            self.write_receipt(evidence, self.NODES["obs5-pg-original"][1], "-again")
+        elif case == "extra_resource_free_receipt":
+            self.write_receipt(evidence, self.NODES["obs5-pg-supplement"][1])
+        elif case in {"inventory_obligations_missing", "inventory_unbound_digest"}:
+            for name in ("e2e-inventory", "obs5-inventory"):
+                path = evidence / name / "nodes.json"
+                nodes = json.loads(path.read_text(encoding="utf-8"))
+                if case == "inventory_obligations_missing":
+                    nodes.pop("receipt_required")
+                else:
+                    nodes["source_manifest_sha256"] = "d" * 64
+                path.write_text(json.dumps(nodes), encoding="utf-8")
+        elif case == "inventory_drops_obligation":
+            for name in ("e2e-inventory", "obs5-inventory"):
+                self.edit_nodes(evidence, name, receipt_required=list(self.RECEIPT_REQUIRED[1:]))
+        elif case == "obligation_outside_lifecycle":
+            for name in ("e2e-inventory", "obs5-inventory"):
+                self.edit_nodes(
+                    evidence,
+                    name,
+                    receipt_required=[*self.RECEIPT_REQUIRED, self.NODES["obs5-real-migration"][0]],
+                )
+        elif case == "phase_inventory_drift":
+            self.edit_nodes(
+                evidence, "obs5-pg-original", receipt_required=[self.NODES["obs5-pg-original"][0]]
+            )
+        else:
+            raise AssertionError("unknown synthetic mutation " + case)
+
+
+class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
+    """Actual seals/runner, genuine unit-fixture Git proof, synthetic execution evidence."""
+
+    def binding(self):
+        return self._proof["binding"]
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    @pytest.mark.parametrize(
+        "failure", ("unlock_before", "unlock_after", "close_after", "close_before")
+    )
+    async def test_lock_settlement_failure_revokes_own_seal(
+        self, tmp_path, monkeypatch, path, failure
+    ):
+        injected = OSError("injected " + failure)
+        descriptor = None
+        close_called = False
+        close_injected = False
+        real_close = os.close
+        if os.name == "nt":
+            import msvcrt
+
+            primitive, release = msvcrt.locking, msvcrt.LK_UNLCK
+            target, attribute = msvcrt, "locking"
+        else:
+            import fcntl
+
+            primitive, release = fcntl.flock, fcntl.LOCK_UN
+            target, attribute = fcntl, "flock"
+
+        def locking(fd, operation, *args):
+            nonlocal descriptor
+            if operation == release:
+                descriptor = fd
+                if failure == "unlock_before":
+                    raise injected
+                result = primitive(fd, operation, *args)
+                if failure == "unlock_after":
+                    raise injected
+                return result
+            return primitive(fd, operation, *args)
+
+        def closing(fd):
+            nonlocal close_called, close_injected
+            if fd == descriptor:
+                close_called = True
+                if failure == "close_before" and not close_injected:
+                    close_injected = True
+                    raise injected
+                result = real_close(fd)
+                if failure == "close_after" and not close_injected:
+                    close_injected = True
+                    raise injected
+                return result
+            return real_close(fd)
+
+        monkeypatch.setattr(target, attribute, locking)
+        monkeypatch.setattr(os, "close", closing)
+        try:
+            await self.test_receipt_namespace_is_closed(tmp_path, monkeypatch, path, "racing_valid")
+            assert descriptor is not None and close_called
+            if failure == "close_before":
+                # A failing close syscall has uncertain settlement; no retry in the
+                # implementation. Test owns this descriptor and releases it explicitly.
+                os.fstat(descriptor)
+                real_close(descriptor)
+            else:
+                with pytest.raises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            monkeypatch.setattr(target, attribute, primitive)
+            monkeypatch.setattr(os, "close", real_close)
+        evidence = tmp_path / "owned" / "evidence"
+        with lifecycle_evidence_lock(evidence):
+            pass
+
+    async def test_preexisting_seal_is_never_revoked(self, tmp_path):
+        evidence, current = self.bound_evidence(tmp_path)
+        seal = evidence / "seal.json"
+        seal.write_text("earlier invocation", encoding="utf-8")
+        identity = seal.stat().st_ino
+        with pytest.raises(AssertionError, match="already sealed"):
+            seal_verification_evidence(evidence, current())
+        assert seal.read_text(encoding="utf-8") == "earlier invocation"
+        assert seal.stat().st_ino == identity
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    async def test_publish_then_error_still_revokes_marker(self, tmp_path, monkeypatch, path):
+        real_link = os.link
+
+        def failing(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            if Path(destination).name in {"seal.json", "obs5-scope-seal.json"}:
+                raise OSError("publication settlement failed")
+            return result
+
+        monkeypatch.setattr(os, "link", failing)
+        await self.test_receipt_namespace_is_closed(tmp_path, monkeypatch, path, "racing_valid")
+
+    async def test_replaced_marker_is_not_deleted_on_failure(self, tmp_path, monkeypatch):
+        evidence, current = self.bound_evidence(tmp_path)
+        real_link = os.link
+        replaced = evidence / "earlier-marker"
+        replaced.write_text("other invocation", encoding="utf-8")
+
+        def replacing(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            if Path(destination).name == "seal.json":
+                os.replace(replaced, destination)
+                raise OSError("publication marker replaced")
+            return result
+
+        monkeypatch.setattr(os, "link", replacing)
+        with pytest.raises(AssertionError, match="revocation failed"):
+            seal_verification_evidence(evidence, current())
+        assert (evidence / "seal.json").read_text(encoding="utf-8") == "other invocation"
+
+    async def test_body_and_unlock_errors_are_both_preserved(self, tmp_path, monkeypatch):
+        evidence = tmp_path / "evidence"
+        evidence.mkdir(mode=0o700)
+        body, cleanup = RuntimeError("body failure"), OSError("unlock failure")
+        if os.name == "nt":
+            import msvcrt
+
+            target, name, release = msvcrt, "locking", msvcrt.LK_UNLCK
+        else:
+            import fcntl
+
+            target, name, release = fcntl, "flock", fcntl.LOCK_UN
+        primitive = getattr(target, name)
+        descriptors = []
+
+        def failing(fd, operation, *args):
+            if operation == release:
+                descriptors.append(fd)
+                raise cleanup
+            return primitive(fd, operation, *args)
+
+        monkeypatch.setattr(target, name, failing)
+        with pytest.raises(AssertionError, match="settlement failed") as caught:
+            with lifecycle_evidence_lock(evidence):
+                raise body
+        assert caught.value.__cause__.exceptions == (body, cleanup)
+        with pytest.raises(OSError):
+            os.fstat(descriptors[0])
+
+    def bound_evidence(self, tmp_path):
+        fixture = TestVerificationSourceManifest()
+        paths = SyntheticVerificationEvidence.binding(self)
+        root = Path(__file__).resolve().parents[3]
+        fixture.FILES = {path: (root / path).read_bytes().replace(b"\r\n", b"\n") for path in paths}
+        fixture.SELECTION = {"literal_paths": tuple(paths), "prefixes": (), "declarations": ()}
+        checkout, commit = fixture.repository(tmp_path)
+        environment, _ = fixture.prepare(tmp_path, checkout, commit)
+        self._proof = fixture.proof(environment, checkout)
+        self.COMMIT, self.DIGEST = commit, self._proof["digest"]
+        evidence, _ = self.evidence(tmp_path)
+        return evidence, lambda: fixture.proof(environment, checkout)
+
+    def change_receipt(self, evidence, case):
+        free = self.NODES["obs5-pg-supplement"][1]
+        extra = self.receipt_path(evidence, free)
+        original = self.lifecycle_receipt(evidence, "obs5-pg-original")
+        if case == "valid":
+            return
+        if case == "extra_missing_owner":
+            extra.write_text(json.dumps({"test": free, "schema_removed": True}), encoding="utf-8")
+        elif case == "extra_malformed":
+            extra.write_text("{", encoding="utf-8")
+        elif case == "extra_missing_fields":
+            extra.write_text(json.dumps({"ownership_token": self.TOKEN}), encoding="utf-8")
+        elif case == "extra_wrong_owner":
+            self.write_receipt(evidence, free)
+            receipt = json.loads(extra.read_text(encoding="utf-8"))
+            receipt["ownership_token"] = "foreign"
+            extra.write_text(json.dumps(receipt), encoding="utf-8")
+        elif case == "extra_resource_free":
+            self.write_receipt(evidence, free)
+        elif case == "required_missing_owner":
+            receipt = json.loads(original.read_text(encoding="utf-8"))
+            receipt.pop("ownership_token")
+            original.write_text(json.dumps(receipt), encoding="utf-8")
+        elif case == "required_missing_fields":
+            original.write_text(json.dumps({"test": self.RECEIPT_REQUIRED[0]}), encoding="utf-8")
+        elif case == "required_malformed":
+            original.write_text("null", encoding="utf-8")
+        elif case == "required_wrong_filename":
+            original.rename(evidence / "obs5-receipt-unknown.json")
+        elif case == "duplicate_filename":
+            self.write_receipt(evidence, self.RECEIPT_REQUIRED[0], "-duplicate")
+        elif case == "unsafe_filename":
+            (evidence / "obs5-receipt-unknown.txt").write_text("{}", encoding="utf-8")
+        elif case == "receipt_directory":
+            original.unlink()
+            original.mkdir()
+        elif case == "required_wrong_node":
+            receipt = json.loads(original.read_text(encoding="utf-8"))
+            receipt["test"] = free
+            original.write_text(json.dumps(receipt), encoding="utf-8")
+        elif case == "required_wrong_owner":
+            receipt = json.loads(original.read_text(encoding="utf-8"))
+            receipt["ownership_token"] = "foreign"
+            original.write_text(json.dumps(receipt), encoding="utf-8")
+        else:
+            raise AssertionError("unknown receipt case " + case)
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    async def test_mutation_after_enumeration_cannot_persist_seal(
+        self, tmp_path, monkeypatch, path
+    ):
+        original_read = Path.read_text
+        mutated = False
+
+        def racing_read(file, *args, **kwargs):
+            nonlocal mutated
+            if file.name.startswith("obs5-receipt-") and not mutated:
+                mutated = True
+                free = self.NODES["obs5-pg-supplement"][1]
+                self.receipt_path(file.parent, free).write_text(
+                    json.dumps({"test": free, "schema_removed": True}), encoding="utf-8"
+                )
+            return original_read(file, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", racing_read)
+        await self.test_receipt_namespace_is_closed(tmp_path, monkeypatch, path, "racing_valid")
+        assert mutated
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    @pytest.mark.parametrize("moment", ("read", "publish"))
+    async def test_concurrent_protocol_writer_is_fenced(self, tmp_path, monkeypatch, path, moment):
+        original_read, original_link = Path.read_text, os.link
+        attempted = False
+        refusals = []
+
+        def attempt(evidence):
+            nonlocal attempted
+            if attempted:
+                return
+            attempted = True
+
+            def writer():
+                try:
+                    write_lifecycle_receipt(evidence, {"test": "unowned"})
+                except AssertionError as error:
+                    refusals.append(str(error))
+
+            worker = threading.Thread(target=writer)
+            worker.start()
+            worker.join(5)
+            assert not worker.is_alive(), "receipt contender did not finish"
+
+        def read(file, *args, **kwargs):
+            if moment == "read" and file.name.startswith("obs5-receipt-"):
+                attempt(file.parent)
+            return original_read(file, *args, **kwargs)
+
+        def link(source, destination, *args, **kwargs):
+            destination = Path(destination)
+            if moment == "publish" and destination.name in {"seal.json", "obs5-scope-seal.json"}:
+                attempt(destination.parent)
+            return original_link(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+        monkeypatch.setattr(os, "link", link)
+        await self.test_receipt_namespace_is_closed(tmp_path, monkeypatch, path, "valid")
+        assert attempted and refusals == ["lifecycle receipt lock unavailable"]
+        with pytest.raises(AssertionError, match="sealed"):
+            write_lifecycle_receipt(tmp_path / "owned" / "evidence", {"test": "late"})
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    async def test_nonprotocol_publish_mutation_removes_seal(self, tmp_path, monkeypatch, path):
+        original_link = os.link
+
+        def link(source, destination, *args, **kwargs):
+            result = original_link(source, destination, *args, **kwargs)
+            destination = Path(destination)
+            if destination.name in {"seal.json", "obs5-scope-seal.json"}:
+                free = self.NODES["obs5-pg-supplement"][1]
+                self.receipt_path(destination.parent, free).write_text("{}", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(os, "link", link)
+        await self.test_receipt_namespace_is_closed(tmp_path, monkeypatch, path, "racing_valid")
+
+    async def test_process_lock_contention_and_crash_release(self, tmp_path):
+        evidence = tmp_path / "evidence"
+        evidence.mkdir(mode=0o700)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from tests.e2e.test_manual_cop_postgresql import lifecycle_evidence_lock\n"
+            "with lifecycle_evidence_lock(Path(sys.argv[1])):\n"
+            " print('LOCKED', flush=True)\n"
+            " sys.stdin.read()\n"
+        )
+        environment = dict(os.environ)
+        root = Path(__file__).resolve().parents[3]
+        environment["PYTHONPATH"] = os.pathsep.join((str(root), str(root.parent)))
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(evidence)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        try:
+            ready = []
+            reader = threading.Thread(target=lambda: ready.append(child.stdout.readline().strip()))
+            reader.start()
+            reader.join(10)
+            assert ready == ["LOCKED"], "receipt lock child did not become ready"
+            with pytest.raises(AssertionError, match="lock unavailable"):
+                write_lifecycle_receipt(evidence, {"test": "contender"})
+        finally:
+            child.kill()
+            child.communicate(timeout=10)
+            reader.join(5)
+        write_lifecycle_receipt(evidence, {"test": "after-crash"})
+        assert (evidence / ".lifecycle-evidence.lock").exists()
+        with pytest.raises(AssertionError, match="lock unavailable"):
+            write_lifecycle_receipt(evidence, {"test": "after-crash"})
+
+    @pytest.mark.parametrize(
+        "case",
+        (
+            "malformed_lock",
+            "directory_lock",
+            "hardlinked_lock",
+            "permission_denied",
+            "publication_failure",
+        ),
+    )
+    async def test_lock_or_publication_failure_never_seals(self, tmp_path, monkeypatch, case):
+        evidence, current = self.bound_evidence(tmp_path)
+        lock = evidence / ".lifecycle-evidence.lock"
+        if case == "malformed_lock":
+            lock.write_text("not a lock", encoding="utf-8")
+        elif case == "directory_lock":
+            lock.mkdir()
+        elif case == "hardlinked_lock":
+            lock.touch()
+            os.link(lock, evidence / "lock-alias")
+        elif case == "permission_denied":
+
+            def denied_open(*args, **kwargs):
+                raise PermissionError("test lock denied")
+
+            monkeypatch.setattr(os, "open", denied_open)
+        else:
+
+            def denied(*args, **kwargs):
+                raise PermissionError("test publication denied")
+
+            monkeypatch.setattr(os, "link", denied)
+        with pytest.raises(AssertionError, match="lifecycle receipt"):
+            seal_verification_evidence(evidence, current())
+        assert not (evidence / "seal.json").exists()
+        assert not list(evidence.glob(".lifecycle-pending-*"))
+
+    @pytest.mark.parametrize("path", ("full", "obs", "prepared"))
+    @pytest.mark.parametrize(
+        "case",
+        (
+            "valid",
+            "extra_missing_owner",
+            "extra_malformed",
+            "extra_missing_fields",
+            "extra_wrong_owner",
+            "extra_resource_free",
+            "required_missing_owner",
+            "required_missing_fields",
+            "required_malformed",
+            "required_wrong_filename",
+            "duplicate_filename",
+            "unsafe_filename",
+            "receipt_directory",
+            "required_wrong_node",
+            "required_wrong_owner",
+        ),
+    )
+    async def test_receipt_namespace_is_closed(self, tmp_path, monkeypatch, path, case):
+        from tests.e2e import test_ml_lifecycle_verification as verification
+
+        evidence, current = self.bound_evidence(tmp_path)
+        if case != "racing_valid":
+            self.change_receipt(evidence, case)
+        seal_path = evidence / ("seal.json" if path == "full" else "obs5-scope-seal.json")
+
+        def invoke():
+            proof = current()
+            if path == "full":
+                seal_verification_evidence(evidence, proof)
+            elif path == "obs":
+                verification.seal_obs5_scope(
+                    evidence, proof, current(), verification.OBS5_RUNNER_PHASES, lambda: "036"
+                )
+            else:
+                assert verification._run_owned_verification(prepared=True) == 0
+
+        if path == "prepared":
+            # Only external execution is faked; proof creation and all seal validators are real.
+            root = evidence.parent
+            (root / "models").mkdir()
+            monkeypatch.setenv("MODEL_DIR", str(root / "models"))
+            monkeypatch.delenv("HPO_OBS5_EXPORT", raising=False)
+            monkeypatch.setattr(
+                verification,
+                "owned_test_environment",
+                lambda: {
+                    "temp_root": str(root),
+                    "token": self.TOKEN,
+                    "commit": self.COMMIT,
+                    "source_manifest_sha256": self.DIGEST,
+                },
+            )
+            monkeypatch.setattr(verification, "current_verification_source_proof", current)
+            monkeypatch.setattr(
+                verification,
+                "_source_receipt",
+                lambda receipt: {
+                    "commit": self.COMMIT,
+                    "source_manifest_sha256": self.DIGEST,
+                },
+            )
+            monkeypatch.setattr(verification, "_wait_owned_health", lambda *args: None)
+            monkeypatch.setattr(verification, "run_verification_phase", lambda *args: None)
+            monkeypatch.setattr(verification, "run_primary_head_upgrade", lambda *args: None)
+            version = verification.importlib.metadata.version
+            monkeypatch.setattr(
+                verification.importlib.metadata,
+                "version",
+                lambda name: "2026.4" if name == "tzdata" else version(name),
+            )
+
+            async def marker():
+                return "036"
+
+            def immediate(coroutine):
+                try:
+                    coroutine.send(None)
+                except StopIteration as stop:
+                    return stop.value
+                coroutine.close()
+                raise AssertionError("fake marker unexpectedly suspended")
+
+            monkeypatch.setattr(verification, "_primary_marker", marker)
+            monkeypatch.setattr(verification, "asyncio", SimpleNamespace(run=immediate))
+        if case == "valid":
+            invoke()
+            assert seal_path.exists()
+            assert not self.receipt_path(evidence, self.NODES["obs5-pg-supplement"][1]).exists()
+        else:
+            with pytest.raises(AssertionError, match="lifecycle receipt"):
+                invoke()
+            assert not seal_path.exists()
+
+
+class TestVerificationSeal(SyntheticVerificationEvidence):
+    """Seal reconciliation over a synthetic evidence tree; no process or database."""
+
+    async def test_complete_disjoint_partition_seals(self, tmp_path):
+        evidence, proof = self.evidence(tmp_path)
+        seal_verification_evidence(evidence, proof)
+        seal = json.loads((evidence / "seal.json").read_text(encoding="utf-8"))
+        assert (seal["commit"], seal["source_manifest_sha256"]) == (self.COMMIT, self.DIGEST)
+        assert seal["partitions"] == {name: sorted(nodes) for name, nodes in self.NODES.items()}
+        assert seal["primary_head"]["after"] == "036"
+        # The resource-free supplement node needs (and has) no lifecycle receipt.
+        free = self.NODES["obs5-pg-supplement"][1]
+        assert free not in self.RECEIPT_REQUIRED
+        assert not self.receipt_path(evidence, free).exists()
+
+    async def test_receipt_obligations_follow_the_actual_fixture_closure(self, tmp_path):
+        """Real pytest collection: direct, transitive and usefixtures closures only."""
+        (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        (tmp_path / "test_closure_probe.py").write_text(
+            "import pytest\n\n\n"
+            "@pytest.fixture\ndef lifecycle_database():\n    yield\n\n\n"
+            "@pytest.fixture\ndef wrapped(lifecycle_database):\n    yield\n\n\n"
+            "def test_direct(lifecycle_database):\n    pass\n\n\n"
+            "def test_transitive(wrapped):\n    pass\n\n\n"
+            "@pytest.mark.usefixtures('lifecycle_database')\ndef test_usefixtures():\n    pass\n\n\n"
+            "@pytest.mark.parametrize('value', [1, 2])\ndef test_param(wrapped, value):\n    pass\n\n\n"
+            "def test_free(tmp_path):\n    pass\n",
+            encoding="utf-8",
+        )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("COP_MANUAL_TEST_") or key == "COP_MANUAL_TEST_PROVIDER"
+        }
+        environment |= {
+            "PYTEST_PLUGINS": "tests.e2e.test_manual_cop_postgresql",
+            "COP_MANUAL_TEST_PHASE": "closure-probe",
+            "COP_MANUAL_TEST_NODES": str(tmp_path / "nodes.json"),
+            "COP_MANUAL_TEST_REPORTS": str(tmp_path / "reports.jsonl"),
+        }
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--noconftest",
+                "-p",
+                "no:cacheprovider",
+                "-c",
+                str(tmp_path / "pytest.ini"),
+                "--rootdir",
+                str(tmp_path),
+                "--collect-only",
+                "-q",
+                str(tmp_path / "test_closure_probe.py"),
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        nodes = json.loads((tmp_path / "nodes.json").read_text(encoding="utf-8"))
+        module = "test_closure_probe.py::"
+        assert nodes["receipt_fixture"] == LIFECYCLE_RESOURCE_FIXTURE
+        assert nodes["receipt_required"] == sorted(
+            module + name
+            for name in (
+                "test_direct",
+                "test_transitive",
+                "test_usefixtures",
+                "test_param[1]",
+                "test_param[2]",
+            )
+        )
+        assert module + "test_free" in nodes["collected"]
+        assert module + "test_free" not in nodes["receipt_required"]
+
+    async def test_receipt_obligations_use_each_items_fixture_closure(self):
+        items = [
+            SimpleNamespace(nodeid="b", fixturenames=("tmp_path", LIFECYCLE_RESOURCE_FIXTURE)),
+            SimpleNamespace(nodeid="a", fixturenames=["wrapped", LIFECYCLE_RESOURCE_FIXTURE]),
+            SimpleNamespace(nodeid="c", fixturenames=("lifecycle_database_like",)),
+            SimpleNamespace(nodeid="d"),
+        ]
+        assert lifecycle_receipt_obligations(items) == ["a", "b"]
+
+    @pytest.mark.parametrize(
+        ("case", "message"),
+        [
+            ("unrun_node", "not completely partitioned"),
+            ("overlap", "overlap"),
+            ("foreign_ordinary", "does not own"),
+            ("duplicate_call", "exactly one setup/call/teardown"),
+            ("missing_teardown", "exactly one setup/call/teardown"),
+            ("failed_setup", "skip/xfail/failure"),
+            ("failed_teardown", "skip/xfail/failure"),
+            ("skipped", "skip/xfail/failure"),
+            ("xfail", "skip/xfail/failure"),
+            ("nonzero_exit", "did not succeed"),
+            ("alive", "did not succeed"),
+            ("timed_out", "did not succeed"),
+            ("process_digest", "verification source drift"),
+            ("process_source", "verification source drift"),
+            ("outside_manifest", "outside the source manifest"),
+            ("manual_inventory", "manual phase inventory is incomplete"),
+            ("schema_check_failed", "did not succeed"),
+            ("primary_not_head", "primary head was not proven"),
+            ("preflight_digest", "receipt source digest mismatch"),
+            ("ownership_commit", "receipt source digest mismatch"),
+            ("lifecycle_cleanup", "lifecycle receipt"),
+            ("lifecycle_digest", "lifecycle receipt"),
+            ("no_lifecycle_receipt", "lifecycle receipt"),
+            ("missing_supplement_receipt", "lifecycle receipt"),
+            ("lifecycle_foreign_test", "lifecycle receipt"),
+            ("lifecycle_duplicate_test", "lifecycle receipt"),
+            ("lifecycle_foreign_token", "lifecycle receipt"),
+            ("lifecycle_truthy_flag", "lifecycle receipt"),
+            ("lifecycle_public_drift", "lifecycle receipt"),
+            ("primary_unexpected_before", "primary head was not proven"),
+            ("primary_check_missing", "did not succeed"),
+            ("missing_original_second_receipt", "lifecycle receipt coverage mismatch"),
+            ("duplicate_receipt", "lifecycle receipt coverage mismatch"),
+            ("extra_resource_free_receipt", "lifecycle receipt coverage mismatch"),
+            ("inventory_obligations_missing", "lifecycle receipt inventory is missing or unbound"),
+            ("inventory_unbound_digest", "lifecycle receipt inventory is missing or unbound"),
+            ("inventory_drops_obligation", "lifecycle receipt inventory drifted"),
+            ("obligation_outside_lifecycle", "ran outside a lifecycle phase"),
+            ("phase_inventory_drift", "lifecycle receipt inventory drifted"),
+        ],
+    )
+    async def test_incomplete_or_unbound_evidence_refuses_seal(self, tmp_path, case, message):
+        evidence, proof = self.evidence(tmp_path)
+        every = [node for nodes in self.NODES.values() for node in nodes]
+        if case == "unrun_node":
+            self.phase(
+                evidence, "e2e-inventory", [], every + ["tests/e2e/test_api_panasonic.py::test_x"]
+            )
+        elif case == "overlap":
+            self.phase(evidence, "manual", self.NODES["manual"] + self.NODES["migration"])
+        elif case == "foreign_ordinary":
+            self.phase(
+                evidence, "ordinary", self.NODES["ordinary"] + self.NODES["obs5-pg-original"]
+            )
+        elif case in {
+            "duplicate_call",
+            "missing_teardown",
+            "failed_setup",
+            "failed_teardown",
+            "skipped",
+            "xfail",
+        }:
+            path, reports = self.reports(evidence, "ordinary")
+            if case == "duplicate_call":
+                reports.append(reports[1])
+            elif case == "missing_teardown":
+                reports.pop(2)
+            elif case == "failed_setup":
+                reports[0]["outcome"] = "failed"
+            elif case == "failed_teardown":
+                reports[2]["outcome"] = "failed"
+            elif case == "skipped":
+                reports[0]["outcome"] = "skipped"
+                reports.pop(1)
+            else:
+                reports[1]["wasxfail"] = True
+            path.write_text("".join(json.dumps(report) + "\n" for report in reports))
+        elif case == "nonzero_exit":
+            self.process(evidence, "ordinary", exit=1)
+        elif case == "alive":
+            self.process(evidence, "obs5-pg-original", alive=True)
+        elif case == "timed_out":
+            self.process(evidence, "manual", timed_out=True)
+        elif case == "process_digest":
+            self.process(evidence, "heads", source_manifest_sha256="d" * 64)
+        elif case == "outside_manifest":
+            proof["binding"].pop("heatpump-optimizer/tests/e2e/test_api_panasonic.py")
+        elif case == "manual_inventory":
+            self.phase(
+                evidence,
+                "manual-inventory",
+                [],
+                self.NODES["migration"] + self.NODES["manual"],
+            )
+        else:
+            self.mutate(evidence, case)
+        with pytest.raises(AssertionError, match=message):
+            seal_verification_evidence(evidence, proof)
+        assert not (evidence / "seal.json").exists()
+
+    async def test_phase_ownership_is_exact_and_unknown_phases_refuse(self):
+        assert _verification_phase_owns("obs5-real-migration", self.NODES["obs5-real-migration"][0])
+        assert not _verification_phase_owns(
+            "obs5-pg-supplement", self.NODES["obs5-real-migration"][0]
+        )
+        assert all(
+            not _verification_phase_owns("ordinary", module + "::test_x")
+            for module in COORDINATOR_MODULES
+        )
+        with pytest.raises(AssertionError, match="unknown verification phase"):
+            _verification_phase_owns("ordinary-extra", self.NODES["ordinary"][0])
 
 
 @pytest.fixture(params=("migration", "metadata"))
@@ -1810,6 +3767,16 @@ class GuardedChildEngine:
         async with self.connect() as connection:
             async with connection.begin():
                 yield connection
+
+
+def _migration_child_alembic_invocation(operation, target=None):
+    """Validated child Alembic call, refused before any worker or settings change."""
+    if operation == "check":
+        assert target is None, "unsupported migration child Alembic check target"
+        return command.check, (Config("alembic.ini"),)
+    assert operation in {"upgrade", "downgrade"}, "unsupported migration child Alembic operation"
+    assert isinstance(target, str) and target, "unsupported migration child Alembic target"
+    return getattr(command, operation), (Config("alembic.ini"), target)
 
 
 async def _release_retained_blockers(workers, retained):
@@ -2478,12 +4445,11 @@ async def owned_migration_child(purpose):
             async with guarded.connect():
                 pass
 
-        async def alembic(operation, target):
+        async def alembic(operation, target=None):
+            function, arguments = _migration_child_alembic_invocation(operation, target)
             await verify()
             settings.database_url = child_url.render_as_string(hide_password=False)
-            worker = asyncio.ensure_future(
-                asyncio.to_thread(getattr(command, operation), Config("alembic.ini"), target)
-            )
+            worker = asyncio.ensure_future(asyncio.to_thread(function, *arguments))
             workers.append(worker)
             try:
                 await asyncio.shield(worker)
@@ -5280,11 +7246,14 @@ if __name__ == "__main__":
         root.mkdir(mode=0o700)
         (root / "models").mkdir(mode=0o700)
         (root / "evidence").mkdir(mode=0o700)
+        digest = write_verification_source_manifest(root / "evidence", os.environ["GITHUB_SHA"])
         os.environ["COP_MANUAL_TEST_EVIDENCE"] = str(root / "evidence")
         os.environ["COP_MANUAL_TEST_REVISION"] = os.environ["GITHUB_SHA"]
+        os.environ[SOURCE_MANIFEST_DIGEST_ENV] = digest
         with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as environment_file:
             environment_file.write(f"COP_MANUAL_TEST_EVIDENCE={root / 'evidence'}\n")
             environment_file.write(f"COP_MANUAL_TEST_REVISION={os.environ['GITHUB_SHA']}\n")
+            environment_file.write(f"{SOURCE_MANIFEST_DIGEST_ENV}={digest}\n")
         verification_preflight(root, owned_sql=False)
     elif operation == "phase":
         name, *command_arguments = arguments
@@ -5292,6 +7261,9 @@ if __name__ == "__main__":
     elif operation == "unit-phase":
         name, *command_arguments = arguments
         run_verification_phase(name, [sys.executable, *command_arguments], owned_sql=False)
+    elif operation == "primary-head":
+        (label,) = arguments
+        run_primary_head_upgrade(label)
     elif operation == "seal":
         seal_verification_evidence()
     else:

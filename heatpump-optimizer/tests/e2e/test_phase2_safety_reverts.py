@@ -1683,7 +1683,9 @@ class TestS1OwnedAttempts:
         try:
             attempt = await SafetyAttempt.acquire(store.device_id + "-pool", pooled.connect)
             assert attempt is not None
-            result = await attempt._query("SELECT pg_backend_pid()", {}, time.monotonic() + 2)
+            # The fixture installs _S1Clock into safety_attempts; deadlines share its epoch.
+            deadline = store.clock.monotonic() + 2
+            result = await attempt._query("SELECT pg_backend_pid()", {}, deadline)
             original_pid = result.scalar_one()
             connection_type = type(attempt.connection)
             original_execute = connection_type.execute

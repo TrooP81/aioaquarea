@@ -273,16 +273,15 @@ class TestIndoorForecast:
         )
         db_session.add(first)
         await activate_plan(db_session, first)
-        db_session.add(
-            PlanActionRecord(
-                plan_id=first.id,
-                scheduled_ts=target_at,
-                action_type="zone_temp_boost",
-                payload_json="{}",
-                device_id="supersession-filter-device",
-                status="pending",
-            )
+        pending = PlanActionRecord(
+            plan_id=first.id,
+            scheduled_ts=target_at,
+            action_type="zone_temp_boost",
+            payload_json="{}",
+            device_id="supersession-filter-device",
+            status="pending",
         )
+        db_session.add(pending)
         second = PlanRecord(
             created_at=now - dt.timedelta(minutes=20),
             horizon_start=issue_at,
@@ -302,10 +301,19 @@ class TestIndoorForecast:
         await db_session.commit()
 
         scorecard = await get_forecast_scorecard(now=now)
+        await db_session.refresh(pending)
+        await db_session.refresh(first)
 
+        # Both plans carry the same evidence identity, so it earns exactly one pair.
         comparison = scorecard["baseline_comparison"]
-        assert comparison["pairs_scored"] >= 2
+        assert comparison["pairs_scored"] == 1
+        assert comparison["plans_scored"] == 1
         assert comparison["exclusions"].get("dispatch_in_or_near_window", 0) == 0
+        assert pending.status == "cancelled"
+        assert pending.executed_at is not None
+        assert json.loads(pending.result_json)["reason"] == "superseded"
+        assert first.status == "superseded"
+        assert first.superseded_by_plan_id == second.id
 
     async def test_historical_restore_inside_horizon_excludes_old_source_and_skips_old_rows(
         self, db_session
@@ -391,15 +399,17 @@ class TestIndoorForecast:
 
         now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
         issue_at = now - dt.timedelta(hours=3)
+        # Distinct issue/origin/target identities keep the two persisted plans unambiguous.
+        earlier_issue_at = issue_at - dt.timedelta(hours=1)
         plans = [
             PlanRecord(
                 created_at=now - dt.timedelta(hours=1),
-                horizon_start=issue_at,
-                horizon_end=issue_at + dt.timedelta(hours=2),
+                horizon_start=earlier_issue_at,
+                horizon_end=earlier_issue_at + dt.timedelta(hours=2),
                 plan_json=json.dumps(
                     {
                         "device_id": "scorecard-device",
-                        "forecast_snapshot": _scorecard_snapshot(issue_at, shadow=False),
+                        "forecast_snapshot": _scorecard_snapshot(earlier_issue_at, shadow=False),
                     }
                 ),
                 optimizer_version="rules_v4",
@@ -422,11 +432,15 @@ class TestIndoorForecast:
         db_session.add_all(
             [
                 IndoorTempReading(
-                    timestamp=issue_at + dt.timedelta(hours=1),
+                    timestamp=target_at,
                     device_id="scorecard-room",
                     temperature=20.0,
                     is_stale=False,
-                ),
+                )
+                for target_at in (
+                    earlier_issue_at + dt.timedelta(hours=1),
+                    issue_at + dt.timedelta(hours=1),
+                )
             ]
         )
         await db_session.commit()
@@ -444,6 +458,46 @@ class TestIndoorForecast:
         assert isinstance(alerts["alerts"], list)
         assert readiness is False
         assert await get_setting("_heat_curve_verification_state") == "{}"
+
+    async def test_same_origin_shadow_and_legacy_plans_are_not_scored(self, db_session):
+        from packages.ml.forecast_quality import get_forecast_scorecard
+
+        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        issue_at = now - dt.timedelta(hours=3)
+        db_session.add_all(
+            [
+                PlanRecord(
+                    created_at=now - dt.timedelta(hours=1, minutes=index),
+                    horizon_start=issue_at,
+                    horizon_end=issue_at + dt.timedelta(hours=2),
+                    plan_json=json.dumps(
+                        {
+                            "device_id": "scorecard-ambiguous-device",
+                            "forecast_snapshot": _scorecard_snapshot(issue_at, shadow=shadow),
+                        }
+                    ),
+                    optimizer_version="rules_v5",
+                    status="superseded",
+                )
+                for index, shadow in enumerate((False, True))
+            ]
+        )
+        db_session.add(
+            IndoorTempReading(
+                timestamp=issue_at + dt.timedelta(hours=1),
+                device_id="scorecard-room",
+                temperature=20.0,
+                is_stale=False,
+            )
+        )
+        await db_session.commit()
+
+        scorecard = await get_forecast_scorecard(now=now)
+
+        # Conflicting evidence for one origin must never earn a baseline pair.
+        assert scorecard["baseline_comparison"]["pairs_scored"] == 0
+        assert scorecard["baseline_comparison"]["plans_scored"] == 0
+        assert scorecard["baseline_comparison"]["exclusions"]["ambiguous_forecast_provenance"] >= 1
 
     async def test_forecast_without_scorecard_evidence_falls_back_and_is_not_on_target(
         self,

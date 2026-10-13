@@ -127,6 +127,10 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py prepare
       - name: Collect complete manual verification inventory
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase manual-inventory -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py --collect-only -q
+      # The seal partitions this complete E2E inventory into disjoint owned phases.
+      # Inventory collects with --noconftest; only the ordinary phase keeps conftest.
+      - name: Collect complete E2E verification inventory
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase e2e-inventory -m pytest --noconftest tests/e2e --collect-only -q
       - name: Verify migration graph
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase heads -m alembic heads
       - name: Verify legacy reversibility and retained migration refusal
@@ -143,8 +147,20 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase exhaustion -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py::TestManualCOPPostgreSQLAPI::test_sequence_exhaustion_is_503_and_never_wraps -q
       - name: Compare schema after exhaustion
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-exhaustion -m alembic check
+      # OBS-5 runs here on this prepared profile and canonical source manifest only;
+      # tests/e2e/run_obs5_verification.ps1 is UNSUPPORTED (fixed historical fingerprint).
+      - name: Verify OBS-5 genuine 032/033 migration on an owned child database
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-real-migration -m pytest --noconftest tests/e2e/test_ml_lifecycle_verification.py::TestOBS5RealMigration -q
+      - name: Prove guarded primary head before OBS-5 lifecycle phases
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py primary-head obs5-primary
+      - name: Run original OBS-5 lifecycle PostgreSQL tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-pg-original -m pytest --noconftest tests/e2e/test_ml_lifecycle_postgresql.py -q
+      - name: Run supplementary OBS-5 lifecycle PostgreSQL tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-pg-supplement -m pytest --noconftest tests/e2e/test_ml_lifecycle_verification.py -k "not TestOBS5RealMigration" -q
+      - name: Compare schema after OBS-5 lifecycle tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-obs5 -m alembic check
       - name: Run remaining database-backed E2E tests
-        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py -q
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_verification.py -q
       - name: Compare schema after ordinary E2E teardown
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-ordinary -m alembic check
       - name: Reconcile node inventory and seal verification receipts

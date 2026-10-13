@@ -44,9 +44,17 @@ async def test_capabilities_use_database_observation_without_cloud_probe(
     assert data["adapter"]["state_fresh"] is True
     assert data["device"]["id"] == seed_device_status.device_id
     assert data["device"]["has_tank"] is True
-    assert data["commands"]["force_dhw"]["available"] is True
-    assert data["commands"]["set_special_status"]["available"] is True
-    assert data["commands"]["set_zone_heat_temperature"]["available"] is True
+    # Fresh observation proves support and ranges; automatic-plan commands stay observe-only.
+    for name in ("force_dhw", "set_special_status", "set_zone_heat_temperature"):
+        command = data["commands"][name]
+        assert command["device_supported"] is True, name
+        assert command["policy"] == "observe_only_build", name
+        assert command["available"] is False, name
+        assert command["ordinary_automation_allowed"] is False, name
+    # Only manual commands become available, and only for observed support.
+    powerful = data["commands"]["set_powerful_time"]
+    assert powerful["policy"] == "manual_only" and powerful["available"] is True
+    assert powerful["ordinary_automation_allowed"] is False
     assert data["commands"]["set_zone_heat_temperature"]["constraints"] == {
         "observed_ranges": {"1": {"minimum": 18, "maximum": 45}},
         "whole_degrees_only": True,

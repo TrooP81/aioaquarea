@@ -1,9 +1,21 @@
-"""Independent OBS-5 checks restricted to receipt-owned disposable storage."""
+"""Independent OBS-5 checks restricted to receipt-owned disposable storage.
+
+Supported entrypoints:
+
+* The backend-e2e workflow phases ``obs5-real-migration``, ``obs5-primary-*``,
+  ``obs5-pg-original``, ``obs5-pg-supplement`` and ``check-obs5`` on the profile
+  prepared by ``test_manual_cop_postgresql.py prepare``.
+* ``python tests/e2e/test_ml_lifecycle_verification.py --prepared`` on an already
+  prepared owned profile; it consumes (never re-prepares) the canonical source
+  manifest and seals OBS-5 scope only, not full backend qualification.
+
+``run_obs5_verification.ps1`` is UNSUPPORTED: its fixed historical source fingerprint
+and external manifest are not the canonical tested-commit source proof.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 import datetime as dt
 import http.client
 import importlib.metadata
@@ -15,27 +27,39 @@ import socket
 import stat
 import sys
 from urllib.parse import urlencode
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
-from alembic import command
-from alembic.config import Config
 import pytest
 from sqlalchemy import event, func, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from packages.core.models import MLLifecycleStateRecord
 from packages.ml.lifecycle import Lifecycle, LifecycleUnavailable, invalidate_lifecycle
 from packages.ml.model_status import get_model_status
 from tests.e2e.test_manual_cop_postgresql import (
+    _publish_lifecycle_json,
+    atomic_lifecycle_seal,
+    lifecycle_evidence_lock,
+    LOCAL_PERIOD_REVISION,
+    OBS5_SCHEMA_PHASES,
+    OBS5_TEST_PHASES,
+    SOURCE_MANIFEST_DIGEST_ENV,
+    SyntheticVerificationEvidence,
     _inspect_owned_resources,
+    _parent_relations,
+    _primary_marker,
+    current_verification_source_proof,
     guard_owned_database,
+    migration_targets,
+    owned_migration_child,
     owned_test_environment,
     owned_test_network,
-    prepare_owned_test_profile,
+    reconcile_verification_partitions,
     retained_storage_state,
+    run_primary_head_upgrade,
     run_verification_phase,
-    verification_preflight,
+    validate_bound_verification_evidence,
 )
 from tests.e2e.test_ml_lifecycle_postgresql import (
     _artifact,
@@ -70,34 +94,52 @@ async def _retained(engine):
     return result
 
 
+def _retained_data(state):
+    # Physical shape legitimately changes across 034-036; retained data must not.
+    return {key: state[key] for key in ("rows", "sequence", "sequence_configuration")}
+
+
+async def _primary_state():
+    engine = create_async_engine(
+        os.environ["DATABASE_URL"], poolclass=NullPool, connect_args={"command_timeout": 20}
+    )
+    try:
+        async with engine.connect() as connection:
+            await guard_owned_database(connection)
+            table = (
+                await connection.execute(text("SELECT to_regclass('public.alembic_version')"))
+            ).scalar_one()
+            marker = (
+                None
+                if table is None
+                else tuple(
+                    (await connection.execute(text("SELECT version_num FROM alembic_version")))
+                    .scalars()
+                    .all()
+                )
+            )
+            return marker, await _parent_relations(connection)
+    finally:
+        await engine.dispose()
+
+
 class TestOBS5RealMigration:
     async def test_032_to_033_round_trip_check_and_populated_refusal(self, request):
+        """Genuine 032->033->032->033 on a fresh receipt-bound owned child database."""
         assert request.config.option.noconftest
         receipt = owned_test_environment()
         _source_receipt(receipt)
-        engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-
-        @asynccontextmanager
-        async def sessions():
-            async with maker() as session:
-                try:
-                    yield session
-                    await session.commit()
-                except BaseException:
-                    await session.rollback()
-                    raise
-
+        head, _ = migration_targets()
+        assert head == LOCAL_PERIOD_REVISION
         with owned_test_network():
-            try:
-                async with engine.begin() as connection:
-                    await guard_owned_database(connection, require_empty=True)
-                await asyncio.to_thread(command.upgrade, Config("alembic.ini"), "032")
-                assert await _marker(engine) == "032"
-                retained = await _retained(engine)
-                await asyncio.to_thread(command.upgrade, Config("alembic.ini"), "033")
-                assert await _marker(engine) == "033"
-                async with engine.connect() as connection:
+            primary = await _primary_state()
+            async with owned_migration_child("obsreal") as child:
+                await child.alembic("upgrade", "032")
+                assert await _marker(child.engine) == "032"
+                retained = await _retained(child.engine)
+                await child.alembic("upgrade", "033")
+                assert await _marker(child.engine) == "033"
+                async with child.engine.connect() as connection:
                     kinds = (
                         await connection.execute(
                             text(
@@ -114,28 +156,32 @@ class TestOBS5RealMigration:
                             text("SELECT is_called FROM public.ml_lifecycle_token_seq")
                         )
                     ).scalar_one() is False
-                await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "032")
-                assert await _marker(engine) == "032"
-                async with engine.connect() as connection:
+                await child.alembic("downgrade", "032")
+                assert await _marker(child.engine) == "032"
+                async with child.engine.connect() as connection:
                     for name in (*TABLES, "ml_lifecycle_token_seq"):
                         assert (
                             await connection.execute(
                                 text("SELECT to_regclass(:name)"), {"name": "public." + name}
                             )
                         ).scalar_one() is None
-                assert await _retained(engine) == retained
-                await asyncio.to_thread(command.upgrade, Config("alembic.ini"), "033")
-                await asyncio.to_thread(command.check, Config("alembic.ini"))
-                lifecycle = Lifecycle(sessions)
+                assert await _retained(child.engine) == retained
+                await child.alembic("upgrade", "033")
+                lifecycle = Lifecycle(child.session_context)
                 before = await lifecycle.initialize()
+                # Historical 033 populated-downgrade refusal, before any later revision.
                 with pytest.raises(RuntimeError, match="ml_lifecycle_retained"):
-                    await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "032")
-                assert await _marker(engine) == "033"
+                    await child.alembic("downgrade", "032")
+                assert await _marker(child.engine) == "033"
                 assert await lifecycle.read() == before
-                assert await _retained(engine) == retained
-                await asyncio.to_thread(command.check, Config("alembic.ini"))
-            finally:
-                await engine.dispose()
+                assert await _retained(child.engine) == retained
+                for target in ("034", "035", head):
+                    await child.alembic("upgrade", target)
+                    assert await _marker(child.engine) == target
+                    assert await lifecycle.read() == before
+                    assert _retained_data(await _retained(child.engine)) == _retained_data(retained)
+                await child.alembic("check")
+            assert await _primary_state() == primary, "real migration touched the primary"
 
 
 async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch):
@@ -378,117 +424,281 @@ def _wait_owned_health(root, role, seconds):
         )
 
 
-def _run_owned_verification():
-    export = Path(os.environ["HPO_OBS5_EXPORT"])
-    assert export.is_dir()
-    root = Path(os.environ["MODEL_DIR"]).parent
-    phases = []
+UNSUPPORTED_ENTRYPOINT = (
+    "unsupported OBS-5 entrypoint: use the backend-e2e workflow or --prepared on an "
+    "owned profile prepared by test_manual_cop_postgresql.py; run_obs5_verification.ps1 "
+    "is UNSUPPORTED"
+)
+OBS5_RUNNER_PHASES = (
+    "obs5-inventory",
+    "obs5-real-migration",
+    "obs5-primary",
+    "obs5-pg-original",
+    "obs5-pg-supplement",
+    "check-obs5",
+)
+
+
+@atomic_lifecycle_seal
+def seal_obs5_scope(evidence, proof, current, completed, read_marker):
+    """OBS-5-only seal; refuses unless every bound receipt validates (never full backend)."""
+    evidence = Path(evidence)
+    assert tuple(completed) == OBS5_RUNNER_PHASES, "OBS-5 phases did not all complete"
+    assert (current["commit"], current["digest"], current["binding"]) == (
+        proof["commit"],
+        proof["digest"],
+        proof["binding"],
+    ), "verification source drift"
+    collected, partitions = reconcile_verification_partitions(
+        evidence, "obs5-inventory", OBS5_TEST_PHASES
+    )
+    outside = sorted(
+        {node.split("::", 1)[0] for node in collected}
+        - {path.removeprefix("heatpump-optimizer/") for path in proof["binding"]}
+    )
+    assert not outside, f"inventoried test source is outside the source manifest: {outside[0]}"
+    head, processes = validate_bound_verification_evidence(
+        evidence, proof, partitions, OBS5_SCHEMA_PHASES, "obs5-inventory"
+    )
+    assert read_marker() == LOCAL_PERIOD_REVISION, "primary head was not proven"
+    seal = {
+        "scope": "OBS-5 only; not full backend release qualification",
+        "passed": True,
+        "commit": proof["commit"],
+        "source_manifest_sha256": proof["digest"],
+        "nodes": sorted(collected),
+        "partitions": {name: sorted(nodes) for name, nodes in partitions.items()},
+        "primary_head": head,
+        "phases": list(completed),
+        "processes": processes,
+    }
+    _publish_lifecycle_json(evidence / "obs5-scope-seal.json", seal)
+    return seal
+
+
+def _run_owned_verification(prepared=False):
+    """Dedicated OBS-5 runner; consumes the canonical prepared source proof, fail-closed."""
+    if not prepared:
+        print(UNSUPPORTED_ENTRYPOINT, file=sys.stderr, flush=True)
+        return 2
+    receipt = owned_test_environment()
+    proof = current_verification_source_proof()
+    source = _source_receipt(receipt)
+    root = Path(receipt["temp_root"])
+    assert Path(os.environ["MODEL_DIR"]).parent == root, "model root is not the owned profile"
+    evidence = root / "evidence"
+    preflight = json.loads((evidence / "preflight.json").read_text(encoding="utf-8"))
+    assert (preflight["commit"], preflight["source_manifest_sha256"]) == (
+        proof["commit"],
+        proof["digest"],
+    ), "preflight source mismatch"
+    export = os.environ.get("HPO_OBS5_EXPORT")
+    export = Path(export) if export else None
+    assert export is None or export.is_dir()
+    pytest_options = ["-q", "-p", "no:cacheprovider", "-rA"]
+    steps = (
+        (
+            "obs5-inventory",
+            [
+                "-m",
+                "pytest",
+                "--noconftest",
+                "tests/e2e/test_ml_lifecycle_postgresql.py",
+                "tests/e2e/test_ml_lifecycle_verification.py",
+                "--collect-only",
+                *pytest_options,
+            ],
+        ),
+        (
+            "obs5-real-migration",
+            [
+                "-m",
+                "pytest",
+                "--noconftest",
+                "tests/e2e/test_ml_lifecycle_verification.py::TestOBS5RealMigration",
+                *pytest_options,
+            ],
+        ),
+        ("obs5-primary", None),
+        (
+            "obs5-pg-original",
+            [
+                "-m",
+                "pytest",
+                "--noconftest",
+                "tests/e2e/test_ml_lifecycle_postgresql.py",
+                *pytest_options,
+            ],
+        ),
+        (
+            "obs5-pg-supplement",
+            [
+                "-m",
+                "pytest",
+                "--noconftest",
+                "tests/e2e/test_ml_lifecycle_verification.py",
+                "-k",
+                "not TestOBS5RealMigration",
+                *pytest_options,
+            ],
+        ),
+        ("check-obs5", ["-m", "alembic", "check"]),
+    )
+    completed = []
     failed = False
     try:
-        assert prepare_owned_test_profile() == root
         _wait_owned_health(root, "postgres", 90)
         _wait_owned_health(root, "redis", 60)
         assert importlib.metadata.version("tzdata") == "2026.4"
-        verification_preflight(root)
-        commands = (
-            (
-                "obs5-real-migration",
-                [
-                    "-m",
-                    "pytest",
-                    "--noconftest",
-                    "tests/e2e/test_ml_lifecycle_verification.py::TestOBS5RealMigration",
-                    "-q",
-                    "-p",
-                    "no:cacheprovider",
-                    "-rA",
-                ],
-                1,
-            ),
-            (
-                "obs5-pg-original",
-                [
-                    "-m",
-                    "pytest",
-                    "--noconftest",
-                    "tests/e2e/test_ml_lifecycle_postgresql.py",
-                    "-q",
-                    "-p",
-                    "no:cacheprovider",
-                    "-rA",
-                ],
-                12,
-            ),
-            (
-                "obs5-pg-supplement",
-                [
-                    "-m",
-                    "pytest",
-                    "--noconftest",
-                    "tests/e2e/test_ml_lifecycle_verification.py",
-                    "-k",
-                    "not TestOBS5RealMigration",
-                    "-q",
-                    "-p",
-                    "no:cacheprovider",
-                    "-rA",
-                ],
-                5,
-            ),
-            ("obs5-alembic-check", ["-m", "alembic", "check"], None),
-        )
-        seen = set()
-        for name, arguments, count in commands:
+        for name, arguments in steps:
             print("OBS5_PHASE=" + name, flush=True)
             try:
-                run_verification_phase(name, [sys.executable, *arguments])
+                if arguments is None:
+                    run_primary_head_upgrade(name)
+                else:
+                    run_verification_phase(name, [sys.executable, *arguments])
             except Exception as error:
                 failed = True
                 print(f"OBS5_PHASE_FAILURE={name}:{type(error).__name__}:{error}", flush=True)
-            phase = root / "evidence" / name
-            process = json.loads((phase / "process.json").read_text(encoding="utf-8"))
-            assert not process["alive"], "verification child still running"
-            if count is not None:
-                nodes = json.loads((phase / "nodes.json").read_text(encoding="utf-8"))
-                selected = set(nodes["selected"])
-                assert len(selected) == count and not seen.intersection(selected)
-                seen.update(selected)
-                reports = [
-                    json.loads(line)
-                    for line in (phase / "reports.jsonl").read_text(encoding="utf-8").splitlines()
-                ]
-                successful = (
-                    process["exit"] == nodes["exit"] == 0
-                    and not process["timed_out"]
-                    and all(
-                        report["outcome"] == "passed" and not report["wasxfail"]
-                        for report in reports
-                    )
-                    and {report["nodeid"] for report in reports if report["when"] == "call"}
-                    == selected
+                break
+            completed.append(name)
+        if failed:
+            with lifecycle_evidence_lock(evidence):
+                assert not any(
+                    (evidence / name).exists() for name in ("seal.json", "obs5-scope-seal.json")
+                ), "lifecycle receipt store is already sealed"
+                _publish_lifecycle_json(
+                    evidence / "obs5-scope-seal.json",
+                    {
+                        "scope": "OBS-5 only; not full backend release qualification",
+                        "passed": False,
+                        **source,
+                        "nodes": [],
+                        "phases": completed,
+                    },
                 )
-                failed |= not successful
-            phases.append(process)
-        _source_receipt(json.loads(os.environ["COP_MANUAL_TEST_RECEIPT"]))
-        (root / "evidence" / "obs5-scope-seal.json").write_text(
-            json.dumps(
-                {
-                    "scope": "OBS-5 only; not full backend release qualification",
-                    "passed": not failed,
-                    "revision": os.environ["COP_MANUAL_TEST_REVISION"],
-                    "nodes": sorted(seen),
-                    "phases": phases,
-                }
-            ),
-            encoding="utf-8",
+            return 1
+        seal_obs5_scope(
+            evidence,
+            proof,
+            current_verification_source_proof(),
+            completed,
+            lambda: asyncio.run(_primary_marker()),
         )
-        return int(failed)
+        return 0
     finally:
-        if (root / "evidence").exists():
-            shutil.copytree(root / "evidence", export / "evidence", dirs_exist_ok=True)
-        if (root / "ownership.json").exists():
-            shutil.copy2(root / "ownership.json", export / "ownership.json")
+        if export is not None:
+            if evidence.exists():
+                shutil.copytree(evidence, export / "evidence", dirs_exist_ok=True)
+            if (root / "ownership.json").exists():
+                shutil.copy2(root / "ownership.json", export / "ownership.json")
+
+
+async def test_supported_entrypoints_are_documented_and_unprepared_mode_refuses(capsys):
+    assert "run_obs5_verification.ps1" in __doc__ and "UNSUPPORTED" in __doc__
+    assert _run_owned_verification() == 2
+    assert "UNSUPPORTED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("digest", [None, "0" * 64], ids=["missing", "stale"])
+async def test_prepared_runner_refuses_stale_source_before_any_phase(digest, monkeypatch):
+    receipt = owned_test_environment()
+    current_verification_source_proof()
+    phase = Mock()
+    primary = Mock()
+    monkeypatch.setitem(globals(), "run_verification_phase", phase)
+    monkeypatch.setitem(globals(), "run_primary_head_upgrade", primary)
+    if digest is None:
+        monkeypatch.delenv(SOURCE_MANIFEST_DIGEST_ENV)
+    else:
+        monkeypatch.setenv(SOURCE_MANIFEST_DIGEST_ENV, digest)
+    with pytest.raises((AssertionError, KeyError)):
+        _run_owned_verification(prepared=True)
+    phase.assert_not_called()
+    primary.assert_not_called()
+    assert not (Path(receipt["temp_root"]) / "evidence" / "obs5-scope-seal.json").exists()
+
+
+LIFECYCLE_NODE_PREFIX = "tests/e2e/test_ml_lifecycle_postgresql.py::"
+
+
+class TestOBS5ScopeSeal(SyntheticVerificationEvidence):
+    """OBS-only seal over the shared synthetic unit fixture; no process or database."""
+
+    def obs5(self, tmp_path):
+        evidence, proof = self.evidence(tmp_path)
+        return evidence, proof, lambda: LOCAL_PERIOD_REVISION
+
+    async def test_complete_bound_obs5_evidence_seals_obs_scope_only(self, tmp_path):
+        evidence, proof, marker = self.obs5(tmp_path)
+        seal = seal_obs5_scope(evidence, proof, dict(proof), OBS5_RUNNER_PHASES, marker)
+        assert seal["passed"] and seal["scope"].startswith("OBS-5 only")
+        assert seal["partitions"] == {name: sorted(self.NODES[name]) for name in OBS5_TEST_PHASES}
+        assert seal["primary_head"]["after"] == LOCAL_PERIOD_REVISION
+        assert json.loads((evidence / "obs5-scope-seal.json").read_text(encoding="utf-8")) == seal
+        assert not self.receipt_path(evidence, self.NODES["obs5-pg-supplement"][1]).exists()
+
+    @pytest.mark.parametrize(
+        ("case", "message"),
+        [
+            ("process_digest", "verification source drift"),
+            ("process_source", "verification source drift"),
+            ("current_source", "verification source drift"),
+            ("schema_check_failed", "did not succeed"),
+            ("primary_check_missing", "did not succeed"),
+            ("primary_not_head", "primary head was not proven"),
+            ("primary_unexpected_before", "primary head was not proven"),
+            ("primary_marker_actual", "primary head was not proven"),
+            ("preflight_digest", "receipt source digest mismatch"),
+            ("ownership_commit", "receipt source digest mismatch"),
+            ("no_lifecycle_receipt", "lifecycle receipt"),
+            ("missing_supplement_receipt", "lifecycle receipt"),
+            ("lifecycle_cleanup", "lifecycle receipt"),
+            ("lifecycle_public_drift", "lifecycle receipt"),
+            ("lifecycle_digest", "lifecycle receipt"),
+            ("lifecycle_foreign_test", "lifecycle receipt"),
+            ("lifecycle_duplicate_test", "lifecycle receipt"),
+            ("lifecycle_foreign_token", "lifecycle receipt"),
+            ("lifecycle_truthy_flag", "lifecycle receipt"),
+            ("missing_original_second_receipt", "lifecycle receipt coverage mismatch"),
+            ("duplicate_receipt", "lifecycle receipt coverage mismatch"),
+            ("extra_resource_free_receipt", "lifecycle receipt coverage mismatch"),
+            ("inventory_obligations_missing", "lifecycle receipt inventory is missing or unbound"),
+            ("inventory_unbound_digest", "lifecycle receipt inventory is missing or unbound"),
+            ("inventory_drops_obligation", "lifecycle receipt inventory drifted"),
+            ("obligation_outside_lifecycle", "ran outside a lifecycle phase"),
+            ("phase_inventory_drift", "lifecycle receipt inventory drifted"),
+            ("unrun_node", "not completely partitioned"),
+            ("incomplete_phases", "did not all complete"),
+            ("outside_manifest", "outside the source manifest"),
+        ],
+    )
+    async def test_unbound_obs5_evidence_refuses_seal(self, tmp_path, case, message):
+        evidence, proof, marker = self.obs5(tmp_path)
+        current = dict(proof)
+        completed = OBS5_RUNNER_PHASES
+        if case == "current_source":
+            current["digest"] = "d" * 64
+        elif case == "primary_marker_actual":
+            marker = lambda: "035"  # noqa: E731
+        elif case == "unrun_node":
+            nodes = [node for name in OBS5_TEST_PHASES for node in self.NODES[name]]
+            self.phase(evidence, "obs5-inventory", [], nodes + [LIFECYCLE_NODE_PREFIX + "test_x"])
+        elif case == "incomplete_phases":
+            completed = OBS5_RUNNER_PHASES[:-1]
+        elif case == "outside_manifest":
+            proof["binding"] = {
+                path: digest
+                for path, digest in proof["binding"].items()
+                if not path.endswith("test_ml_lifecycle_postgresql.py")
+            }
+            current = dict(proof)
+        else:
+            self.mutate(evidence, case)
+        with pytest.raises(AssertionError, match=message):
+            seal_obs5_scope(evidence, proof, current, completed, marker)
+        assert not (evidence / "obs5-scope-seal.json").exists()
 
 
 if __name__ == "__main__":
-    raise SystemExit(_run_owned_verification())
+    raise SystemExit(_run_owned_verification(sys.argv[1:] == ["--prepared"]))

@@ -1,7 +1,8 @@
 """OBS-5 races on receipt-proven disposable PostgreSQL, run with --noconftest.
 
-The coordinator must provision/migrate its own services and pass the tested
-source receipt. No service creation, adoption or Compose operation occurs here.
+The coordinator must provision/migrate its own services and prepare the canonical
+tested-source manifest (``current_verification_source_proof``). No service creation,
+adoption or Compose operation occurs here.
 """
 
 from __future__ import annotations
@@ -46,11 +47,13 @@ from packages.ml.lifecycle import (
 )
 from packages.ml.safe_persistence import publish_signed_artifact, verify_signed_artifact
 from tests.e2e.test_manual_cop_postgresql import (
+    current_verification_source_proof,
     guard_owned_database,
     migration_targets,
     owned_test_environment,
     owned_test_network,
     retained_storage_state,
+    write_lifecycle_receipt,
 )
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -90,20 +93,22 @@ def _pre_lifecycle_device_table():
     )
 
 
-def _source_receipt(receipt):
-    fingerprint = os.environ["HPO_OBS5_TESTED_REVISION"]
-    assert re.fullmatch(r"[0-9a-f]{64}", fingerprint), "missing tested source fingerprint"
-    assert receipt["revision"].endswith("+" + fingerprint), "ownership/source mismatch"
-    report = json.loads(Path(os.environ["HPO_OBS5_SOURCE_RECEIPT"]).read_text(encoding="utf-8"))
-    manifest = report["post_change_source_manifest"]
-    canonical = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    assert hashlib.sha256(canonical).hexdigest() == fingerprint, "source manifest mismatch"
-    checkout = Path(__file__).resolve().parents[3]
-    for entry in manifest:
-        path = checkout / entry["path"]
-        assert path.resolve().is_relative_to(checkout), "unsafe source path"
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], "source drift"
-    return fingerprint
+def _source_receipt(receipt, environment=None):
+    """Bind ownership to the one canonical prepared manifest; never a second producer."""
+    environment = os.environ if environment is None else environment
+    proof = current_verification_source_proof(environment)
+    # Legacy aliases may only restate the canonical proof, never substitute for it.
+    alias = environment.get("HPO_OBS5_TESTED_REVISION")
+    assert alias is None or alias == proof["digest"], "stale tested source fingerprint"
+    receipt_alias = environment.get("HPO_OBS5_SOURCE_RECEIPT")
+    assert receipt_alias is None or Path(receipt_alias).resolve(strict=True) == Path(
+        proof["path"]
+    ).resolve(strict=True), "foreign tested source receipt"
+    assert (receipt["commit"], receipt["source_manifest_sha256"]) == (
+        proof["commit"],
+        proof["digest"],
+    ), "ownership/source mismatch"
+    return {"commit": proof["commit"], "source_manifest_sha256": proof["digest"]}
 
 
 @pytest_asyncio.fixture
@@ -111,7 +116,7 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
     assert request.config.option.noconftest, "coordinator-owned suite requires --noconftest"
     assert os.name == "posix", "owned harness requires Linux Unix-socket/process semantics"
     receipt = owned_test_environment()
-    fingerprint = _source_receipt(receipt)
+    source = _source_receipt(receipt)
     root = Path(receipt["temp_root"])
     assert tmp_path.resolve().is_relative_to(root), "pytest basetemp must be coordinator-owned"
     model_dir = tmp_path / "artifact-fixtures"
@@ -176,21 +181,19 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     assert public_unchanged, "public manual storage drift"
             finally:
                 await control.dispose()
-                (root / "evidence" / ("obs5-" + request.node.name + ".json")).write_text(
-                    json.dumps(
-                        {
-                            "test": request.node.nodeid,
-                            "source_revision": fingerprint,
-                            "ownership_token": receipt["token"],
-                            "schema": schema,
-                            "started_at": started.isoformat(),
-                            "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                            "schema_owned": created,
-                            "schema_removed": removed,
-                            "public_manual_storage_unchanged": public_unchanged,
-                        }
-                    ),
-                    encoding="utf-8",
+                write_lifecycle_receipt(
+                    root / "evidence",
+                    {
+                        "test": request.node.nodeid,
+                        **source,
+                        "ownership_token": receipt["token"],
+                        "schema": schema,
+                        "started_at": started.isoformat(),
+                        "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "schema_owned": created,
+                        "schema_removed": removed,
+                        "public_manual_storage_unchanged": public_unchanged,
+                    },
                 )
 
 
