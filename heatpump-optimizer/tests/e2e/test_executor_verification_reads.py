@@ -146,6 +146,7 @@ async def _reservation_rows(db_session) -> list[ExecutorVerificationReadRecord]:
 @pytest.mark.asyncio(loop_scope="session")
 async def test_concurrent_admission_never_exceeds_total_or_ordinary_caps(db_session):
     actions = await _seed_actions(db_session, 8)
+    action_ids = {action.id for action in actions}
     restore_ids = await _seed_restores(8, "mixed")
     contenders = _Contenders(restore_ids)
 
@@ -168,7 +169,7 @@ async def test_concurrent_admission_never_exceeds_total_or_ordinary_caps(db_sess
     safety = [row for row in rows if row.lane == "safety"]
     assert sum(results) == len(rows) == 5
     assert len(ordinary) <= 3
-    assert {row.action_id for row in ordinary} <= {action.id for action in actions}
+    assert {row.action_id for row in ordinary} <= action_ids
     assert {row.action_id for row in safety} <= set(restore_ids)
 
 
