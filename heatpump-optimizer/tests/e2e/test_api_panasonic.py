@@ -39,7 +39,8 @@ async def test_capabilities_use_database_observation_without_cloud_probe(
     data = response.json()
     assert data["api"]["live_probe_performed"] is False
     assert data["api"]["write_preflight_required"] is True
-    assert data["availability"]["commands_allowed"] is True
+    assert data["availability"]["commands_allowed"] is False
+    assert data["availability"]["observation_available"] is True
     assert data["adapter"]["status"] == "available"
     assert data["adapter"]["state_fresh"] is True
     assert data["device"]["id"] == seed_device_status.device_id

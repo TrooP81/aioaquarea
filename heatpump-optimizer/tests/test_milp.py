@@ -92,7 +92,7 @@ BLOCKED = SpaceHeatingGateState.BLOCKED
 UNKNOWN = SpaceHeatingGateState.UNKNOWN
 
 
-def _context(prices, **overrides):
+def _context(prices, *, demand=None, power=12.0, **overrides):
     """Aware frozen observation bound to the synthetic device and horizon start."""
     context = {
         "device_id": _DEVICE,
@@ -101,8 +101,21 @@ def _context(prices, **overrides):
         "max_age_seconds": 900,
         "tank_target_c": 60.0,
         "force_dhw": 0,
+        "tank_hardware_floor_c": 30,
+        "auxiliary_power_kw": 0,
     }
     context.update(overrides)
+    method = "unchanged_hourly_load_over_declared_max_electrical_power"
+    context["native_sh_provenance"] = {
+        "kind": "explicit_conditional_assumption",
+        "method": method,
+        "device_id": context["device_id"],
+        "captured_at": prices[0][0].isoformat(),
+        "horizon_start": prices[0][0].isoformat(),
+        "horizon_end": (prices[-1][0] + dt.timedelta(hours=1)).isoformat(),
+        "maximum_electrical_power_kw": power,
+        "hourly_electrical_kw": list(demand if demand is not None else [0] * len(prices)),
+    }
     return context
 
 
@@ -202,6 +215,7 @@ class _Case:
             "current_tank_temp": self.tank,
             "current_indoor_temp": self.room,
             "dhw_deadlines": list(self.deadlines),
+            "dhw_deadline_tank_floors_c": [max(self.tank_floors)] * len(self.deadlines),
             "indoor_targets": list(self.room_floors),
             "tank_min_per_hour": None if self.default_tank_floor else list(self.tank_floors),
             "tank_max_temp_setting": self.tank_ceiling,
@@ -209,7 +223,9 @@ class _Case:
             "gate_states": list(self.gates),
             "indoor_max_temp_setting": self.room_ceiling,
             "hardware_tank_ceiling": self.tank_ceiling,
-            "observation_context": _context(prices, tank_target_c=self.target),
+            "observation_context": _context(
+                prices, tank_target_c=self.target, demand=self.demand, power=self.power
+            ),
         }
         kwargs.update(overrides)
         with self.physics():
@@ -428,14 +444,9 @@ class TestMILPSolver:
             hardware_tank_ceiling=55,
             tank_max_temp_setting=55,
             tank_min_per_hour=[48] * 24,
-            observation_context={
-                "device_id": "snapshot-device",
-                "observed_at": prices[0][0],
-                "captured_at": prices[0][0],
-                "max_age_seconds": 900,
-                "tank_target_c": 55,
-                "force_dhw": 0,
-            },
+            observation_context=_context(
+                prices, device_id="snapshot-device", tank_target_c=55, demand=[1.0] * 24
+            ),
         )
 
         snapshot = plan["forecast_snapshot"]

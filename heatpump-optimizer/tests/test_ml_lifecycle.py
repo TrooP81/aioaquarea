@@ -2612,9 +2612,13 @@ async def test_optimizer_startup_queues_after_quality_without_fitting(monkeypatc
         "packages.core.log_sink.shutdown_log_sink",
         AsyncMock(side_effect=lambda: events.append("log_drain")),
     )
+    monkeypatch.setattr(
+        "packages.core.database.engine",
+        SimpleNamespace(dispose=AsyncMock(side_effect=lambda: events.append("engine"))),
+    )
     with pytest.raises(RuntimeError, match="owned fixture stop"):
         await optimizer.main()
-    assert events == ["log_drain", "wrapper"]
+    assert events == ["log_drain", "wrapper", "engine"]
     wrapper.stop.assert_awaited_once_with()
     assert enqueue.await_count == 1
     assert enqueue.await_args.args == ("comfort", "optimizer_startup")
@@ -2645,6 +2649,10 @@ async def test_poller_registers_single_utc_maintenance_owner(monkeypatch):
         AsyncMock(side_effect=lambda: events.append("log_drain")),
     )
     monkeypatch.setattr(module, "MaintenanceRunner", Mock(return_value=owner))
+    monkeypatch.setattr(
+        "packages.core.database.engine",
+        SimpleNamespace(dispose=AsyncMock(side_effect=lambda: events.append("engine"))),
+    )
     enqueue = AsyncMock(return_value=None)
     monkeypatch.setattr(module, "enqueue_maintenance_request", enqueue)
     await poller.main()
@@ -2668,7 +2676,7 @@ async def test_poller_registers_single_utc_maintenance_owner(monkeypatch):
         for call in enqueue.await_args_list
     )
     poller.AquareaWrapper.assert_called_once_with(read_only=True)
-    assert events == ["scheduler", "owner", "log_drain", "wrapper"]
+    assert events == ["scheduler", "owner", "log_drain", "wrapper", "engine"]
     scheduler.close.assert_awaited_once_with()
     scheduler.shutdown.assert_not_called()
     owner.close.assert_awaited_once_with()

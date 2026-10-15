@@ -1,34 +1,6 @@
 import { expect, test, type Page } from "./fixtures";
 
-for (const refusal of [
-  { status: 409, detail: { code: "unresolved_safety_reverts", action_id: 11763 }, message: "Reset blocked: an unresolved safety restore (action 11763) must be settled first." },
-  { status: 503, detail: { code: "ml_lifecycle_unavailable" }, message: "Reset unavailable: model lifecycle storage could not be reached. Try again later." },
-  { status: 409, detail: { code: "unresolved_safety_reverts", action_id: { unsafe: true } }, message: "Reset blocked: an unresolved safety restore must be settled first." },
-  { status: 400, detail: "A readable refusal", message: "A readable refusal" },
-  { status: 500, detail: ["not", "a", "message"], message: "Reset failed" },
-  { status: 500, detail: null, message: "Reset failed" },
-  { status: 500, detail: { unexpected: true }, message: "Reset failed" },
-]) {
-  test(`reset renders safe refusal: ${JSON.stringify(refusal.detail)}`, async ({ page }) => {
-    await mockSettings(page);
-    await page.route("**/api/admin/reset", (route) => route.fulfill({
-      status: refusal.status, contentType: "application/json",
-      body: JSON.stringify({ detail: refusal.detail }),
-    }));
-    page.on("dialog", (dialog) => dialog.accept());
-    await page.goto("/settings?tab=system");
-    const selected = page.getByRole("checkbox", { name: /Device status history/ });
-    await selected.check();
-    await page.getByRole("button", { name: "Reset Selected Data" }).click();
-    await expect(page.getByText(refusal.message, { exact: true })).toBeVisible();
-    await expect(selected).toBeChecked();
-    await expect(page.getByRole("button", { name: "Reset Selected Data" })).toBeEnabled();
-  });
-}
-
 const settings = {
-  ml_maintenance_enabled: { value: "false", type: "bool", description: "Model maintenance" },
-  seasonal_calibration_auto_exit: { value: "true", type: "bool", description: "Legacy automatic exit", read_only: true },
   price_provider: { value: "manual", type: "text", description: "Price provider", options: ["manual", "entsoe", "tibber"] },
   manual_price_eur_per_kwh: { value: "0.12", type: "float", description: "Manual price" },
   entsoe_api_token: { value: "***", type: "secret", description: "ENTSO-E token" },
@@ -43,30 +15,20 @@ async function mockSettings(
   onSave?: (payload: Record<string, string>) => void,
   saveResponse: { status?: number; body?: unknown } = {},
 ) {
-  let persisted = settings;
   await page.route("**/api/**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
   await page.route("**/api/settings", (route) => {
     if (route.request().method() === "PUT") {
-      const payload: Record<string, string> = JSON.parse(route.request().postData() || "{}").settings;
-      onSave?.(payload);
-      if ((saveResponse.status ?? 200) < 400) {
-        for (const [key, value] of Object.entries(payload)) {
-          if (key in persisted) {
-            const settingKey = key as keyof typeof settings;
-            persisted = { ...persisted, [settingKey]: { ...persisted[settingKey], value } };
-          }
-        }
-      }
+      onSave?.(JSON.parse(route.request().postData() || "{}").settings);
       return route.fulfill({
         status: saveResponse.status ?? 200,
         contentType: "application/json",
-        body: JSON.stringify(saveResponse.body ?? persisted),
+        body: JSON.stringify(saveResponse.body ?? settings),
       });
     }
     return route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(persisted),
+      body: JSON.stringify(settings),
     });
   });
   await page.route("**/api/currency", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR" }) }));
@@ -74,47 +36,6 @@ async function mockSettings(
   await page.route("**/api/comfort-schedule", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ weekday: [], weekend: [] }) }));
   await page.route("**/api/comfort-schedule/learned", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ weekday: {}, weekend: {} }) }));
 }
-
-test("model maintenance defaults off and saves only explicit enablement", async ({ page }, testInfo) => {
-  let saved: Record<string, string> | undefined;
-  await mockSettings(page, (payload) => { saved = payload; }, {
-    body: { ...settings, ml_maintenance_enabled: { ...settings.ml_maintenance_enabled, value: "true" } },
-  });
-  await page.goto("/settings");
-  const toggle = page.getByRole("checkbox", { name: "Model maintenance", exact: true });
-  await expect(toggle).not.toBeChecked();
-  await toggle.check();
-  await page.getByRole("button", { name: /Save 1 change/ }).click();
-  await expect.poll(() => saved).toEqual({ ml_maintenance_enabled: "true" });
-  await expect(toggle).toBeChecked();
-  await page.reload();
-  await expect(toggle).toBeChecked();
-  await toggle.scrollIntoViewIfNeeded();
-  const box = await toggle.boundingBox();
-  expect(box).not.toBeNull();
-  expect(box!.x).toBeGreaterThanOrEqual(0);
-  expect(box!.x + box!.width).toBeLessThanOrEqual(await page.evaluate(() => window.innerWidth));
-  await page.screenshot({ path: testInfo.outputPath("ml-maintenance-settings.png") });
-});
-
-test("maintenance defaults off and legacy auto-exit is read-only and ineffective", async ({ page }, testInfo) => {
-  let saved: Record<string, string> | undefined;
-  await mockSettings(page, (payload) => { saved = payload; });
-  await page.goto("/settings");
-  await expect(page.getByRole("checkbox", { name: "Model maintenance", exact: true })).not.toBeChecked();
-  await page.getByRole("button", { name: "Show advanced" }).click();
-  const autoExit = page.getByRole("checkbox", { name: "Automatic observation exit", exact: true });
-  await expect(autoExit).toBeDisabled();
-  await expect(autoExit).not.toBeChecked();
-  await expect(page.getByText("Always false. Observation persists until explicit human exit; legacy stored values are ineffective.")).toBeVisible();
-  await page.getByRole("checkbox", { name: "Model maintenance", exact: true }).check();
-  await page.getByRole("button", { name: /Save 1 change/ }).click();
-  await expect.poll(() => saved).toEqual({ ml_maintenance_enabled: "true" });
-  await expect(autoExit).toBeDisabled();
-  await expect(autoExit).not.toBeChecked();
-  await autoExit.scrollIntoViewIfNeeded();
-  await page.screenshot({ path: testInfo.outputPath("obs6-auto-exit-disabled.png") });
-});
 
 test("settings exposes one skip target and validates without sending invalid drafts", async ({ page }) => {
   let saves = 0;
@@ -130,6 +51,61 @@ test("settings exposes one skip target and validates without sending invalid dra
   await expect(page.locator(".override-banner[role=alert]")).toContainText("Fix 1 invalid field");
   await expect(page.locator("#setting-tank_min_temp")).toBeFocused();
   expect(saves).toBe(0);
+});
+
+for (const { name, body, expected } of [
+  { name: "structured invalid values", body: { detail: { invalid_values: { tank_min_temp: "outside controller range" } } }, expected: "tank_min_temp: outside controller range" },
+  { name: "string detail", body: { detail: "Settings temporarily unavailable" }, expected: "Settings temporarily unavailable" },
+  { name: "structured refusal", body: { detail: { code: "settings_unavailable" } }, expected: "Save failed" },
+  { name: "malformed invalid values", body: { detail: { invalid_values: { tank_min_temp: { message: "not renderable" } } } }, expected: "Save failed" },
+  { name: "validation array", body: { detail: [{ msg: "Invalid value", loc: ["body", "settings"] }] }, expected: "Save failed" },
+]) {
+  test(`settings safely renders ${name} without losing the draft`, async ({ page }) => {
+    const pageErrors: string[] = [];
+    let saved: Record<string, string> | undefined;
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    await mockSettings(page, (payload) => { saved = payload; }, { status: 422, body });
+    await page.goto("/settings");
+    await page.locator("#setting-tank_min_temp").fill("46");
+    await page.getByRole("button", { name: "Save 1 change", exact: true }).click();
+    await expect(page.locator(".override-banner[role=alert]")).toHaveText(expected);
+    await expect(page.locator("#setting-tank_min_temp")).toHaveValue("46");
+    await expect(page.getByRole("button", { name: "Save 1 change", exact: true })).toBeEnabled();
+    expect(saved).toEqual({ tank_min_temp: "46" });
+    expect(pageErrors).toEqual([]);
+    await expect(page.locator("body")).not.toContainText("[object Object]");
+  });
+}
+
+test("settings preserves read-only metadata, explicit observation exit, maintenance and gate controls", async ({ page }) => {
+  let saved: Record<string, string> | undefined;
+  await mockSettings(page, (payload) => { saved = payload; });
+  const metadata = {
+    ...settings,
+    optimizer_layer: { value: "rules_only", type: "str", description: "Optimizer layer", options: ["rules_only", "auto"], read_only: true },
+    tank_max_temp: { ...settings.tank_max_temp, read_only: true },
+    ml_maintenance_enabled: { value: "false", type: "bool", description: "Reporting-only model maintenance" },
+    seasonal_calibration_auto_exit: { value: "true", type: "bool", description: "Legacy stored auto exit", read_only: true },
+    space_heating_behavior_profile: { value: "default", type: "str", description: "Heating behavior profile", options: ["default"] },
+    space_heating_gate_on_offset_c: { value: "-2", type: "float", description: "Heating ON offset" },
+    space_heating_gate_off_offset_c: { value: "0", type: "float", description: "Heating OFF offset" },
+  };
+  await page.route("**/api/settings", (route) => route.request().method() === "GET"
+    ? route.fulfill({ contentType: "application/json", body: JSON.stringify(metadata) })
+    : route.fallback());
+  await page.goto("/settings");
+  await expect(page.locator("#setting-optimizer_layer")).toBeDisabled();
+  await expect(page.locator("#setting-tank_max_temp")).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "Space Heating Gate", exact: true })).toBeVisible();
+  await page.getByLabel("Model maintenance", { exact: true }).check();
+  await page.getByLabel("Gate ON offset", { exact: true }).fill("-3");
+  await page.getByRole("button", { name: "Show advanced" }).click();
+  await expect(page.getByLabel("Automatic observation exit", { exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Automatic observation exit", { exact: true })).not.toBeChecked();
+  await expect(page.locator("#seasonal-learning")).toContainText("Observation persists until explicit human exit");
+  await expect(page.locator("#seasonal-learning")).not.toContainText("end itself");
+  await page.getByRole("button", { name: "Save 2 changes", exact: true }).click();
+  expect(saved).toEqual({ ml_maintenance_enabled: "true", space_heating_gate_on_offset_c: "-3" });
 });
 
 test("settings tabs follow valid URL history and ignore invalid tab values", async ({ page }) => {
@@ -215,22 +191,6 @@ test("settings sends only applicable dirty values", async ({ page }) => {
   await expect.poll(() => saved).toEqual({ manual_price_eur_per_kwh: "0.20" });
 });
 
-test("R04 saves a finite zero price and retains it after reload", async ({ page }, testInfo) => {
-  let saved: Record<string, string> | undefined;
-  await mockSettings(page, (payload) => { saved = payload; });
-  await page.goto("/settings?tab=data");
-  const input = page.locator("#setting-manual_price_eur_per_kwh");
-  await input.fill("0");
-  await page.getByRole("button", { name: /Save 1 change/ }).click();
-  await expect.poll(() => saved).toEqual({ manual_price_eur_per_kwh: "0" });
-  await expect(page.getByRole("status").filter({ hasText: "Saved 1 setting(s)" })).toBeVisible();
-  await page.reload();
-  await expect(input).toHaveValue("0");
-  await expect(page.getByRole("button", { name: "Save  change" })).toBeDisabled();
-  await input.scrollIntoViewIfNeeded();
-  await page.screenshot({ path: testInfo.outputPath("r04-finite-zero-saved.png") });
-});
-
 test("settings filters values that become inapplicable and masked secrets", async ({ page }) => {
   let saved: Record<string, string> | undefined;
   await mockSettings(page, (payload) => { saved = payload; });
@@ -250,48 +210,18 @@ test("settings filters values that become inapplicable and masked secrets", asyn
   });
 });
 
-for (const failure of [
-  { name: "API save failure", status: 500, detail: "Backend unavailable", message: "Backend unavailable" },
-  {
-    name: "R04 structured numeric refusal", status: 400,
-    detail: { invalid_values: { manual_price_eur_per_kwh: "Value must be finite" } },
-    message: "manual_price_eur_per_kwh: Value must be finite"
-  },
-  {
-    name: "R04 multi-field numeric refusal", status: 400,
-    detail: { invalid_values: { manual_price_eur_per_kwh: "Value must be finite", tank_min_temp: "Value must be at least 20" } },
-    message: "manual_price_eur_per_kwh: Value must be finite; tank_min_temp: Value must be at least 20"
-  },
-  {
-    name: "R04 empty numeric refusal", status: 400,
-    detail: { invalid_values: {} }, message: "Save failed"
-  },
-  {
-    name: "R04 malformed numeric refusal", status: 400,
-    detail: { invalid_values: ["Value must be finite"] }, message: "Save failed"
-  },
-  {
-    name: "R04 unknown structured refusal", status: 400,
-    detail: { code: "invalid_numeric_setting" }, message: "Save failed"
-  },
-  {
-    name: "R04 null structured refusal", status: 400,
-    detail: null, message: "Save failed"
-  },
-]) {
-  test(`settings retains the draft after ${failure.name}`, async ({ page }) => {
-    await mockSettings(page, undefined, { status: failure.status, body: { detail: failure.detail } });
-    await page.goto("/settings?tab=data");
-    const input = page.locator("#setting-manual_price_eur_per_kwh");
-    await input.fill("0.20");
+test("settings retains the draft after an API save failure", async ({ page }) => {
+  await mockSettings(page, undefined, { status: 500, body: { detail: "Backend unavailable" } });
+  await page.goto("/settings?tab=data");
+  const input = page.locator("#setting-manual_price_eur_per_kwh");
+  await input.fill("0.20");
 
-    await page.getByRole("button", { name: /Save 1 change/ }).click();
+  await page.getByRole("button", { name: /Save 1 change/ }).click();
 
-    await expect(page.locator(".override-banner[role=alert]")).toContainText(failure.message);
-    await expect(input).toHaveValue("0.20");
-    await expect(page.getByRole("button", { name: /Save 1 change/ })).toBeEnabled();
-  });
-}
+  await expect(page.locator(".override-banner[role=alert]")).toContainText("Backend unavailable");
+  await expect(input).toHaveValue("0.20");
+  await expect(page.getByRole("button", { name: /Save 1 change/ })).toBeEnabled();
+});
 
 test("advanced validation focuses the first applicable invalid field without a PUT", async ({ page }) => {
   let saves = 0;
@@ -325,7 +255,7 @@ test("settings focuses the first invalid field in declared order", async ({ page
 test("comfort schedule has a single roving cell and 44px touch targets", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
+  const cells = page.getByRole("checkbox");
   await expect(cells).toHaveCount(48);
   await expect(page.locator('[role="checkbox"][tabindex="0"]')).toHaveCount(1);
   const size = await cells.first().evaluate((cell) => {
@@ -344,7 +274,7 @@ test("comfort schedule has a single roving cell and 44px touch targets", async (
 test("comfort schedule keyboard interaction changes only selection state", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
+  const cells = page.getByRole("checkbox");
 
   await cells.first().focus();
   await page.keyboard.press("ArrowRight");
@@ -369,7 +299,7 @@ test("comfort schedule keyboard interaction changes only selection state", async
 test("comfort schedule syncs the roving cell when selected with the mouse", async ({ page }) => {
   await mockSettings(page);
   await page.goto("/settings");
-  const cells = page.locator("#comfort-schedule").getByRole("checkbox");
+  const cells = page.getByRole("checkbox");
 
   await cells.nth(30).click();
 

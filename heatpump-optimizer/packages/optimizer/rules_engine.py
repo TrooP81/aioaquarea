@@ -242,7 +242,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         quiet_at_timestamp: dict[dt.datetime | None, dict[str, Any]] = {}
         non_quiet: list[dict[str, Any]] = []
         for action in ordered:
-            if str(action.get("type", "")) in {"quiet_mode_on", "quiet_mode_off"}:
+            # A linked source/restore is an ownership obligation, not a redundant
+            # level transition. Never discard it through quiet-state coalescing.
+            has_owner = (
+                action.get("action_key") is not None or action.get("reverts_action_key") is not None
+            )
+            if not has_owner and str(action.get("type", "")) in {"quiet_mode_on", "quiet_mode_off"}:
                 timestamp = cls._action_timestamp(action)
                 current = quiet_at_timestamp.get(timestamp)
                 if current is None or quiet_level(action) >= quiet_level(current):
@@ -256,7 +261,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             ),
         )
         normalised: list[dict[str, Any]] = []
-        seen_exact: set[tuple[dt.datetime | None, str, str]] = set()
+        seen_exact: set[tuple[dt.datetime | None, str, str, str]] = set()
         active_quiet_level = (
             initial_quiet_level
             if isinstance(initial_quiet_level, int)
@@ -270,18 +275,24 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             timestamp = cls._action_timestamp(action)
             payload = action.get("payload", {})
             payload_key = json.dumps(payload, sort_keys=True, default=str)
-            exact_key = (timestamp, action_type, payload_key)
+            ownership_key = json.dumps(
+                [action.get("action_key"), action.get("reverts_action_key")], default=str
+            )
+            exact_key = (timestamp, action_type, payload_key, ownership_key)
             if exact_key in seen_exact:
                 continue
             seen_exact.add(exact_key)
+            has_owner = (
+                action.get("action_key") is not None or action.get("reverts_action_key") is not None
+            )
 
             if action_type == "quiet_mode_on":
                 requested_level = quiet_level(action)
-                if active_quiet_level == requested_level:
+                if active_quiet_level == requested_level and not has_owner:
                     continue
                 active_quiet_level = requested_level
             elif action_type == "quiet_mode_off":
-                if active_quiet_level == 0:
+                if active_quiet_level == 0 and not has_owner:
                     continue
                 active_quiet_level = 0
 
@@ -806,7 +817,21 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         try:
             actions = represented_rules_commands(actions)
             native_gates = [evidence.state for evidence in gate_projections]
-            native_demand = assumed_native_demand(weather, native_gates)
+            context = await observation_context(last_status, now)
+            native_demand = assumed_native_demand(
+                weather, native_gates, context["native_sh_provenance"]
+            )
+            dhw_deadlines = [
+                int((deadline - horizon_start).total_seconds() // 3600)
+                for deadline, _ in local_dhw_deadlines_in_horizon(
+                    comfort_schedule,
+                    horizon_start,
+                    tz_name,
+                    horizon_end=prices[-1][0] + dt.timedelta(hours=1),
+                )
+                if 0 < (deadline - horizon_start).total_seconds() // 3600 <= len(prices)
+            ]
+            tank_comfort_floor = await get_float_setting("tank_min_temp")
             represented = build_represented_plan(
                 prices=prices,
                 weather=weather,
@@ -814,14 +839,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 demand_per_hour=native_demand,
                 current_tank_temp=getattr(last_status, "tank_temp", None),
                 current_indoor_temp=current_indoor_temp,
-                context=await observation_context(last_status, now),
-                dhw_deadlines=[
-                    int((deadline - horizon_start).total_seconds() // 3600)
-                    for deadline, _ in local_dhw_deadlines_in_horizon(
-                        comfort_schedule, horizon_start, tz_name
-                    )
-                    if 0 < (deadline - horizon_start).total_seconds() // 3600 <= len(prices)
-                ],
+                context=context,
+                dhw_deadlines=dhw_deadlines,
+                dhw_deadline_tank_floors_c=[tank_comfort_floor] * len(dhw_deadlines),
                 indoor_targets=[comfort_temp_min] * len(prices),
                 indoor_rates=self._represented_indoor_rates(
                     prices=prices,
@@ -833,11 +853,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     max_passive_change_c_per_hour=max_passive_change_c_per_hour,
                 ),
                 tank_min_per_hour=[
-                    await get_float_setting(
-                        "tank_min_temp"
-                        if is_comfort_hour(comfort_schedule, timestamp, tz_name=tz_name)
-                        else "tank_min_temp_offpeak"
-                    )
+                    tank_comfort_floor
+                    if is_comfort_hour(comfort_schedule, timestamp, tz_name=tz_name)
+                    else await get_float_setting("tank_min_temp_offpeak")
                     for timestamp, _ in prices
                 ],
                 tank_max_temp_setting=await get_float_setting("tank_max_temp"),
@@ -866,13 +884,15 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             "forecast_with_plan"
         ]
         forecast_snapshot["forecast"] = forecast_snapshot["forecast_with_plan"]
+        for key in ("forecast_no_heating", "no_heating_basis", "price_forecast"):
+            forecast_snapshot[key] = represented["forecast_snapshot"][key]
         forecast_snapshot["represented_strategy"] = represented["represented_strategy"]
         forecast_snapshot["serialized_replay"] = represented["serialized_replay"]
 
         return {
             "device_id": last_status.device_id if last_status is not None else None,
-            "horizon_start": horizon_start,
-            "horizon_end": horizon_end,
+            "horizon_start": represented["horizon_start"],
+            "horizon_end": represented["horizon_end"],
             "actions": actions,
             "version": self.VERSION,
             "cop_source": "assumed",

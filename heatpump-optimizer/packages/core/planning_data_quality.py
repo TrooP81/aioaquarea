@@ -206,10 +206,21 @@ def planning_batch_quality(
         reasons.append(f"Only {weather_hours} contiguous future weather hours are available.")
     if not weather_fresh or not weather_coherent or not weather_unique:
         reasons.append("Weather forecast clocks are missing, future, stale or incoherent.")
-    latest_price = min((row.fetched_at for row in batch.prices if row.fetched_at), default=None)
-    latest_weather = min(
-        (row.forecast_issued_at for row in batch.weather if row.forecast_issued_at), default=None
-    )
+
+    def oldest_clock(clocks):
+        # Invalid clocks already deny readiness above. Do not let diagnostic
+        # formatting compare naive legacy values with aware batch clocks.
+        return min(
+            (
+                clock
+                for clock in clocks
+                if isinstance(clock, dt.datetime) and clock.tzinfo is not None
+            ),
+            default=None,
+        )
+
+    latest_price = oldest_clock(row.fetched_at for row in batch.prices)
+    latest_weather = oldest_clock(row.forecast_issued_at for row in batch.weather)
 
     def age(clock):
         return round((now - clock).total_seconds()) if clock and clock.tzinfo is not None else None

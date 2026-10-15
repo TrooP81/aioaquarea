@@ -314,6 +314,7 @@ def iter_counter_change_intervals(
                     continue
 
             if abs(new_value - old_value) <= COUNTER_CONFIRMATION_EPSILON:
+                pending_corrections.pop(device_id, None)
                 increment("zero_delta")
                 continue
             if new_value > old_value:
@@ -450,9 +451,10 @@ def iter_confirmed_zero_intervals(
             or source_day != getattr(anchor, "source_date", None)
             or source_day != start.astimezone(timezone).date()
             or source_day != end.astimezone(timezone).date()
-            or old_value is None
-            or value is None
-            or not np.isfinite([old_value, value]).all()
+            or not is_finite_number(old_value)
+            or not is_finite_number(value)
+            or old_value < 0
+            or value < 0
             or abs(value - old_value) > COUNTER_CONFIRMATION_EPSILON
         ):
             continue

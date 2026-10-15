@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from copy import deepcopy
 
 from packages.optimizer import DataIncompleteError, InfeasibleError, SolverTimeoutError
 
 SCHEMA = "native_sh_trace_v1"
 TOLERANCE = 1e-5
+NATIVE_ASSUMPTION = "unchanged_hourly_load_over_declared_max_electrical_power"
 
 
 async def observation_context(status, captured_at):
@@ -24,6 +26,12 @@ async def observation_context(status, captured_at):
     max_age = max(minutes * 60, 3 * interval)
     if device_status_clock_issue(status, as_of=captured_at, max_age_seconds=max_age):
         raise DataIncompleteError("Cached device status clocks are not admissible")
+    provenance = getattr(status, "native_policy_provenance", None)
+    declarations = (
+        provenance.get("diagnostic_assumptions", {}) if isinstance(provenance, dict) else {}
+    )
+    if not isinstance(declarations, dict):
+        raise DataIncompleteError("Diagnostic assumptions unavailable")
     return {
         "device_id": getattr(status, "device_id", None),
         "observed_at": getattr(status, "ts", None),
@@ -31,22 +39,29 @@ async def observation_context(status, captured_at):
         "tank_target_c": getattr(status, "tank_target_temp", None),
         "force_dhw": getattr(status, "force_dhw", None),
         "max_age_seconds": max_age,
+        "tank_hardware_floor_c": getattr(status, "tank_heat_min", None),
+        # Observations do not establish compressor duty or absence of auxiliary load.
+        "native_sh_provenance": deepcopy(declarations.get("native_sh_provenance")),
+        "auxiliary_power_kw": declarations.get("auxiliary_power_kw"),
     }
 
 
-def assumed_native_demand(weather, gate_states):
+def assumed_native_demand(weather, gate_states, provenance):
     from packages.core.config import settings
 
     if len(gate_states) != len(weather) or any(
         state not in {"ALLOWED", "BLOCKED"} for state in gate_states
     ):
         raise DataIncompleteError("Native SH demand requires complete known gate coverage")
-    return [
-        min(settings.sh_max_power_kw, max(0, settings.sh_max_power_kw * (20 - _number(temp)) / 35))
-        if state == "ALLOWED"
-        else 0.0
-        for (_, temp), state in zip(weather, gate_states)
-    ]
+    demand = provenance.get("hourly_electrical_kw") if isinstance(provenance, dict) else None
+    if not isinstance(demand, list) or len(demand) != len(weather):
+        raise DataIncompleteError("Native SH provenance requires explicit hourly electrical load")
+    if any(
+        not 0 <= _number(load) <= settings.sh_max_power_kw or (state == "BLOCKED" and load != 0)
+        for load, state in zip(demand, gate_states)
+    ):
+        raise DataIncompleteError("Declared native SH load contradicts power or gate")
+    return list(demand)
 
 
 def build_represented_plan(
@@ -61,6 +76,7 @@ def build_represented_plan(
     hardware_tank_ceiling,
     context,
     dhw_deadlines=None,
+    dhw_deadline_tank_floors_c=None,
     indoor_targets=None,
     tank_min_per_hour=None,
     tank_max_temp_setting=None,
@@ -97,6 +113,7 @@ def build_represented_plan(
             tank_max_temp_setting if tank_max_temp_setting is not None else settings.tank_max_temp
         ),
     )
+    hardware_floor = _number(context.get("tank_hardware_floor_c"))
     room_ceiling = _number(
         indoor_max_temp_setting
         if indoor_max_temp_setting is not None
@@ -142,10 +159,13 @@ def build_represented_plan(
                 "tank_loss_c_per_h": _number(loss),
                 "indoor_full_heat_c_per_h": _number(gain),
                 "indoor_passive_c_per_h": _number(passive),
-                "tank_floor_c": _number(
-                    tank_min_per_hour[hour]
-                    if tank_min_per_hour is not None
-                    else settings.tank_min_temp
+                "tank_floor_c": max(
+                    hardware_floor,
+                    _number(
+                        tank_min_per_hour[hour]
+                        if tank_min_per_hour is not None
+                        else settings.tank_min_temp
+                    ),
                 ),
                 "indoor_floor_c": _number(
                     indoor_targets[hour]
@@ -156,12 +176,17 @@ def build_represented_plan(
                 - (
                     _number(forecast_bias_corrections_c[hour]) if forecast_bias_corrections_c else 0
                 ),
+                "forecast_bias_correction_c": (
+                    _number(forecast_bias_corrections_c[hour]) if forecast_bias_corrections_c else 0
+                ),
             }
         )
     trace = {
         "schema": SCHEMA,
         "native_sh_basis": "assumed",
-        "native_sh_assumption": "unchanged_hourly_load_over_declared_max_electrical_power",
+        "native_sh_assumption": NATIVE_ASSUMPTION,
+        "native_sh_provenance": deepcopy(context.get("native_sh_provenance")),
+        "auxiliary_power_kw": context.get("auxiliary_power_kw"),
         "device_id": context.get("device_id"),
         "observation_context": {
             key: (
@@ -176,8 +201,16 @@ def build_represented_plan(
         "initial_tank_c": _number(current_tank_temp),
         "initial_indoor_c": _number(current_indoor_temp),
         "tank_ceiling_c": ceiling,
+        "tank_hardware_floor_c": hardware_floor,
         "indoor_ceiling_c": room_ceiling,
         "deadline_hours": list(dhw_deadlines or []),
+        # Ready-by requirements are not sampled from hourly slot-start floors:
+        # comfort may begin only at the final priced endpoint.
+        "deadline_tank_floors_c": (
+            [max(hardware_floor, _number(floor)) for floor in dhw_deadline_tank_floors_c]
+            if dhw_deadline_tank_floors_c is not None
+            else ([] if not dhw_deadlines else None)
+        ),
         "price_currency": None,
         "hours": rows,
     }
@@ -279,26 +312,64 @@ def _number(value):
 
 
 def _instant(value):
-    result = dt.datetime.fromisoformat(value) if isinstance(value, str) else value
-    if not isinstance(result, dt.datetime) or result.tzinfo is None:
+    try:
+        result = dt.datetime.fromisoformat(value) if isinstance(value, str) else value
+    except ValueError as error:
+        raise DataIncompleteError("Represented strategy requires aware instants") from error
+    if not isinstance(result, dt.datetime) or result.tzinfo is None or result.utcoffset() is None:
         raise DataIncompleteError("Represented strategy requires aware instants")
     return result.astimezone(dt.timezone.utc)
 
 
 def validate_trace(trace):
-    if trace.get("schema") != SCHEMA or trace.get("native_sh_basis") not in {"assumed", "history"}:
+    if not isinstance(trace, dict) or trace.get("schema") != SCHEMA:
         raise DataIncompleteError("Native SH trace provenance unavailable")
+    # No historical trace reader currently proves selection, coverage and native-only duty.
+    # A history label alone must not acquire the conditional assumed-trace contract.
+    provenance = trace.get("native_sh_provenance")
+    if (
+        trace.get("native_sh_basis") != "assumed"
+        or trace.get("native_sh_assumption") != NATIVE_ASSUMPTION
+        or not isinstance(provenance, dict)
+        or provenance.get("kind") != "explicit_conditional_assumption"
+        or provenance.get("method") != NATIVE_ASSUMPTION
+    ):
+        raise DataIncompleteError("Native SH trace provenance unavailable or history unproven")
     rows = trace.get("hours")
     if not isinstance(rows, list) or not rows:
         raise DataIncompleteError("Complete native SH horizon required")
-    for name in ("initial_tank_c", "initial_indoor_c", "tank_ceiling_c", "indoor_ceiling_c"):
+    if any(not isinstance(row, dict) for row in rows):
+        raise DataIncompleteError("Native SH horizon requires physical rows")
+    if trace.get("auxiliary_power_kw") is None or _number(trace.get("auxiliary_power_kw")) != 0:
+        raise DataIncompleteError("Only explicit ZERO auxiliary load is represented")
+    declared_loads = provenance.get("hourly_electrical_kw")
+    if not isinstance(declared_loads, list) or len(declared_loads) != len(rows):
+        raise DataIncompleteError("Native SH provenance requires complete hourly electrical load")
+    declared_power = _number(provenance.get("maximum_electrical_power_kw"))
+    for name in (
+        "initial_tank_c",
+        "initial_indoor_c",
+        "tank_ceiling_c",
+        "tank_hardware_floor_c",
+        "indoor_ceiling_c",
+    ):
         _number(trace.get(name))
     target = _number(trace.get("observed_tank_target_c"))
     context = trace.get("observation_context", {})
+    if not isinstance(context, dict):
+        raise DataIncompleteError("Represented observation context unavailable")
     if not context.get("device_id") or context.get("device_id") != trace.get("device_id"):
         raise DataIncompleteError("Represented observation device identity unavailable")
     observed = _instant(context.get("observed_at"))
     captured = _instant(context.get("captured_at"))
+    if (
+        provenance.get("device_id") != trace.get("device_id")
+        or not observed <= _instant(provenance.get("captured_at")) <= captured
+        or _instant(provenance.get("horizon_start")) != _instant(rows[0].get("ts"))
+        or _instant(provenance.get("horizon_end"))
+        != _instant(rows[-1].get("ts")) + dt.timedelta(hours=1)
+    ):
+        raise DataIncompleteError("Native SH provenance differs from device, clock or horizon")
     max_age = _number(context.get("max_age_seconds"))
     if max_age <= 0 or not dt.timedelta(0) <= captured - observed <= dt.timedelta(seconds=max_age):
         raise DataIncompleteError("Represented observation clock is future or stale")
@@ -311,7 +382,7 @@ def validate_trace(trace):
     if target <= 0:
         raise DataIncompleteError("Observed tank target unavailable")
     for index, row in enumerate(rows):
-        start = _instant(row["ts"])
+        start = _instant(row.get("ts"))
         if start.minute or start.second or start.microsecond:
             raise DataIncompleteError("Trace requires complete market-price hours")
         if index and start != _instant(rows[index - 1]["ts"]) + dt.timedelta(hours=1):
@@ -331,31 +402,64 @@ def validate_trace(trace):
             _number(row.get(name))
         if row.get("gate_state") not in {"ALLOWED", "BLOCKED"}:
             raise DataIncompleteError("Missing or unknown native SH gate")
+        if (
+            declared_power <= 0
+            or row["native_sh_power_kw"] != declared_power
+            or abs(
+                _number(declared_loads[index])
+                - row["native_sh_fraction"] * row["native_sh_power_kw"]
+            )
+            > TOLERANCE
+        ):
+            raise DataIncompleteError(
+                "Native SH provenance contradicts represented electrical load"
+            )
         if not 0 <= row["native_sh_fraction"] <= 1 or (
             row["gate_state"] != "ALLOWED" and row["native_sh_fraction"] != 0
         ):
             raise DataIncompleteError("Native SH trace contradicts controller gate")
         if (
-            row["native_sh_power_kw"] < 0
+            row["native_sh_power_kw"] <= 0
             or row["dhw_power_kw"] <= 0
             or row["tank_net_heating_c_per_h"] <= 0
             or row["tank_loss_c_per_h"] > 0
             or row["tank_floor_c"] > trace["tank_ceiling_c"]
+            or row["tank_floor_c"] < trace["tank_hardware_floor_c"]
             or row["indoor_floor_c"] > trace["indoor_ceiling_c"]
         ):
             raise DataIncompleteError("Invalid represented physical bounds")
         ceiling = _number(row.get("indoor_ceiling_c", trace["indoor_ceiling_c"]))
         if row["indoor_floor_c"] > ceiling:
             raise DataIncompleteError("Indoor floor exceeds corrected upper comfort bound")
-    for deadline in trace.get("deadline_hours", []):
+    deadlines = trace.get("deadline_hours")
+    floors = trace.get("deadline_tank_floors_c")
+    if (
+        not isinstance(deadlines, list)
+        or not isinstance(floors, list)
+        or len(deadlines) != len(floors)
+    ):
+        raise DataIncompleteError("Complete explicit DHW deadline floors required")
+    for deadline, floor in zip(deadlines, floors):
         if type(deadline) is not int or not 0 < deadline <= len(rows):
             raise DataIncompleteError("DHW deadline outside represented horizon")
+        if not trace["tank_hardware_floor_c"] <= _number(floor) <= trace["tank_ceiling_c"]:
+            raise DataIncompleteError("DHW deadline floor outside represented hardware bounds")
+    if len(set(deadlines)) != len(deadlines):
+        raise DataIncompleteError("Duplicate DHW deadline requirement")
     return rows
 
 
 def replay_serialized_actions(trace, actions):
     """Rebuild continuous piecewise-linear states solely from serialized on/off commands."""
     rows = validate_trace(trace)
+    if not isinstance(actions, list) or any(
+        not isinstance(action, dict)
+        or not isinstance(action.get("payload", {}), dict)
+        or not isinstance(action.get("type"), str)
+        or action.get("ts") is None
+        for action in actions
+    ):
+        raise DataIncompleteError("Serialized command contract unavailable")
     horizon_start = _instant(rows[0]["ts"])
     horizon_end = horizon_start + dt.timedelta(hours=len(rows))
     pulses = []
@@ -402,9 +506,9 @@ def replay_serialized_actions(trace, actions):
         "tank_below_floor": tank < rows[0]["tank_floor_c"],
         "tank_above_ceiling": tank > trace["tank_ceiling_c"],
         "indoor_below_floor": indoor < rows[0]["indoor_floor_c"],
-        "indoor_above_ceiling": indoor > trace["indoor_ceiling_c"],
+        "indoor_above_ceiling": indoor > rows[0].get("indoor_ceiling_c", trace["indoor_ceiling_c"]),
     }
-    deadline_floor = max(row["tank_floor_c"] for row in rows)
+    deadline_floors = dict(zip(trace["deadline_hours"], trace["deadline_tank_floors_c"]))
     for index, row in enumerate(rows):
         start = _instant(row["ts"])
         end = start + dt.timedelta(hours=1)
@@ -449,7 +553,7 @@ def replay_serialized_actions(trace, actions):
                 }
             )
             segment_start = boundary
-        if index + 1 in trace.get("deadline_hours", []) and tank < deadline_floor - TOLERANCE:
+        if index + 1 in deadline_floors and tank < deadline_floors[index + 1] - TOLERANCE:
             raise InfeasibleError("Serialized strategy misses DHW deadline")
     return {
         "schema": SCHEMA,
@@ -462,6 +566,127 @@ def replay_serialized_actions(trace, actions):
         "price_currency": trace.get("price_currency"),
         "strategy_supported": True,
     }
+
+
+def validate_represented_plan(plan):
+    """Recheck the serialized diagnostic DTO before it can be persisted as priced evidence."""
+    if plan.get("diagnostic_status") != "conditional_feasible":
+        raise DataIncompleteError("Diagnostic strategy is unproven")
+    trace = plan.get("represented_strategy")
+    replay = replay_serialized_actions(trace, plan.get("diagnostic_strategy_actions"))
+    if (
+        _instant(plan.get("horizon_start")) != _instant(trace["hours"][0]["ts"])
+        or _instant(plan.get("horizon_end"))
+        != _instant(trace["hours"][-1]["ts"]) + dt.timedelta(hours=1)
+        or (
+            plan.get("actions") != plan["diagnostic_strategy_actions"]
+            and not (plan.get("diagnostic") is True and plan.get("actions") == [])
+        )
+    ):
+        raise DataIncompleteError("Diagnostic commands or horizon differ from represented trace")
+    stored = plan.get("serialized_replay")
+    if not isinstance(stored, dict) or stored != replay:
+        raise DataIncompleteError("Diagnostic serialized replay differs from commands")
+    if abs(_number(plan.get("cost_estimate")) - replay["cost"]) > TOLERANCE:
+        raise DataIncompleteError("Diagnostic cost differs from serialized electrical energy")
+    accounting = plan.get("cost_accounting", {})
+    if (
+        not isinstance(accounting, dict)
+        or abs(_number(accounting.get("electrical_kwh")) - replay["electricity_kwh"]) > TOLERANCE
+        or accounting.get("price_currency") != replay["price_currency"]
+    ):
+        raise DataIncompleteError("Diagnostic accounting differs from serialized electrical energy")
+    snapshot = plan.get("forecast_snapshot", {})
+    if not isinstance(snapshot, dict):
+        raise DataIncompleteError("Diagnostic trajectory unavailable")
+    if snapshot.get("represented_strategy") != trace or snapshot.get("serialized_replay") != stored:
+        raise DataIncompleteError("Diagnostic snapshot differs from represented trace or replay")
+    for name in ("forecast", "forecast_with_plan"):
+        points = snapshot.get(name)
+        if not isinstance(points, list) or len(points) != len(trace["hours"]):
+            raise DataIncompleteError("Diagnostic trajectory has incomplete horizon")
+        for row, point in zip(trace["hours"], points):
+            end = _instant(row["ts"]) + dt.timedelta(hours=1)
+            state = next(item for item in replay["states"] if _instant(item["ts"]) == end)
+            if (
+                not isinstance(point, dict)
+                or _instant(point.get("ts")) != end
+                or abs(
+                    _number(point.get("predicted_indoor_temp"))
+                    - state["indoor_c"]
+                    - _number(row.get("forecast_bias_correction_c", 0))
+                )
+                > TOLERANCE
+            ):
+                raise DataIncompleteError("Diagnostic trajectory differs from serialized commands")
+    if snapshot.get("no_heating_basis") != "fully_passive_no_SH_no_DHW":
+        raise DataIncompleteError("Diagnostic passive counterfactual basis unavailable")
+    for name in ("forecast_no_heating", "price_forecast"):
+        points = snapshot.get(name)
+        if not isinstance(points, list) or len(points) != len(trace["hours"]):
+            raise DataIncompleteError("Diagnostic counterfactual or prices have incomplete horizon")
+    passive = trace["initial_indoor_c"]
+    delivered = [0.0] * len(trace["hours"])
+    previous = _instant(replay["states"][0]["ts"])
+    start = previous
+    for state in replay["states"][1:]:
+        end = _instant(state["ts"])
+        index = int((previous - start).total_seconds() // 3600)
+        delivered[index] += (
+            (end - previous).total_seconds() / 3600 * state["space_heating_fraction"]
+        )
+        previous = end
+    for index, row in enumerate(trace["hours"]):
+        end = _instant(row["ts"]) + dt.timedelta(hours=1)
+        passive += row["indoor_passive_c_per_h"]
+        point = snapshot["forecast_no_heating"][index]
+        price = snapshot["price_forecast"][index]
+        if (
+            not isinstance(point, dict)
+            or _instant(point.get("ts")) != end
+            or abs(
+                _number(point.get("predicted_indoor_temp"))
+                - passive
+                - _number(row.get("forecast_bias_correction_c", 0))
+            )
+            > TOLERANCE
+        ):
+            raise DataIncompleteError("Diagnostic passive counterfactual differs from trace")
+        if (
+            not isinstance(price, dict)
+            or _instant(price.get("ts")) != _instant(row["ts"])
+            or any(
+                abs(_number(price.get(key)) - row["price_per_kwh"]) > TOLERANCE
+                for key in ("price_per_kwh", "price_eur_per_kwh")
+            )
+        ):
+            raise DataIncompleteError("Diagnostic price forecast differs from priced trace")
+        point = snapshot["forecast_with_plan"][index]
+        for key, expected in (
+            ("native_space_heating_fraction", row["native_sh_fraction"]),
+            ("space_heating_fraction", delivered[index]),
+        ):
+            if key in point and abs(_number(point[key]) - expected) > TOLERANCE:
+                raise DataIncompleteError("Diagnostic compatibility fraction differs from replay")
+    if "indoor_forecast" in plan:
+        points = plan["indoor_forecast"]
+        if not isinstance(points, list) or len(points) != len(trace["hours"]):
+            raise DataIncompleteError("Diagnostic compatibility trajectory has incomplete horizon")
+        for index, point in enumerate(points):
+            canonical = snapshot["forecast_with_plan"][index]
+            if (
+                not isinstance(point, dict)
+                or _instant(point.get("ts")) != _instant(canonical["ts"])
+                or abs(
+                    _number(point.get("predicted_indoor_temp")) - canonical["predicted_indoor_temp"]
+                )
+                > TOLERANCE
+                or abs(_number(point.get("space_heating_fraction")) - delivered[index]) > TOLERANCE
+            ):
+                raise DataIncompleteError("Diagnostic compatibility trajectory differs from replay")
+    if "initial_violations" in plan and plan["initial_violations"] != replay["initial_violations"]:
+        raise DataIncompleteError("Diagnostic initial-state disclosure differs from replay")
+    return replay
 
 
 def represented_rules_commands(actions):
@@ -529,7 +754,7 @@ def solve_represented_trace(trace, *, timeout_seconds):
     tank, indoor = trace["initial_tank_c"], trace["initial_indoor_c"]
     tank_ends, room_ends = [], []
     cost = 0
-    deadline_floor = max(row["tank_floor_c"] for row in rows)
+    deadline_floors = dict(zip(trace["deadline_hours"], trace["deadline_tank_floors_c"]))
     for hour, row in enumerate(rows):
         fraction = minutes[hour] / 60
         problem += minutes[hour] <= 60 * active[hour]
@@ -547,7 +772,14 @@ def solve_represented_trace(trace, *, timeout_seconds):
             )
         )
         # The actual initial state may require recovery; endpoint and pulse extrema are hard.
-        problem += tank_peak <= trace["tank_ceiling_c"]
+        # An inactive pulse has no intermediate peak. Only the first hour can
+        # start above the ceiling: every prior endpoint is already constrained.
+        # This exact initial excess (not an arbitrary big-M) removes only that
+        # nonexistent boundary; active pulses and all endpoints keep the ceiling.
+        initial_excess = (
+            max(0, trace["initial_tank_c"] - trace["tank_ceiling_c"]) if hour == 0 else 0
+        )
+        problem += tank_peak <= trace["tank_ceiling_c"] + initial_excess * (1 - active[hour])
         target_limit = trace["observed_tank_target_c"] - 0.5 - TOLERANCE
         target_relaxation = (
             abs(trace["initial_tank_c"])
@@ -586,8 +818,8 @@ def solve_represented_trace(trace, *, timeout_seconds):
             + abs(row["tank_floor_c"])
             + 1
         ) * (1 - active[hour])
-        if hour + 1 in trace.get("deadline_hours", []):
-            problem += tank_end >= deadline_floor
+        if hour + 1 in deadline_floors:
+            problem += tank_end >= deadline_floors[hour + 1]
         cost += row["price_per_kwh"] * (
             fraction * row["dhw_power_kw"]
             + (1 - fraction) * row["native_sh_fraction"] * row["native_sh_power_kw"]

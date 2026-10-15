@@ -1,3 +1,4 @@
+import datetime as dt
 from types import SimpleNamespace
 
 from packages.core.heat_curve import HeatCurveConfig
@@ -13,6 +14,8 @@ def _gate(state: str):
             reason_code="test_gate",
             config_fingerprint=config.fingerprint,
             last_raw_outdoor_c=5.0,
+            source_status_ts=dt.datetime.now(dt.timezone.utc),
+            evaluated_at=dt.datetime.now(dt.timezone.utc),
         ),
         config,
     )
@@ -22,7 +25,12 @@ def test_manual_trial_is_withheld_above_heat_curve_cutoff():
     gate_row, gate_config = _gate("BLOCKED")
     result = assess_manual_trial_conditions(
         HeatCurveConfig(heating_off_outdoor_c=13.0),
-        SimpleNamespace(outdoor_temp=16.0, device_action="OFF", defrost_active=False),
+        SimpleNamespace(
+            ts=dt.datetime.now(dt.timezone.utc),
+            outdoor_temp=16.0,
+            device_action="OFF",
+            defrost_active=False,
+        ),
         gate_row,
         gate_config,
     )
@@ -36,6 +44,7 @@ def test_manual_trial_is_withheld_for_dhw_even_when_cold():
     result = assess_manual_trial_conditions(
         HeatCurveConfig(),
         SimpleNamespace(
+            ts=dt.datetime.now(dt.timezone.utc),
             outdoor_temp=5.0,
             device_action="HEATING_WATER",
             defrost_active=False,
@@ -54,6 +63,7 @@ def test_manual_trial_can_be_reviewed_in_cool_non_conflicting_conditions():
     result = assess_manual_trial_conditions(
         HeatCurveConfig(),
         SimpleNamespace(
+            ts=dt.datetime.now(dt.timezone.utc),
             outdoor_temp=5.0,
             device_action="OFF",
             defrost_active=False,

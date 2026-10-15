@@ -19,42 +19,67 @@ from packages.optimizer.represented_strategy import (
 
 def trace(hours=3):
     start = dt.datetime(2026, 10, 12, tzinfo=dt.timezone.utc)
-    return {
-        "schema": "native_sh_trace_v1",
-        "native_sh_basis": "assumed",
-        "device_id": "offline-device",
-        "observation_context": {
+    return declare_native(
+        {
+            "schema": "native_sh_trace_v1",
+            "native_sh_basis": "assumed",
             "device_id": "offline-device",
-            "observed_at": start.isoformat(),
-            "captured_at": start.isoformat(),
-            "max_age_seconds": 900,
-        },
-        "observed_tank_target_c": 55.0,
-        "observed_force_dhw": 0,
-        "initial_tank_c": 48.0,
-        "initial_indoor_c": 20.0,
-        "tank_ceiling_c": 55.0,
-        "indoor_ceiling_c": 22.0,
-        "deadline_hours": [hours],
-        "price_currency": "SEK",
-        "hours": [
-            {
-                "ts": (start + dt.timedelta(hours=hour)).isoformat(),
-                "price_per_kwh": [-0.2, 0.3, 0.1][hour % 3],
-                "gate_state": "ALLOWED",
-                "native_sh_fraction": 0.5,
-                "native_sh_power_kw": 4.0,
-                "dhw_power_kw": 1.0,
-                "tank_net_heating_c_per_h": 5.0,
-                "tank_loss_c_per_h": -0.5,
-                "indoor_full_heat_c_per_h": 0.2,
-                "indoor_passive_c_per_h": -0.1,
-                "tank_floor_c": 48.0,
-                "indoor_floor_c": 19.0,
-            }
-            for hour in range(hours)
+            "observation_context": {
+                "device_id": "offline-device",
+                "observed_at": start.isoformat(),
+                "captured_at": start.isoformat(),
+                "max_age_seconds": 900,
+            },
+            "observed_tank_target_c": 55.0,
+            "observed_force_dhw": 0,
+            "initial_tank_c": 48.0,
+            "initial_indoor_c": 20.0,
+            "tank_ceiling_c": 55.0,
+            "tank_hardware_floor_c": 40.0,
+            "auxiliary_power_kw": 0.0,
+            "indoor_ceiling_c": 22.0,
+            "deadline_hours": [hours],
+            "deadline_tank_floors_c": [48.0],
+            "price_currency": "SEK",
+            "hours": [
+                {
+                    "ts": (start + dt.timedelta(hours=hour)).isoformat(),
+                    "price_per_kwh": [-0.2, 0.3, 0.1][hour % 3],
+                    "gate_state": "ALLOWED",
+                    "native_sh_fraction": 0.5,
+                    "native_sh_power_kw": 4.0,
+                    "dhw_power_kw": 1.0,
+                    "tank_net_heating_c_per_h": 5.0,
+                    "tank_loss_c_per_h": -0.5,
+                    "indoor_full_heat_c_per_h": 0.2,
+                    "indoor_passive_c_per_h": -0.1,
+                    "tank_floor_c": 48.0,
+                    "indoor_floor_c": 19.0,
+                }
+                for hour in range(hours)
+            ],
+        }
+    )
+
+
+def declare_native(value):
+    """Explicit synthetic assumption; never used to infer a real installation's duty."""
+    value["native_sh_assumption"] = "unchanged_hourly_load_over_declared_max_electrical_power"
+    value["native_sh_provenance"] = {
+        "kind": "explicit_conditional_assumption",
+        "method": value["native_sh_assumption"],
+        "device_id": value["device_id"],
+        "captured_at": value["observation_context"]["captured_at"],
+        "horizon_start": value["hours"][0]["ts"],
+        "horizon_end": (
+            dt.datetime.fromisoformat(value["hours"][-1]["ts"]) + dt.timedelta(hours=1)
+        ).isoformat(),
+        "maximum_electrical_power_kw": value["hours"][0]["native_sh_power_kw"],
+        "hourly_electrical_kw": [
+            row["native_sh_fraction"] * row["native_sh_power_kw"] for row in value["hours"]
         ],
     }
+    return value
 
 
 @pytest.mark.parametrize("value", [None, True, float("nan"), float("inf"), "48"])
@@ -66,10 +91,22 @@ def test_R28_missing_actual_tank_never_defaults(value):
 
 
 def owner_context(value):
+    from packages.core.config import settings
+
+    provenance = {
+        **value["native_sh_provenance"],
+        "maximum_electrical_power_kw": settings.sh_max_power_kw,
+        "hourly_electrical_kw": [
+            row["native_sh_fraction"] * settings.sh_max_power_kw for row in value["hours"]
+        ],
+    }
     return {
         **value["observation_context"],
         "tank_target_c": value["observed_tank_target_c"],
         "force_dhw": value["observed_force_dhw"],
+        "tank_hardware_floor_c": value["tank_hardware_floor_c"],
+        "auxiliary_power_kw": value["auxiliary_power_kw"],
+        "native_sh_provenance": provenance,
     }
 
 
@@ -136,6 +173,7 @@ def test_S4_QR1_at_target_negative_price_never_credits_suppressed_DHW():
     value = trace(1)
     value["initial_tank_c"] = value["observed_tank_target_c"] = 50
     value["hours"][0].update(gate_state="BLOCKED", native_sh_fraction=0)
+    declare_native(value)
     actions, result = solve_represented_trace(value, timeout_seconds=10)
     assert actions == []
     assert result["electricity_kwh"] == result["cost"] == 0
@@ -179,6 +217,7 @@ async def test_S4_QR1_exact_dispatch_target_boundary(monkeypatch, offset):
     with pytest.raises(DataIncompleteError, match="suppressed|termination"):
         replay_serialized_actions(value, pulse(value, 0, 5))
     value["hours"][0].update(gate_state="BLOCKED", native_sh_fraction=0)
+    declare_native(value)
     actions, result = solve_represented_trace(value, timeout_seconds=10)
     assert actions == [] and result["electricity_kwh"] == 0
 
@@ -249,6 +288,7 @@ async def test_S4_QR2_actual_rules_generation_without_optional_solver(monkeypatc
         tank_target_temp=55,
         force_dhw=0,
         tank_heat_max=55,
+        tank_heat_min=40,
         holiday_mode=0,
         zone1_temp=35,
         zone1_target_temp=None,
@@ -257,6 +297,17 @@ async def test_S4_QR2_actual_rules_generation_without_optional_solver(monkeypatc
         heat_pump_outdoor_temp=5,
         outdoor_temp=5,
     )
+    declared = trace(1)
+    declared["hours"][0]["ts"] = start.isoformat()
+    declared["hours"][0]["native_sh_fraction"] = 0
+    declared["observation_context"]["captured_at"] = now.isoformat()
+    declare_native(declared)
+    status.native_policy_provenance = {
+        "diagnostic_assumptions": {
+            "native_sh_provenance": owner_context(declared)["native_sh_provenance"],
+            "auxiliary_power_kw": 0,
+        }
+    }
     session = SimpleNamespace(
         info={}, execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None))
     )
@@ -456,7 +507,16 @@ def _publication_plan(monkeypatch):
         "max_age_seconds": 900,
         "tank_target_c": 55.0,
         "force_dhw": 0,
+        "tank_hardware_floor_c": 40,
+        "auxiliary_power_kw": 0,
     }
+    declared = trace(hours)
+    declared["observation_context"]["captured_at"] = captured.isoformat()
+    for hour, row in enumerate(declared["hours"]):
+        row["ts"] = (start + dt.timedelta(hours=hour)).isoformat()
+        row["native_sh_fraction"] = 0
+    declare_native(declared)
+    context["native_sh_provenance"] = owner_context(declared)["native_sh_provenance"]
     last_hour = {"hours": [{"ts": (start + dt.timedelta(hours=hours - 1)).isoformat()}]}
     plan = represented_strategy.build_represented_plan(
         prices=[(row.ts, row.value) for row in batch.prices],
@@ -573,6 +633,9 @@ async def test_S4_QR3_product_publication_preserves_priced_diagnostic(monkeypatc
     assert saved["represented_strategy"]["price_currency"] == "SEK"
     assert saved["serialized_replay"]["price_currency"] == "SEK"
     assert saved["cost_accounting"]["price_currency"] == "SEK"
+    from packages.optimizer.represented_strategy import validate_represented_plan
+
+    assert validate_represented_plan(saved)["price_currency"] == "SEK"
     assert saved["forecast_snapshot"]["price_forecast"][0]["price_per_kwh"] == -0.2
     assert saved["forecast_snapshot"]["forecast_no_heating"][0][
         "predicted_indoor_temp"
@@ -665,6 +728,7 @@ def test_R28_feasible_integer_solver_and_independent_replay(case):
             row["native_sh_fraction"] = 0.0
             row["gate_state"] = "BLOCKED"
     initial = value["initial_tank_c"]
+    declare_native(value)
     actions, result = solve_represented_trace(value, timeout_seconds=10)
     serialized_trace = json.loads(json.dumps(value, allow_nan=False))
     serialized = json.loads(json.dumps(actions, allow_nan=False))
@@ -813,6 +877,7 @@ def test_R28_MILP_owner_preserves_actual_states_and_only_represented_commands(mo
         indoor_max_temp_setting=22,
         hardware_tank_ceiling=55,
         observation_context=owner_context(value),
+        dhw_deadline_tank_floors_c=[48],
     )
     assert plan["diagnostic_status"] == "conditional_feasible"
     assert plan["represented_strategy"]["initial_tank_c"] == 47.0
@@ -1011,6 +1076,9 @@ async def test_R23_service_first_await_failure_owns_cleanup(monkeypatch, service
     async def logs():
         calls.append("logs")
 
+    async def dispose():
+        calls.append("engine")
+
     async def immediate_cleanup(cleanup):
         # No workers exist in this fake startup case; this does not test cancellation shielding.
         await cleanup()
@@ -1021,6 +1089,7 @@ async def test_R23_service_first_await_failure_owns_cleanup(monkeypatch, service
     monkeypatch.setattr(module, "_run_service", fail)
     monkeypatch.setattr(runtime_ownership, "finish_owned_cleanup", immediate_cleanup)
     monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", logs)
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=dispose))
     monkeypatch.setattr(
         "packages.ml.lifecycle.MaintenanceRunner",
         lambda **kwargs: SimpleNamespace(close=close_maintenance),
@@ -1034,6 +1103,7 @@ async def test_R23_service_first_await_failure_owns_cleanup(monkeypatch, service
         *(("maintenance",) if service == "poller" else ()),
         "logs",
         "wrapper",
+        "engine",
     ]
 
 
@@ -1106,6 +1176,7 @@ def test_R23_R35_entrypoints_protect_startup_and_schedule_all_async_jobs():
 def _flat_dhw_trace(prices):
     value = trace(len(prices))
     value["deadline_hours"] = []
+    value["deadline_tank_floors_c"] = []
     value["initial_tank_c"] = 46.0
     for row, price in zip(value["hours"], prices):
         row.update(
@@ -1116,7 +1187,7 @@ def _flat_dhw_trace(prices):
             tank_loss_c_per_h=-1.0,
             tank_floor_c=45.0,
         )
-    return value
+    return declare_native(value)
 
 
 def _enumerate_schedules(value):

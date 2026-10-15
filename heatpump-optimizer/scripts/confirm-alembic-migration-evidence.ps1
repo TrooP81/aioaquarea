@@ -101,7 +101,7 @@ function Get-ComposeArguments {
         $arguments.Add('--file')
         $arguments.Add($composeFile)
     }
-    return ,$arguments
+    return , $arguments
 }
 
 function Get-DbContainerIdentity {
@@ -170,11 +170,11 @@ print(expected)
     }
 
     [pscustomobject]@{
-        CandidateImageId = $resolvedImageId
+        CandidateImageId     = $resolvedImageId
         CandidateAlembicHead = $candidateHead
-        DatabaseContainerId = $beforeContainerId
-        DatabaseAlembicHead = $databaseHead
-        ReadOnly = $true
+        DatabaseContainerId  = $beforeContainerId
+        DatabaseAlembicHead  = $databaseHead
+        ReadOnly             = $true
     } | ConvertTo-Json -Compress
 }
 finally {

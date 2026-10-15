@@ -35,29 +35,25 @@ body {
   padding: 2rem;
 }
 
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+}
+
 .refresh-allowance,
 .data-age {
   color: var(--text-muted);
   font-size: 0.8rem;
 }
 
-.refresh-allowance {
-  margin: -1.4rem 0 1rem;
-}
-
 .data-age--stale {
   color: var(--warning);
 }
 
-.heat-pump-details {
-  margin-bottom: 2rem;
-}
-
-.heat-pump-details>summary {
-  cursor: pointer;
-  font-size: 0.875rem;
-  font-weight: 600;
-  margin-bottom: 1rem;
+.refresh-allowance {
+  margin: -1.4rem 0 1rem;
 }
 
 .banner {
@@ -86,11 +82,26 @@ body {
   background: rgba(239, 68, 68, 0.12);
 }
 
-.header {
+.optimizer-readable-text,
+.optimizer-status-label {
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.optimizer-diagnostics-header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 2rem;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.optimizer-diagnostics-panel {
+  margin-top: 1rem;
+}
+
+.optimizer-diagnostics-section {
+  margin-top: 1.25rem;
 }
 
 .header h1 {
@@ -688,11 +699,6 @@ body {
   padding: 0 0 1rem;
 }
 
-.plan-activity-item.deep-link-target .plan-activity-card {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
-}
-
 .plan-activity-item:not(:last-child)::before {
   position: absolute;
   top: 0.75rem;
@@ -774,6 +780,45 @@ body {
 
 .chart-title-row .chart-title {
   margin-bottom: 1rem;
+}
+
+.comfort-impact-chart {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.comfort-impact-note {
+  margin-top: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.comfort-impact-tooltip {
+  min-width: 13rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--card-bg);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-size: 0.78rem;
+}
+
+.comfort-impact-tooltip strong {
+  display: block;
+  margin-bottom: 0.45rem;
+}
+
+.comfort-impact-tooltip div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: var(--text-muted);
+}
+
+.comfort-impact-tooltip b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 
 .chart-details {
@@ -1527,28 +1572,6 @@ body {
   margin-bottom: 1.25rem;
 }
 
-.optimizer-readable-text,
-.optimizer-status-label {
-  font-size: 0.8rem;
-  line-height: 1.5;
-}
-
-.optimizer-diagnostics-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  flex-wrap: wrap;
-}
-
-.optimizer-diagnostics-panel {
-  margin-top: 1rem;
-}
-
-.optimizer-diagnostics-section {
-  margin-top: 1.25rem;
-}
-
 .opt-layer-badge {
   padding: 0.25rem 0.75rem;
   border-radius: 9999px;
@@ -1787,19 +1810,6 @@ body {
 }
 
 @media (max-width: 640px) {
-  .header-actions {
-    min-width: 0;
-  }
-
-  .header-actions>* {
-    max-width: 100%;
-  }
-
-  .decision-summary-grid,
-  .workspace-panel .grid {
-    grid-template-columns: 1fr;
-  }
-
   .plan-activity-item {
     grid-template-columns: 0.75rem minmax(0, 1fr);
   }
@@ -1914,7 +1924,6 @@ body {
 
 .forecast-data-warning,
 .comfort-risk-card,
-.comfort-assessment-card,
 .forecast-overlap-note {
   margin: 0.85rem 0;
   padding: 0.75rem 0.9rem;
@@ -1923,8 +1932,7 @@ body {
   background: rgba(245, 158, 11, 0.08);
 }
 
-.comfort-risk-card,
-.comfort-assessment-card {
+.comfort-risk-card {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2088,13 +2096,6 @@ body {
   color: #fbbf24;
 }
 
-/* Keep all Diagnostics text at the Models readability floor. */
-.optimizer-diagnostics-panel,
-.optimizer-diagnostics-panel :where(p, span, div, strong, h3, h4, button, label) {
-  font-size: 0.8rem;
-  line-height: 1.5;
-}
-
 /* Safer settings editor */
 .settings-action-bar--sticky {
   position: sticky;
@@ -2227,6 +2228,7 @@ body {
   border-radius: 0.75rem;
   margin-bottom: 2rem;
   padding: 1.5rem;
+  min-width: 0;
 }
 
 .timeline-heading {
@@ -2313,13 +2315,8 @@ body {
   width: 8px;
 }
 
-.timeline-actual {
-  background: var(--success);
-}
-
-.timeline-forecast {
-  background: var(--accent);
-}
+.timeline-actual { background: var(--success); }
+.timeline-forecast { background: var(--accent); }
 
 .timeline-comfort-band,
 .timeline-target {
@@ -2330,10 +2327,7 @@ body {
   top: 0.3rem;
 }
 
-.timeline-target {
-  left: auto;
-  right: 0.5rem;
-}
+.timeline-target { left: auto; right: 0.5rem; }
 
 .timeline-action-track {
   bottom: 44px;
@@ -2357,22 +2351,10 @@ body {
   white-space: normal;
 }
 
-.timeline-action-marker small {
-  display: block;
-  color: var(--text-muted);
-}
-
-.timeline-action-marker.failed {
-  border-color: var(--danger);
-}
-
-.timeline-action-marker.executed {
-  border-color: var(--success);
-}
-
-.timeline-action-marker.skipped {
-  border-color: var(--warning);
-}
+.timeline-action-marker small { display: block; color: var(--text-muted); }
+.timeline-action-marker.failed { border-color: var(--danger); }
+.timeline-action-marker.executed { border-color: var(--success); }
+.timeline-action-marker.skipped { border-color: var(--warning); }
 
 .timeline-axis {
   bottom: 0.6rem;
@@ -2384,9 +2366,7 @@ body {
   right: 0.5rem;
 }
 
-.timeline-action-list ol {
-  list-style: none;
-}
+.timeline-action-list ol { list-style: none; }
 
 .timeline-action-list li {
   align-items: baseline;
@@ -2397,16 +2377,8 @@ body {
   padding: 0.75rem 0;
 }
 
-.timeline-action-list p {
-  color: var(--text-muted);
-  grid-column: 2 / -1;
-}
-
-.timeline-table-section table {
-  border-collapse: collapse;
-  min-width: 1000px;
-  width: 100%;
-}
+.timeline-action-list p { color: var(--text-muted); grid-column: 2 / -1; }
+.timeline-table-section table { border-collapse: collapse; min-width: 1000px; width: 100%; }
 
 .timeline-table-section th,
 .timeline-table-section td {
@@ -2417,24 +2389,18 @@ body {
 }
 
 @media (max-width: 640px) {
-  .timeline-chart-container {
-    padding: 1rem;
-  }
+  .header-actions { min-width: 0; }
+  .header-actions > * { max-width: 100%; }
+  .timeline-chart-container { padding: 1rem; }
+  .timeline-heading { display: block; }
+  .timeline-action-list li { grid-template-columns: 4.5rem minmax(0, 1fr); }
+  .timeline-action-list li .plan-action-status { grid-column: 2; justify-self: start; }
+  .timeline-action-list p { grid-column: 2; }
+}
 
-  .timeline-heading {
-    display: block;
-  }
-
-  .timeline-action-list li {
-    grid-template-columns: 4.5rem minmax(0, 1fr);
-  }
-
-  .timeline-action-list li .plan-action-status {
-    grid-column: 2;
-    justify-self: start;
-  }
-
-  .timeline-action-list p {
-    grid-column: 2;
-  }
+/* Preserve the diagnostic text floor after the compact badge styles. */
+.optimizer-diagnostics-panel,
+.optimizer-diagnostics-panel :where(p, span, div, strong, h3, h4, button, label) {
+  font-size: 0.8rem;
+  line-height: 1.5;
 }

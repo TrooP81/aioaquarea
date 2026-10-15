@@ -22,12 +22,14 @@ def local_dhw_deadlines_in_horizon(
     comfort_schedule: dict[str, list[int]],
     horizon_start: dt.datetime,
     tz_name: str | None,
+    *,
+    horizon_end: dt.datetime | None = None,
 ) -> list[tuple[dt.datetime, int]]:
-    """Return future DHW deadlines as UTC instants with their local hour."""
+    """Return deadlines after the start through the final priced endpoint."""
     timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
     if horizon_start.tzinfo is None:
         horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
-    horizon_end = horizon_start + dt.timedelta(hours=24)
+    horizon_end = horizon_end or horizon_start + dt.timedelta(hours=24)
     local_start = horizon_start.astimezone(timezone)
     local_end = horizon_end.astimezone(timezone)
     current_date = local_start.date()
@@ -40,7 +42,7 @@ def local_dhw_deadlines_in_horizon(
         ):
             local_deadline = dt.datetime.combine(current_date, dt.time(ready_hour), tzinfo=timezone)
             deadline = local_deadline.astimezone(dt.timezone.utc)
-            if horizon_start < deadline < horizon_end:
+            if horizon_start < deadline <= horizon_end:
                 deadlines.append((deadline, ready_hour))
         current_date += dt.timedelta(days=1)
 
@@ -293,8 +295,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         comfort_schedule: dict[str, list[int]],
         horizon_start: dt.datetime,
         tz_name: str | None,
+        *,
+        horizon_end: dt.datetime | None = None,
     ) -> list[tuple[dt.datetime, int]]:
-        return local_dhw_deadlines_in_horizon(comfort_schedule, horizon_start, tz_name)
+        return local_dhw_deadlines_in_horizon(
+            comfort_schedule, horizon_start, tz_name, horizon_end=horizon_end
+        )
 
     def _project_tank_temperature(
         self,
@@ -382,6 +388,8 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         tz_name: str | None = None,
     ) -> list[dict]:
         actions = []
+        if not prices:
+            return actions
         prediction = thermal_model.predict_tank_heating_time(
             current_temp=current_tank_temp,
             target_temp=float(tank_target),
@@ -391,7 +399,10 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
             return actions
         base_hours_needed = max(1, math.ceil(prediction.estimated_hours))
         for deadline, ready_hour in self._local_dhw_deadlines_in_horizon(
-            comfort_schedule, horizon_start, tz_name
+            comfort_schedule,
+            horizon_start,
+            tz_name,
+            horizon_end=prices[-1][0] + dt.timedelta(hours=1),
         ):
             latest_start = thermal_model.optimal_start_time(
                 current_temp=current_tank_temp,

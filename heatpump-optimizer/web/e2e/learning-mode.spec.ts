@@ -100,7 +100,6 @@ test.describe("Learning Mode", () => {
       await page.route("**/api/learning-mode", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, since: new Date().toISOString(), days_elapsed: 3 }) }));
       await page.goto("/");
       await expect(page.getByText("Qualified for reporting: 0/3", { exact: true })).toBeVisible();
-      await page.getByText("Heat pump details", { exact: true }).click();
       await expect(page.locator(".ml-status-label")).toHaveText("0/3 qualified for reporting");
       await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(0);
     });

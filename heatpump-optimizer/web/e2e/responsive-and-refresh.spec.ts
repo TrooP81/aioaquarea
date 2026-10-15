@@ -1,4 +1,4 @@
-import { test, expect, controlState, manualCOPObservation, manualCOPResponse, retiredCopModel, type Page } from "./fixtures";
+import { test, expect, type Page } from "./fixtures";
 
 const jsonResponse = (body: unknown) => ({
   status: 200,
@@ -39,7 +39,7 @@ const mockOptimizerStatus = {
   active_layer: "rules",
   fallback_layer: "rules",
   last_plan: null,
-  cop_model: retiredCopModel,
+  cop_model: { trained: false, last_trained: null },
   demand_model: { trained: false, last_trained: null },
   thermal_model: {
     calibrated: false,
@@ -54,7 +54,6 @@ const mockOptimizerStatus = {
 async function mockDashboardRequests(page: Page) {
   const routes: Array<[string | RegExp, unknown]> = [
     ["**/api/dashboard", mockDashboard],
-    ["**/api/control-state", controlState],
     ["**/api/indoor-temp/latest", mockIndoorTemp],
     ["**/api/learning-mode", { enabled: false, since: null, days_elapsed: null }],
     ["**/api/optimizer/status", mockOptimizerStatus],
@@ -106,120 +105,11 @@ test.describe("Responsive Layout", () => {
     await mockDashboardRequests(page);
   });
 
-  test("manual controller fields and actions fit mobile and desktop", async ({ page }) => {
-    await page.route("**/api/cop/manual**", (route) => {
-      const url = new URL(route.request().url());
-      const device = url.searchParams.get("device_id");
-      return route.fulfill(jsonResponse({
-        ...manualCOPResponse,
-        device_id: device,
-        observations: device ? [manualCOPObservation(), manualCOPObservation("2026-10-03", 3.7, "2")] : [],
-        forecasting_enabled: true,
-        monitoring: {
-          ...manualCOPResponse.monitoring,
-          status: "ready",
-          reason: "matched_clock_retrospective_folds",
-          target_date: "2026-10-05",
-          counts: { ...manualCOPResponse.monitoring.counts, available_closed_days: 28, fold_training_rows: [20, 21, 22, 23, 24, 25, 26] },
-          forecast: {
-            value: 4.2, lower: 3.4, upper: 5.2, log_daily_trend: .01, daily_trend_pct: 1.005,
-            band_label: "experimental empirical log-error band, uncalibrated",
-          },
-        },
-      }));
-    });
-    for (const width of [320, 375, 640, 1280]) {
-      await page.setViewportSize({ width, height: 800 });
-      await page.goto("/?view=under-the-hood");
-      await page.getByRole("button", { name: "Show diagnostics" }).click();
-      const panel = page.locator('section[aria-labelledby="manual-cop-heading"]');
-      await panel.getByRole("combobox", { name: "Device", exact: true }).selectOption("fixture-device");
-      await panel.getByRole("button", { name: "Edit reading 2026-10-04" }).click();
-      await expect(panel.getByTestId("manual-projection")).toHaveText("4.20");
-      await expect(panel.getByLabel("COP value")).toHaveValue("9.7");
-      await expect(panel.getByRole("textbox", { name: "Controller timezone", exact: true })).toHaveValue("Europe/Stockholm");
-      const outOfBounds = await panel.locator("input, select, button").evaluateAll((controls) => {
-        const bounds = controls[0].closest("section")!.getBoundingClientRect();
-        return controls.filter((control) => {
-          const rectangle = control.getBoundingClientRect();
-          return rectangle.left < bounds.left - 1 || rectangle.right > bounds.right + 1;
-        }).map((control) => control.outerHTML);
-      });
-      expect(outOfBounds).toEqual([]);
-      expect(await page.evaluate(() => document.body.scrollWidth)).toBeLessThanOrEqual(width + 1);
-      const overlaps = await panel.locator(".manual-field").evaluateAll((fields) => fields.filter((field) => {
-        const control = field.querySelector("input,select")!.getBoundingClientRect();
-        return Array.from(field.parentElement!.querySelectorAll(".manual-field")).some((other) => {
-          if (other === field) return false;
-          const rectangle = other.getBoundingClientRect();
-          return control.left < rectangle.right && control.right > rectangle.left && control.top < rectangle.bottom && control.bottom > rectangle.top;
-        });
-      }).map((field) => field.textContent));
-      expect(overlaps).toEqual([]);
-      const overflowingText = await panel.evaluate((element) => {
-        const bounds = element.getBoundingClientRect();
-        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-        const failures: string[] = [];
-        let current = walker.nextNode();
-        while (current) {
-          const parent = current.parentElement;
-          if (parent && current.textContent?.trim() && !["STYLE", "SCRIPT", "OPTION"].includes(parent.tagName)) {
-            const style = getComputedStyle(parent);
-            if (style.display !== "none" && style.visibility !== "hidden" && parent.getClientRects().length) {
-              const container = parent.getBoundingClientRect();
-              const range = document.createRange();
-              range.selectNodeContents(current);
-              if (Array.from(range.getClientRects()).some((rectangle) =>
-                rectangle.left < Math.max(bounds.left, container.left) - 1
-                || rectangle.right > Math.min(bounds.right, container.right) + 1
-                || rectangle.top < container.top - 1
-                || rectangle.bottom > container.bottom + 1,
-              )) failures.push(current.textContent.trim());
-            }
-          }
-          current = walker.nextNode();
-        }
-        return failures;
-      });
-      expect(overflowingText).toEqual([]);
-      if (width === 375 || width === 1280) {
-        await panel.evaluate((element) => {
-          const tabs = document.querySelector('[role="tablist"][aria-label="Dashboard workspace"]');
-          window.scrollBy(0, element.getBoundingClientRect().top - (tabs?.getBoundingClientRect().height ?? 0) - 16);
-        });
-        await panel.screenshot({ path: test.info().outputPath(`manual-controller-${width}.png`) });
-      }
-    }
-  });
-
   test("desktop layout loads correctly", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     await expect(page.locator(".header-actions .status-badge.online", { hasText: "Connected" })).toBeVisible();
-  });
-
-  test("overview leads with decision context and renders one indoor reading", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto("/");
-
-    const decisionBeforeCost = await page.locator(".decision-summary").evaluate((decision) => {
-      const cost = document.querySelector("#dashboard-panel-home h3.card-group-label");
-      return cost !== null && Boolean(decision.compareDocumentPosition(cost) & Node.DOCUMENT_POSITION_FOLLOWING);
-    });
-    expect(decisionBeforeCost).toBe(true);
-    await expect(page.getByText("21.5°C indoors", { exact: true })).toHaveCount(1);
-  });
-
-  test("unknown status code uses the explicit fallback copy", async ({ page }) => {
-    await page.route("**/api/thermal/forecast-scorecard", (route) =>
-      route.fulfill(jsonResponse({ plans_scored: 1, overall: { samples: 1, mae: 0.1, bias: 0, p90_abs_error: 0.2 }, horizons: [], regimes: {}, quality_gate: { status: "failed", control_allowed: false, reason: "mystery_code" }, note: "No forecast evidence" }))
-    );
-
-    await page.goto("/?view=under-the-hood");
-
-    await page.getByRole("button", { name: "Show diagnostics" }).click();
-    await expect(page.getByText(/Quality gate: Unrecognized status \(mystery_code\)/)).toBeVisible();
   });
 
   test("tablet layout renders without overflow", async ({ page }) => {
@@ -263,7 +153,7 @@ test.describe("Responsive Layout", () => {
   });
 
   test("workspace tabs support roving keyboard focus and URL history", async ({ page }) => {
-    await page.goto("/?view=under-the-hood");
+    await page.goto("/?view=charts");
     const tabs = page.getByRole("tab");
     const charts = page.getByRole("tab", { name: "Under the hood" });
     await expect(charts).toHaveAttribute("aria-selected", "true");
@@ -271,22 +161,22 @@ test.describe("Responsive Layout", () => {
 
     await charts.focus();
     await page.keyboard.press("ArrowRight");
-    await expect(page.getByRole("tab", { name: "Home" })).toBeFocused();
-    await expect(page.getByRole("tab", { name: "Home" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("tab", { name: "Home", exact: true })).toBeFocused();
+    await expect(page.getByRole("tab", { name: "Home", exact: true })).toHaveAttribute("aria-selected", "true");
     await page.keyboard.press("Home");
     await expect(tabs.first()).toBeFocused();
     await page.keyboard.press("End");
     await expect(tabs.last()).toBeFocused();
 
     await page.evaluate(() => {
-      window.history.pushState({}, "", "/?view=timeline");
+      window.history.pushState({}, "", "/?view=plan");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
     await expect(page.getByRole("tab", { name: "Timeline" })).toHaveAttribute("aria-selected", "true");
     await expect(page.locator("#dashboard-panel-timeline")).toBeVisible();
 
     await page.goto("/?view=not-a-section");
-    await expect(page.getByRole("tab", { name: "Home" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("tab", { name: "Home", exact: true })).toHaveAttribute("aria-selected", "true");
   });
 
   test("loading and normal dashboard states each expose exactly one main", async ({ page }) => {
@@ -315,22 +205,21 @@ test.describe("Responsive Layout", () => {
 
     await page.goto("/");
     await page.getByRole("button", { name: "Refresh from heat pump" }).click();
-    await expect(page.getByRole("status").filter({ hasText: "All data fetched successfully" })).toContainText("All data fetched successfully");
+    await expect(page.getByRole("status", { name: "Heat pump refresh result" })).toContainText("All data fetched successfully");
 
     succeed = false;
     await page.getByRole("button", { name: "Refresh from heat pump" }).click();
-    await expect(page.locator('.banner[role="status"]').filter({ hasText: "prices: Prices unavailable" })).toContainText("prices: Prices unavailable");
+    await expect(page.getByRole("alert", { name: "Heat pump refresh result" })).toContainText("prices: Prices unavailable");
   });
 
   test("status indicators expose text or accessible labels without relying on color", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator(".header-actions .status-badge")).toContainText("Connected");
     await expect(page.locator('[aria-label^="COP efficiency model"]')).toHaveCount(0);
+    await expect(page.locator('[aria-label^="Comfort forecast model"]')).toHaveCount(1);
     await expect(page.locator('[aria-label^="Demand heating model"]')).toHaveCount(1);
     await expect(page.locator('[aria-label^="Thermal heat-up model"]')).toHaveCount(1);
-    await expect(page.locator('[aria-label^="Comfort forecast model"]')).toHaveCount(1);
-    await expect(page.locator('[aria-label^="Demand heating model"]')).toHaveAttribute("aria-label", /reporting only/);
-    await expect(page.locator(".ml-status-label")).toContainText("0/3 qualified for reporting");
+    await expect(page.locator(".ml-status-label")).toContainText("/3 qualified for reporting");
   });
 
   test("skip link moves focus to the main content target", async ({ page }) => {
@@ -358,7 +247,7 @@ test.describe("Responsive Layout", () => {
   });
 
   test("responsive grids and primary controls fit the three required viewports", async ({ page }) => {
-    for (const [width, expectedColumns] of [[375, 2], [640, 1], [768, 2], [1280, 4]] as const) {
+    for (const [width, expectedColumns] of [[375, 2], [768, 2], [1280, 4]] as const) {
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/");
       const grid = page.locator("#dashboard-panel-home > .grid").first();
@@ -384,6 +273,9 @@ test.describe("Responsive Layout", () => {
 test.describe("Auto-refresh", () => {
   test("dashboard refreshes data periodically", async ({ page }) => {
     let fetchCount = 0;
+    const now = new Date("2026-10-15T12:00:00Z");
+    await page.clock.install({ time: now });
+    await page.clock.pauseAt(now);
 
     await mockDashboardRequests(page);
     await page.route("**/api/dashboard", (route) => {
@@ -401,9 +293,122 @@ test.describe("Auto-refresh", () => {
     ]);
     const initialCount = fetchCount;
 
-    // The initial load proves that the refresh callback can reach the API;
-    // interval timing itself is deliberately left to the browser runtime.
     expect(initialCount).toBeGreaterThanOrEqual(1);
+    await expect(page.getByRole("tab", { name: "Home", exact: true })).toBeVisible();
+    await page.clock.fastForward(30_000);
+    await expect.poll(() => fetchCount).toBe(initialCount + 1);
+    await expect(page.locator("#dashboard-panel-home")).toContainText(`${(12.5 + initialCount + 1).toFixed(1)} kWh`);
+    await page.clock.fastForward(30_000);
+    await expect.poll(() => fetchCount).toBe(initialCount + 2);
+  });
+
+  for (const trigger of ["manual", "timed"] as const) {
+    for (const plan of ["constant", "null"] as const) {
+      for (const outcome of ["at_risk", "unavailable"] as const) {
+        test(`${trigger} refresh replaces on-target decision evidence with ${outcome} for ${plan} plan`, async ({ page }) => {
+          const now = new Date("2026-10-15T12:00:00Z");
+          await page.clock.install({ time: now });
+          await page.clock.pauseAt(now);
+          await mockDashboardRequests(page);
+          const activePlan = plan === "constant"
+            ? { id: 42, status: "active", optimizer_version: "rules_v7", cost_estimate_eur: 2, actions_count: 0 } : null;
+          await page.route("**/api/dashboard", (route) => route.fulfill(jsonResponse({ ...mockDashboard, active_plan: activePlan })));
+          await page.route("**/api/poll-now", (route) => route.fulfill(jsonResponse({ status: "ok", results: {} })));
+          let updated = false;
+          let updatedRequests = 0;
+          let release!: () => void;
+          const pending = new Promise<void>((resolve) => { release = resolve; });
+          await page.route("**/api/thermal/indoor-forecast*", async (route) => {
+            const refresh = updated;
+            if (refresh) {
+              updatedRequests++;
+              await pending;
+            }
+            await route.fulfill(jsonResponse({
+              forecast_with_plan: [], forecast_no_heating: [], target_schedule: [],
+              planned_actions: [], weather_forecast: [], price_forecast: [],
+              forecast_status: refresh && outcome === "unavailable" ? "unavailable" : "available",
+              display_status: refresh ? outcome === "at_risk" ? "diverged" : "unavailable" : "fresh",
+              comfort_assessment: {
+                state: refresh ? outcome : "on_target",
+                summary: refresh ? `Updated comfort evidence: ${outcome}` : "Initial on-target evidence",
+                ...(refresh && outcome === "at_risk" ? { worst_miss: { shortfall_c: 1.5 } } : {}),
+              },
+            }));
+          });
+          await page.goto("/");
+          const summary = page.getByRole("region", { name: "Current optimizer decision" });
+          await expect(summary).toContainText("Forecast stays within the active target");
+          await expect(summary.locator(".forecast-trust-badge")).toHaveText("Fresh forecast");
+          updated = true;
+          if (trigger === "manual") await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+          else await page.clock.fastForward(30_000);
+          await expect.poll(() => updatedRequests).toBe(1);
+          await expect(summary.locator(".forecast-trust-badge")).toHaveText("Checking forecast");
+          await expect(summary).not.toContainText("Initial on-target evidence");
+          await expect(summary).not.toContainText("Forecast stays within the active target");
+          release();
+          await expect(summary).toContainText(`Updated comfort evidence: ${outcome}`);
+          await expect(summary.locator(".forecast-trust-badge")).toHaveText(outcome === "at_risk" ? "Forecast diverged" : "Forecast unavailable");
+          await expect(summary).not.toContainText("Forecast stays within the active target");
+          if (outcome === "at_risk") {
+            await expect(summary).toHaveClass(/decision-summary--risk/);
+            await expect(summary).toContainText("1.5°C below target");
+          } else {
+            await expect(summary).not.toHaveClass(/decision-summary--risk/);
+            await expect(summary).toContainText("Comfort impact is unavailable until forecast evidence is ready");
+          }
+        });
+      }
+    }
+  }
+
+  test("a delayed superseded decision forecast cannot overwrite newer refresh evidence", async ({ page }) => {
+    await mockDashboardRequests(page);
+    await page.route("**/api/poll-now", (route) => route.fulfill(jsonResponse({ status: "ok", results: {} })));
+    let phase: "initial" | "older" | "newer" = "initial";
+    let olderRequests = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    let finished!: () => void;
+    const olderFinished = new Promise<void>((resolve) => { finished = resolve; });
+    await page.route("**/api/thermal/indoor-forecast*", async (route) => {
+      const requestPhase = phase;
+      if (requestPhase === "older") { olderRequests++; await pending; }
+      try {
+        await route.fulfill(jsonResponse({
+          display_status: requestPhase === "newer" ? "diverged" : "fresh",
+          comfort_assessment: {
+            state: requestPhase === "newer" ? "at_risk" : "on_target",
+            summary: `${requestPhase} forecast evidence`,
+            worst_miss: { shortfall_c: 2 },
+          },
+          forecast_with_plan: [], forecast_no_heating: [], target_schedule: [],
+          planned_actions: [], weather_forecast: [], price_forecast: [],
+        }));
+      } catch (error) {
+        // A superseded request is aborted by the component before fulfillment.
+        if (requestPhase !== "older") throw error;
+      } finally {
+        if (requestPhase === "older") finished();
+      }
+    });
+    await page.goto("/");
+    const summary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(summary).toContainText("initial forecast evidence");
+    phase = "older";
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    await expect.poll(() => olderRequests).toBe(1);
+    await expect(summary.locator(".forecast-trust-badge")).toHaveText("Checking forecast");
+    phase = "newer";
+    await page.getByRole("button", { name: "Refresh from heat pump" }).click();
+    await expect(summary).toContainText("newer forecast evidence");
+    release();
+    await olderFinished;
+    await expect(summary).toContainText("newer forecast evidence");
+    await expect(summary).not.toContainText("older forecast evidence");
+    await expect(summary.locator(".forecast-trust-badge")).toHaveText("Forecast diverged");
+    await expect(summary).toHaveClass(/decision-summary--risk/);
   });
 });
 

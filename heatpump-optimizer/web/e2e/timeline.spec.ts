@@ -331,7 +331,8 @@ test("Timeline requests each source once per shared refresh tick", async ({ page
         await expect.poll(() => sourceCounts, { message: `Source counts after shared refresh tick ${tick}` }).toEqual({
             prices: beforeTick.prices + 1,
             indoor: beforeTick.indoor + 1,
-            forecast: beforeTick.forecast + 1,
+            // Timeline and the mounted Home decision summary each refresh once.
+            forecast: beforeTick.forecast + 2,
             activity: beforeTick.activity + 1,
             settings: beforeTick.settings + 1,
             plan: beforeTick.plan + 1,

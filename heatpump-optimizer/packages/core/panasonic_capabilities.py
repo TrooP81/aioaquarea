@@ -57,7 +57,7 @@ def build_panasonic_capabilities(
     else:
         reason = "available"
 
-    commands_allowed = reason == "available"
+    observation_available = reason == "available"
     observed_device = latest_status is not None
     has_tank = (
         _observed(
@@ -111,7 +111,9 @@ def build_panasonic_capabilities(
         return {
             "integration_supported": True,
             "device_supported": device_supported,
-            "available": commands_allowed and device_supported is True and policy == "manual_only",
+            "available": observation_available
+            and device_supported is True
+            and policy == "manual_only",
             "policy": "observe_only_build" if policy == "automatic_with_plan" else policy,
             "ordinary_automation_allowed": False,
             "values": values or [],
@@ -151,7 +153,8 @@ def build_panasonic_capabilities(
             "write_preflight_required": True,
         },
         "availability": {
-            "commands_allowed": commands_allowed,
+            "commands_allowed": False,
+            "observation_available": observation_available,
             "ordinary_automation_allowed": False,
             "execution_policy": "observe_only_build",
             "reason": reason,

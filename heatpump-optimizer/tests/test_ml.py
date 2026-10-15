@@ -897,12 +897,16 @@ class TestCOPRetirementLifecycle:
         demand = MagicMock(is_trained=trained)
         demand.train = AsyncMock(return_value={"error": "Insufficient data", "samples": 167})
         scheduler = MagicMock()
+        scheduler.close = AsyncMock()
         enqueue = AsyncMock(return_value={"request_id": "fixture", "status": "queued"})
+        dispose_engine = AsyncMock()
         with (
             patch.object(ml_main, "demand_model", demand),
             patch("packages.ml.lifecycle.enqueue_maintenance_request", enqueue),
             patch.object(ml_main, "create_scheduler", return_value=scheduler),
             patch("packages.core.logging.configure_logging"),
+            patch("packages.core.log_sink.shutdown_log_sink", new=AsyncMock()) as drain_logs,
+            patch("packages.core.database.engine", new=SimpleNamespace(dispose=dispose_engine)),
             patch.object(ml_main.asyncio, "sleep", new=AsyncMock(side_effect=KeyboardInterrupt)),
             patch("packages.ml.models.COPModel.train", side_effect=AssertionError("COP train")),
             patch(
@@ -923,7 +927,10 @@ class TestCOPRetirementLifecycle:
             id="retrain",
             kwargs={"automatic": True, "source": "ml_schedule"},
         )
-        scheduler.shutdown.assert_called_once_with()
+        scheduler.close.assert_awaited_once()
+        scheduler.shutdown.assert_not_called()
+        drain_logs.assert_awaited_once()
+        dispose_engine.assert_awaited_once()
 
     async def test_weekly_and_manual_retrain_only_enqueue_demand(self):
         from packages.ml import main as ml_main
@@ -1050,8 +1057,10 @@ class TestCOPRetirementLifecycle:
         wrapper.start = AsyncMock(side_effect=RuntimeError("fixture startup stop"))
         wrapper.stop = AsyncMock()
         drain = AsyncMock()
+        dispose_engine = AsyncMock()
         with (
             patch("packages.core.log_sink.shutdown_log_sink", new=drain),
+            patch("packages.core.database.engine", new=SimpleNamespace(dispose=dispose_engine)),
             patch.object(optimizer_main, "_demand_model", demand),
             patch.object(optimizer_main, "comfort_model", comfort),
             patch.object(optimizer_main, "thermal_model", thermal),
@@ -1072,6 +1081,7 @@ class TestCOPRetirementLifecycle:
                 await optimizer_main.main()
 
         drain.assert_awaited_once_with()
+        dispose_engine.assert_awaited_once()
         wrapper.stop.assert_awaited_once_with()
         demand.load_latest.assert_called_once_with()
         comfort.load_latest.assert_called_once_with()

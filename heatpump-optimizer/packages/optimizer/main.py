@@ -39,7 +39,7 @@ logger = structlog.get_logger()
 
 # Cooldown: skip scheduled optimization if a plan was generated recently
 _OPTIMIZATION_COOLDOWN_S = 300  # 5 minutes
-_last_plan_generated_at: float = 0.0
+_last_plan_generated_at: float | None = None
 _PLAN_STABILITY_WINDOW_HOURS = 6
 _OPTIMIZATION_REQUEST_TIMEOUT = dt.timedelta(minutes=30)
 _ABANDONED_REQUEST_ERROR = (
@@ -415,7 +415,7 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
 
     global _last_plan_generated_at
 
-    if scheduled:
+    if scheduled and _last_plan_generated_at is not None:
         elapsed = _time.monotonic() - _last_plan_generated_at
         if elapsed < _OPTIMIZATION_COOLDOWN_S:
             logger.info(
@@ -428,7 +428,11 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
 
     # Serialize scheduled and queued diagnostic generation within this process.
     async with _optimization_lock:
-        if scheduled and _time.monotonic() - _last_plan_generated_at < _OPTIMIZATION_COOLDOWN_S:
+        if (
+            scheduled
+            and _last_plan_generated_at is not None
+            and _time.monotonic() - _last_plan_generated_at < _OPTIMIZATION_COOLDOWN_S
+        ):
             return None
         try:
             learning_mode_state = await resolve_learning_mode_state()
@@ -496,6 +500,16 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
 
             if plan is None:
                 logger.info("optimizer_no_plan", reason="insufficient data")
+                return None
+
+            from packages.optimizer.represented_strategy import validate_represented_plan
+
+            try:
+                validate_represented_plan(plan)
+            except (DataIncompleteError, InfeasibleError) as refusal:
+                logger.info(
+                    "optimizer_no_plan", reason="unproven_serialized_strategy", refusal=str(refusal)
+                )
                 return None
 
             from packages.core.pricing import PriceContext
@@ -897,7 +911,9 @@ async def main() -> None:
     finally:
 
         async def cleanup():
-            await close_service_resources(scheduler=scheduler, wrapper=wrapper)
+            from packages.core.database import engine
+
+            await close_service_resources(scheduler=scheduler, wrapper=wrapper, engine=engine)
 
         await finish_owned_cleanup(cleanup)
 

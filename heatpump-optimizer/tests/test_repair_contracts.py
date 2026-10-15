@@ -250,7 +250,7 @@ def test_R27_ceil_runtime_requires_final_deadline_and_full_price_window(
     monkeypatch.setattr(
         optimizer,
         "_local_dhw_deadlines_in_horizon",
-        lambda *args: [(start + dt.timedelta(hours=deadline_hours), 10)],
+        lambda *args, **kwargs: [(start + dt.timedelta(hours=deadline_hours), 10)],
     )
     prices = [(start + dt.timedelta(hours=h), 0.1) for h in range(priced_hours)]
     actions = optimizer._plan_dhw(

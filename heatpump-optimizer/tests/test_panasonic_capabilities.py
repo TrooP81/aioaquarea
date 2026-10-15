@@ -64,7 +64,8 @@ def test_fresh_observation_advertises_available_observed_commands() -> None:
         now=now,
     )
 
-    assert result["availability"]["commands_allowed"] is True
+    assert result["availability"]["commands_allowed"] is False
+    assert result["availability"]["observation_available"] is True
     assert result["availability"]["reason"] == "available"
     assert result["device"] == {
         "id": "device-1",
@@ -156,7 +157,8 @@ def test_missing_tank_limits_blocks_target_write_but_keeps_tank_support() -> Non
     )
 
     command = result["commands"]["set_tank_temperature"]
-    assert result["availability"]["commands_allowed"] is True
+    assert result["availability"]["commands_allowed"] is False
+    assert result["availability"]["observation_available"] is True
     assert command["device_supported"] is True
     assert command["available"] is False
     assert command["constraints"]["observed_range"] is None

@@ -209,6 +209,7 @@ def test_under_min_and_over_max_treats_floor_protection_as_a_soft_cap():
     from packages.core.space_heating_gate import SpaceHeatingGateState
     from packages.optimizer import InfeasibleError
     from packages.optimizer.milp import MILPOptimizer
+    from tests.test_milp import _context
 
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
@@ -233,14 +234,9 @@ def test_under_min_and_over_max_treats_floor_protection_as_a_soft_cap():
                 # A 48.2 C hardware ceiling admits no 5-minute pulse (+0.42 C), isolating
                 # the native SH duty from any cost-driven DHW diversion.
                 hardware_tank_ceiling=48.2,
-                observation_context={
-                    "device_id": "synthetic-floor-device",
-                    "observed_at": start,
-                    "captured_at": start,
-                    "max_age_seconds": 900,
-                    "tank_target_c": 60.0,
-                    "force_dhw": 0,
-                },
+                observation_context=_context(
+                    [(start, 0.1)], device_id="synthetic-floor-device", demand=[demand]
+                ),
             )
 
     assert duties == pytest.approx([1.0])
@@ -1182,6 +1178,24 @@ def _isolated_represented_inputs(stack, optimizer, horizon):
 
     async def prices(_session, start, _end):
         horizon["start"] = start
+        if "status" in horizon:
+            from packages.core.config import settings
+            from tests.test_milp import _context
+
+            status = horizon["status"]
+            declared = _context(
+                [(start, 0.1)],
+                device_id=status.device_id,
+                demand=[0],
+                power=settings.sh_max_power_kw,
+            )["native_sh_provenance"]
+            declared["captured_at"] = status.ts.isoformat()
+            status.native_policy_provenance = {
+                "diagnostic_assumptions": {
+                    "native_sh_provenance": declared,
+                    "auxiliary_power_kw": 0,
+                }
+            }
         return [(start, 0.1)]
 
     async def weather(_session, start, _end):
@@ -1228,6 +1242,7 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         ts=observed_at,
         force_dhw=0,
         tank_heat_max=65.0,
+        tank_heat_min=30.0,
         device_id="device-1",
         holiday_mode=0,
         tank_temp=48.0,
@@ -1242,6 +1257,7 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
         heat_pump_outdoor_temp=None,
         outdoor_temp=5.0,
     )
+    horizon["status"] = status
     session = MagicMock()
     query_result = MagicMock()
     query_result.scalar_one_or_none.return_value = None
@@ -1455,6 +1471,7 @@ async def _generate_with_passive_policy(limit, curve, *, gate=None):
         ts=observed_at,
         force_dhw=0,
         tank_heat_max=65.0,
+        tank_heat_min=30.0,
         device_id="device-1",
         holiday_mode=0,
         tank_temp=48.0,
@@ -1469,6 +1486,7 @@ async def _generate_with_passive_policy(limit, curve, *, gate=None):
         heat_pump_outdoor_temp=None,
         outdoor_temp=5.0,
     )
+    horizon["status"] = status
     session = MagicMock()
     session.execute = AsyncMock(
         return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None))
@@ -1885,8 +1903,20 @@ def test_represented_plan_replays_real_policy_rates_with_native_mix_and_dhw_dive
     with _synthetic_passive_predictor(-0.3):
         rates = _policy_rates(limit, learned=True)
     gates = ["ALLOWED"] * 6
-    demand = assumed_native_demand(weather, gates)
     captured = start - dt.timedelta(minutes=1)
+    from tests.test_milp import _context
+
+    context = _context(
+        prices,
+        device_id="synthetic-device",
+        observed_at=captured - dt.timedelta(minutes=2),
+        captured_at=captured,
+        tank_target_c=55.0,
+        power=settings.sh_max_power_kw,
+        demand=[settings.sh_max_power_kw * 3 / 7] * 6,
+    )
+    context["native_sh_provenance"]["captured_at"] = captured.isoformat()
+    demand = assumed_native_demand(weather, gates, context["native_sh_provenance"])
     plan = build_represented_plan(
         prices=prices,
         weather=weather,
@@ -1896,15 +1926,9 @@ def test_represented_plan_replays_real_policy_rates_with_native_mix_and_dhw_dive
         current_indoor_temp=20.0,
         gate_states=gates,
         hardware_tank_ceiling=65.0,
-        context={
-            "device_id": "synthetic-device",
-            "observed_at": captured - dt.timedelta(minutes=2),
-            "captured_at": captured,
-            "max_age_seconds": 900,
-            "tank_target_c": 55.0,
-            "force_dhw": 0,
-        },
+        context=context,
         dhw_deadlines=[6],
+        dhw_deadline_tank_floors_c=[45],
         indoor_targets=[18.0] * 6,
         tank_min_per_hour=[45.0] * 6,
         tank_max_temp_setting=55.0,

@@ -5,23 +5,21 @@ services:
     image: ${TIMESCALE_IMAGE:-timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57}
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
-      # Local development defaults only. Override these explicitly for any
-      # non-local deployment; this compose file binds every host port to loopback.
-      POSTGRES_USER: ${POSTGRES_USER:-heatpump}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
-      POSTGRES_DB: ${POSTGRES_DB:-heatpump}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "127.0.0.1:${DB_PORT:-5434}:5432"
+      - "127.0.0.1:${DB_PORT}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-heatpump}" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER}" ]
       interval: 5s
       timeout: 3s
       retries: 5
 
   redis:
-    image: ${REDIS_IMAGE:-redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952}
+    image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
     volumes:
       - redisdata:/data
     healthcheck:
@@ -41,10 +39,7 @@ services:
     command: [ "alembic", "upgrade", "head" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-heatpump}:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/${POSTGRES_DB:-heatpump}
-      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
-      API_TOKEN: ${API_TOKEN:-disabled}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4444}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     depends_on:
       db:
         condition: service_healthy
@@ -60,10 +55,7 @@ services:
     command: [ "python", "-m", "packages.poller.main" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-heatpump}:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/${POSTGRES_DB:-heatpump}
-      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
-      API_TOKEN: ${API_TOKEN:-disabled}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4444}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     volumes:
       - modeldata:/app/models
     depends_on:
@@ -86,10 +78,7 @@ services:
     command: [ "python", "-m", "packages.optimizer.main" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-heatpump}:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/${POSTGRES_DB:-heatpump}
-      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
-      API_TOKEN: ${API_TOKEN:-disabled}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4444}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     volumes:
       - modeldata:/app/models
     depends_on:
@@ -112,14 +101,11 @@ services:
     command: [ "uvicorn", "packages.api.main:app", "--host", "0.0.0.0", "--port", "8500" ]
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-heatpump}:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/${POSTGRES_DB:-heatpump}
-      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
-      API_TOKEN: ${API_TOKEN:-disabled}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4444}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     volumes:
       - modeldata:/app/models
     ports:
-      - "127.0.0.1:${API_PORT:-8500}:8500"
+      - "127.0.0.1:${API_PORT}:8500"
     depends_on:
       db:
         condition: service_healthy
@@ -142,11 +128,11 @@ services:
         APP_VERSION: ${APP_VERSION:-0.15.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     ports:
-      - "127.0.0.1:${WEB_PORT:-4444}:3000"
+      - "127.0.0.1:${WEB_PORT}:3000"
     environment:
       # Kept server-side by the Next route handler; never exposed as NEXT_PUBLIC.
       INTERNAL_API_URL: http://api:8500
-      INTERNAL_API_TOKEN: ${API_TOKEN:-disabled}
+      INTERNAL_API_TOKEN: ${API_TOKEN:-}
     depends_on:
       api:
         condition: service_healthy
@@ -164,13 +150,13 @@ services:
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
       PGHOST: db
-      PGUSER: ${POSTGRES_USER:-heatpump}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
-      PGDATABASE: ${POSTGRES_DB:-heatpump}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
       BACKUP_DIR: /backups
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
-      BACKUP_VERIFY_AFTER_DUMP: "false"
+      BACKUP_VERIFY_AFTER_DUMP: ${BACKUP_VERIFY_AFTER_DUMP:-false}
       BACKUP_REPLICA_ENABLED: ${BACKUP_REPLICA_ENABLED:-false}
       BACKUP_REPLICA_DIR: /replica
       BACKUP_REPLICA_REQUIRED: ${BACKUP_REPLICA_REQUIRED:-false}

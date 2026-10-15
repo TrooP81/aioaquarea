@@ -59,6 +59,9 @@ async def test_flush_loop_reports_failure_to_stderr_and_continues(monkeypatch, c
     with pytest.raises(asyncio.CancelledError):
         await log_sink._flush_loop()
 
+    if log_sink._DIAGNOSTIC_THREAD is not None:
+        await asyncio.to_thread(log_sink._DIAGNOSTIC_THREAD.join, 1)
+        assert not log_sink._DIAGNOSTIC_THREAD.is_alive()
     captured = capsys.readouterr().err
     assert "log sink flush failed: RuntimeError" in captured
     assert "database unavailable" not in captured
@@ -92,6 +95,22 @@ def test_R35_oversize_and_unencodable_rows_do_not_enter_queue(monkeypatch):
         log_sink._db_log_processor(None, "info", {"event": "invalid", "details": details})
     assert log_sink._LOG_BUFFER == []
     assert log_sink._DROP_COUNTS["oversize"] == 2
+
+
+@pytest.mark.parametrize("field", ["event", "logger"])
+def test_R35_invalid_utf8_is_counted_without_interrupting_producer(monkeypatch, field):
+    monkeypatch.setattr(log_sink, "_LOG_BUFFER", [])
+    monkeypatch.setattr(log_sink, "_DROP_COUNTS", Counter())
+    monkeypatch.setattr(log_sink, "_CLOSING", False)
+    event = {"event": "invalid", field: "\ud800"}
+
+    assert log_sink._db_log_processor(None, "info", event) is event
+    assert log_sink._LOG_BUFFER == []
+    assert log_sink._DROP_COUNTS["oversize"] == 1
+
+    valid = {"event": "valid"}
+    assert log_sink._db_log_processor(None, "info", valid) is valid
+    assert len(log_sink._LOG_BUFFER) == 1
 
 
 def test_R35_retry_and_age_loss_are_explicit(monkeypatch):

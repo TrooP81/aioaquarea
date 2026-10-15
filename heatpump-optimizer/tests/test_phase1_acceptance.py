@@ -796,7 +796,10 @@ class TestAC10FreshnessSafety:
         assert quality["threshold_seconds"] == 900
 
         optimizer_main = importlib.import_module("packages.optimizer.main")
-        planner = AsyncMock()
+        # This test owns admission up to planner invocation, not plan publication.
+        # An unconstrained AsyncMock plan gives synchronous mapping methods
+        # coroutine return values and leaks an unawaited coroutine in validation.
+        planner = SimpleNamespace(generate_plan=AsyncMock(return_value=None))
         with (
             patch.object(
                 optimizer_main, "_select_optimizer", new=AsyncMock(return_value=("rules", planner))
@@ -808,6 +811,7 @@ class TestAC10FreshnessSafety:
             patch.object(
                 optimizer_main, "get_device_data_quality", new=AsyncMock(return_value=quality)
             ),
+            patch.object(optimizer_main._demand_model, "arefresh_committed", new=AsyncMock()),
         ):
             await optimizer_main.run_optimization()
         assert planner.generate_plan.await_count == int(expected_fresh)
@@ -1068,6 +1072,7 @@ class TestAC10FreshnessSafety:
         scheduler = MagicMock()
         scheduler.close = AsyncMock()
         drain = AsyncMock()
+        dispose_engine = AsyncMock()
         shutdown_event = MagicMock()
         shutdown_event.wait = AsyncMock()
 
@@ -1088,6 +1093,7 @@ class TestAC10FreshnessSafety:
                 new=AsyncMock(),
             ),
             patch("packages.core.log_sink.shutdown_log_sink", new=drain),
+            patch("packages.core.database.engine", new=SimpleNamespace(dispose=dispose_engine)),
             patch.object(optimizer_main.asyncio, "Event", return_value=shutdown_event),
         ):
             with capture_logs() as logs:
@@ -1105,6 +1111,7 @@ class TestAC10FreshnessSafety:
         scheduler.close.assert_awaited_once_with()
         drain.assert_awaited_once_with()
         wrapper.stop.assert_awaited_once_with()
+        dispose_engine.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_AC10_3_degraded_optimizer_does_not_supersede_a_plan(self):

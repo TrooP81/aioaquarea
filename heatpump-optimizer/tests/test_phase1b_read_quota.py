@@ -221,6 +221,9 @@ async def test_api_lifespan_start_failure_leaves_wrapper_unset_and_stops_partial
     monkeypatch,
 ):
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
+    dispose = AsyncMock()
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=dispose))
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", AsyncMock())
 
     class FailingWrapper:
         instances = []
@@ -241,6 +244,7 @@ async def test_api_lifespan_start_failure_leaves_wrapper_unset_and_stops_partial
 
     assert FailingWrapper.instances[0].read_only is True
     FailingWrapper.instances[0].stop.assert_awaited_once()
+    dispose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1257,6 +1261,9 @@ async def test_quota_response_contains_all_fields_without_identifiers() -> None:
 
 @pytest.mark.asyncio
 async def test_api_lifespan_success_exposes_then_removes_one_wrapper(monkeypatch) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
+    drain = AsyncMock()
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     wrapper = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
     constructor = MagicMock(return_value=wrapper)
@@ -1270,11 +1277,15 @@ async def test_api_lifespan_success_exposes_then_removes_one_wrapper(monkeypatch
     constructor.assert_called_once_with(read_only=True)
     wrapper.start.assert_awaited_once()
     wrapper.stop.assert_awaited_once()
+    drain.assert_awaited_once()
     assert not hasattr(application.state, "aquarea_wrapper")
 
 
 @pytest.mark.asyncio
 async def test_lifespan_start_failure_leaves_other_routes_available(monkeypatch) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
+    drain = AsyncMock()
+    monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     wrapper = SimpleNamespace(
         start=AsyncMock(side_effect=RuntimeError("startup failed")), stop=AsyncMock()
@@ -1287,12 +1298,14 @@ async def test_lifespan_start_failure_leaves_other_routes_available(monkeypatch)
         assert not hasattr(application.state, "aquarea_wrapper")
 
     wrapper.stop.assert_awaited_once()
+    drain.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_api_lifespan_disabled_quota_creates_no_wrapper_and_still_drains_logs(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", False)
     constructor = MagicMock()
     drain = AsyncMock()
@@ -1311,6 +1324,7 @@ async def test_api_lifespan_disabled_quota_creates_no_wrapper_and_still_drains_l
 async def test_api_lifespan_failed_start_disposes_once_before_final_log_drain(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     events = []
     wrapper = SimpleNamespace(
@@ -1336,6 +1350,8 @@ async def test_api_lifespan_failed_start_disposes_once_before_final_log_drain(
 async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_stop(
     monkeypatch,
 ) -> None:
+    dispose_engine = AsyncMock()
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=dispose_engine))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     wrapper = SimpleNamespace(
         start=AsyncMock(side_effect=RuntimeError("startup failed")),
@@ -1352,6 +1368,7 @@ async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_
 
     wrapper.stop.assert_awaited_once()
     drain.assert_awaited_once()
+    dispose_engine.assert_not_awaited()
     assert not hasattr(application.state, "aquarea_wrapper")
 
 
@@ -1359,6 +1376,7 @@ async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_
 async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_stops_once(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     stopping = asyncio.Event()
     release = asyncio.Event()
@@ -1406,6 +1424,7 @@ async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_s
 async def test_api_lifespan_cancellation_during_start_disposes_partial_wrapper_once(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     starting = asyncio.Event()
 

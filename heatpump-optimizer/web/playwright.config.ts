@@ -37,7 +37,7 @@ export default defineConfig({
   webServer: liveBaseURL
     ? undefined
     : {
-        command: `npm run dev -- --hostname 127.0.0.1 --port ${localPort}`,
+        command: `npm run ${process.env.PLAYWRIGHT_PRODUCTION === "1" ? "start" : "dev"} -- --hostname 127.0.0.1 --port ${localPort}`,
         url: localBaseURL,
         reuseExistingServer: false,
         timeout: 120_000,

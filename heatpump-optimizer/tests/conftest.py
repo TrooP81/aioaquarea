@@ -11,10 +11,10 @@ import tempfile
 import warnings
 from contextlib import suppress
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock
 
 TEST_API_TOKEN = "test-token"
 
@@ -35,7 +35,7 @@ def optimization_learning_gate(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture(autouse=True)
 def isolate_model_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Keep every unit test's model reads and writes in its own temporary directory."""
+    """Keep model reads and writes inside the test's owned directory."""
     from packages.core.config import settings
 
     model_dir = tmp_path / "_isolated_models"

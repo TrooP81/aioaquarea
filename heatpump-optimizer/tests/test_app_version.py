@@ -23,9 +23,12 @@ def test_release_version_is_consistent_across_services():
     """The dashboard and API must report the same release version."""
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     web_package = json.loads((PROJECT_ROOT / "web" / "package.json").read_text(encoding="utf-8"))
+    web_lock = json.loads((PROJECT_ROOT / "web" / "package-lock.json").read_text(encoding="utf-8"))
 
     assert pyproject["project"]["version"] == APP_VERSION
     assert web_package["version"] == APP_VERSION
+    assert web_lock["version"] == APP_VERSION
+    assert web_lock["packages"][""]["version"] == APP_VERSION
     assert app.version == APP_VERSION
 
 
@@ -47,6 +50,19 @@ def test_release_version_is_embedded_in_container_builds():
     assert (
         f"| `APP_VERSION` / `BUILD_REVISION` | `{APP_VERSION}` / `unknown` |"
         in configuration_reference
+    )
+
+
+def test_backend_image_installs_the_qualified_dependency_constraints():
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert (
+        "COPY heatpump-optimizer/pyproject.toml heatpump-optimizer/constraints.txt ./" in dockerfile
+    )
+    assert 'pip install --no-cache-dir -c constraints.txt -e ".[all]"' in dockerfile
+    installer_upgrade = "python -m pip install --no-cache-dir --upgrade pip==26.2.0"
+    assert installer_upgrade in dockerfile
+    assert dockerfile.index(installer_upgrade) < dockerfile.index(
+        'pip install --no-cache-dir -c constraints.txt -e ".[all]"'
     )
 
 

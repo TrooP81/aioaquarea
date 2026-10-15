@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY heatpump-optimizer/pyproject.toml heatpump-optimizer/constraints.txt ./
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.0
 RUN pip install --no-cache-dir -c constraints.txt -e ".[all]"
 
 COPY heatpump-optimizer/ .

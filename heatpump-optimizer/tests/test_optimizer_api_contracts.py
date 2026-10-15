@@ -1366,18 +1366,64 @@ def _admitted_planning_quality(
 
 
 def _admissible_plan(*, version: str = "rules_v7", **quality_options) -> dict:
+    from packages.core.config import settings
+    from packages.ml.thermal import thermal_model
+    from packages.optimizer.represented_strategy import (
+        NATIVE_ASSUMPTION,
+        build_represented_plan,
+        validate_represented_plan,
+    )
+
     quality = _admitted_planning_quality(**quality_options)
     start = dt.datetime.fromisoformat(quality["horizon_start"])
-    end = start + dt.timedelta(hours=quality["effective_horizon_hours"])
-    return {
-        "horizon_start": start,
-        "horizon_end": end,
-        "version": version,
-        "diagnostic_status": "conditional_feasible",
-        "actions": [{"type": "force_dhw_on", "ts": start.isoformat(), "payload": {}}],
-        "forecast_snapshot": {"device_id": "device-a", "price_forecast": []},
-        "planning_data_quality": quality,
+    hours = quality["effective_horizon_hours"]
+    end = start + dt.timedelta(hours=hours)
+    captured = dt.datetime.fromisoformat(quality["captured_at"])
+    power = settings.sh_max_power_kw
+    context = {
+        "device_id": "device-a",
+        "observed_at": (captured - dt.timedelta(minutes=1)).isoformat(),
+        "captured_at": captured.isoformat(),
+        "max_age_seconds": 900,
+        "tank_target_c": 55,
+        "force_dhw": 0,
+        "tank_hardware_floor_c": 40,
+        "auxiliary_power_kw": 0,
+        "native_sh_provenance": {
+            "kind": "explicit_conditional_assumption",
+            "method": NATIVE_ASSUMPTION,
+            "device_id": "device-a",
+            "captured_at": captured.isoformat(),
+            "horizon_start": start.isoformat(),
+            "horizon_end": end.isoformat(),
+            "maximum_electrical_power_kw": power,
+            "hourly_electrical_kw": [power / 2] * hours,
+        },
     }
+    prices = [(start + dt.timedelta(hours=hour), 0.25) for hour in range(hours)]
+    # Real represented/replayed fixture, not a hand-written "feasible" label.
+    # Fixed synthetic default rates avoid inheriting another test's fitted model.
+    with patch.object(thermal_model.params, "last_calibrated", None):
+        plan = build_represented_plan(
+            prices=prices,
+            weather=[(ts, 5.0) for ts, _ in prices],
+            cop_fn=lambda *args: 3,
+            demand_per_hour=[power / 2] * hours,
+            current_tank_temp=55,
+            current_indoor_temp=20,
+            gate_states=["ALLOWED"] * hours,
+            hardware_tank_ceiling=55,
+            context=context,
+            indoor_rates=[(0.2, -0.1)] * hours,
+            indoor_targets=[19] * hours,
+            tank_min_per_hour=[40] * hours,
+            serialized_actions=[],
+        )
+    plan["version"] = version
+    plan["planning_data_quality"] = quality
+    plan["forecast_snapshot"]["device_id"] = "device-a"
+    validate_represented_plan(plan)
+    return plan
 
 
 @pytest.mark.parametrize("planner", ["rules", "milp", "fallback"])
@@ -1473,8 +1519,11 @@ def _refused_plan_session():
     return session, records
 
 
-async def _run_admission(plan, *, layer="rules", failure=None, fallback_plan=None):
+async def _run_admission(
+    plan, *, layer="rules", failure=None, fallback_plan=None, isolate_frozen_quality=True
+):
     from packages.optimizer import main as optimizer_main
+    from packages.optimizer.represented_strategy import validate_represented_plan
 
     optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     if failure is not None:
@@ -1483,6 +1532,15 @@ async def _run_admission(plan, *, layer="rules", failure=None, fallback_plan=Non
     session, records = _refused_plan_session()
     session_factory = MagicMock(side_effect=lambda *args, **kwargs: _session_context(session))
     with (
+        # These unit oracles target the frozen-input owner, not the earlier S4
+        # serializer/replay gate. Integrated S4 and diagnostic-publication controls
+        # keep the real gate; repair-one also explicitly tests that earlier refusal.
+        patch(
+            "packages.optimizer.represented_strategy.validate_represented_plan",
+            side_effect=(lambda _plan: None)
+            if isolate_frozen_quality
+            else validate_represented_plan,
+        ),
         patch.object(optimizer_main, "get_session", new=session_factory),
         patch.object(optimizer_main, "get_setting", new=AsyncMock(return_value=layer)),
         patch.object(

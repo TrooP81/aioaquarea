@@ -59,13 +59,19 @@ def _observed_tank_temperature(status) -> float:
 
 
 def _dhw_deadline_offsets(
-    comfort_schedule: dict[str, list[int]], horizon_start: dt.datetime, tz_name: str | None
+    comfort_schedule: dict[str, list[int]],
+    horizon_start: dt.datetime,
+    tz_name: str | None,
+    *,
+    horizon_end: dt.datetime | None = None,
 ) -> list[int]:
     if horizon_start.tzinfo is None:
         horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
     return [
         math.floor((deadline - horizon_start).total_seconds() / 3600)
-        for deadline, _ in local_dhw_deadlines_in_horizon(comfort_schedule, horizon_start, tz_name)
+        for deadline, _ in local_dhw_deadlines_in_horizon(
+            comfort_schedule, horizon_start, tz_name, horizon_end=horizon_end
+        )
     ]
 
 
@@ -230,7 +236,12 @@ class MILPOptimizer:
         # Get comfort schedule to derive DHW deadlines
         comfort_schedule = await get_comfort_schedule()
         tz_name = await get_user_tz()
-        dhw_deadlines = _dhw_deadline_offsets(comfort_schedule, horizon_start, tz_name)
+        dhw_deadlines = _dhw_deadline_offsets(
+            comfort_schedule,
+            horizon_start,
+            tz_name,
+            horizon_end=prices[-1][0] + dt.timedelta(hours=1),
+        )
 
         # Resolve per-hour indoor comfort targets from schedule
         comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
@@ -368,6 +379,7 @@ class MILPOptimizer:
             comfort_temp_max,
             getattr(last_status, "tank_heat_max", None) if last_status is not None else None,
             observation_context=await observation_context(last_status, now),
+            dhw_deadline_tank_floors_c=[tank_min_temp] * len(dhw_deadlines),
         )
         if plan and isinstance(plan.get("forecast_snapshot"), dict):
             snapshot = plan["forecast_snapshot"]
@@ -708,6 +720,7 @@ class MILPOptimizer:
         hardware_tank_ceiling=None,
         serialized_actions=None,
         observation_context=None,
+        dhw_deadline_tank_floors_c=None,
     ):
         from packages.optimizer.represented_strategy import build_represented_plan
 
@@ -739,6 +752,7 @@ class MILPOptimizer:
             hardware_tank_ceiling=hardware_tank_ceiling,
             context=observation_context,
             dhw_deadlines=dhw_deadlines,
+            dhw_deadline_tank_floors_c=dhw_deadline_tank_floors_c,
             indoor_targets=indoor_targets,
             tank_min_per_hour=tank_min_per_hour,
             tank_max_temp_setting=tank_max_temp_setting,

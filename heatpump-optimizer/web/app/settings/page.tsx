@@ -42,6 +42,8 @@ interface FieldRule {
 const FIELD_RULES: Record<string, FieldRule> = {
   ml_maintenance_enabled: { label: "Model maintenance" },
   seasonal_calibration_auto_exit: { label: "Automatic observation exit" },
+  space_heating_gate_on_offset_c: { label: "Gate ON offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
+  space_heating_gate_off_offset_c: { label: "Gate OFF offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
   tank_min_temp: { label: "Minimum tank temperature during comfort hours", unit: "°C", min: 20, max: 65, step: 0.5, inputType: "number" },
   tank_min_temp_offpeak: { label: "Minimum tank temperature during off-peak hours", unit: "°C", min: 20, max: 65, step: 0.5, inputType: "number" },
   tank_max_temp: { label: "Maximum tank temperature", unit: "°C", min: 30, max: 65, step: 0.5, inputType: "number" },
@@ -54,8 +56,6 @@ const FIELD_RULES: Record<string, FieldRule> = {
   heat_curve_supply_warm_c: { label: "Supply temperature at warm point", unit: "°C", min: 20, max: 65, step: 1, inputType: "number" },
   heat_curve_heating_off_outdoor_c: { label: "Heating-off outdoor cutoff", unit: "°C", min: 5, max: 30, step: 0.5, inputType: "number" },
   heat_curve_delta_t_c: { label: "Controller ΔT", unit: "°C", min: 1, max: 15, step: 1, inputType: "number" },
-  space_heating_gate_on_offset_c: { label: "Gate ON offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
-  space_heating_gate_off_offset_c: { label: "Gate OFF offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
   quiet_mode_start: { label: "Quiet mode starts", unit: "hour", min: 0, max: 23, step: 1, inputType: "number" },
   quiet_mode_end: { label: "Quiet mode ends", unit: "hour", min: 0, max: 23, step: 1, inputType: "number" },
   latitude: { label: "Latitude", unit: "°", min: -90, max: 90, step: 0.0001, inputType: "number" },
@@ -187,7 +187,7 @@ const SETTING_GROUPS = [
   },
   {
     title: "Seasonal Learning",
-    description: "Observe-only seasonal evidence",
+    description: "Observe-only seasonal evidence. Observation persists until explicit human exit; model readiness never enables device writes.",
     keys: ["seasonal_calibration_enabled", "seasonal_calibration_max_outdoor_c", "seasonal_calibration_window_days", "seasonal_calibration_auto_train", "seasonal_calibration_auto_exit"],
   },
   {
@@ -271,7 +271,8 @@ export default function SettingsPage() {
   const [pendingErrorKey, setPendingErrorKey] = useState<string | null>(null);
   const currency = useCurrency();
   const applicableKeys = useMemo(
-    () => new Set(Object.keys(settings).filter((key) => isSettingApplicable(key, editValues, showAdvanced))),
+    () => new Set(Object.keys(settings).filter((key) => !settings[key].read_only
+      && key !== "seasonal_calibration_auto_exit" && isSettingApplicable(key, editValues, showAdvanced))),
     [editValues, settings, showAdvanced],
   );
   const activeTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
@@ -451,7 +452,7 @@ export default function SettingsPage() {
         body: JSON.stringify({ settings: updates }),
       });
       if (!res.ok) {
-        const errorResponse: unknown = await res.json();
+        const errorResponse: unknown = await res.json().catch(() => null);
         const detail = errorResponse !== null && typeof errorResponse === "object" && "detail" in errorResponse
           ? errorResponse.detail : undefined;
         let failureMessage = typeof detail === "string" ? detail : "";
@@ -633,8 +634,8 @@ export default function SettingsPage() {
                     key === "seasonal_calibration_auto_exit"
                       ? "Always false. Observation persists until explicit human exit; legacy stored values are ineffective."
                       : key === "manual_price_eur_per_kwh"
-                        ? `Static electricity price (${currency.code}/kWh)`
-                        : meta.description;
+                      ? `Static electricity price (${currency.code}/kWh)`
+                      : meta.description;
                   const label = meta.label || rule.label || description;
                   const unit = meta.unit || rule.unit;
                   const inputType = rule.inputType
@@ -670,6 +671,7 @@ export default function SettingsPage() {
                         <>
                           <select
                             id={`setting-${key}`}
+                            disabled={isReadOnlySetting}
                             value={editValues[key] || ""}
                             onChange={(e) =>
                               setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
@@ -713,6 +715,7 @@ export default function SettingsPage() {
                           <input
                             id={`setting-${key}`}
                             type={inputType}
+                            disabled={isReadOnlySetting}
                             value={editValues[key] || ""}
                             onChange={(e) =>
                               setEditValues((prev) => ({ ...prev, [key]: e.target.value }))

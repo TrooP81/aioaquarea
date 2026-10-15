@@ -1,5 +1,11 @@
 # Heat Pump Optimizer configuration reference
 
+The backend image installs dependencies using `constraints.txt` and upgrades its
+bundled package installer to the qualified `pip==26.2.0` before installation.
+Release qualification audits the installed image graph, not the developer's shared
+Python environment. The dashboard production graph is audited separately from its
+development tooling; a clean production audit does not certify development tools.
+
 The optimizer reads configuration from two layers:
 
 1. **Environment variables** – read once at process start by
@@ -15,6 +21,33 @@ Values are stored as strings. `secret` values are masked in `GET /api/settings`;
 a `PUT` that echoes a masked value (containing `***`) does not overwrite the
 stored secret. A value outside a setting's options, type, or range is rejected
 with an error. An empty string clears a free-form value.
+
+### Feed attribution during settings changes
+
+Each price/weather request captures its provider, request-start time and applicable
+area or coordinates before outbound HTTP I/O. Changing runtime settings while a
+request is in flight applies to the next request; it does not relabel the response
+already being fetched. Price persistence uses this captured context, including the
+provider's currency, rather than rereading current settings.
+
+Schema markers describe validated provider normalization, not merely a successful
+HTTP response. Unannotated legacy price/weather lists are not automatically
+certified. Tibber entries without currency metadata remain available to list-only
+callers but do not receive an hourly schema marker. Missing or invalid currency
+metadata leaves otherwise valid price-only values uncertified, independently of
+entry order. Valid currency codes are normalized before checking for genuine
+currency conflicts. Conflicting currencies, nonfinite values, duplicate timestamps
+and unverifiable hourly timestamps reject the batch with a fixed validation reason;
+the price poller logs failure rather than a successful empty fetch. Legitimately
+empty provider results remain distinct from rejected batches. Price-fetch errors
+log exception classification and HTTP status where available, never exception text
+or provider URLs/query strings that may contain API credentials.
+SMHI retains its timezone-aware `referenceTime` as forecast issuance; missing or
+invalid issue clocks remain unknown and do not acquire a units marker.
+Open-Meteo has no forecast issue clock in this response, so its captured request
+start is used as the retrieval-based freshness clock (also used for manual weather).
+Existing planning freshness, completeness and unit checks remain unchanged.
+No historical rows are relabeled or rescaled.
 
 ## Environment variables
 
@@ -332,6 +365,15 @@ and does not authorize ordinary device writes.
 Viewing advice derives verification progress and eligible audit recovery without
 persisting settings or completing a durable transition. The GET is read-only;
 existing observation thresholds and recommendation gates still apply.
+The manual outcome-experiment card uses the same configured device freshness
+policy and requires admissible status and persisted gate clocks. Missing, future,
+stale or nonfinite evidence cannot produce `manual_review_ready`; this card
+creates no device action.
+
+Learned-usage hours follow the configured IANA timezone, including DST gaps and
+repeated local hours. Scheduled diagnostic cooldown starts only after a successful
+publication commit, never at process startup. Action normalization compares UTC
+instants while preserving distinct source/restore ownership keys.
 
 Represented diagnostic planning uses `native_sh_trace_v1`: unchanged hourly
 native space-heating demand with explicitly **assumed** provenance, plus integer
@@ -361,11 +403,30 @@ Service entrypoints own startup cleanup from their first await and track all
 scheduled coroutine jobs until their cleanup ends. A cancelled solver await waits
 for its owned thread to finish. Scheduled jobs drain before maintenance, then
 ordinary logs drain within their five-second budget, then wrapper resources close.
+The API, poller, optimizer and standalone ML entrypoint dispose their database
+engine last, after these owners settle, including on startup failure or cancellation.
 An unsettled log writer blocks disposal and retains ownership rather than claiming
 successful shutdown. Cancellation-resistant teardown does not relax restore
 attempt deadlines or grant ordinary-write permission.
 
+Ordinary DB logging reserves capacity **before** encoding. Its 1,000 total slots
+include rows still being encoded and in-flight batches; batches contain at most
+100 rows, and each encoded row is limited to 8,192 bytes. Traversal is bounded to
+4,096 nodes and 16 levels without copying the input tree or invoking arbitrary
+string-conversion hooks. Oversized, unsupported and unencodable rows release
+their reservation and increment the oversize counter. Admission never waits for
+capacity. Failed-write diagnostics use at most one bounded-message daemon writer;
+a stalled stderr drops subsequent diagnostics instead of blocking the event loop.
+Diagnostic losses are reported separately from row losses. Ordinary logs retain
+the existing retry/age limits and five-second shutdown budget, may duplicate
+after ambiguous commits, and may be lost on abrupt death. Transactional safety
+audit records remain outside this dropping queue.
+
 ### Panasonic
+
+Capability `availability.commands_allowed` is false in this observe-only build.
+`observation_available` separately describes fresh observed hardware/adapter
+availability; observed support does not authorize ordinary automation.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -6,8 +6,11 @@ import { PriceChart } from "@/components/PriceChart";
 import { TemperatureChart } from "@/components/TemperatureChart";
 import { ConsumptionChart } from "@/components/ConsumptionChart";
 import { ForecastChart } from "@/components/ForecastChart";
+import { ComfortImpactChart } from "@/components/ComfortImpactChart";
 import { ThermalPredictionChart } from "@/components/ThermalPredictionChart";
-import { PlanActivityTimeline } from "@/components/PlanActivityTimeline";
+import { PlanView } from "@/components/PlanView";
+import type { PlanAction } from "@/components/usePlanActions";
+import { PlanActivityTimeline, type PlanActivity } from "@/components/PlanActivityTimeline";
 import { PlanHistory } from "@/components/PlanHistory";
 import { Controls } from "@/components/Controls";
 import { LearningModeCard } from "@/components/LearningModeCard";
@@ -19,13 +22,10 @@ import { TabNavigation } from "@/components/TabNavigation";
 import { DecisionSummary } from "@/components/DecisionSummary";
 import { Banner } from "@/components/Banner";
 import { DataAge } from "@/components/DataAge";
+import { LEGACY_SECTION_ALIASES, SECTIONS, SectionId } from "@/lib/constants";
+import type { ControlState, ReadQuotaResponse, SpaceHeatingGate } from "@/lib/api-types";
 import { RefreshProvider, useRefresh } from "@/components/RefreshContext";
 import { TimelineWorkspace } from "@/components/TimelineWorkspace";
-import { PlanView } from "@/components/PlanView";
-import type { PlanActivity } from "@/components/PlanActivityTimeline";
-import type { PlanAction } from "@/components/usePlanActions";
-import type { ControlState, ReadQuotaResponse, SpaceHeatingGate } from "@/lib/api-types";
-import { LEGACY_SECTION_ALIASES, SECTIONS, SectionId } from "@/lib/constants";
 import Link from "next/link";
 
 interface DashboardData {
@@ -64,7 +64,7 @@ interface DashboardData {
   today_cost_complete: boolean;
   active_plan: {
     id: number;
-    status: string;
+    status?: string;
     optimizer_version: string;
     cost_estimate_eur: number | null;
     actions_count: number;
@@ -94,10 +94,7 @@ interface PollNowResponse {
 }
 
 interface PollNowErrorResponse {
-  detail?: {
-    code?: string;
-    retry_after_seconds?: number;
-  };
+  detail?: { code?: string; retry_after_seconds?: number };
 }
 
 interface IndoorTempData {
@@ -107,53 +104,40 @@ interface IndoorTempData {
   last_fresh_reading: string | null;
 }
 
-const POLL_RESULT_SUCCESS_AUTO_DISMISS_MS = 6000;
-const CONTROL_STATE_NAMES = new Set<ControlState["state"]>([
-  "paused_by_user",
-  "observing",
-  "holding",
-  "comfort_at_risk",
-  "automatic",
-]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+interface LearningModeData {
+  enabled: boolean;
+  since: string | null;
+  days_elapsed: number | null;
 }
 
+const POLL_RESULT_SUCCESS_AUTO_DISMISS_MS = 6000;
+
 function isControlState(value: unknown): value is ControlState {
-  if (
-    !isRecord(value) ||
-    typeof value.headline !== "string" ||
-    typeof value.detail !== "string" ||
-    typeof value.state !== "string" ||
-    !CONTROL_STATE_NAMES.has(value.state as ControlState["state"]) ||
-    !Array.isArray(value.notices)
-  ) {
-    return false;
-  }
-  if (!value.notices.every((notice) => isRecord(notice) && typeof notice.detail === "string")) {
-    return false;
-  }
-  if (value.primary_action === null) return true;
-  if (!isRecord(value.primary_action) || typeof value.primary_action.label !== "string") return false;
-  if (value.primary_action.kind === "link") return true;
-  return (
-    value.primary_action.kind === "request" &&
-    typeof value.primary_action.endpoint === "string" &&
-    typeof value.primary_action.method === "string"
-  );
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<ControlState>;
+  return typeof state.headline === "string" && typeof state.detail === "string"
+    && ["paused_by_user", "observing", "holding", "comfort_at_risk", "automatic"].includes(state.state ?? "")
+    && Array.isArray(state.notices)
+    && state.notices.every((notice) => notice && typeof notice.detail === "string")
+    && (state.primary_action === null || (
+      state.primary_action != null && typeof state.primary_action.label === "string"
+      && (state.primary_action.kind === "link" || (
+        state.primary_action.kind === "request" && typeof state.primary_action.endpoint === "string"
+        && typeof state.primary_action.method === "string"
+      ))
+    ));
 }
 
 async function fetchOptionalJson<T>(
   path: string,
+  signal: AbortSignal,
   validate?: (value: unknown) => value is T,
-  signal?: AbortSignal,
 ): Promise<T | null> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 1_000);
   const abort = () => controller.abort();
-  signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) controller.abort();
+  const timeout = window.setTimeout(abort, 1_000);
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) controller.abort();
   try {
     const response = await fetch(path, { signal: controller.signal });
     if (!response.ok) return null;
@@ -163,16 +147,12 @@ async function fetchOptionalJson<T>(
     return null;
   } finally {
     window.clearTimeout(timeout);
-    signal?.removeEventListener("abort", abort);
+    signal.removeEventListener("abort", abort);
   }
 }
 
 export default function Home() {
-  return (
-    <RefreshProvider>
-      <DashboardPage />
-    </RefreshProvider>
-  );
+  return <RefreshProvider><DashboardPage /></RefreshProvider>;
 }
 
 function DashboardPage() {
@@ -181,6 +161,7 @@ function DashboardPage() {
   const [indoorTemp, setIndoorTemp] = useState<IndoorTempData | null>(null);
   const [controlState, setControlState] = useState<ControlState | null>(null);
   const [readQuota, setReadQuota] = useState<ReadQuotaResponse | null>(null);
+  const [learningMode, setLearningMode] = useState<LearningModeData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
@@ -204,30 +185,32 @@ function DashboardPage() {
     window.history.pushState({ view: section }, "", url);
   };
 
-  const fetchData = useCallback(async (signal?: AbortSignal) => {
+  const fetchData = useCallback(async (signal: AbortSignal) => {
     const generation = ++fetchGeneration.current;
     try {
-      const [dashRes, tempRes, controlRes, quotaRes] = await Promise.all([
+      const [dashRes, tempRes, controlRes, quotaRes, learningRes] = await Promise.all([
         fetch("/api/dashboard", { signal }),
-        fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest", undefined, signal),
-        fetchOptionalJson("/api/control-state", isControlState, signal),
-        fetchOptionalJson<ReadQuotaResponse>("/api/panasonic/read-quota", undefined, signal),
+        fetchOptionalJson<IndoorTempData>("/api/indoor-temp/latest", signal),
+        fetchOptionalJson("/api/control-state", signal, isControlState),
+        fetchOptionalJson<ReadQuotaResponse>("/api/panasonic/read-quota", signal),
+        fetchOptionalJson<LearningModeData>("/api/learning-mode", signal),
       ]);
       if (!dashRes.ok) throw new Error(`API error: ${dashRes.status}`);
       const json = await dashRes.json();
-      if (signal?.aborted || generation !== fetchGeneration.current) return;
+      if (signal.aborted || generation !== fetchGeneration.current) return;
       setData(json);
       setIndoorTemp(tempRes);
       setControlState(controlRes);
       setReadQuota(quotaRes);
+      setLearningMode(learningRes);
       setError(null);
       setLastUpdated(new Date());
     } catch (e) {
-      if (!signal?.aborted && generation === fetchGeneration.current) {
+      if (!signal.aborted && generation === fetchGeneration.current) {
         setError(e instanceof Error ? e.message : "Failed to fetch data");
       }
     } finally {
-      if (!signal?.aborted && generation === fetchGeneration.current) setLoading(false);
+      if (!signal.aborted && generation === fetchGeneration.current) setLoading(false);
     }
   }, []);
 
@@ -243,18 +226,14 @@ function DashboardPage() {
       const requested = url.searchParams.get("view");
       const canonical = SECTIONS.find((section) => section.id === requested);
       const alias = requested ? LEGACY_SECTION_ALIASES[requested] : undefined;
-      const section = canonical?.id ?? alias?.section ?? "home";
-
       if (alias) {
         url.searchParams.set("view", alias.section);
         if (!url.hash && alias.hash) url.hash = alias.hash;
-      } else if (requested && !canonical) {
-        url.searchParams.delete("view");
-      }
+      } else if (requested && !canonical) url.searchParams.delete("view");
       if (url.href !== window.location.href) window.history.replaceState({}, "", url);
       setLocationHash(url.hash);
       if (requested === "charts") setShowRawChartDetails(true);
-      setActiveSection(section);
+      setActiveSection(canonical?.id ?? alias?.section ?? "home");
     };
 
     applyLocation();
@@ -267,10 +246,9 @@ function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    const hash = locationHash;
-    if (!hash || /^#plan-action-\d+$/.test(hash)) return;
+    if (!locationHash || /^#plan-action-\d+$/.test(locationHash)) return;
     const frame = window.requestAnimationFrame(() => {
-      document.getElementById(hash.slice(1))?.scrollIntoView({ block: "start" });
+      document.getElementById(locationHash.slice(1))?.scrollIntoView({ block: "start" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeSection, loading, locationHash, showRawChartDetails]);
@@ -281,30 +259,16 @@ function DashboardPage() {
     try {
       const res = await fetch("/api/poll-now", { method: "POST" });
       if (!res.ok) {
-        const errorBody: PollNowErrorResponse | null = await res.json().catch(() => null);
-        const retryAfterHeader = Number(res.headers.get("Retry-After"));
-        const retryAfterSeconds = Number.isFinite(retryAfterHeader) && retryAfterHeader >= 0
-          ? retryAfterHeader
-          : errorBody?.detail?.retry_after_seconds;
-
-        if (res.status === 429) {
-          const wait = typeof retryAfterSeconds === "number"
-            ? ` — try again in ~${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`
-            : " — try again later";
-          setPollResult({
-            success: false,
-            tone: "warning",
-            message: `Panasonic read allowance used up${wait}`,
-          });
-        } else if (res.status === 503 && errorBody?.detail?.code === "panasonic_read_quota_unavailable") {
-          setPollResult({
-            success: false,
-            tone: "danger",
-            message: "Read quota service unavailable — refresh is paused, background polling continues",
-          });
-        } else {
-          setPollResult({ success: false, tone: "danger", message: `Refresh failed (HTTP ${res.status})` });
-        }
+        const body: PollNowErrorResponse | null = await res.json().catch(() => null);
+        const header = res.headers.get("Retry-After");
+        const retryAfter = header !== null ? Number(header) : body?.detail?.retry_after_seconds;
+        const wait = typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0
+          ? ` — try again in ~${Math.max(1, Math.ceil(retryAfter / 60))} min` : " — try again later";
+        setPollResult({ success: false, tone: res.status === 429 ? "warning" : "danger", message: res.status === 429
+          ? `Panasonic read allowance used up${wait}`
+          : res.status === 503 && body?.detail?.code === "panasonic_read_quota_unavailable"
+            ? "Read quota service unavailable — refresh is paused, background polling continues"
+            : `Refresh failed (HTTP ${res.status})` });
         return;
       }
       const json: PollNowResponse = await res.json();
@@ -337,12 +301,8 @@ function DashboardPage() {
 
   const cancelOverride = async () => {
     const action = controlState?.primary_action;
-    if (
-      action?.kind !== "request" ||
-      action.method !== "DELETE" ||
-      typeof action.endpoint !== "string" ||
-      !/^\/api\/overrides\/\d+$/.test(action.endpoint)
-    ) return;
+    if (action?.kind !== "request" || action.method !== "DELETE" || typeof action.endpoint !== "string"
+      || !/^\/api\/overrides\/\d+$/.test(action.endpoint)) return;
     try {
       const res = await fetch(action.endpoint, { method: action.method });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
@@ -367,7 +327,6 @@ function DashboardPage() {
     );
   }
 
-  const activePlan = data?.active_plan?.status === "active" ? data.active_plan : null;
   const headerStatus = data?.current_status
     ? (data.current_status_fresh === false ? "stale" : "online")
     : "offline";
@@ -380,14 +339,25 @@ function DashboardPage() {
         : "● Disconnected";
 
   const activeSectionMeta = SECTIONS.find((section) => section.id === activeSection) ?? SECTIONS[0];
+  const activePlan = data?.active_plan?.status === "active" ? data.active_plan : null;
   const quotaBlocksRefresh = readQuota?.enabled === true && (
-    readQuota.reliable === false ||
-    readQuota.remaining === null ||
-    readQuota.remaining < readQuota.manual_required
+    readQuota.reliable === false || readQuota.remaining === null || readQuota.remaining < readQuota.manual_required
   );
 
   return (
     <main id="main-content" className="dashboard" tabIndex={-1}>
+      <TabNavigation
+        activeId={activeSection}
+        ariaLabel="Dashboard workspace"
+        idPrefix="dashboard"
+        items={SECTIONS}
+        onChange={selectSection}
+      />
+      <p className="tab-context" aria-live="polite">
+        <strong>{activeSectionMeta.label}</strong>
+        <span>{activeSectionMeta.description}</span>
+      </p>
+
       <div className="header">
         <h1>Heat Pump Optimizer</h1>
         <div className="header-actions">
@@ -395,7 +365,7 @@ function DashboardPage() {
           {lastUpdated && (
             <DataAge timestamp={lastUpdated.toISOString()} />
           )}
-          <button className="btn" onClick={pollNow} disabled={polling || quotaBlocksRefresh}>
+          <button className="btn btn-primary" onClick={pollNow} disabled={polling || quotaBlocksRefresh}>
             {polling ? "Refreshing..." : "Refresh from heat pump"}
           </button>
           <Link href="/settings" className="btn">Settings</Link>
@@ -411,20 +381,9 @@ function DashboardPage() {
             : "Panasonic read quota is temporarily unavailable."
           : "Uses the Panasonic hourly read allowance."}
       </p>
-      <TabNavigation
-        activeId={activeSection}
-        ariaLabel="Dashboard workspace"
-        idPrefix="dashboard"
-        items={SECTIONS}
-        onChange={selectSection}
-      />
-      <p className="tab-context" aria-live="polite">
-        <strong>{activeSectionMeta.label}</strong>
-        <span>{activeSectionMeta.description}</span>
-      </p>
 
       {pollResult && (
-        <Banner tone={pollResult.success ? "info" : pollResult.tone ?? "warning"} label="Heat pump refresh result">
+        <Banner tone={pollResult.success ? "info" : pollResult.tone ?? "danger"} label="Heat pump refresh result">
           <p>{pollResult.message}</p>
           <button className="btn btn-sm" onClick={() => setPollResult(null)}>
             Dismiss
@@ -446,6 +405,23 @@ function DashboardPage() {
         </Banner>
       )}
 
+      {learningMode?.enabled && (
+        <div
+          className="override-banner"
+          style={{ borderColor: "var(--success)", background: "rgba(34,197,94,0.1)" }}
+        >
+          <p style={{ color: "var(--success)" }}>
+            🎓 Learning mode active — optimizer is observing only (no device commands)
+            {learningMode.days_elapsed != null
+              ? ` · collecting data for ${learningMode.days_elapsed < 1
+                ? `${Math.round(learningMode.days_elapsed * 24)}h`
+                : `${Math.floor(learningMode.days_elapsed)}d`
+              }`
+              : ""}
+          </p>
+        </div>
+      )}
+
       {/* ── Overview section ── */}
       <section
         id="dashboard-panel-home"
@@ -454,16 +430,12 @@ function DashboardPage() {
         aria-labelledby="dashboard-tab-home"
         hidden={activeSection !== "home"}
       >
-        <DecisionSummary
-          plan={activePlan}
-          indoorTemp={indoorTemp?.avg_temperature ?? null}
+        <DecisionSummary plan={activePlan} indoorTemp={indoorTemp?.avg_temperature ?? null}
           indoorTimestamp={indoorTemp?.latest_reading ?? null}
           indoorStale={indoorTemp?.last_fresh_reading !== indoorTemp?.latest_reading}
-          controlState={controlState}
-          onRetry={fetchData}
-        />
-        <Dashboard data={data} />
+          controlState={controlState} onRetry={refreshNow} />
         <OperationalAlerts />
+        <Dashboard data={data} indoorTemp={indoorTemp?.avg_temperature ?? null} indoorSensorCount={indoorTemp?.sensor_count ?? 0} lastFreshReading={indoorTemp?.last_fresh_reading ?? null} latestReading={indoorTemp?.latest_reading ?? null} />
         <OutcomeSummary />
         <div id="controls">
           <Controls controlState={controlState} onChanged={async () => refreshNow()} />
@@ -471,6 +443,7 @@ function DashboardPage() {
         </div>
       </section>
 
+      {/* ── Plan section ── */}
       <section
         id="dashboard-panel-timeline"
         className="workspace-panel"
@@ -478,26 +451,18 @@ function DashboardPage() {
         aria-labelledby="dashboard-tab-timeline"
         hidden={activeSection !== "timeline"}
       >
-        {activeSection === "timeline" && (
-          <>
-            <PlanView
-              plan={activePlan}
-              controlledActions={timelineActions}
-              controlledError={timelineActionsError}
-              controlledLoading={timelineActionsLoading}
-            />
-            <TimelineWorkspace
-              planId={activePlan?.id}
-              controlState={controlState}
-              onActivity={(actions, activityError, activityLoading) => { setTimelineActivity(actions); setTimelineActivityError(activityError); setTimelineActivityLoading(activityLoading); }}
-              onActions={(actions, actionsError, actionsLoading) => { setTimelineActions(actions); setTimelineActionsError(actionsError); setTimelineActionsLoading(actionsLoading); }}
-            />
-            <PlanActivityTimeline activityData={timelineActivity} activityError={timelineActivityError} activityLoading={timelineActivityLoading} />
-            <PlanHistory />
-          </>
-        )}
+        {activeSection === "timeline" && <>
+          <PlanView plan={activePlan} controlledActions={timelineActions}
+            controlledError={timelineActionsError} controlledLoading={timelineActionsLoading} />
+          <TimelineWorkspace planId={activePlan?.id} controlState={controlState}
+            onActivity={(actions, error, loading) => { setTimelineActivity(actions); setTimelineActivityError(error); setTimelineActivityLoading(loading); }}
+            onActions={(actions, error, loading) => { setTimelineActions(actions); setTimelineActionsError(error); setTimelineActionsLoading(loading); }} />
+          <PlanActivityTimeline activityData={timelineActivity} activityError={timelineActivityError} activityLoading={timelineActivityLoading} />
+          <PlanHistory />
+        </>}
       </section>
 
+      {/* ── Charts section ── */}
       <section
         id="dashboard-panel-under-the-hood"
         className="workspace-panel"
@@ -505,6 +470,7 @@ function DashboardPage() {
         aria-labelledby="dashboard-tab-under-the-hood"
         hidden={activeSection !== "under-the-hood"}
       >
+        {activeSection === "under-the-hood" && <ComfortImpactChart />}
         <ConsumptionChart />
         <div id="raw-charts">
           <div style={{ marginBottom: "1rem" }}>

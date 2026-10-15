@@ -202,8 +202,7 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.offline")).toContainText("Disconnected");
-    await page.locator("summary", { hasText: "Heat pump details" }).click();
-    await expect(page.locator("details.heat-pump-details .data-age")).toHaveText("Unavailable");
+    await expect(page.locator("#dashboard-panel-home > .data-age")).toHaveText("Unavailable");
   });
 
   test("shows stale readings messaging for an old device sample", async ({ page }) => {
@@ -236,7 +235,6 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".status-badge.stale")).toContainText("Stale");
-    await page.locator("summary", { hasText: "Heat pump details" }).click();
     await expect(page.getByText("Latest readings", { exact: true })).toBeVisible();
     await expect(page.getByText(/Heat-pump readings are stale/)).toBeVisible();
   });
@@ -261,8 +259,7 @@ test.describe("Dashboard", () => {
 
     await page.goto("/");
     await expect(page.locator(".header-actions .data-age")).toHaveText("Updated just now");
-    await page.locator("summary", { hasText: "Heat pump details" }).click();
-    await expect(page.locator("details.heat-pump-details .data-age")).toHaveText("Updated 2 hours ago");
+    await expect(page.locator("#dashboard-panel-home > .data-age")).toHaveText("Updated 2 hours ago");
   });
 
   test("shows error banner on API failure", async ({ page }) => {

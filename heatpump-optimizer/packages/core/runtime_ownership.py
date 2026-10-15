@@ -38,7 +38,8 @@ async def run_owned_thread(function, *args, **kwargs):
         raise
 
 
-async def close_service_resources(*, scheduler=None, maintenance=None, wrapper=None):
+async def close_service_resources(*, scheduler=None, maintenance=None, wrapper=None, engine=None):
+    """Dispose only after every owner using the service's resources has settled."""
     from packages.core.log_sink import shutdown_log_sink
 
     if scheduler is not None:
@@ -50,3 +51,5 @@ async def close_service_resources(*, scheduler=None, maintenance=None, wrapper=N
     await shutdown_log_sink()
     if wrapper is not None:
         await wrapper.stop()
+    if engine is not None:
+        await engine.dispose()

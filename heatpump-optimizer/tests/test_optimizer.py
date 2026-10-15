@@ -1647,7 +1647,9 @@ class TestRulesOptimizer:
     def test_dhw_deadline_uses_next_days_local_schedule(self):
         optimizer = RulesOptimizer()
         start = dt.datetime(2026, 7, 12, 15, tzinfo=dt.timezone.utc)  # Sunday 17:00 in Amsterdam
-        prices = [(start + dt.timedelta(hours=h), 0.10) for h in range(24)]
+        # Isolate Monday's morning boundary; a full 24-hour endpoint now correctly
+        # also admits Monday's 17:00 deadline under the accepted S4 contract.
+        prices = [(start + dt.timedelta(hours=h), 0.10) for h in range(23)]
         weather = [(ts, 8.0) for ts, _ in prices]
         schedule = {
             "weekday": [7, 8, 9, 17, 18, 19, 20, 21],

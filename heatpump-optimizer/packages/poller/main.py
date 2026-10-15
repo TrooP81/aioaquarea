@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 from zoneinfo import ZoneInfo
 
+import httpx
 import structlog
 
 from packages.core.config import settings
@@ -28,7 +29,6 @@ from packages.poller.smartthings import poll_smartthings_temps
 from packages.core.settings_service import (
     get_bool_setting,
     get_int_setting,
-    get_string_setting,
     get_user_tz,
 )
 from packages.core.device_status_snapshot import build_device_status_record
@@ -283,28 +283,32 @@ async def poll_prices() -> None:
 
     try:
         feed = await fetch_price_feed()
+        if feed.rejection_reason is not None:
+            logger.error(
+                "price_fetch_failed",
+                error="provider_validation_failed",
+                provider=feed.source,
+                reason=feed.rejection_reason,
+            )
+            return
         prices = feed.prices
+        if prices and (
+            feed.context is None or not feed.context.area or feed.context.provider != feed.source
+        ):
+            raise ValueError("Price feed has no coherent fetch context")
         before_quality = await get_planning_data_quality() if prices else None
-        fetched_at = dt.datetime.now(dt.timezone.utc)
-        provider = await get_string_setting("price_provider")
-        if provider == "entsoe":
-            area = (await get_string_setting("entsoe_area")) or settings.entsoe_area
-        elif provider == "manual":
-            area = "manual"
-        else:
-            area = "tibber"
         async with get_session() as session:
             if prices:
                 stmt = pg_insert(PriceRecord).values(
                     [
                         {
                             "ts": ts,
-                            "area": area,
+                            "area": feed.context.area,
                             "price_eur_per_kwh": price,
                             "price_currency": feed.currency,
                             "price_source": feed.source,
-                            "fetched_at": fetched_at,
-                            "interval_schema": "hourly_duration_weighted_v1",
+                            "fetched_at": feed.context.started_at,
+                            "interval_schema": feed.interval_schema,
                         }
                         for ts, price in prices
                     ]
@@ -330,11 +334,15 @@ async def poll_prices() -> None:
         logger.info(
             "prices_fetched",
             count=len(prices),
-            provider=settings.price_provider,
+            provider=feed.source,
             currency=feed.currency,
         )
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "price_fetch_failed", error="http_status_error", status_code=e.response.status_code
+        )
     except Exception as e:
-        logger.error("price_fetch_failed", error=str(e))
+        logger.error("price_fetch_failed", error=type(e).__name__)
 
 
 async def _queue_price_horizon_reoptimization(
@@ -398,7 +406,7 @@ async def poll_weather() -> None:
                     [
                         {
                             "ts": entry["ts"],
-                            "source": entry.get("source", "open-meteo"),
+                            "source": entry["source"],
                             "temperature": entry["temperature"],
                             "irradiance": entry.get("irradiance"),
                             "wind_speed": entry.get("wind_speed"),
@@ -633,8 +641,10 @@ async def main() -> None:
     finally:
 
         async def cleanup():
+            from packages.core.database import engine
+
             await close_service_resources(
-                scheduler=scheduler, maintenance=maintenance, wrapper=wrapper
+                scheduler=scheduler, maintenance=maintenance, wrapper=wrapper, engine=engine
             )
 
         await finish_owned_cleanup(cleanup)

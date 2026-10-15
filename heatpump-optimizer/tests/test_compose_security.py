@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from packages.core.config import Settings
 from scripts import render_compose_evidence
@@ -82,6 +83,28 @@ def _render_compose_evidence(
 
 
 class TestComposeSecurity:
+    def test_guarded_restore_service_matches_the_restore_script_contract(self) -> None:
+        compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        restore = compose["services"]["restore-tool"]
+        script = (PROJECT_ROOT / "scripts" / "restore_db.sh").read_text(encoding="utf-8")
+
+        assert "restore-tool sh /scripts/restore_archive.sh" in script
+        assert restore["profiles"] == ["maintenance"]
+        assert restore["entrypoint"] == []
+        assert restore["environment"]["RESTORE_DISPOSABLE"] == "false"
+        assert restore["image"] == compose["services"]["db"]["image"].split(":-", 1)[1][:-1]
+        assert "./backups:/backups:ro" in restore["volumes"]
+        assert "./scripts/restore_archive.sh:/scripts/restore_archive.sh:ro" in restore["volumes"]
+        assert "Use scripts/restore_db.sh for guarded restores" in restore["command"][-1]
+        assert "exit 2" in restore["command"][-1]
+
+    def test_live_compose_has_no_incompatible_backup_verifier(self) -> None:
+        compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        assert "backup-verify" not in compose["services"]
+        for service in compose["services"].values():
+            command = service.get("command", [])
+            assert "/scripts/verify_backup.sh" not in command
+
     def test_all_compose_env_files_default_to_dotenv_when_not_overridden(self) -> None:
         env_file_entries = []
         for compose_file in COMPOSE_FILES:

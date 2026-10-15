@@ -45,6 +45,7 @@ async def lifespan(application: FastAPI):
     from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
 
     wrapper: AquareaWrapper | None = None
+    failed_wrapper_stopped = True
     try:
         configure_logging("api")
         if settings.panasonic_distributed_read_quota_enabled:
@@ -56,14 +57,25 @@ async def lifespan(application: FastAPI):
                 # Transfer disposal ownership before awaiting so final cleanup cannot
                 # stop the failed wrapper a second time, including after cancellation.
                 failed_wrapper, wrapper = wrapper, None
-                await finish_owned_cleanup(failed_wrapper.stop)
+                failed_wrapper_stopped = False
+
+                async def stop_failed_wrapper():
+                    nonlocal failed_wrapper_stopped
+                    await failed_wrapper.stop()
+                    failed_wrapper_stopped = True
+
+                await finish_owned_cleanup(stop_failed_wrapper)
             else:
                 application.state.aquarea_wrapper = wrapper
         yield
     finally:
 
         async def cleanup():
-            await close_service_resources(wrapper=wrapper)
+            from packages.core.database import engine
+
+            await close_service_resources(
+                wrapper=wrapper, engine=engine if failed_wrapper_stopped else None
+            )
             if hasattr(application.state, "aquarea_wrapper"):
                 del application.state.aquarea_wrapper
 

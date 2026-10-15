@@ -10,8 +10,11 @@ Usage in service entry points::
 
 Admission does not wait for capacity. The queue owns at most 1,000 rows,
 including in-flight batches; encoded rows are limited to 8 KiB and batches
-to 100 rows. A batch is acknowledged only after the transaction context
-commits. Failed writes retain ownership for at most three attempts or
+to 100 rows. Capacity is reserved before bounded traversal/encoding; unsupported
+values, excessive nesting and unencodable rows use the oversize drop counter.
+Failure diagnostics use at most one daemon writer, never the event loop.
+A batch is acknowledged only after the transaction context commits.
+Failed writes retain ownership for at most three attempts or
 30 seconds, with bounded attempt waits. Drop counters are exposed by
 ``log_sink_status``. Entries older than 24 h are pruned on each write.
 
@@ -27,6 +30,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -50,6 +54,7 @@ class _BufferedLog:
 _LOG_BUFFER: list[_BufferedLog] = []
 _BUFFER_LOCK = asyncio.Lock()
 _ADMISSION_LOCK = threading.Lock()
+_ENCODING_ROWS = 0
 _MAX_OWNED_ROWS = 1000
 _BATCH_SIZE = 100
 _MAX_ENCODED_ROW_BYTES = 8 * 1024
@@ -65,6 +70,9 @@ _SERVICE_NAME: str = "unknown"
 _FLUSH_TASK: asyncio.Task[None] | None = None
 _INFLIGHT_TASK: asyncio.Task[None] | None = None
 _INFLIGHT_BATCH: list[_BufferedLog] = []
+_DIAGNOSTIC_LOCK = threading.Lock()
+_DIAGNOSTIC_THREAD: threading.Thread | None = None
+_DIAGNOSTIC_DROPS = 0
 
 # Retention: keep only the last 24 h of logs
 _RETENTION_HOURS = 24
@@ -75,55 +83,122 @@ def _record_drop(reason: str, count: int = 1) -> None:
         _DROP_COUNTS[reason] += count
 
 
-def _db_log_processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-    """Structlog processor: enqueue a log row for async DB persistence."""
-    # Extract the fields we care about
-    level = method_name.upper()
-    event = str(event_dict.get("event", ""))[:256]
-    logger_name = event_dict.get("logger", None)
-    if logger_name:
-        logger_name = str(logger_name)[:128]
+def _bounded_json(value: Any, *, ensure_ascii=True, skip=frozenset()) -> str:
+    """Encode at most 8 KiB, 4096 nodes and 16 levels, without copying input trees.
 
-    # Everything except the standard keys goes into details_json
+    Strings are escaped one character at a time so even a single enormous value
+    cannot allocate an oversized JSON chunk. Arbitrary __str__/iterator hooks
+    are not invoked by this best-effort path.
+    """
+    remaining_nodes = 4096
+    encoded = bytearray()
+
+    def chunks(item, depth=0):
+        nonlocal remaining_nodes
+        remaining_nodes -= 1
+        if remaining_nodes < 0 or depth > 16:
+            raise ValueError("log traversal budget exceeded")
+        kind = type(item)
+        if kind in (dt.datetime, dt.date):
+            item, kind = item.isoformat(), str
+        if kind is str:
+            yield '"'
+            for char in item:
+                yield json.dumps(char, ensure_ascii=ensure_ascii)[1:-1]
+            yield '"'
+        elif kind is dict:
+            yield "{"
+            separator = ""
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError("unsupported log key")
+                if depth == 0 and key in skip:
+                    continue
+                yield separator
+                yield from chunks(key, depth + 1)
+                yield ": "
+                yield from chunks(child, depth + 1)
+                separator = ", "
+            yield "}"
+        elif kind in (list, tuple):
+            yield "["
+            for index, child in enumerate(item):
+                if index:
+                    yield ", "
+                yield from chunks(child, depth + 1)
+            yield "]"
+        elif item is None or kind is bool:
+            yield json.dumps(item)
+        elif kind is int and item.bit_length() <= 256:
+            yield str(item)
+        elif kind is float and math.isfinite(item):
+            yield json.dumps(item)
+        else:
+            raise ValueError("unsupported log value")
+
+    for chunk in chunks(value):
+        part = chunk.encode("utf-8")
+        if len(encoded) + len(part) > _MAX_ENCODED_ROW_BYTES:
+            raise ValueError("encoded log budget exceeded")
+        encoded.extend(part)
+    return encoded.decode("utf-8")
+
+
+def _log_text(value: Any, limit: int) -> str:
+    if type(value) is str:
+        return value[:limit]
+    # Only bounded builtin conversion; never call application __str__ methods.
+    return _bounded_json(value)[:limit]
+
+
+def _encode_row(method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     skip = {"event", "logger", "level", "timestamp", "_record"}
-    details = {k: v for k, v in event_dict.items() if k not in skip}
-    # Ensure JSON-safe values
-    for k, v in list(details.items()):
-        if isinstance(v, (dt.datetime, dt.date)):
-            details[k] = v.isoformat()
-        elif not isinstance(v, (str, int, float, bool, list, dict, type(None))):
-            details[k] = str(v)
-
-    try:
-        details_json = json.dumps(details, default=str) if details else None
-    except (TypeError, ValueError, OverflowError):
-        _record_drop("oversize")
-        return event_dict
-
+    details_json = _bounded_json(event_dict, skip=skip)
+    logger_name = event_dict.get("logger")
+    logger_name = None if logger_name is None else _log_text(logger_name, 128)
     entry = {
-        "level": level,
+        "level": _log_text(method_name, 32).upper(),
         "logger_name": logger_name,
-        "event": event,
-        "details_json": details_json,
+        "event": _log_text(event_dict.get("event", ""), 256),
+        "details_json": None if details_json == "{}" else details_json,
         "service": _SERVICE_NAME,
     }
+    _bounded_json(entry, ensure_ascii=False)
+    return entry
 
-    if len(json.dumps(entry, ensure_ascii=False).encode("utf-8")) > _MAX_ENCODED_ROW_BYTES:
-        _record_drop("oversize")
-        return event_dict
+
+def _db_log_processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Reserve ownership before inspecting the event; never wait for queue capacity."""
+    global _ENCODING_ROWS
     if not _ADMISSION_LOCK.acquire(blocking=False):
         _record_drop("saturation")
         return event_dict
     try:
         if _CLOSING:
             _record_drop("shutdown")
-        elif len(_LOG_BUFFER) >= _MAX_OWNED_ROWS:
+            return event_dict
+        if len(_LOG_BUFFER) + _ENCODING_ROWS >= _MAX_OWNED_ROWS:
             _record_drop("saturation")
-        else:
-            _LOG_BUFFER.append(_BufferedLog(entry, time.monotonic()))
+            return event_dict
+        _ENCODING_ROWS += 1
     finally:
         _ADMISSION_LOCK.release()
 
+    admitted_at = time.monotonic()
+    entry = None
+    try:
+        entry = _encode_row(method_name, event_dict)
+    except (TypeError, ValueError, OverflowError, UnicodeError, RecursionError, RuntimeError):
+        _record_drop("oversize")
+    finally:
+        # Metadata-only critical section: no encoding, I/O or capacity wait.
+        with _ADMISSION_LOCK:
+            _ENCODING_ROWS -= 1
+            if entry is not None:
+                if _CLOSING:
+                    _record_drop("shutdown")
+                else:
+                    _LOG_BUFFER.append(_BufferedLog(entry, admitted_at))
     return event_dict
 
 
@@ -161,12 +236,44 @@ def log_sink_status() -> dict[str, object]:
         with _DROP_LOCK:
             drops = dict(_DROP_COUNTS)
         return {
-            "owned_rows": len(_LOG_BUFFER),
+            "owned_rows": len(_LOG_BUFFER) + _ENCODING_ROWS,
+            "encoding_rows": _ENCODING_ROWS,
             "inflight_rows": len(_INFLIGHT_BATCH),
             "maximum_owned_rows": _MAX_OWNED_ROWS,
             "drops": drops,
             "accepting": not _CLOSING,
+            "diagnostic_pending": _DIAGNOSTIC_LOCK.locked(),
+            "diagnostic_drops": _DIAGNOSTIC_DROPS,
         }
+
+
+def _report_flush_failure(exc: Exception) -> None:
+    """At most one bounded message/writer; a stalled stderr cannot stall asyncio."""
+    global _DIAGNOSTIC_THREAD, _DIAGNOSTIC_DROPS
+    if not _DIAGNOSTIC_LOCK.acquire(blocking=False):
+        with _DROP_LOCK:
+            _DIAGNOSTIC_DROPS += 1
+        return
+    sink = sys.stderr
+    message = f"log sink flush failed: {type(exc).__name__[:128]}\n"
+
+    def write():
+        global _DIAGNOSTIC_DROPS
+        try:
+            sink.write(message)
+        except Exception:
+            with _DROP_LOCK:
+                _DIAGNOSTIC_DROPS += 1
+        finally:
+            _DIAGNOSTIC_LOCK.release()
+
+    try:
+        _DIAGNOSTIC_THREAD = threading.Thread(target=write, daemon=True)
+        _DIAGNOSTIC_THREAD.start()
+    except Exception:
+        _DIAGNOSTIC_LOCK.release()
+        with _DROP_LOCK:
+            _DIAGNOSTIC_DROPS += 1
 
 
 def _acknowledge_batch(batch: list[_BufferedLog]) -> None:
@@ -192,7 +299,7 @@ def _settle_inflight() -> None:
                 _record_drop("shutdown", len(batch))
                 del _LOG_BUFFER[: len(batch)]
     except Exception as exc:
-        sys.stderr.write(f"log sink flush failed: {type(exc).__name__}\n")
+        _report_flush_failure(exc)
         if _CLOSING:
             with _ADMISSION_LOCK:
                 _record_drop("shutdown", len(batch))
