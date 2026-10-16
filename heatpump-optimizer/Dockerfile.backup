@@ -4,8 +4,3 @@ FROM ${TIMESCALE_IMAGE}
 # Backup replication can optionally encrypt archives before copying them to
 # the replica directory. The pinned Timescale image is Alpine-based.
 RUN apk add --no-cache openssl
-# Alpine supplies BusyBox timeout (-k is its kill-after option) and setsid.
-# Fail the image build rather than silently losing the hard termination bound.
-RUN timeout --help 2>&1 | grep -q -- '-k' && command -v setsid
-
-COPY scripts/backup_db.sh scripts/backup_status.sql scripts/stage_backup.sh /scripts/

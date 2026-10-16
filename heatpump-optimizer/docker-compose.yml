@@ -139,8 +139,6 @@ services:
     restart: unless-stopped
 
   backup:
-    # Staged only. Activation (including the immediate first dump) needs approval.
-    profiles: [ "backup" ]
     # Uses the same pinned PostgreSQL/Timescale image as the primary database,
     # so pg_dump and pg_restore always match the server major version. The
     # derived image adds only OpenSSL for optional encrypted replication.
@@ -156,20 +154,18 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: ${POSTGRES_DB}
       BACKUP_DIR: /backups
-      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-2592000}
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-100}
-      BACKUP_MAX_AGE_SECONDS: ${BACKUP_MAX_AGE_SECONDS:-2764800}
-      BACKUP_TIMEOUT_SECONDS: ${BACKUP_TIMEOUT_SECONDS:-3600}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_VERIFY_AFTER_DUMP: ${BACKUP_VERIFY_AFTER_DUMP:-false}
       BACKUP_REPLICA_ENABLED: ${BACKUP_REPLICA_ENABLED:-false}
       BACKUP_REPLICA_DIR: /replica
       BACKUP_REPLICA_REQUIRED: ${BACKUP_REPLICA_REQUIRED:-false}
       BACKUP_REPLICA_ENCRYPTION_KEY: ${BACKUP_REPLICA_ENCRYPTION_KEY:-}
     command: [ "/bin/sh", "/scripts/backup_db.sh" ]
     volumes:
-      - ${BACKUP_HOST_DIR:-./backups}:/backups
+      - ./backups:/backups
       - ./scripts/backup_db.sh:/scripts/backup_db.sh:ro
-      - ./scripts/backup_status.sql:/scripts/backup_status.sql:ro
-      - ./scripts/stage_backup.sh:/scripts/stage_backup.sh:ro
+      - ./scripts/verify_backup.sh:/scripts/verify_backup.sh:ro
       - ${BACKUP_REPLICA_HOST_DIR:-./backups-replica}:/replica
     depends_on:
       db:

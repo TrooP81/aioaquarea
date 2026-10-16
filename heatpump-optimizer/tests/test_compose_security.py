@@ -83,26 +83,6 @@ def _render_compose_evidence(
 
 
 class TestComposeSecurity:
-    def test_backup_is_staged_and_monthly_without_infrastructure_replacement(self) -> None:
-        compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
-        backup = compose["services"]["backup"]
-        assert backup["profiles"] == ["backup"]
-        assert backup["environment"]["BACKUP_INTERVAL_SECONDS"].endswith(":-2592000}")
-        assert backup["environment"]["BACKUP_RETENTION_DAYS"].endswith(":-100}")
-        assert "${BACKUP_HOST_DIR:-./backups}:/backups" in backup["volumes"]
-        overlay = yaml.safe_load(
-            (PROJECT_ROOT / "docker-compose.backup.yml").read_text(encoding="utf-8")
-        )
-        assert set(overlay["services"]) == {"backup"}
-        staged = overlay["services"]["backup"]
-        assert staged["profiles"] == ["backup"]
-        assert not staged.get("ports")
-        assert staged["volumes"][0]["bind"]["create_host_path"] is False
-        assert staged["volumes"][0]["source"].startswith("${BACKUP_HOST_DIR:?")
-        assert overlay["networks"]["source"]["external"] is True
-        assert staged["environment"]["BACKUP_REPLICA_ENABLED"] == "false"
-        assert staged["environment"]["BACKUP_REPLICA_REQUIRED"] == "false"
-
     def test_guarded_restore_service_matches_the_restore_script_contract(self) -> None:
         compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
         restore = compose["services"]["restore-tool"]

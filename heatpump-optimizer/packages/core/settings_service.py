@@ -13,7 +13,6 @@ from typing import Any
 from sqlalchemy import select, text
 
 from packages.core.config import settings as env_settings
-from packages.core.backup_health import BACKUP_BOUNDS, BACKUP_DEFAULTS, BackupPolicy
 from packages.core.database import get_session
 from packages.core.heat_curve import HEAT_CURVE_SETTING_KEYS, HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig
@@ -556,20 +555,6 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
 }
 
-SETTINGS_SCHEMA.update(
-    {
-        key: {
-            "type": "int",
-            "default": str(default),
-            "default_env": key,
-            "min_value": BACKUP_BOUNDS[key][0],
-            "max_value": BACKUP_BOUNDS[key][1],
-            "description": "Backup policy; validated transactionally with the other backup settings",
-        }
-        for key, default in BACKUP_DEFAULTS.items()
-    }
-)
-
 SETTING_SPECS: dict[str, SettingSpec] = {
     key: SettingSpec(
         key=key,
@@ -772,7 +757,7 @@ async def get_string_setting(key: str) -> str:
 
 async def set_setting(key: str, value: str) -> None:
     """Upsert a setting in the DB."""
-    if key == "seasonal_calibration_enabled" or key in BACKUP_DEFAULTS:
+    if key == "seasonal_calibration_enabled":
         await set_settings_bulk({key: value})
         return
     if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
@@ -829,11 +814,6 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
         rows = await session.execute(select(SettingRecord))
         values.update({row.key: row.value for row in rows.scalars() if row.key in values})
         values.update(updates)
-        if BACKUP_DEFAULTS.keys() & updates.keys():
-            BackupPolicy.from_settings(
-                values,
-                fallbacks={key: getattr(env_settings, key) for key in BACKUP_DEFAULTS},
-            )
         if updates.get("_seasonal_calibration_campaign_since") and not _parse_bool(
             values["seasonal_calibration_enabled"]
         ):

@@ -48,7 +48,7 @@ retirement is not physical OFF verification; it creates no pending carryover.
 - **Configurable settings UI**: Tank/comfort bounds, quiet mode hours, price sensitivity, learning thresholds — editable from the dashboard
 - **Application log viewer**: Live, filterable view of structured logs from all services on the settings page
 - **Operational alerts**: In-app (and optional webhook) alerts for stale data, adaptor outages, failed actions, and degraded forecasts
-- **Database backups (staged)**: Monthly PostgreSQL archives, protected retention, separate backup/attempt/restore histories, and an explicitly approved isolated initial drill
+- **Automated backups**: Daily PostgreSQL archives with retention, isolated restore drills, and optional encrypted replica
 - **Audit log**: Every executed action is recorded
 
 ## Quick Start
@@ -127,49 +127,49 @@ Panasonic Comfort Cloud username and password are entered in the dashboard **Set
 | `migrate` | — | One-shot `alembic upgrade head`; `poller`, `optimizer`, and `api` start after it succeeds |
 | `db` | `DB_PORT` (5434 → container 5432) | TimescaleDB |
 | `redis` | (internal only) | Panasonic auth circuit-breaker state |
-| `backup` | — | Inactive `backup` profile; deployment-configured protected storage |
+| `backup` | — | Scheduled `pg_dump` archives into `./backups` |
 | `restore-tool` | — | `maintenance` profile only; pinned tools for the guarded restore entry point, not a live verifier |
 
 ## Backups And Calibration
 
-The reviewed monthly backup implementation is **staged, not activated or
-operationally qualified**. Defaults are a fixed 30-day UTC interval, 32-day
-freshness, 100-day retention and a one-hour timeout. Configure the four numeric
-policy keys through the existing settings API; updates validate the merged policy
-transactionally. Existing stored values still win. The worker checks due state
-every 60 seconds and anchors scheduling to the last successful snapshot across
-restarts, with five-minute failure retry spacing.
+The `backup` service creates PostgreSQL custom-format archives every 24 hours by default and retains completed archives for 14 days. Set `BACKUP_INTERVAL_SECONDS` and `BACKUP_RETENTION_DAYS` to change those bounds. Optional encrypted replicas require `BACKUP_REPLICA_ENABLED=true` and `BACKUP_REPLICA_ENCRYPTION_KEY`; set `BACKUP_REPLICA_REQUIRED=true` only when a failed replica should make backup health fail.
 
-The approved deployment-only `BACKUP_HOST_DIR` is
-`D:\backups\heatpump-optimizer\` (never its parent). Off-host replication is disabled
-and not required. Latest successful/newest eligible/latest verified archives and
-at least two eligible snapshots override age-based deletion. Unknown protection,
-invalid manifests/checksums or uncertain inventory block deletion rather than
-guessing. The primary archives are plaintext within separately protected storage.
+The legacy live-pointed verifier has been removed. `BACKUP_VERIFY_AFTER_DUMP` is
+forced to `false` in Compose. Never verify on `PGHOST=db`, against the live
+database, or on the live Compose network. `verify_backup.sh` rejects these targets
+and a missing `BACKUP_VERIFY_ISOLATED=true` marker before inspecting any archive.
 
-Readiness, operational alerts and the dashboard distinguish successful backup,
-latest attempt and verified restore. A heartbeat update, disabled alert delivery,
-empty alert list or UI loading failure is not evidence of backup health. Public
-summaries and backup webhook details exclude archive identifiers/paths/checksums,
-source identity, credentials and database error text.
+Run the synthetic Timescale drill with Docker and a POSIX shell:
 
-The supported qualification route is the existing **owned Linux CI `backend-e2e`**
-job, including the supplementary source-bound `backup-roundtrip`, `check-backup`
-and full seal after ordinary E2E. No bare Compose invocation or native Windows
-qualification is claimed. Legacy standalone restore workflows/tests are regression
-coverage, not a replacement for the owned phase or approval for household drills.
-Recurring real-backup drills are not part of the approved monthly design.
+```bash
+RUN_DOCKER_RESTORE_TESTS=1 python -m pytest tests/test_restore_db_integration.py --noconftest -q -s
+```
 
-See [configuration reference](docs/configuration-reference.md#backups) and
-[backup runbook](docs/backup-runbook.md) for the source receipt, immutable
-coordinator-base input, locked staging, capacity/deadline/cleanup contracts and
-separate activation/first-live-dump/drill approval gates. No activation should
-occur before those qualification gates pass.
+The dedicated `Backup Restorability Phase 1` workflow runs the synthetic drill on
+every PR. It proves the missing-`heatpump` role failure at `bgw_job` COPY, successful
+full restore with a disposable `heatpump NOLOGIN` role, four hypertables/chunks/
+validated parent keys, and actual scheduled job execution after database rename.
+The execution probe uses the existing disposable login role: TimescaleDB will not
+run jobs owned by a `NOLOGIN` compatibility role. Real production roles are checked,
+never created or altered automatically.
 
-The owner accepts approximately **30 days nominal RPO**, local-only loss,
-exclusion of external keys/Compose secrets/configuration/`modeldata`, and initial
-source/schema restore qualification only. Source/schema changes need renewed
-qualification. These are database backups, not complete application recovery.
+Weekly real-backup drills run Sunday at 04:17 UTC on a dedicated Linux self-hosted
+runner labelled `restore-drill`. Configure repository variables
+`RESTORE_DRILL_BACKUP_DIR`, `RESTORE_DRILL_EXPECTED_REVISION`, and
+`RESTORE_DRILL_TMPFS_BYTES`. Give that runner read-only archive access, no live
+database credentials or live volumes, and enough Docker-host memory. Real dumps
+are never used on hosted PR runners or uploaded as CI artifacts.
+
+Each drill uses a unique `restore-db-production-test-*` project, an internal-only
+network with no published ports, the immutable image, read-only backups, tmpfs
+storage, explicit PostgreSQL settings, and unconditional project/volume cleanup.
+The legacy manual budget is 2 GiB tmpfs plus 2 GiB process headroom. For a known
+source size `S`, provision at least `ceil(1.5*S) + 1 GiB`, rounded up to 256 MiB,
+for tmpfs; container memory is always tmpfs plus 2 GiB. Do not infer `S` from the
+compressed archive size. Resource failures report `verification_resource_failed`,
+not archive corruption. Phase 2 will add metadata-driven automatic sizing,
+container-state/OOM inspection, the isolated scheduler launcher, and backup health
+state reporting; those are not shipped here.
 
 ### Local Evidence And Restore Runbook
 

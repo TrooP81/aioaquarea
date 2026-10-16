@@ -4155,10 +4155,6 @@ class TestCOPRetirementAPI:
         }
         with (
             patch(
-                "packages.core.backup_health.load_backup_health",
-                new=AsyncMock(return_value={"ready": True, "reason_codes": []}),
-            ),
-            patch(
                 "packages.api.routers.models_router.get_session",
                 return_value=_session_context(session),
             ),
