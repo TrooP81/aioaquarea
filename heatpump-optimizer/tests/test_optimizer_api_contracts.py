@@ -3195,21 +3195,24 @@ async def test_dashboard_uses_data_quality_threshold_for_status_freshness() -> N
 
 
 @pytest.mark.asyncio
-async def test_stats_source_date_grouping_keeps_timestamp_bounds() -> None:
-    consumption_result = SimpleNamespace(one=lambda: (1.0, 2.0, 3.0))
-    price_result = SimpleNamespace(scalar=lambda: 0.1)
+async def test_stats_confirmed_intervals_keep_timestamp_bounds() -> None:
+    consumption_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    price_result = SimpleNamespace(all=lambda: [])
     session = SimpleNamespace(execute=AsyncMock(side_effect=[consumption_result, price_result]))
-
-    with patch(
-        "packages.api.routers.dashboard.get_session", return_value=_session_context(session)
+    with (
+        patch("packages.api.routers.dashboard.get_session", return_value=_session_context(session)),
+        patch("packages.api.routers.dashboard.get_user_tz", new=AsyncMock(return_value="UTC")),
+        patch(
+            "packages.api.routers.dashboard.get_active_price_context",
+            new=AsyncMock(return_value=SimpleNamespace(area="FI", currency="EUR", source="entsoe")),
+        ),
     ):
         response = await get_stats("day")
-
-    assert response.total_kwh == 6.0
+    assert response.total_kwh is None
+    assert response.complete is False
+    assert response.coverage_pct is None
     stats_sql = str(session.execute.call_args_list[0].args[0])
-    assert "source_date" in stats_sql
-    assert "consumption.ts >=" in stats_sql
-    assert "consumption.ts <=" in stats_sql
+    assert "consumption.ts >=" in stats_sql and "consumption.ts <=" in stats_sql
 
 
 @pytest.mark.asyncio

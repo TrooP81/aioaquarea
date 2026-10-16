@@ -3,10 +3,9 @@ from __future__ import annotations
 import datetime as dt
 import asyncio
 import time
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import Date, and_, desc, func, select
+from sqlalchemy import and_, desc, func, select
 import structlog
 
 from packages.api._helpers import get_price_area
@@ -36,7 +35,13 @@ from packages.core.models import (
     SpaceHeatingGateRecord,
 )
 from packages.core.operational_alerts import device_status_is_fresh
-from packages.core.plan_outcome import cumulative_counter_delta, effective_source_date, hour_start
+from packages.core.plan_outcome import (
+    cumulative_counter_delta,
+    duration_allocated_cost,
+    effective_source_date,
+    hour_start,
+)
+from packages.core.pricing import get_active_price_context
 from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
     get_space_heating_gate_config,
@@ -57,11 +62,6 @@ async def get_dashboard():
     now = dt.datetime.now(dt.timezone.utc)
     timezone_name = await get_user_tz()
     today_start = local_day_start_utc(now, timezone_name)
-    today_source_date = now.astimezone(ZoneInfo(timezone_name)).date()
-    effective_source_date_expression = func.coalesce(
-        ConsumptionRecord.source_date,
-        func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
-    )
     device_quality = await get_device_data_quality(now=now)
 
     async with get_session() as session:
@@ -127,9 +127,8 @@ async def get_dashboard():
 
         consumption_records_result = await session.execute(
             select(ConsumptionRecord)
-            .where(ConsumptionRecord.ts >= today_start)
-            .where(ConsumptionRecord.ts <= now)
-            .where(effective_source_date_expression == today_source_date)
+            .where(ConsumptionRecord.ts >= today_start - dt.timedelta(hours=2))
+            .where(ConsumptionRecord.ts <= now + dt.timedelta(hours=2))
             .order_by(ConsumptionRecord.ts)
         )
         consumption_records = consumption_records_result.scalars().all()
@@ -184,48 +183,32 @@ async def get_dashboard():
         else None
     )
 
-    latest_by_device = {record.device_id: record for record in consumption_records}
-    today_kwh = sum(
-        (record.heat_kwh or 0) + (record.cool_kwh or 0) + (record.tank_kwh or 0)
-        for record in latest_by_device.values()
-    )
-
     current_price = current_price_row[0] if current_price_row is not None else None
     price_currency = current_price_row[1] if current_price_row is not None else "EUR"
     price_source = current_price_row[2] if current_price_row is not None else "unavailable"
-    priced_cost = 0.0
-    priced_kwh = 0.0
-    unpriced_kwh = 0.0
-    prev_record = None
-    for record in consumption_records:
-        if prev_record is not None and effective_source_date(record) == effective_source_date(
-            prev_record
-        ):
-            heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
-            cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
-            tank_delta = max(0.0, (record.tank_kwh or 0) - (prev_record.tank_kwh or 0))
-            delta_kwh = heat_delta + cool_delta + tank_delta
-            if delta_kwh > 0:
-                hour_key = hour_start(record.ts)
-                price_entry = price_by_hour.get(hour_key)
-                if (
-                    price_entry is not None
-                    and price_entry[1] == price_currency
-                    and price_entry[2] == price_source
-                ):
-                    priced_cost += delta_kwh * price_entry[0]
-                    priced_kwh += delta_kwh
-                else:
-                    unpriced_kwh += delta_kwh
-        prev_record = record
-
-    # The first cumulative meter sample of the day has no preceding sample in
-    # this query. Treat that energy as unpriced rather than attributing it to a
-    # guessed market hour. This makes the displayed coverage truthful.
-    unpriced_kwh += max(0.0, today_kwh - priced_kwh - unpriced_kwh)
-    today_cost_complete = today_kwh <= 0.0001 or unpriced_kwh <= 0.0001
-    today_cost = priced_cost if today_cost_complete else None
-    coverage_pct = 100.0 if today_kwh <= 0.0001 else (priced_kwh / today_kwh) * 100.0
+    # Daily tariff provenance must survive a gap in the current-hour feed.
+    daily_price_context = (
+        price_by_hour[max(price_by_hour)][1:] if price_by_hour else (price_currency, price_source)
+    )
+    daily_currency, daily_source = daily_price_context
+    outcome = duration_allocated_cost(
+        consumption_records,
+        {
+            ts: price
+            for ts, (price, currency, source) in price_by_hour.items()
+            if currency == daily_currency and source == daily_source
+        },
+        start=today_start,
+        end=now,
+        timezone_name=timezone_name,
+    )
+    today_kwh = outcome["measured_kwh"]
+    priced_kwh = outcome["priced_kwh"]
+    unpriced_kwh = outcome["unpriced_kwh"]
+    priced_cost = outcome["partial_priced_amount"]
+    today_cost_complete = outcome["complete"]
+    today_cost = outcome["total_cost"]
+    coverage_pct = outcome["coverage_pct"]
 
     return DashboardResponse(
         current_status=DeviceStatusResponse(
@@ -271,12 +254,14 @@ async def get_dashboard():
         price_currency=price_currency,
         price_source=price_source,
         today_kwh=today_kwh,
+        today_telemetry_status=outcome["telemetry_status"],
+        today_cost_allocation_basis=outcome["allocation_basis"],
         today_cost_eur=today_cost,
-        today_cost_currency=price_currency,
+        today_cost_currency=daily_currency,
         today_cost_priced_kwh=priced_kwh,
         today_cost_unpriced_kwh=unpriced_kwh,
         today_cost_priced_amount=priced_cost,
-        today_cost_coverage_pct=round(max(0.0, min(100.0, coverage_pct)), 1),
+        today_cost_coverage_pct=coverage_pct,
         today_cost_complete=today_cost_complete,
         active_plan=PlanResponse(
             id=active_plan.id,
@@ -506,47 +491,45 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
     else:
         since = now - dt.timedelta(days=30)
 
+    context = await get_active_price_context()
+    timezone_name = await get_user_tz()
     async with get_session() as session:
-        effective_date = func.coalesce(
-            ConsumptionRecord.source_date,
-            func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
+        meter_result = await session.execute(
+            select(ConsumptionRecord)
+            .where(ConsumptionRecord.ts >= since - dt.timedelta(hours=2))
+            .where(ConsumptionRecord.ts <= now + dt.timedelta(hours=2))
+            .order_by(ConsumptionRecord.ts)
         )
-        daily_latest = (
-            select(
-                ConsumptionRecord.heat_kwh.label("heat"),
-                ConsumptionRecord.cool_kwh.label("cool"),
-                ConsumptionRecord.tank_kwh.label("tank"),
-                func.row_number()
-                .over(
-                    partition_by=(ConsumptionRecord.device_id, effective_date),
-                    order_by=ConsumptionRecord.ts.desc(),
-                )
-                .label("row_number"),
-            )
-            .where(ConsumptionRecord.ts >= since)
-            .where(ConsumptionRecord.ts <= now)
-            .subquery()
-        )
-        cons_result = await session.execute(
-            select(
-                func.sum(daily_latest.c.heat),
-                func.sum(daily_latest.c.cool),
-                func.sum(daily_latest.c.tank),
-            ).where(daily_latest.c.row_number == 1)
-        )
-        cons = cons_result.one()
-        total_kwh = (cons[0] or 0) + (cons[1] or 0) + (cons[2] or 0)
-
         price_result = await session.execute(
-            select(func.avg(PriceRecord.price_eur_per_kwh)).where(PriceRecord.ts >= since)
+            select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
+            .where(PriceRecord.ts >= hour_start(since), PriceRecord.ts < now)
+            .where(PriceRecord.area == context.area)
+            .where(PriceRecord.price_source == context.source)
+            .where(PriceRecord.price_currency == context.currency)
         )
-        avg_price = price_result.scalar() or 0.10
-
-    total_cost = total_kwh * avg_price
+        outcome = duration_allocated_cost(
+            meter_result.scalars().all(),
+            dict(price_result.all()),
+            start=since,
+            end=now,
+            timezone_name=timezone_name,
+        )
 
     return StatsResponse(
         period=period,
-        total_kwh=total_kwh,
-        total_cost_eur=total_cost,
-        avg_price_eur_kwh=avg_price,
+        window_start=since,
+        window_end=now,
+        price_area=context.area,
+        price_source=context.source,
+        price_currency=context.currency,
+        total_kwh=outcome["measured_kwh"] if outcome["telemetry_status"] != "unavailable" else None,
+        total_cost_eur=outcome["total_cost"],
+        avg_price_eur_kwh=outcome["flat_price_per_kwh"],
+        telemetry_status=outcome["telemetry_status"],
+        complete=outcome["complete"],
+        priced_kwh=outcome["priced_kwh"],
+        unpriced_kwh=outcome["unpriced_kwh"],
+        coverage_pct=outcome["coverage_pct"],
+        partial_priced_amount=outcome["partial_priced_amount"],
+        allocation_basis=outcome["allocation_basis"],
     )

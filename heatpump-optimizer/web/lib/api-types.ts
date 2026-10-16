@@ -194,3 +194,24 @@ export interface ReadQuotaResponse {
     counters: Record<"status" | "consumption" | "weekly_timer" | "manual", number>;
     observed_at: string;
 }
+/** Reporting only. Legacy *_eur names carry price_currency; no FX conversion. */
+export interface StatsResponse {
+    period: string;
+    window_start: string;
+    window_end: string;
+    price_area: string;
+    price_source: string;
+    price_currency: string;
+    total_kwh: number | null;
+    total_cost_eur: number | null;
+    avg_cop: number | null;
+    avg_price_eur_kwh: number | null;
+    savings_vs_baseline_eur: number | null;
+    telemetry_status: "complete" | "incomplete" | "unavailable";
+    complete: boolean;
+    priced_kwh: number;
+    unpriced_kwh: number;
+    coverage_pct: number | null;
+    partial_priced_amount: number | null;
+    allocation_basis: string;
+}
