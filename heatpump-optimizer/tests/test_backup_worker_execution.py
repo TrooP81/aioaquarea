@@ -216,7 +216,11 @@ def worker(tmp_path):
     return Harness(tmp_path, require_bash(working_bash()))
 
 
-def test_fake_clock_first_activation_and_suppression_after_persisted_success(worker):
+@pytest.mark.parametrize("shell_route", ["bash", "sh"])
+def test_fake_clock_first_activation_and_suppression_after_persisted_success(worker, shell_route):
+    if shell_route == "sh":
+        worker.bash = shutil.which("sh")
+        assert worker.bash, "Linux worker qualification requires /bin/sh"
     worker.run()
     first = worker.read("state.json")
     assert first["last_attempt"]["status"] == "succeeded"

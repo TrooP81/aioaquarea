@@ -152,7 +152,15 @@ Alpine-based image this is BusyBox ash, not bash. The worker therefore uses POSI
 functions/read/case/arithmetic only. No worker command substitution, backtick
 capture or external pipeline remains. SQL policy/due/identity/manifest/protection
 queries, archive/retention/replica checksums, UUID generation and clock reads all
-run through main-shell-owned process groups. Captured results use an exclusively
+run through main-shell-owned process groups. Each owned process's stdin is
+saved on fd 7 in the main shell before backgrounding, then
+explicitly forwarded and closed in both parent and child. This preserves SQL
+heredocs under dash/ash, whose asynchronous-list stdin otherwise becomes
+`/dev/null`; bash alone does not expose that defect. Group signals use POSIX
+`kill -s TERM -- -PGID` / `kill -s KILL -- -PGID`, including the staging watchdog.
+The abbreviated `kill -KILL -- -PGID` form is not portable to dash.
+
+Captured results use an exclusively
 created private `.work-<uuid>` directory and builtin reads, not subshells. Each
 invocation reads a fresh UUID from `/proc/sys/kernel/random/uuid`, the same Linux
 kernel interface already required for archive IDs, using POSIX builtin `read`.
@@ -195,6 +203,13 @@ authority. Detailed content assertions independently restore the exact
 checksum-bound synthetic dump; the guarded entry must additionally produce its
 own verified content/cleanup receipt and leave the source unchanged. No target is
 kept for inspection after that entry: verified teardown remains mandatory.
+
+The synthetic source role is LOGIN, without a superuser grant: Timescale's
+`add_retention_policy` registers a background process as its current role.
+The independent content restore uses a separate fresh cluster so it proves
+restored job roles are created NOLOGIN rather than adopting the source's LOGIN
+role. Synthetic qualification command diagnostics retain stderr and identify
+empty/malformed JSON commands; public backup-health output remains sanitized.
 
 Before any command capable of starting the worker, obtain approval explicitly
 covering **activation and the immediate first live dump**. Independently inspect

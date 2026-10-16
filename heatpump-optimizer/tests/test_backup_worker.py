@@ -84,14 +84,14 @@ def test_runtime_requires_kill_after_and_group_settlement_without_new_dependenci
     assert "Alpine" in dockerfile and "TIMESCALE_IMAGE" in dockerfile
     assert "timeout --help 2>&1 | grep -q -- '-k' && command -v setsid" in dockerfile
     assert 'setsid timeout -k 2 "$owned_limit"' in WORKER
-    assert 'kill -TERM -- "-$child"' in WORKER
-    assert 'kill -KILL -- "-$child"' in WORKER
+    assert 'kill -s TERM -- "-$child"' in WORKER
+    assert 'kill -s KILL -- "-$child"' in WORKER
     assert "sleep 2 || true" in WORKER
     assert "setsid sleep 60 &" in WORKER
     stage = (SCRIPTS / "stage_backup.sh").read_text(encoding="utf-8")
     assert 'exec timeout -k 2 "$2" sh "$0" copy' in stage
     assert 'setsid sh "$0" bounded-copy "$seconds"' in stage
-    assert 'kill -KILL -- "-$group"' in stage
+    assert 'kill -s KILL -- "-$group"' in stage
     assert "flock -w 50 8" in stage
     assert "trap '' TERM" in stage
 

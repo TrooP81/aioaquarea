@@ -26,10 +26,14 @@ sql() {
 owned() {
     owned_limit=$1; shift
     # Separate process group permits settlement of descendants, not just timeout.
-    setsid timeout -k 2 "$owned_limit" "$@" <&0 &
+    # POSIX sh redirects an asynchronous list's stdin to /dev/null before
+    # applying its redirections. Save the caller's heredoc in the MAIN shell.
+    exec 7<&0
+    setsid timeout -k 2 "$owned_limit" "$@" <&7 7<&- &
     child=$!
+    exec 7<&-
     if wait "$child"; then command_result=0; else command_result=$?; fi
-    kill -KILL -- "-$child" 2>/dev/null || true
+    kill -s KILL -- "-$child" 2>/dev/null || true
     child=""
     return "$command_result"
 }
@@ -309,9 +313,9 @@ settle() {
     result=$?
     trap - EXIT HUP INT TERM
     if [ -n "${child:-}" ]; then
-        if kill -TERM -- "-$child" 2>/dev/null; then
+        if kill -s TERM -- "-$child" 2>/dev/null; then
             sleep 2 || true
-            kill -KILL -- "-$child" 2>/dev/null || true
+            kill -s KILL -- "-$child" 2>/dev/null || true
         fi
         wait "$child" || true
     fi
