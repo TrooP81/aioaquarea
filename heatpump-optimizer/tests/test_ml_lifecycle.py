@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from dataclasses import replace
 import datetime as dt
+import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,6 +16,21 @@ from sqlalchemy.dialects import postgresql
 
 from packages.ml import lifecycle as module
 from packages.ml.lifecycle import ArtifactReference, Lease, Lifecycle, LifecycleSnapshot
+
+
+@pytest.fixture
+def windows_directory_fsync(monkeypatch):
+    """Exercise lifecycle behavior, not POSIX directory durability, on Windows."""
+    if os.name != "nt":
+        yield
+        return
+    # Windows cannot open directories through os.open for fsync. Keep real file
+    # writes/fsync, signing, publication and verification; replace only this
+    # platform-specific durability boundary in the explicitly requesting tests.
+    directory_fsync = Mock()
+    monkeypatch.setattr(module.safe_persistence, "_fsync_directory", directory_fsync)
+    yield
+    directory_fsync.assert_called()
 
 
 def scalar(value):
@@ -1033,6 +1049,7 @@ class TestR06ThermalQualificationRoute:
                 assert counts["fit_status"] == "rejected_no_skill_over_baseline"
                 assert "holdout_targets" not in counts["validation"]
 
+    @pytest.mark.usefixtures("windows_directory_fsync")
     async def test_UR3_SR2_native_dto_to_qualification_no_incumbent(self, state, monkeypatch):
         from packages.core.models import MLMaintenanceRequestRecord
         from packages.ml import thermal
@@ -1158,6 +1175,7 @@ class TestR06ThermalQualificationRoute:
                     )
         return pairs
 
+    @pytest.mark.usefixtures("windows_directory_fsync")
     async def test_signed_indoor_candidate_issues_and_evaluates_each_head(self, state, monkeypatch):
         import math
         from packages.ml import forecast_quality as quality, thermal
@@ -1262,6 +1280,7 @@ class TestR06ThermalQualificationRoute:
             await owner.close()
 
     @pytest.mark.parametrize("identity", ["legacy-dedup", "structured"])
+    @pytest.mark.usefixtures("windows_directory_fsync")
     async def test_supported_families_are_queued_serially_after_publication(
         self, state, monkeypatch, identity
     ):
@@ -2092,6 +2111,10 @@ async def test_R13_revalidation_preserves_authority_without_DML(
     assert await lifecycle._read(sessions.session) == before
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Creating directory symlinks requires Windows symlink privilege; exercised on POSIX",
+)
 async def test_R13_symlink_replacement_at_admission_has_zero_DML(
     state, lease, tmp_path, monkeypatch
 ):
@@ -2163,6 +2186,7 @@ async def test_R13_stable_payload_corruption_remains_fenced_after_revalidation(
 @pytest.mark.parametrize(
     "condition", ["restored_file", "new_directory", "storage_outage", "stable_missing"]
 )
+@pytest.mark.usefixtures("windows_directory_fsync")
 async def test_R13_missing_confirmation_is_rechecked_at_invalidation_admission(
     state, lease, tmp_path, monkeypatch, condition
 ):
