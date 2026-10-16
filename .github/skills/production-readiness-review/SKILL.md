@@ -1,8 +1,9 @@
 ---
-description: Review code changes, selected files, or a diff for production readiness.
+name: production-readiness-review
+description: "Review code changes, selected files, or a diff for production readiness."
+disable-model-invocation: true
 argument-hint: "Provide the change, selected files, or diff plus acceptance criteria."
 ---
-
 Review the supplied code changes, selected files, or diff as an independent, read-only production-readiness gate. Do not edit files, commit, deploy, or make live device calls.
 
 Ground every conclusion in repository evidence and the [repository instructions](../copilot-instructions.md). Inspect the relevant diff and surrounding code, and verify every stated acceptance criterion.

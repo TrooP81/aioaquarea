@@ -129,3 +129,12 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Local-only live review evidence (personal identifiers; repo is public)
+heatpump-optimizer/docs/reviews/**/live-*.json
+heatpump-optimizer/docs/reviews/**/*.jpg
+heatpump-optimizer/docs/reviews/**/runtime-manifest.json
+heatpump-optimizer/docs/reviews/**/source-runtime-hashes.json
+heatpump-optimizer/docs/reviews/**/api-error-extract.txt
+heatpump-optimizer/docs/reviews/**/probe-live-*.ps1
+heatpump-optimizer/docs/reviews/evidence/

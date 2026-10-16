@@ -130,3 +130,12 @@ E2E backend tests require a separate test database (Postgres on port 5433, Redis
 - Default host ports are non-standard: web `4444`, API `8500`, Postgres `5434` (test DB `5433`, test Redis `6380`). Don't hardcode `localhost:8000` / `5432`.
 - The web frontend reaches the API via the server-side proxy route `web/app/api/[...path]/route.ts` (`/api/*` → `INTERNAL_API_URL`, bearer token added server-side); never hardcode the API origin or token in client code.
 - `AquareaWrapper.start()` must be called before any device call; it creates the `aiohttp.ClientSession`, opens Redis, and authenticates. Always pair with `stop()` on shutdown.
+
+## Delivery tracking
+
+`heatpump-optimizer/docs/ml-optimization-tracker.md` is the single user-facing status for the ML-optimization roadmap.
+For any work on a roadmap item, Implementer and Test Engineer edit the tracker directly; Delivery Lead arranges edits through an editing specialist. These edits must update the item's Status and Evidence/notes cells, update “At a glance” when the phase, next step, or waiting-on-you changes, and add one Activity log line (date, role, item ID, plain-language result, log path).
+Read-only roles (Solution Architect, Quality Reviewer, Lightweight Reviewer, Release Gate) emit `TRACKER:` lines instead of editing the tracker. Delivery Lead forwards these lines to an editing specialist.
+Record user decisions in Decisions and user approvals in Approvals. Keep the last-updated date and role current.
+Never mark 🟢 Done without all required gates passing, including Release Gate PASS.
+Use plain language. Do not include long logs or secrets.

@@ -35,11 +35,20 @@ Run scoped local checks with disposable data independently. Never access product
 5. Check async cleanup, retries, rate limits, time zones, fallback behavior, overrides, API authorization, and UI loading/error/empty states when relevant.
 6. Distinguish product defects, test defects, environment failures, and unavailable checks. Never modify an assertion merely to match incorrect behavior.
 
+Terminal: use Windows PowerShell from the repo root, `cd` explicitly per call, and use `;` not `&&`. Capture every test run with the Delivery Lead's run folder under `.agent-runs\` (`<command> 2>&1 | Tee-Object -FilePath <log> -Append`, then append `EXIT: $LASTEXITCODE` and a command, cwd, and short revision header). Put the log path and exit code in each Verification Report row; never edit or fabricate logs.
+
 If production code is defective, stop editing, preserve the failing test and evidence, and return `CHANGES_REQUIRED` for the Implementer.
 
 After steering, repairs, or resume, confirm the criteria and revision being tested. Repeat checks invalidated by the change, not unrelated investigations. Keep reproduction evidence concise and sanitized. Parallelize checks only when the runtime supports it and their resources are isolated.
 
 ## Verification Report
+
+### Tracker updates
+
+Before returning, directly update `heatpump-optimizer/docs/ml-optimization-tracker.md` for the roadmap item verified; this tracking edit is permitted alongside test-only edits.
+Set its status to 🔵 In progress or 🧪 In verification (testing/review), update Evidence/notes, and add one Activity log line with date, role, item ID, plain-language result, and log path.
+Keep “At a glance” and the last-updated date/role current; apply pending `TRACKER` lines forwarded by Delivery Lead.
+Do not mark 🟢 Done before all required gates pass, including Release Gate PASS.
 
 Return a table with each acceptance-criterion ID, test case, level, command, and result. Record the tested revision, working directory, relevant environment, and exit status, followed by:
 

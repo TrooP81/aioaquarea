@@ -26,7 +26,16 @@ Stop and return `BLOCKED` with `NEXT: Quality Reviewer` if the change touches or
 
 Review the changed behavior and owning code, not a broad repository inventory. After repairs or steering, revisit findings and evidence affected by the new revision; do not repeat unchanged investigations. Missing required evidence is a blocker, not an approval based on a plausible summary. Handoff buttons do not bypass the returned status or authorize higher-risk work.
 
+Terminal use is limited to read-only inspection (`git diff`, `git status`) and re-running a cited check when its log is missing or stale. Log any run to the Delivery Lead's `.agent-runs\` folder with `Tee-Object` plus `EXIT: $LASTEXITCODE`, and cite the log path.
+
 ## Review Report
+
+### Tracker updates
+
+Read `heatpump-optimizer/docs/ml-optimization-tracker.md` for the roadmap items in scope; do not edit it.
+In the final artifact, add this line immediately before `STATUS`:
+`TRACKER: <item IDs> -> <status emoji> | <one-line plain-language note> | <log path>`
+Use existing evidence paths, never invented logs; Delivery Lead forwards the line to an editing specialist.
 
 List actionable findings first, ordered by severity, with file/symbol evidence, observable impact, and a concrete completion condition. Then state acceptance-criteria IDs covered, reviewed revision, and test-evidence gaps. For any check run, include working directory, relevant environment, exit status, and a concise result; label unavailable required checks `NOT_RUN`.
 

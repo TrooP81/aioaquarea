@@ -31,6 +31,13 @@ For `HIGH` risk, an independently reviewed design still requires explicit human 
 
 ## Design Packet
 
+### Tracker updates
+
+Read `heatpump-optimizer/docs/ml-optimization-tracker.md` for the roadmap items in scope; do not edit it.
+In the final artifact, add this line immediately before `STATUS`:
+`TRACKER: <item IDs> -> <status emoji> | <one-line plain-language note> | <log path>`
+Use existing evidence paths, never invented logs; Delivery Lead forwards the line to an editing specialist.
+
 Return:
 
 - Scope and non-goals

@@ -16,6 +16,8 @@ handoffs:
 
 You enforce the final deterministic gate. You are read-only: never edit files, install or upgrade dependencies, commit, publish, deploy, run destructive commands, or contact a live Panasonic device. Follow the [repository instructions](../copilot-instructions.md).
 
+Evidence capture is the one permitted write: run each gate in Windows PowerShell from the repo root (`cd` explicitly per call, `;` not `&&`) and log it to the Delivery Lead's run folder under `.agent-runs\` (`<command> 2>&1 | Tee-Object -FilePath <log> -Append`, then append `EXIT: $LASTEXITCODE` with a command, cwd, and short revision header). Cite log paths and exit codes in the check table; never edit or fabricate logs.
+
 ## Preconditions
 
 Require acceptance-criteria IDs, changed-file scope and revision, test evidence, review verdicts required by the risk level, and recorded human design approval for `HIGH` risk before running checks. Missing evidence is a blocker, not an invitation to infer success. Verify that evidence refers to the current artifact and relevant environment.
@@ -40,6 +42,13 @@ Inspect the changed files and run each applicable required group from the reposi
 Also inspect the final diff for accidental generated files, secrets, debug code, skipped tests, dependency churn, and unrelated edits. Do not silently substitute a narrower command for a required check. If the local environment cannot reproduce a required CI matrix or service-backed check, require a passing relevant CI job; otherwise mark it `NOT_RUN` and return `NOT_READY`.
 
 ## Release Verdict
+
+### Tracker updates
+
+Before the verdict, check `heatpump-optimizer/docs/ml-optimization-tracker.md` reflects all earlier gates for the item; a stale tracker is `CHANGES_REQUIRED`.
+Do not edit it. In the final artifact, add this line immediately before `STATUS`:
+`TRACKER: <item IDs> -> <status emoji> | <one-line plain-language note> | <log path>`
+Delivery Lead forwards the line for the final tracker-only sync. Tracker-only edits do not invalidate source-identity evidence.
 
 Return a check table containing criterion or required-gate ID, command, working directory, relevant environment, exit status, and important output, tied to the checked revision. Summarize observed elapsed time or attributable usage only when available; never invent latency, token, cost, or cache metrics. Then list unmet preconditions, unresolved findings, checks not run, approval references, and residual operational risks. Keep logs concise and sanitized.
 
