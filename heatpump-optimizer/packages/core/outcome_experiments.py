@@ -156,15 +156,15 @@ async def get_outcome_experiment_status() -> dict[str, object]:
             if status is not None
             else None
         )
-    quality = device_data_quality_from_inputs(now=now, values=values, status=status)
-    conditions = assess_manual_trial_conditions(
-        config,
-        status,
-        gate_row,
-        gate_config,
-        now=now,
-        max_age_seconds=quality["threshold_seconds"],
-    )
+        quality = device_data_quality_from_inputs(now=now, values=values, status=status)
+        conditions = assess_manual_trial_conditions(
+            config,
+            status,
+            gate_row,
+            gate_config,
+            now=now,
+            max_age_seconds=quality["threshold_seconds"],
+        )
     safe_step_c = round(min(1.0, max(0.1, max_step_c)), 1)
     state = (
         "manual_review_ready"

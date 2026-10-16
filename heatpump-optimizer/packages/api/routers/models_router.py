@@ -1005,11 +1005,14 @@ async def get_heat_curve_advice():
                 if float(temperature) < heat_curve.heating_off_outdoor_c
             )
 
-    outdoor_temp = (
-        float(status.outdoor_temp)
-        if status is not None and is_finite_number(status.outdoor_temp) and status_quality["ready"]
-        else None
-    )
+        outdoor_temp = (
+            float(status.outdoor_temp)
+            if status is not None
+            and is_finite_number(status.outdoor_temp)
+            and status_quality["ready"]
+            else None
+        )
+        gate_evidence = resolve_effective_gate(gate_row, gate_config)
     elapsed_hours = (now - started_at).total_seconds() / 3600 if started_at is not None else 0.0
     verification = evaluate_heat_curve_verification(
         verification_state,
@@ -1038,7 +1041,6 @@ async def get_heat_curve_advice():
             outdoor_temp < heat_curve.heating_off_outdoor_c if outdoor_temp is not None else None
         ),
     }
-    gate_evidence = resolve_effective_gate(gate_row, gate_config)
     advice = heat_curve_advice(
         heat_curve,
         float(indoor_temp) if indoor_temp is not None else None,
