@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -61,6 +64,39 @@ def test_backup_nodes_are_never_owned_by_ordinary_phase():
     assert not _verification_phase_owns(
         "backup-roundtrip", "tests/e2e/test_api_dashboard.py::test_x"
     )
+
+
+def test_unit_gate_executes_conftest_free_seal_regressions(tmp_path):
+    """Keep the normal unit gate from missing coordinator-only synthetic fixtures."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("COP_MANUAL_TEST_") and key != "PYTEST_PLUGINS"
+    }
+    environment["HPO_TEST_OFFLINE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--noconftest",
+            "tests/e2e/test_manual_cop_postgresql.py::TestLifecycleReceiptSeal",
+            "tests/e2e/test_manual_cop_postgresql.py::TestVerificationSeal",
+            "tests/e2e/test_ml_lifecycle_verification.py::TestOBS5ScopeSeal",
+            "-q",
+            "--tb=short",
+            "--basetemp=" + str(tmp_path / "seal-protocol"),
+            "-o",
+            "cache_dir=" + str(tmp_path / "seal-cache"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert " skipped" not in result.stdout
 
 
 @pytest.mark.parametrize(
