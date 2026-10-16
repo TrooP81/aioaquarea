@@ -26,6 +26,7 @@ def build_comfort_assessment(
     heat_curve: HeatCurveConfig,
     gate_projections: Sequence[EffectiveGateEvidence] | Sequence[Any] | None = None,
     forecast_status: str = "available",
+    forecast_reason: str | None = None,
     room_envelope: RoomComfortEnvelope | None = None,
     comfort_temp_min: float | None = None,
 ) -> dict[str, Any]:
@@ -37,9 +38,45 @@ def build_comfort_assessment(
     trial is required.
     """
     if forecast_status != "available":
+        reason = forecast_reason or {
+            "fallback": "forecast_quality_not_qualified",
+            "legacy": "legacy_forecast",
+        }.get(forecast_status, "forecast_unavailable")
+        summaries = {
+            "insufficient_scored_forecasts": (
+                "Too few scored forecasts are available to qualify the learned forecast; "
+                "comfort risk is not assessed from the rules fallback."
+            ),
+            "observe_only_build": (
+                "This is an observe-only build: heat-pump writes are prohibited, "
+                "regardless of sensor freshness or forecast quality."
+            ),
+            "forecast_quality_not_qualified": (
+                "The learned forecast is not qualified; comfort risk is not assessed "
+                "from the rules fallback."
+            ),
+            "legacy_forecast": (
+                "This saved forecast uses a legacy format; comfort risk cannot be assessed."
+            ),
+            "stale_forecast": "The forecast is stale; comfort risk cannot be assessed.",
+        }
+        sensor_reasons = {
+            "no_trusted_indoor_observation",
+            "no_fresh_selected_sensor_readings",
+            "reference_sensor_not_fresh",
+            "all_sensor_readings_rejected_as_outliers",
+        }
+        summary = (
+            "A fresh trusted indoor observation is required before comfort risk can be assessed."
+            if reason in sensor_reasons
+            else summaries.get(
+                reason, f"Comfort risk cannot be assessed: {reason.replace('_', ' ')}."
+            )
+        )
         return {
             "state": "degraded" if forecast_status == "fallback" else "unavailable",
-            "summary": "A fresh trusted indoor observation is required before comfort risk can be assessed.",
+            "reason_code": reason,
+            "summary": summary,
             "misses": [],
             "recommendations": [],
         }

@@ -62,6 +62,8 @@ def _build_active_plan_comfort_assessment(
     """Assess an active plan against fresh room evidence, not saved room state."""
     from packages.core.comfort_assessment import build_comfort_assessment
 
+    quality = plan_snapshot.get("forecast_quality")
+    quality_reason = quality.get("reason") if isinstance(quality, dict) else None
     return build_comfort_assessment(
         forecast=plan_snapshot.get("forecast_with_plan", []),
         targets=plan_snapshot.get("target_schedule", []),
@@ -70,6 +72,7 @@ def _build_active_plan_comfort_assessment(
         heat_curve=heat_curve,
         gate_projections=gate_projections,
         forecast_status=plan_snapshot.get("forecast_status", "unavailable"),
+        forecast_reason=plan_snapshot.get("forecast_unavailable_reason") or quality_reason,
         room_envelope=room_envelope,
         comfort_temp_min=comfort_temp_min,
     )
@@ -1493,6 +1496,7 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             heat_curve=heat_curve,
             gate_projections=gate_projections,
             forecast_status=_forecast_status_from_quality(forecast_quality),
+            forecast_reason=forecast_quality.get("reason"),
             room_envelope=room_envelope,
             comfort_temp_min=comfort_temp_min,
         ),

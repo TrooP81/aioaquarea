@@ -96,6 +96,7 @@ interface IndoorForecastData {
   planned_actions: PlannedAction[];
   forecast_status?: "available" | "unavailable" | "fallback" | "legacy";
   forecast_unavailable_reason?: string | null;
+  forecast_quality?: { control_reason?: string; reason?: string };
   comfort_assessment?: {
     state: "on_target" | "at_risk" | "unavailable" | "degraded" | "conflict" | "room_overheat_suppression";
     summary: string;
@@ -277,6 +278,13 @@ export function ThermalPredictionChart() {
   })();
 
   const comfortAssessment = indoorForecast?.comfort_assessment;
+  const forecastUnavailableReason = indoorForecast?.forecast_unavailable_reason;
+  const sensorUnavailable = [
+    "no_trusted_indoor_observation",
+    "no_fresh_selected_sensor_readings",
+    "reference_sensor_not_fresh",
+    "all_sensor_readings_rejected_as_outliers",
+  ].includes(forecastUnavailableReason || "");
   const forecastProvenance = indoorForecast?.forecast_provenance;
   const sensorBasisLabel = indoorForecast?.sensor_basis?.label || "Indoor temperature";
   const firstComfortMiss = comfortAssessment?.first_miss;
@@ -433,9 +441,15 @@ export function ThermalPredictionChart() {
       )}
 
       {/* Indoor temperature forecast chart */}
+      {indoorForecast?.forecast_quality?.control_reason === "observe_only_build" && (
+        <div className="indoor-temp-card text-muted text-sm" style={{ marginTop: "1.5rem" }}>
+          Observe-only build: heat-pump writes are prohibited, regardless of sensor freshness or forecast quality.
+        </div>
+      )}
       {indoorForecast?.forecast_status === "unavailable" && (
         <div className="indoor-temp-card text-warning text-sm" style={{ marginTop: "1.5rem" }}>
-          Indoor forecast paused: {(indoorForecast.forecast_unavailable_reason || "no_trusted_indoor_observation").replace(/_/g, " ")}. A fresh trusted room reading is required; no default temperature is used.
+          Indoor forecast paused: {(forecastUnavailableReason || "forecast_unavailable").replace(/_/g, " ")}.
+          {sensorUnavailable && " A fresh trusted room reading is required; no default temperature is used."}
         </div>
       )}
       {indoorForecast?.forecast_status !== "unavailable" && indoorChartData.length > 0 && (
