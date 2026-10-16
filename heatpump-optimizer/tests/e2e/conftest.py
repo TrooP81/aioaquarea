@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import importlib
 import json
@@ -43,6 +44,8 @@ from packages.core.models import (  # noqa: E402
     PriceRecord,
     WeatherRecord,
 )
+from packages.core.settings_service import get_user_tz  # noqa: E402
+from tests.e2e import consumption_seed  # noqa: E402
 
 
 LEGACY_TABLES = tuple(
@@ -313,13 +316,23 @@ async def seed_weather(db_session: AsyncSession):
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def seed_consumption(db_session: AsyncSession):
-    """Seed consumption records for today (cumulative values — most recent is highest)."""
+    """Seed consumption records for today (cumulative values — most recent is highest).
+
+    Samples stay inside the current local day with a matching source date, so
+    "today" assertions hold at any wall-clock time, including just after midnight.
+    """
+    tz_name = await get_user_tz()
     now = dt.datetime.now(dt.timezone.utc)
+    remaining = consumption_seed.time_until_local_midnight(now, tz_name)
+    if remaining < consumption_seed.MIDNIGHT_GUARD:
+        await asyncio.sleep(remaining.total_seconds() + 1)
+        now = dt.datetime.now(dt.timezone.utc)
     records = []
-    for h in range(6):
-        ts = now - dt.timedelta(hours=h)
+    seed_points = consumption_seed.same_day_seed_timestamps(now, tz_name, 6)
+    for h, (ts, source_date) in enumerate(seed_points):
         record = ConsumptionRecord(
             ts=ts,
+            source_date=source_date,
             device_id="test-device-001",
             heat_kwh=1.7 - h * 0.1,
             cool_kwh=0.0,
