@@ -140,3 +140,20 @@ def test_receipts_are_snapshot_bound_and_cannot_be_overwritten(tmp_path):
     changed = dict(receipt, cleanup_verified=False)
     path.write_text(json.dumps(changed), encoding="utf-8")
     assert _lifecycle_evidence_snapshot(tmp_path) != before
+
+
+def test_unit_phase_receipts_retain_per_test_duration_even_without_a_summary(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tests.e2e.test_manual_cop_postgresql import pytest_runtest_logreport
+
+    path = tmp_path / "reports.jsonl"
+    with monkeypatch.context() as environment:
+        environment.setenv("COP_MANUAL_TEST_PHASE", "unit")
+        environment.setenv("COP_MANUAL_TEST_REPORTS", str(path))
+        pytest_runtest_logreport(
+            SimpleNamespace(nodeid="slow::case", when="call", duration=15.0, outcome="passed")
+        )
+    report = json.loads(path.read_text())
+    assert report["duration"] == 15.0
+    assert report["nodeid"] == "slow::case"

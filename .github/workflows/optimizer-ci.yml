@@ -56,7 +56,7 @@ jobs:
       - name: Run unit tests
         # Includes test_backup_worker_execution.py: real bash + disposable PATH
         # shims, with a hard failure rather than a skip when Linux CI lacks bash.
-        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase unit -m pytest tests --ignore=tests/e2e -q
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase unit -m pytest tests --ignore=tests/e2e -q --durations=50
       - uses: actions/upload-artifact@v4
         if: always()
         with:

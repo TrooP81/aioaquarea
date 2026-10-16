@@ -120,6 +120,12 @@ ignores TERM. A separate watchdog in that isolated process group sends group KIL
 at the hard deadline even if its caller dies or BusyBox timeout kills only its
 monitored PID. Cleanup cannot acquire the control lock while that group survives.
 
+Lock waits use `timeout -k 2 <seconds> flock <fd>`: BusyBox `flock`
+does not implement util-linux's `-w` option. The coordinator extracts the staged
+archive and manifest through bounded `docker exec ... cat` into exclusive binary
+files; `docker cp` cannot read the worker's live `/backups` tmpfs. Checksums and
+manifest bindings are validated before any target restore.
+
 Source cleanup waits (bounded to 55 seconds plus kill-after) for the control lock.
 It verifies the owner token, removes only the known files and requires successful
 `rmdir` before acknowledging settlement. It never stops the source worker.

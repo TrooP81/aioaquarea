@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import subprocess
@@ -234,7 +235,7 @@ def pipeline(coordinator):
         calls.append(("create", kind, identity, args))
         return identity
 
-    def docker(*args, **_):
+    def docker(*args, **options):
         calls.append(args)
         if args[:2] == ("volume", "create"):
             name = args[-1]
@@ -268,10 +269,11 @@ def pipeline(coordinator):
             del items[(args[0], args[2])]
         elif len(args) > 1 and args[1] == "ls":
             return "\n".join(identity for kind, identity in items if kind == args[0])
-        elif args[0] == "cp" and args[1].startswith(source + ":"):
-            path = Path(args[2])
-            path.write_bytes(
-                b"synthetic" if path.suffix == ".dump" else json.dumps(metadata).encode()
+        elif args[:3] == ("exec", source, "cat"):
+            output = options["output"]
+            assert args[3].startswith(c.stage_path + "/")
+            output.write(
+                b"synthetic" if args[3].endswith(".dump") else json.dumps(metadata).encode()
             )
             if state["copy_failure"]:
                 raise drill.DrillError("copy_failed")
@@ -320,6 +322,8 @@ def test_idle_start_then_runtime_inspection_precedes_restore_and_cleans_copies(p
     assert c.receipt["cleanup_verified"] is True, c.receipt
     assert {p.name for p in c.lease.iterdir()} == {"receipt.json"}
     assert any(call[0] == "exec" and "/backups/restore_archive.sh" in call for call in calls)
+    readiness = next(call for call in calls if call[0] == "exec" and "pg_isready" in call)
+    assert readiness[readiness.index("-h") + 1] == "127.0.0.1"
     for index, call in enumerate(calls):
         if call[0] == "start":
             identity = call[1]
@@ -534,3 +538,34 @@ def test_staging_blocks_retention_until_validated_copy_survives_original_deletio
     assert deleted.is_set()
     drill.validate_manifest(staged_metadata, staged)
     assert staged.read_bytes() == b"synthetic archive retained during staging"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_command_streams_binary_to_owned_file_without_decoding_or_buffering(tmp_path, fail):
+    destination = tmp_path / "archive.dump"
+    data = b"PGDMP\x00\xff\xfe\n"
+    command = [
+        sys.executable,
+        "-c",
+        f"import sys; sys.stdout.buffer.write({data!r}); sys.exit({int(fail)})",
+    ]
+    with destination.open("xb") as output:
+        if fail:
+            with pytest.raises(drill.DrillError, match="command_failed"):
+                drill.run_command(command, timeout=5, output=output)
+        else:
+            assert drill.run_command(command, timeout=5, output=output) == ""
+    assert destination.read_bytes() == data
+
+
+def test_stream_timeout_kills_and_reaps_owned_process_group(tmp_path):
+    if os.name != "posix":
+        pytest.skip("POSIX process-group lifecycle is qualified on Linux")
+    destination = tmp_path / "archive.dump"
+    with destination.open("xb") as output:
+        with pytest.raises(subprocess.TimeoutExpired):
+            drill.run_command(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                timeout=0.1,
+                output=output,
+            )

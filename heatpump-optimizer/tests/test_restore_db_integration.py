@@ -164,6 +164,7 @@ def _isolated_stack(backup_dir: Path) -> Iterator[RestoreStack]:
         assert int(database_config["mem_limit"]) == stack.tmpfs_bytes + 2 * GIB
         assert str(stack.tmpfs_bytes) in database_config["tmpfs"][0]
         assert database_config.get("ports", []) == []
+        assert "pg_isready -h 127.0.0.1 " in database_config["healthcheck"]["test"][1]
         assert config["networks"]["default"]["internal"] is True
         assert all(volume["read_only"] for volume in config["services"]["restore-tool"]["volumes"])
         stack.compose("up", "-d", "--wait", "db")
@@ -275,12 +276,12 @@ def synthetic_archive(stack: RestoreStack) -> Path:
         "--format=custom",
         "--no-owner",
         "--no-privileges",
-        "--file=/tmp/synthetic.dump",
+        "--file=/synthetic.dump",
     )
     archive = stack.backup_dir / "heatpump-20261003T000000Z.dump"
     container = stack.compose("ps", "-q", "db").stdout.strip()
     subprocess.run(
-        ["docker", "cp", f"{container}:/tmp/synthetic.dump", str(archive)],
+        ["docker", "cp", f"{container}:/synthetic.dump", str(archive)],
         check=True,
         capture_output=True,
     )
@@ -587,7 +588,16 @@ def test_test_mode_restores_synthetic_archive_and_preserves_source(
         binding = state["last_success"]
         assert binding["source_id"] == source["source_id"]
         archive = stack.backup_dir / (binding["archive_id"] + ".dump")
-        stack.docker("cp", f"{worker}:/backups/{archive.name}", str(archive))
+        # docker cp does not see the live tmpfs used by this worker.
+        with archive.open("xb") as output:
+            copied = subprocess.run(
+                ["docker", "exec", worker, "cat", f"/backups/{archive.name}"],
+                stdout=output,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+        assert copied.returncode == 0, copied.stderr.decode(errors="replace")
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         assert checksum == binding["sha256"]
         # A fresh cluster, not the LOGIN source cluster: otherwise existing

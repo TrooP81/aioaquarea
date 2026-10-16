@@ -295,6 +295,7 @@ def main() -> int:
             args.insert(0, "--foreground")
         os.execv(os.environ["HPO_BACKUP_REAL_TIMEOUT"], ["timeout", *args])
     elif command == "flock":
+        assert "-w" not in args, "BusyBox flock has no wait-timeout flag"
         # Preserve fd 9's *same open file description*: the real shell remains
         # lock owner after the flock subprocess exits.
         code = subprocess.run(

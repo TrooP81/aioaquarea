@@ -20,7 +20,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import BinaryIO, Callable
 
 IMAGE = (
     "timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57"
@@ -53,10 +53,13 @@ class Budget:
         return min(cap, available)
 
 
-def run_command(args: list[str], *, timeout: float) -> str:
+def run_command(args: list[str], *, timeout: float, output: BinaryIO | None = None) -> str:
     """Bound CLI and reap its process group; cleanup separately settles containers."""
     process = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        args,
+        stdout=output if output is not None else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, _ = process.communicate(timeout=timeout)
@@ -70,7 +73,7 @@ def run_command(args: list[str], *, timeout: float) -> str:
         raise
     if process.returncode:
         raise DrillError("command_failed")
-    return out.decode("utf-8").strip()
+    return out.decode("utf-8").strip() if out is not None else ""
 
 
 def digest(path: Path) -> str:
@@ -175,12 +178,17 @@ class Coordinator:
         temporary.write_text(json.dumps(self.receipt, sort_keys=True), encoding="utf-8")
         temporary.replace(self.lease / "receipt.json")
 
-    def docker(self, *args: str, cap: float = 30, cleanup: bool = False) -> str:
+    def docker(
+        self, *args: str, cap: float = 30, cleanup: bool = False, output: BinaryIO | None = None
+    ) -> str:
         if self.report_deadline is not None:
             cap = min(cap, self.report_deadline - time.monotonic())
             if cap <= 0:
                 raise DrillError("report_timeout")
-        return self.runner(["docker", *args], timeout=self.budget.remaining(cap, cleanup=cleanup))
+        options = {"output": output} if output is not None else {}
+        return self.runner(
+            ["docker", *args], timeout=self.budget.remaining(cap, cleanup=cleanup), **options
+        )
 
     def inspect(self, kind: str, identity: str, *, cleanup: bool = False) -> dict:
         values = json.loads(self.docker(kind, "inspect", identity, cleanup=cleanup))
@@ -462,7 +470,10 @@ class Coordinator:
         if stage != expected:
             raise DrillError("source_stage_invalid")
         for name in ("archive.dump", "archive.json"):
-            self.docker("cp", f"{source}:{stage}/{name}", str(self.lease / name), cap=60)
+            # Docker archive/cp reads the rootfs, not a running tmpfs mount.
+            # Stream from the owned live mount without buffering a database dump.
+            with (self.lease / name).open("xb") as output:
+                self.docker("exec", source, "cat", f"{stage}/{name}", cap=60, output=output)
         archive = self.lease / "archive.dump"
         self.manifest = json.loads((self.lease / "archive.json").read_text(encoding="utf-8"))
         validate_manifest(self.manifest, archive)
@@ -565,7 +576,18 @@ class Coordinator:
         startup = time.monotonic() + self.budget.remaining(90)
         while True:
             try:
-                self.docker("exec", db, "pg_isready", "-U", "restore_test", "-d", database, cap=2)
+                self.docker(
+                    "exec",
+                    db,
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    "restore_test",
+                    "-d",
+                    database,
+                    cap=2,
+                )
                 break
             except DrillError:
                 if time.monotonic() >= startup:

@@ -203,7 +203,8 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
         assert item["HostConfig"]["NetworkMode"] == "none"
         assert not item["HostConfig"].get("PortBindings")
         docker("start", coordinator)
-        assert docker("wait", coordinator, limit=420) == "0"
+        exit_code = docker("wait", coordinator, limit=420)
+        assert exit_code == "0", docker("logs", coordinator)
         records = list(leases.glob("*/receipt.json"))
         assert len(records) == 1
         drill = json.loads(records[0].read_text(encoding="utf-8"))

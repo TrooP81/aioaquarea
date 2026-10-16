@@ -27,7 +27,7 @@ case $mode in
             [ -f "$stage/$file" ] && [ ! -L "$stage/$file" ] || exit 2
         done
         exec 8<>"$stage/control.lock"
-        if [ "$mode" != cleanup-inner ]; then flock -n 8; else flock -w 50 8; fi
+        if [ "$mode" != cleanup-inner ]; then flock -n 8; else timeout -k 2 50 flock 8; fi
         [ "$(cat "$stage/owner")" = "$BACKUP_STAGE_TOKEN" ] || exit 2
         case $(cat "$stage/state") in reserved|running|settled) ;; *) exit 2 ;; esac
         if [ "$mode" = cleanup-inner ]; then
@@ -68,7 +68,7 @@ case $mode in
     *) exit 2 ;;
 esac
 exec 9>"$BACKUP_DIR/.backup.lock"
-flock -w 30 9
+timeout -k 2 30 flock 9
 # Selection itself, validation and copying all happen while retention is excluded.
 selection=$(psql -XqAt -v ON_ERROR_STOP=1 <<'SQL'
 SELECT (details_json::jsonb->'last_success'->>'archive_id') || '|' ||

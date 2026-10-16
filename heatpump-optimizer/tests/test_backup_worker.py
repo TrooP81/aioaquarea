@@ -73,7 +73,7 @@ def test_status_histories_fenced_and_source_parameters_not_interpolated_sql():
 
 def test_staging_selects_and_validates_before_unlock():
     stage = (SCRIPTS / "stage_backup.sh").read_text(encoding="utf-8")
-    assert stage.index("flock -w 30 9") < stage.index("selection=$(")
+    assert stage.index("timeout -k 2 30 flock 9") < stage.index("selection=$(")
     assert stage.index('[ "$actual" = "$checksum" ]') < stage.index('cp "$archive"')
     assert stage.index('cp "$archive"') < stage.index('[ "$staged" = "$checksum" ]')
     assert "flock -u" not in stage  # fd held through validation and process exit
@@ -92,7 +92,7 @@ def test_runtime_requires_kill_after_and_group_settlement_without_new_dependenci
     assert 'exec timeout -k 2 "$2" sh "$0" copy' in stage
     assert 'setsid sh "$0" bounded-copy "$seconds"' in stage
     assert 'kill -s KILL -- "-$group"' in stage
-    assert "flock -w 50 8" in stage
+    assert "timeout -k 2 50 flock 8" in stage
     assert "trap '' TERM" in stage
 
 

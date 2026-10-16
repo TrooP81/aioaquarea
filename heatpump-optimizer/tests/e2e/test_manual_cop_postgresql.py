@@ -955,6 +955,7 @@ def pytest_runtest_logreport(report):
                     {
                         "nodeid": report.nodeid,
                         "when": report.when,
+                        "duration": report.duration,
                         "outcome": report.outcome,
                         "wasxfail": bool(getattr(report, "wasxfail", None)),
                     }
