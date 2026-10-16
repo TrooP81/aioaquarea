@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { Banner } from "./Banner";
-import type { ModelLifecycleStatuses } from "@/lib/api-types";
+import { ResetHistoryNotice } from "./ResetHistoryNotice";
+import type { ModelLifecycleStatuses, ResetHistory } from "@/lib/api-types";
 
 interface LearningModeState {
   enabled: boolean;
@@ -11,8 +12,9 @@ interface LearningModeState {
   effective_active: boolean;
   sources: string[];
   state_reliable: boolean;
+  reset_history?: ResetHistory | null;
   open_revert_obligations: {
-    count: number;
+    count: number | null;
     oldest_scheduled_at: string | null;
     oldest_age_seconds: number | null;
     action_types: string[];
@@ -160,7 +162,8 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
               className={`status-badge ${(state.effective_active ?? state.enabled) ? "online" : "offline"}`}
               role="status"
             >
-              {state.state_reliable === false ? "Observation state unavailable" : (state.effective_active ?? state.enabled)
+              {state.state_reliable === false ? (state.effective_active ?? state.enabled)
+                ? "Learning (other source unavailable)" : "Observation state unavailable" : (state.effective_active ?? state.enabled)
                 ? state.enabled ? "Learning" : "Learning (seasonal)"
                 : "Off"}
             </span>
@@ -178,7 +181,10 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
             </button>
           </div>
 
-          {state.open_revert_obligations?.count > 0 && (
+          {state.open_revert_obligations?.count == null && (
+            <p role="status">Current safety obligations unavailable — not known clear.</p>
+          )}
+          {state.open_revert_obligations?.count != null && state.open_revert_obligations.count > 0 && (
             <div className="model-card-details" style={{ marginTop: "1rem" }} role="status">
               <div>
                 Pending safety restores: {state.open_revert_obligations.count}
@@ -192,11 +198,12 @@ export function LearningModeCard({ onChange }: { onChange?: () => void }) {
               <div>Safety restores are held while observation is active.</div>
             </div>
           )}
+          <ResetHistoryNotice history={state.reset_history} />
 
           {(state.effective_active ?? state.enabled) && (
             <div className="model-card-details" style={{ marginTop: "1rem" }}>
-              <div>Started: {formatDate(state.since)}</div>
-              <div>Collecting data for: {formatDuration(state.days_elapsed)}</div>
+              <div>Retained campaign started: {formatDate(state.since)}</div>
+              <div>Campaign elapsed (not evidence age): {formatDuration(state.days_elapsed)}</div>
               {state.sources?.includes("seasonal") && <div>Seasonal observation remains active until explicit human exit.</div>}
               {models && (
                 <div>

@@ -8,6 +8,10 @@ Observe-only monitoring, diagnostic cost planning, and forecast evaluation for P
 
 Known measurement/retrieval clocks must each be no older than the lesser of 60 seconds and the device freshness-policy maximum at captured UTC evaluation time. The maximum-age boundary is inclusive; observation must not follow retrieval, and neither may follow live read completion. A new wrapper call never makes known stale, future, or misordered evidence fresh. A source's nullable `executed_at` is not a physical-dispatch clock: a valid linked legacy restore can instead use reserved fresh post-claim live proof, completing without a write when already safe. Only absent clocks permit the live-read fallback with device identity, noncached status, and local UTC/monotonic read provenance; clocks are not invented. Executing/dispatched legacy rows without a UUID, unproven prior-owner drainage, or lost ownership remain deferred; age alone does not authorize reclaim. Ambiguous external effects are verified before any possible duplicate. This is not an exactly-once device guarantee and does not enable ordinary writes or maintenance.
 
+**Local fresh start:** the [settings-preserving reset operator procedure](docs/settings-preserving-reset.md)
+is separately guarded and requires exact runtime-manifest approval. Administrative
+retirement is not physical OFF verification; it creates no pending carryover.
+
 ## Architecture
 
 ```

@@ -16,6 +16,7 @@ from packages.core.models import (
     ShowerEventRecord,
 )
 from packages.core.settings_service import get_setting
+from packages.core.safety_reverts import OPEN_SHOWER_STATUSES, lock_shower_device
 from packages.optimizer.data_access import get_prices
 
 logger = structlog.get_logger()
@@ -111,6 +112,22 @@ class ShowerDetector:
         current: DeviceStatusRecord,
     ) -> None:
         """Check if the tank has recovered to pre-shower temperature, or timed out."""
+        if not await lock_shower_device(session, current.device_id):
+            return
+        event = (
+            await session.execute(
+                select(ShowerEventRecord)
+                .where(
+                    ShowerEventRecord.id == event.id,
+                    ShowerEventRecord.device_id == current.device_id,
+                    ShowerEventRecord.status.in_(OPEN_SHOWER_STATUSES),
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if event is None or event.status not in OPEN_SHOWER_STATUSES:
+            return
         if current.ts >= event.expires_at:
             event.status = "timeout_pending"
             await self._reschedule_linked_off(session, event, current.ts, "timeout")
@@ -172,14 +189,12 @@ async def reconcile_shower_expiry(now: dt.datetime | None = None) -> None:
         events = (
             (
                 await session.execute(
-                    select(ShowerEventRecord)
-                    .where(
+                    select(ShowerEventRecord).where(
                         ShowerEventRecord.status.in_(
                             ("active", "recovery_pending", "timeout_pending")
                         ),
                         ShowerEventRecord.expires_at <= now,
                     )
-                    .with_for_update(skip_locked=True)
                 )
             )
             .scalars()
@@ -187,5 +202,8 @@ async def reconcile_shower_expiry(now: dt.datetime | None = None) -> None:
         )
         detector = ShowerDetector()
         for event in events:
-            event.status = "timeout_pending"
-            await detector._reschedule_linked_off(session, event, now, "timeout")
+            await detector._check_recovery(
+                session,
+                event,
+                DeviceStatusRecord(ts=now, device_id=event.device_id, tank_temp=None),
+            )

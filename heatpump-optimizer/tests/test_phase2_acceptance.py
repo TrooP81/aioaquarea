@@ -964,6 +964,7 @@ class TestPhase2ShowerAcceptance:
         active_event = MagicMock()
         active_event.scalar_one_or_none.return_value = ShowerEventRecord(
             id=1,
+            device_id=current.device_id,
             started_at=now - dt.timedelta(minutes=65),
             expires_at=now - dt.timedelta(minutes=5),
             activation_action_id=11762,
@@ -971,8 +972,13 @@ class TestPhase2ShowerAcceptance:
             status="active",
         )
         session = SimpleNamespace(
+            scalar=AsyncMock(return_value=True),
             execute=AsyncMock(
-                side_effect=[active_event, RuntimeError("linked OFF reschedule failed")]
+                side_effect=[
+                    active_event,
+                    active_event,
+                    RuntimeError("linked OFF reschedule failed"),
+                ]
             ),
             add=MagicMock(),
             flush=AsyncMock(side_effect=RuntimeError("linked OFF insert failed")),
@@ -1000,6 +1006,14 @@ class TestPhase2ShowerAcceptance:
                 await detector.check(current)
 
         assert exit_args and exit_args[0][0] is RuntimeError
+        assert str(exit_args[0][1]) == "linked OFF reschedule failed"
+        session.scalar.assert_awaited_once()
+        assert "pg_try_advisory_xact_lock" in str(session.scalar.call_args.args[0])
+        assert session.execute.await_count == 3
+        reread = session.execute.await_args_list[1].args[0]
+        assert "FOR UPDATE" in str(reread)
+        assert reread.get_execution_options()["populate_existing"] is True
+        assert "UPDATE plan_actions" in str(session.execute.await_args_list[2].args[0])
         session.add.assert_not_called()
         session.flush.assert_not_awaited()
 

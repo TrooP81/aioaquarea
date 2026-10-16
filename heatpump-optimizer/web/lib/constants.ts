@@ -155,6 +155,7 @@ export const STATUS_DISPLAY: Record<string, StatusDisplay> = {
   skipped_peak: { text: "Skipped (peak price)", className: "skipped" },
   cancelled: { text: "Cancelled", className: "skipped" },
   expired: { text: "Missed", className: "skipped" },
+  operator_invalidated: { text: "Administratively retired (not physically verified)", className: "skipped" },
 };
 
 function recognizedStatus(code: string | null | undefined, labels: Record<string, string>): string {
@@ -185,6 +186,8 @@ export function reasonLabel(code: string | null | undefined): string {
     new_plans_paused: "New plans paused",
     control_state_unavailable: "Control state unavailable",
     readiness_unavailable: "Readiness unavailable",
+    resolve_current_safety_obligations: "Resolve current safety obligations before training guidance",
+    safety_obligations_unavailable: "Current safety obligations unavailable; not known clear",
   });
 }
 
@@ -224,6 +227,7 @@ export function seasonalReasonLabel(code: string | null | undefined): string {
     available_but_not_enabled: "Observation campaign is not enabled",
     seasonal_reporting_unavailable: "Seasonal reporting unavailable",
     blocked_by_unresolved_safety_revert: "Waiting for unresolved safety restores",
+    safety_obligations_unavailable: "Current safety obligations unavailable; not known clear",
     waiting_for_heating_season: "Waiting for heating season",
   });
 }

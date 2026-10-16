@@ -213,6 +213,7 @@ class TestShowerDetection:
         mock_session = SimpleNamespace()
         mock_session.add = MagicMock()
         mock_session.flush = AsyncMock()
+        mock_session.scalar = AsyncMock(return_value=True)
 
         mock_active_result = MagicMock()
         mock_active_result.scalar_one_or_none.return_value = active_event
@@ -263,6 +264,7 @@ class TestShowerDetection:
         mock_session = SimpleNamespace()
         mock_session.add = MagicMock()
         mock_session.flush = AsyncMock()
+        mock_session.scalar = AsyncMock(return_value=True)
 
         mock_active_result = MagicMock()
         mock_active_result.scalar_one_or_none.return_value = active_event
@@ -310,10 +312,14 @@ class TestShowerDetection:
         )
         current = _make_status(now, tank_temp=56.0, force_dhw=0)
         session = AsyncMock()
+        session.scalar.return_value = True
+        session.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=event))
         await detector._check_recovery(session, event, current)
 
         assert event.status == "recovery_pending"
-        session.execute.assert_not_awaited()
+        session.execute.assert_awaited_once()
+        assert str(session.execute.call_args.args[0]).startswith("SELECT shower_events.")
+        assert "FOR UPDATE" in str(session.execute.call_args.args[0])
 
     @pytest.mark.asyncio
     async def test_build_refuses_shower_activation_independent_of_price(
@@ -390,6 +396,7 @@ class TestShowerDetection:
         mock_session = SimpleNamespace()
         mock_session.add = lambda obj: added_objects.append(obj)
         mock_session.flush = AsyncMock()
+        mock_session.scalar = AsyncMock(return_value=True)
 
         mock_active_result = MagicMock()
         mock_active_result.scalar_one_or_none.return_value = active_event

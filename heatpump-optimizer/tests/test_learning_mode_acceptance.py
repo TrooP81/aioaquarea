@@ -25,6 +25,21 @@ class _AsyncContext:
         return False
 
 
+@pytest.fixture(autouse=True)
+def isolate_reset_history_projection(monkeypatch):
+    """These existing tests isolate learning policy; receipt projection has its own tests."""
+    monkeypatch.setattr(
+        "packages.core.data_reset.reset_history_summary",
+        AsyncMock(
+            return_value={
+                "available": True,
+                "data_reset_at": None,
+                "historical_retirement": None,
+            }
+        ),
+    )
+
+
 @pytest.mark.parametrize("case", ["cold", "restore", "warming", "optout", "lock_timeout"])
 async def test_UR4_SR3_cycle_atomic_latch_and_precedence(case):
     from packages.core.settings_service import SETTING_SPECS
@@ -142,9 +157,15 @@ async def test_learning_mode_endpoint_keeps_manual_toggle_when_seasonal_lookup_f
 
 @pytest.mark.asyncio
 async def test_manual_learning_read_failure_remains_unknown():
-    with patch(
-        "packages.core.settings_service.get_bool_setting",
-        new=AsyncMock(side_effect=RuntimeError("settings unavailable")),
+    with (
+        patch(
+            "packages.core.settings_service.get_bool_setting",
+            new=AsyncMock(side_effect=RuntimeError("settings unavailable")),
+        ),
+        patch(
+            "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+            new=AsyncMock(side_effect=RuntimeError("seasonal unavailable")),
+        ),
     ):
         snapshot, _ = await get_learning_state_details()
         executor_state = await resolve_learning_mode_state()
@@ -216,9 +237,9 @@ async def test_manual_learning_read_failure_remains_unknown():
             True,
             True,
             False,
-            LearningStateSnapshot(False, False, False),
-            LearningModeState.UNKNOWN,
-            False,
+            LearningStateSnapshot(False, True, False),
+            LearningModeState.ACTIVE,
+            True,
         ),
         (
             False,
@@ -227,7 +248,7 @@ async def test_manual_learning_read_failure_remains_unknown():
             False,
             LearningStateSnapshot(False, False, False),
             LearningModeState.UNKNOWN,
-            False,
+            True,
         ),
         (
             False,
@@ -236,7 +257,7 @@ async def test_manual_learning_read_failure_remains_unknown():
             True,
             LearningStateSnapshot(False, False, False),
             LearningModeState.UNKNOWN,
-            False,
+            True,
         ),
     ],
     ids=[
@@ -446,6 +467,7 @@ async def test_learning_mode_status_preserves_wire_semantics_for_manual_and_seas
         "sources",
         "state_reliable",
         "open_revert_obligations",
+        "reset_history",
         "seasonal_blocked_by_unresolved_safety_revert",
         "seasonal_first_deferred_at",
         "seasonal_deferred_seconds",

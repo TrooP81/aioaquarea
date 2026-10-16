@@ -3,7 +3,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DataAge } from "./DataAge";
 import { LAYER_LABELS, MODEL_REPORTING_LABELS, reasonLabel, seasonalReasonLabel } from "@/lib/constants";
-import type { ControlState, ModelComponent, ModelLifecycleStatus, ModelLifecycleStatuses, ModelReportingState, ReadinessComponent, SeasonalReadiness, SpaceHeatingGate } from "@/lib/api-types";
+import type { ControlState, ModelComponent, ModelLifecycleStatus, ModelLifecycleStatuses, ModelReportingState, ReadinessComponent, ResetHistory, SeasonalReadiness, SpaceHeatingGate } from "@/lib/api-types";
+import { ResetHistoryNotice } from "./ResetHistoryNotice";
 import { OptimizerDiagnostics } from "./OptimizerDiagnostics";
 import { WhyItDecides } from "./WhyItDecides";
 import { ManualCOPMonitoring } from "./ManualCOPMonitoring";
@@ -120,6 +121,8 @@ interface OptimizerStatusData {
     reason: string;
     average_outdoor_c: number | null;
     next_step?: string;
+    campaign_since?: string | null;
+    reset_history?: ResetHistory | null;
     auto_train?: boolean | null;
     auto_exit?: boolean;
     readiness?: SeasonalReadiness;
@@ -688,6 +691,8 @@ export function OptimizerStatus({ controlState, spaceHeatingGate }: { controlSta
         ) : <p className="optimizer-readable-text">Unavailable.</p>}
           {status.seasonal_calibration && (
             <div data-testid="seasonal-reporting-summary" className="text-muted text-xs" style={{ margin: "0.75rem 0", display: "block", minWidth: 0, overflowWrap: "anywhere" }}>
+              <div>Retained seasonal campaign: {status.seasonal_calibration.campaign_since ?? "Not started"}</div>
+              <ResetHistoryNotice history={status.seasonal_calibration.reset_history} />
               <strong>Season readiness</strong>
               {readiness ? <>
                 <div>As of: {readiness.as_of ? formatDate(readiness.as_of) : "Unknown"}; Generation: {readiness.generation?.slice(0, 8) ?? "Unknown"}; Context: {readiness.context_digest?.slice(0, 8) ?? "Unknown"}</div>

@@ -265,14 +265,18 @@ def test_R27_ceil_runtime_requires_final_deadline_and_full_price_window(
 
 
 @pytest.mark.parametrize(
-    "reason,with_context",
+    "reason,with_context,safety_count,expected_next_step",
     [
-        ("readiness_input_budget_exceeded", True),
-        ("readiness_unavailable", True),
-        ("readiness_busy", False),
+        ("readiness_input_budget_exceeded", True, 0, "readiness_unavailable"),
+        ("readiness_unavailable", True, 0, "readiness_unavailable"),
+        ("readiness_busy", False, None, "readiness_unavailable"),
+        ("readiness_unavailable", True, None, "safety_obligations_unavailable"),
+        ("readiness_unavailable", True, 1, "resolve_current_safety_obligations"),
     ],
 )
-async def test_RC_M1_unavailable_readiness_projects_full_reporting_status(reason, with_context):
+async def test_RC_M1_unavailable_readiness_projects_full_reporting_status(
+    monkeypatch, reason, with_context, safety_count, expected_next_step
+):
     from packages.core.settings_service import SETTING_SPECS
     from packages.ml import model_status
     from packages.ml.seasonal_learning import get_seasonal_calibration_progress
@@ -287,7 +291,20 @@ async def test_RC_M1_unavailable_readiness_projects_full_reporting_status(reason
         else None
     )
     snapshot = model_status._unavailable_readiness(
-        reason, as_of=as_of, generation="rc-m1", context=context
+        reason,
+        as_of=as_of,
+        generation="rc-m1",
+        context=context,
+        seasonal_inputs={
+            "open_revert_obligations": {"count": safety_count},
+            "reset_history": {"available": False},
+        },
+    )
+    # A captured safety summary is independent of failed seasonal/outdoor evidence.
+    # Keep the unavailable-readiness contract under test without fabricating clearance.
+    monkeypatch.setattr(
+        "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+        AsyncMock(side_effect=RuntimeError("seasonal evidence unavailable")),
     )
     for component in snapshot["readiness"]["components"].values():
         reporting = component["reporting"]
@@ -308,15 +325,42 @@ async def test_RC_M1_unavailable_readiness_projects_full_reporting_status(reason
 
     assert progress["reporting_ready"] is False
     assert progress["control_ready"] is False
-    assert progress["next_step"] == "readiness_unavailable"
+    assert progress["next_step"] == expected_next_step
     assert progress["demand"]["usable_samples"] is None
     assert progress["demand"]["trained"] is False
     assert progress["indoor_heating"]["samples"] is None
     assert progress["readiness"]["availability"] == "unavailable"
     assert progress["readiness"]["reason"] == reason
     if with_context:
+        assert progress["open_revert_obligations"] == {"count": safety_count}
+        assert progress["reset_history"] == {"available": False}
         assert progress["reason"] == "seasonal_reporting_unavailable"
         assert progress["heating_season_detected"] is None
     else:
         assert progress["enabled"] is None
         assert progress["observe_only_active"] is None
+
+
+@pytest.mark.parametrize(
+    "seasonal_inputs", [None, {}, {"open_revert_obligations": {"count": None}}]
+)
+async def test_RC_M1_missing_safety_evidence_never_defaults_to_clear(seasonal_inputs):
+    from packages.core.settings_service import SETTING_SPECS
+    from packages.ml import model_status
+    from packages.ml.seasonal_learning import get_seasonal_calibration_progress
+
+    as_of = dt.datetime(2026, 10, 12, tzinfo=dt.timezone.utc)
+    snapshot = model_status._unavailable_readiness(
+        "readiness_unavailable",
+        as_of=as_of,
+        context={
+            "settings": {key: spec.serialize_default() for key, spec in SETTING_SPECS.items()},
+            "as_of": as_of,
+        },
+        seasonal_inputs=seasonal_inputs,
+    )
+    progress = await get_seasonal_calibration_progress(snapshot=snapshot)
+    assert progress["next_step"] == "safety_obligations_unavailable"
+    assert progress["open_revert_obligations"] == {"count": None}
+    assert progress["reset_history"] is None
+    assert progress["reporting_ready"] is progress["control_ready"] is False

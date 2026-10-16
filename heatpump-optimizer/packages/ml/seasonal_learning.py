@@ -74,9 +74,9 @@ async def get_seasonal_calibration_status(
     heating_season = bool(enough_readings and average_c is not None and average_c <= threshold_c)
     safety_deferred_since: dt.datetime | None = None
     unresolved_summary = materialized.get("open_revert_obligations", {"count": None})
-    blocked = bool(
-        enabled and heating_season and not campaign_active and unresolved_summary.get("count")
-    )
+    safety_count = unresolved_summary.get("count")
+    safety_unavailable = type(safety_count) is not int or safety_count < 0
+    blocked = not safety_unavailable and safety_count > 0
     if blocked:
         try:
             safety_deferred_since = dt.datetime.fromisoformat(
@@ -86,7 +86,11 @@ async def get_seasonal_calibration_status(
                 safety_deferred_since = safety_deferred_since.replace(tzinfo=dt.timezone.utc)
         except (TypeError, ValueError):
             pass
-    if campaign_active:
+    if safety_unavailable:
+        reason = "safety_obligations_unavailable"
+    elif blocked:
+        reason = "blocked_by_unresolved_safety_revert"
+    elif campaign_active:
         reason = "observe_only_seasonal_calibration_active"
     elif not enough_readings:
         reason = "waiting_for_recent_outdoor_data"
@@ -94,8 +98,6 @@ async def get_seasonal_calibration_status(
         reason = "waiting_for_heating_season"
     elif not enabled:
         reason = "available_but_not_enabled"
-    elif blocked:
-        reason = "blocked_by_unresolved_safety_revert"
     else:
         reason = "awaiting_explicit_seasonal_cycle"
 
@@ -124,11 +126,13 @@ async def get_seasonal_calibration_status(
         ),
         "seasonal_deferred_seconds": deferred_seconds,
         "open_revert_obligations": unresolved_summary,
+        "reset_history": materialized.get("reset_history"),
     }
 
 
 async def materialize_seasonal_inputs(*, now: dt.datetime, window_days: int, session) -> dict:
     from packages.core.safety_reverts import unresolved_revert_summary
+    from packages.core.data_reset import reset_history_summary
 
     average, readings = (
         await session.execute(
@@ -145,6 +149,7 @@ async def materialize_seasonal_inputs(*, now: dt.datetime, window_days: int, ses
         "outdoor_readings": int(readings or 0),
         "outdoor_data_reliable": True,
         "open_revert_obligations": await unresolved_revert_summary(session, now=now),
+        "reset_history": await reset_history_summary(session),
     }
 
 
@@ -195,6 +200,8 @@ async def _transition_seasonal_campaign(*, now: dt.datetime) -> dict:
             current = await get_seasonal_calibration_status(
                 now=now, context={"settings": values}, materialized=evidence
             )
+            if current["reason"] == "safety_obligations_unavailable":
+                return {**current, "transition": "unavailable"}
             if current["window_days"] != status["window_days"]:
                 return {**current, "transition": "context_changed"}
             updates = {}
@@ -323,6 +330,7 @@ async def get_seasonal_calibration_progress(
         )
     except Exception:
         values = snapshot["context"]["settings"]
+        seasonal_inputs = snapshot.get("seasonal_inputs") or {}
         try:
             enabled = SETTING_SPECS["seasonal_calibration_enabled"].parse(
                 values["seasonal_calibration_enabled"]
@@ -346,6 +354,10 @@ async def get_seasonal_calibration_progress(
             "reason": "seasonal_reporting_unavailable",
             "auto_train": auto_train,
             "auto_exit": False,
+            "open_revert_obligations": seasonal_inputs.get(
+                "open_revert_obligations", {"count": None}
+            ),
+            "reset_history": seasonal_inputs.get("reset_history"),
         }
     demand_collection = readiness["components"]["demand"]["collection"]
     indoor_collection = readiness["components"]["indoor_heating"]["collection"]
@@ -365,7 +377,12 @@ async def get_seasonal_calibration_progress(
         readiness["components"][component]["reporting"]["status"] == "qualified-for-reporting"
         for component in ("demand", "indoor_heating")
     )
-    if status["heating_season_detected"] is None or status["observe_only_active"] is None:
+    safety_count = status.get("open_revert_obligations", {}).get("count")
+    if type(safety_count) is not int or safety_count < 0:
+        next_step = "safety_obligations_unavailable"
+    elif safety_count:
+        next_step = "resolve_current_safety_obligations"
+    elif status["heating_season_detected"] is None or status["observe_only_active"] is None:
         next_step = "readiness_unavailable"
     elif not status["heating_season_detected"] and not status["observe_only_active"]:
         next_step = "wait_for_heating_season"

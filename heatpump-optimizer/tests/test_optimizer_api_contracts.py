@@ -313,10 +313,18 @@ async def test_UR4_SR3_real_get_is_read_only(monkeypatch):
             scalar_one_or_none=lambda: value,
         )
 
+    async def scalars(statement, *_args):
+        result = await execute(statement, *_args)
+        rows = result.scalars().all()
+        return SimpleNamespace(all=lambda: rows, first=lambda: next(iter(rows), None))
+
     class SessionContext:
         async def __aenter__(self):
             active.append(True)
-            return SimpleNamespace(execute=AsyncMock(side_effect=execute))
+            return SimpleNamespace(
+                execute=AsyncMock(side_effect=execute),
+                scalars=AsyncMock(side_effect=scalars),
+            )
 
         async def __aexit__(self, *_args):
             active.pop()
@@ -380,6 +388,11 @@ async def test_UR4_SR3_real_get_is_read_only(monkeypatch):
     assert response["thermal_model"]["indoor_heating_samples"] is None
     assert response["model_lifecycle"]["thermal"]["counts"] is None
     assert response["ordinary_writes_allowed"] is False and "data_freshness" in response
+    assert response["learning_mode"]["reset_history"] == {
+        "available": True,
+        "data_reset_at": None,
+        "historical_retirement": None,
+    }
     assert not active and before == repr(thermal.thermal_model.params)
     assert statements and all(statement.is_select for statement in statements)
     assert "aquarea_password" not in json.dumps(response)

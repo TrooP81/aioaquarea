@@ -44,6 +44,7 @@ from packages.core.safety_attempts import (
     safety_connection,
 )
 from packages.core.safety_reverts import (
+    complete_linked_shower,
     dhw_embargoed,
     is_restorative_action,
     normalize_zone_id,
@@ -115,11 +116,13 @@ async def resolve_learning_mode_state() -> LearningModeState:
     remains eligible for the executor's separate safety lane.
     """
     state, seasonal = await get_learning_state_details()
-    if not state.reliable:
-        return LearningModeState.UNKNOWN
     if state.seasonal_active:
         logger.info("executor_seasonal_calibration_active", **seasonal)
-    return LearningModeState.ACTIVE if state.active else LearningModeState.INACTIVE
+    if state.active:
+        return LearningModeState.ACTIVE
+    if not state.reliable:
+        return LearningModeState.UNKNOWN
+    return LearningModeState.INACTIVE
 
 
 async def is_learning_mode_active() -> bool:
@@ -808,6 +811,8 @@ class PlanExecutor:
                 )
                 if result.rowcount != 1:
                     raise _SafetyAuthorityLost("Restore claim CAS affected no current action")
+                if values.get("status") == "executed" and audit is not None:
+                    await complete_linked_shower(session, stored, verified_at=values["executed_at"])
                 await attempt.check_fence(cleanup=cleanup)
                 if audit is not None:
                     session.add(audit)

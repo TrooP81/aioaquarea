@@ -5,6 +5,18 @@ export type ModelReportingState =
     | "expired"
     | "unavailable";
 
+export interface ResetHistory {
+    available: boolean;
+    data_reset_at: string | null;
+    historical_retirement: {
+        disposition: "operator_invalidated";
+        reason: "reset_superseded";
+        physical_state_verified: false;
+        device_write: false;
+        retired_at: string;
+    } | null;
+}
+
 export type ModelComponent = "demand" | "comfort" | "thermal";
 
 export interface ReadinessCollection {

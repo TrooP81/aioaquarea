@@ -8,10 +8,11 @@ from collections.abc import Iterable
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import and_, case, distinct, func, or_, select
+from sqlalchemy import and_, case, distinct, func, or_, select, text, update
 from sqlalchemy.orm import aliased
 
-from packages.core.models import PlanActionRecord
+from packages.core.models import PlanActionRecord, ShowerEventRecord
+from packages.core.safety_attempts import device_attempt_key
 from packages.optimizer.actions import ActionType
 from packages.optimizer.executor_gate import is_room_heating_increase
 
@@ -19,6 +20,34 @@ UNRESOLVED_STATUSES = ("pending", "executing", "dispatched")
 MAX_UNRESOLVED_REVERT_ACTION_TYPES = 20
 MAX_UNRESOLVED_REVERT_DEVICE_IDS = 500
 MAX_HISTORICAL_REVERT_OVERLAPS = 500
+OPEN_SHOWER_STATUSES = ("active", "recovery_pending", "timeout_pending")
+
+
+async def lock_shower_device(session: Any, device_id: str | None) -> bool:
+    """Share the executor's ownership key; never wait behind a live device actor."""
+    if not device_id:
+        return False
+    return bool(
+        await session.scalar(
+            text("SELECT pg_try_advisory_xact_lock(:key)"),
+            {"key": device_attempt_key(device_id)},
+        )
+    )
+
+
+async def complete_linked_shower(session: Any, action: Any, *, verified_at: dt.datetime) -> None:
+    """Called only inside the fenced verified-OFF action/audit transaction."""
+    if action.action_type != "force_dhw_off" or action.reverts_action_id is None:
+        return
+    await session.execute(
+        update(ShowerEventRecord)
+        .where(
+            ShowerEventRecord.activation_action_id == action.reverts_action_id,
+            ShowerEventRecord.device_id == action.device_id,
+            ShowerEventRecord.status.in_(OPEN_SHOWER_STATUSES),
+        )
+        .values(status="recovered", recovered_at=verified_at)
+    )
 
 
 def is_restorative_action(action: Any) -> bool:

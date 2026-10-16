@@ -416,7 +416,7 @@ async def cancel_override(override_id: int):
 
 
 async def _learning_mode_status(*, context=None, materialized=None, now=None) -> dict[str, object]:
-    """Return learning-mode state plus how long it has been collecting data."""
+    """Read campaign timing and reset history from flat materialized seasonal inputs."""
     from packages.core.learning_state import get_learning_state_details
     from packages.core.settings_service import get_setting
 
@@ -445,10 +445,14 @@ async def _learning_mode_status(*, context=None, materialized=None, now=None) ->
             since_iso = None
 
     if context is None:
-        async with get_session() as session:
+        from packages.core.data_reset import reset_history_summary
+
+        async with get_session(read_only=True) as session:
             obligations = await unresolved_revert_summary(session, now=now)
+            reset_history = await reset_history_summary(session)
     else:
         obligations = (materialized or {}).get("open_revert_obligations", {"count": None})
+        reset_history = (materialized or {}).get("reset_history")
     if obligations.get("count") is not None:
         obligations = serialize_unresolved_revert_summary(obligations)
     sources = ["manual"] if enabled else []
@@ -459,13 +463,14 @@ async def _learning_mode_status(*, context=None, materialized=None, now=None) ->
         "build_policy": "observe_only",
         "ordinary_writes_allowed": False,
         "optimization_requires_new_build": True,
-        "linked_restores_eligible": not (learning.reliable and learning.active),
+        "linked_restores_eligible": not learning.active,
         "since": since_iso,
         "days_elapsed": days_elapsed,
         "effective_active": bool(sources),
         "sources": sources,
         "state_reliable": learning.reliable,
         "open_revert_obligations": obligations,
+        "reset_history": reset_history,
         "seasonal_blocked_by_unresolved_safety_revert": bool(
             seasonal.get("seasonal_blocked_by_unresolved_safety_revert")
         ),

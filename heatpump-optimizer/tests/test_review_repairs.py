@@ -74,6 +74,9 @@ class TestQRReadinessProjection:
                     "reason": "fixture",
                     "auto_train": False,
                     "auto_exit": False,
+                    "open_revert_obligations": captured["seasonal_inputs"][
+                        "open_revert_obligations"
+                    ],
                 }
             ),
         )
@@ -85,6 +88,7 @@ class TestQRReadinessProjection:
         response = await optimizer.get_optimizer_status()
 
         seasonal = response["seasonal_calibration"]
+        assert seasonal["open_revert_obligations"]["count"] == 0
         indoor = seasonal["readiness"]["components"]["indoor_heating"]
         assert seasonal["reporting_ready"] is (case == "qualified")
         assert (indoor["reporting"]["status"] == "qualified-for-reporting") is (case == "qualified")

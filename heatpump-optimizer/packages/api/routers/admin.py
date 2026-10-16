@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import structlog
 
 from packages.core.database import get_session
+from packages.core.data_reset import AUDIT_ACTIONS
 from packages.core.models import (
     AppLogRecord,
     AuditLogRecord,
@@ -171,8 +172,16 @@ async def reset_data(body: ResetRequest):
                 ) from error
         for scope in body.scopes:
             for model in RESET_SCOPES[scope]:
-                count = await session.scalar(select(func.count()).select_from(model))
-                await session.execute(delete(model))
+                retained_audit = (
+                    model.action.not_in(AUDIT_ACTIONS) if model is AuditLogRecord else None
+                )
+                count_query = select(func.count()).select_from(model)
+                deletion = delete(model)
+                if retained_audit is not None:
+                    count_query = count_query.where(retained_audit)
+                    deletion = deletion.where(retained_audit)
+                count = await session.scalar(count_query)
+                await session.execute(deletion)
                 deleted_rows[model.__tablename__] = count or 0
 
     deleted_models: list[str] = reset_ml_models() if models_affected else []

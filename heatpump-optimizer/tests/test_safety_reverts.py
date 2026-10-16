@@ -596,6 +596,7 @@ class _S1RestoreStore:
             result_json='{"reason":"original_obligation"}',
         )
         self.actions = [self.source, self.restore]
+        self.events = []
         self.status = DeviceStatusRecord(
             ts=now, device_id=self.device_id, zone1_target_temp=current_target
         )
@@ -677,9 +678,11 @@ class _S1RestoreStore:
                 )
             return _s1_result(0)
         if statement.is_update:
+            assert statement.table.name in ("plan_actions", "shower_events")
+            table_rows = self.events if statement.table.name == "shower_events" else self.actions
             matched = [
                 row
-                for row in self.actions
+                for row in table_rows
                 if all(self._matches(clause, row) for clause in statement._where_criteria)
             ]
             for row in matched:

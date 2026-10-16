@@ -56,6 +56,46 @@ async function mockCommon(page: import("@playwright/test").Page) {
 }
 
 test.describe("Learning Mode", () => {
+  for (const count of [0, 1, null]) {
+    test(`CG-T8 historical retirement is not physical verification; current count ${count}`, async ({ page }) => {
+      await mockCommon(page);
+      const mutations: string[] = [];
+      page.on("request", (request) => {
+        if (request.method() !== "GET" && new URL(request.url()).pathname.startsWith("/api/")) mutations.push(request.url());
+      });
+      await page.route("**/api/learning-mode", (route) => route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true, effective_active: true, sources: ["manual"], state_reliable: true,
+          since: "2025-10-16T06:00:00Z", days_elapsed: 365,
+          open_revert_obligations: { count, action_types: ["force_dhw_off"], oldest_age_seconds: 60 },
+          reset_history: {
+            available: true, data_reset_at: "2026-10-16T06:30:00Z",
+            historical_retirement: {
+              disposition: "operator_invalidated", reason: "reset_superseded",
+              physical_state_verified: false, device_write: false, retired_at: "2026-10-16T06:29:00Z",
+            },
+          },
+        }),
+      }));
+      await page.goto("/");
+      const notice = page.getByTestId("reset-history");
+      await expect(notice).toContainText("Fresh data collection reset: 2026-10-16T06:30:00Z");
+      await expect(notice).toContainText("operator_invalidated / reset_superseded");
+      await expect(notice).toContainText("physical OFF was not verified");
+      await expect(page.getByText("Retained campaign started:", { exact: false })).toBeVisible();
+      await expect(page.getByText("Campaign elapsed (not evidence age):", { exact: false })).toBeVisible();
+      if (count === null) {
+        await expect(page.getByText("Current safety obligations unavailable — not known clear.")).toBeVisible();
+      } else if (count > 0) {
+        await expect(page.getByText("Pending safety restores: 1", { exact: true })).toBeVisible();
+      } else {
+        await expect(page.getByText(/Pending safety restores:/)).toHaveCount(0);
+      }
+      expect(mutations).toEqual([]);
+    });
+  }
+
   for (const enabled of [false, true, null]) {
     for (const preference of ["automatic", "manual", "unknown"] as const) {
       test(`SR-3 UR5 maintenance ${enabled}/${preference} never promises automatic operation`, async ({ page }) => {
