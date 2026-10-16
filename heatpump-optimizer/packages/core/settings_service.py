@@ -156,6 +156,27 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "0.5",
         "description": "Largest heat-curve adjustment suggested for one manual trial (°C)",
     },
+    "external_heartbeat_enabled": {
+        "type": "bool",
+        "default_env": "external_heartbeat_enabled",
+        "default": "false",
+        "description": "Send an external reporting heartbeat when all reporting checks pass",
+    },
+    "external_heartbeat_url": {
+        "type": "secret",
+        "default_env": "external_heartbeat_url",
+        "redaction": "full",
+        "default": "",
+        "description": "Healthchecks.io ping URL; stored and displayed as a fully redacted secret",
+    },
+    "external_heartbeat_interval_seconds": {
+        "type": "int",
+        "default_env": "external_heartbeat_interval_seconds",
+        "default": "60",
+        "min_value": 30,
+        "max_value": 300,
+        "description": "Minimum time between external heartbeat attempts (30–300 seconds)",
+    },
     "operational_alerts_enabled": {
         "type": "bool",
         "default": "true",
@@ -615,7 +636,11 @@ def is_masked_secret(spec: SettingSpec, value: str) -> bool:
     secret with the mask. The frontend already guards this; this is the
     matching server-side guard so a direct API client can't clobber a secret.
     """
-    return spec.value_type == "secret" and SECRET_MASK_MARKER in value
+    if spec.value_type != "secret":
+        return False
+    if SETTINGS_SCHEMA[spec.key].get("redaction") == "full":
+        return value == SECRET_MASK_MARKER
+    return SECRET_MASK_MARKER in value
 
 
 def validate_setting_value(key: str, value: str) -> None:
@@ -640,6 +665,10 @@ def validate_setting_value(key: str, value: str) -> None:
         from packages.core.price_scope import tibber_scope
 
         tibber_scope(value)
+    if key == "external_heartbeat_url" and value:
+        from packages.core.external_heartbeat import validate_heartbeat_url_structure
+
+        validate_heartbeat_url_structure(value)
 
     if spec.value_type == "json":
         try:
@@ -685,6 +714,8 @@ async def get_all_settings(*, session=None) -> dict[str, str]:
         rows = await session.execute(select(SettingRecord))
         for row in rows.scalars().all():
             if row.key in SETTINGS_SCHEMA:
+                if row.key == "external_heartbeat_url" and row.value == "":
+                    continue
                 result[row.key] = row.value
 
     for key, spec in SETTING_SPECS.items():
@@ -704,6 +735,8 @@ async def get_setting(key: str, *, session=None) -> str:
         row = await session.execute(select(SettingRecord).where(SettingRecord.key == key))
         record = row.scalar_one_or_none()
         if record is not None:
+            if key == "external_heartbeat_url" and record.value == "":
+                return _default_setting_value(get_setting_spec(key))
             return record.value
 
     # Fallback to env
@@ -790,7 +823,11 @@ async def get_string_setting(key: str) -> str:
 
 async def set_setting(key: str, value: str) -> None:
     """Upsert a setting in the DB."""
-    if key == "seasonal_calibration_enabled" or key in BACKUP_DEFAULTS:
+    if (
+        key == "seasonal_calibration_enabled"
+        or key in BACKUP_DEFAULTS
+        or key.startswith("external_heartbeat_")
+    ):
         await set_settings_bulk({key: value})
         return
     if (
@@ -833,6 +870,7 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
             key == "tibber_home_id"
             or SETTINGS_SCHEMA.get(key, {}).get("read_only")
             or SETTINGS_SCHEMA.get(key, {}).get("type") in {"int", "float"}
+            or key == "external_heartbeat_url"
         ):
             validate_setting_value(key, value)
     if "seasonal_calibration_enabled" in updates and not _parse_bool(
@@ -864,6 +902,16 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
             values["seasonal_calibration_enabled"]
         ):
             updates.pop("_seasonal_calibration_campaign_since")
+        heartbeat_changed = any(key.startswith("external_heartbeat_") for key in updates)
+        if heartbeat_changed:
+            effective_url = values.get("external_heartbeat_url", "")
+            enabled = _parse_bool(values.get("external_heartbeat_enabled", "false"))
+            if not effective_url:
+                effective_url = _default_setting_value(SETTING_SPECS["external_heartbeat_url"])
+            if effective_url and ("external_heartbeat_url" in updates or enabled):
+                from packages.core.external_heartbeat import validate_heartbeat_url
+
+                await validate_heartbeat_url(effective_url)
         if any(
             key in HEAT_CURVE_SETTING_KEYS
             or key.startswith("space_heating_gate_")

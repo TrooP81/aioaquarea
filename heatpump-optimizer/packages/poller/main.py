@@ -39,6 +39,7 @@ from packages.core.panasonic_diagnostics import (
     classify_panasonic_adapter_reason,
 )
 from packages.core.service_health import record_service_heartbeat
+from packages.core.external_heartbeat import ExternalHeartbeatRunner
 from packages.optimizer.shower_mode import ShowerDetector
 
 logger = structlog.get_logger()
@@ -604,6 +605,16 @@ async def _run_service(wrapper, maintenance, scheduler) -> None:
         max_instances=1,
         id="ml_maintenance",
         next_run_time=utc_after(minutes=5),
+    )
+
+    scheduler.add_job(
+        ExternalHeartbeatRunner().tick,
+        "interval",
+        seconds=30,
+        id="external_heartbeat",
+        coalesce=True,
+        max_instances=1,
+        next_run_time=utc_after(seconds=30),
     )
 
     scheduler.add_job(

@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     executor_safety_read_reserve: int = Field(default=2, ge=1, le=4)
     panasonic_distributed_read_quota_enabled: bool = False
 
+    # External reporting heartbeat (the ping URL is a runtime secret setting).
+    external_heartbeat_enabled: bool = False
+    external_heartbeat_url: str = ""
+    external_heartbeat_interval_seconds: int = Field(default=60, ge=30, le=300)
+    external_heartbeat_allowed_authorities: str = "hc-ping.com:443"
+    external_heartbeat_api_url: str = "http://api:8500"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property

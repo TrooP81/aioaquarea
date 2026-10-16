@@ -12,21 +12,25 @@ services:
       - "127.0.0.1:${DB_PORT}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER}" ]
+      test: [ "CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"" ]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 60s
 
   redis:
     image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
     volumes:
       - redisdata:/data
+    restart: unless-stopped
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 10s
 
   migrate:
     build:
@@ -37,6 +41,7 @@ services:
         APP_VERSION: ${APP_VERSION:-0.15.0}
         BUILD_REVISION: ${BUILD_REVISION:-unknown}
     command: [ "alembic", "upgrade", "head" ]
+    restart: "no"
     env_file: ${COMPOSE_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -119,6 +124,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   web:
     build:
@@ -187,6 +193,7 @@ services:
       PGDATABASE: ${POSTGRES_DB:-heatpump}
       RESTORE_DISPOSABLE: "false"
     entrypoint: []
+    restart: "no"
     command: [ "/bin/sh", "-c", "echo 'Use scripts/restore_db.sh for guarded restores' >&2; exit 2" ]
     volumes:
       - ./backups:/backups:ro

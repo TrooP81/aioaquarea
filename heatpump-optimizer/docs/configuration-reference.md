@@ -65,6 +65,11 @@ No historical rows are relabeled or rescaled.
 | `LOG_LEVEL` | `INFO` | Log level. |
 | `POLL_INTERVAL_SECONDS` | `300` | Device status poll interval used by the poller scheduler. Also the env fallback for `poll_interval_seconds`. |
 | `PANASONIC_DISTRIBUTED_READ_QUOTA_ENABLED` | `false` | Enables the Redis-backed, per-account Panasonic logical-read quota. Manual refresh reserves two reads and requires ten available reads before admission; background reads wait and fall back to the local limiter when Redis is unavailable. |
+| `EXTERNAL_HEARTBEAT_ENABLED` | `false` | Environment fallback for the external reporting-heartbeat setting; disabled by default. |
+| `EXTERNAL_HEARTBEAT_URL` | _(empty)_ | Healthchecks.io ping URL fallback. Treat as a secret; API responses fully redact it. |
+| `EXTERNAL_HEARTBEAT_INTERVAL_SECONDS` | `60` | Attempt interval, constrained to 30–300 seconds. Failed attempts consume the interval. |
+| `EXTERNAL_HEARTBEAT_ALLOWED_AUTHORITIES` | `hc-ping.com:443` | Deployment-only exact `host[:port]` allowlist; comma-separated, no wildcards. Change only in protected deployment configuration. |
+| `EXTERNAL_HEARTBEAT_API_URL` | `http://api:8500` | Trusted internal API base used for the fixed `/health` check; never derived from the external URL. |
 | `EXECUTOR_SAFETY_READ_RESERVE` | `2` | Startup-only count of the five hourly executor verification reads reserved for safety restores. Valid range: 1–4. |
 | `PRICE_PROVIDER` | `entsoe` | Env fallback for `price_provider`. |
 | `ENTSOE_API_TOKEN` | _(empty)_ | Env fallback for `entsoe_api_token`. |
@@ -646,3 +651,15 @@ Stats and dashboard costs retain P1.6a's confirmed-interval allocation, nullable
 Compatibility poll-now paths persist Tibber prices under the captured fetch identity,
 registering that identity in the same transaction; an in-flight setting change cannot
 relabel those rows. Suspended fetches write no prices.
+
+### External reporting heartbeat
+
+The optional Healthchecks.io sender remains disabled unless explicitly enabled. Its
+runtime URL is a full-redaction secret setting. An empty database value clears
+the override and falls back to `EXTERNAL_HEARTBEAT_URL`; use
+`external_heartbeat_enabled=false` to disable rather than relying on an empty URL. Create a separate provider check per
+deployment and never use a real ping URL in source control or tests. The sender
+requires fresh poller and optimizer heartbeats (no older than 180 seconds), Redis
+`PONG`, API `/health` healthy payload, and ready persisted device observations.
+Unhealthy-but-running containers are alert-only; a hung process that continues to
+satisfy these signals may not be detected. See `docs/heartbeat-runbook.md` for setup.
