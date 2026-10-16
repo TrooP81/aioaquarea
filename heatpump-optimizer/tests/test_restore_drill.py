@@ -46,11 +46,47 @@ def coordinator(tmp_path):
         if path == root:
             from types import SimpleNamespace
 
-            return SimpleNamespace(st_mode=0o40700)
+            return SimpleNamespace(st_mode=0o40700, st_uid=result.st_uid, st_gid=result.st_gid)
         return result
 
     with patch.object(Path, "stat", private_stat):
         yield drill.Coordinator(root, {}, runner=Mock())
+
+
+@pytest.mark.parametrize(
+    "euid,owner,expected", [(0, 1001, (1001, 1002)), (0, 0, None), (1001, 1001, None)]
+)
+def test_root_coordinator_hands_lease_and_receipt_to_lease_root_owner(
+    tmp_path, monkeypatch, euid, owner, expected
+):
+    # The pinned Docker CLI coordinator runs as root; the requesting runner/operator
+    # must still be able to read its private lease receipt (CI E2E found zero).
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    root = tmp_path / "leases"
+    root.mkdir(mode=0o700)
+    original = Path.stat
+    chown = Mock()
+    monkeypatch.setattr(drill.os, "geteuid", lambda: euid, raising=False)
+    monkeypatch.setattr(drill.os, "chown", chown, raising=False)
+
+    def owned_stat(path, **kwargs):
+        if path == root:
+            return SimpleNamespace(st_mode=0o40700, st_uid=owner, st_gid=owner + 1)
+        return original(path, **kwargs)
+
+    with patch.object(Path, "stat", owned_stat):
+        coordinator = drill.Coordinator(root, {}, runner=Mock())
+    coordinator.save()
+    assert (coordinator.lease / "receipt.json").is_file()
+    if expected is None:
+        chown.assert_not_called()
+        return
+    handed = [call.args for call in chown.call_args_list]
+    assert handed[0] == (coordinator.lease, *expected)
+    assert handed[1:] == [(coordinator.lease / "receipt.tmp", *expected)] * 2
+    assert all(call.kwargs == {"follow_symlinks": False} for call in chown.call_args_list)
 
 
 def test_deadline_reserves_cleanup():

@@ -20,6 +20,31 @@ SCRIPTS = PROJECT / "scripts"
 SHIM = Path(__file__).with_name("helpers") / "backup_command_shim.py"
 NOW = 1800000000
 INTERVAL = 2592000
+# Replaces the product's fixed 2 s TERM->KILL grace inside real timers only.
+TEST_GRACE = 0.5
+DATE_SHIM = """#!/bin/sh
+IFS= read -r now < "$HPO_BACKUP_FAKE_ROOT/clock.json" || [ -n "$now" ] || exit 1
+for format; do :; done
+[ "$format" != +%s ] || { printf '%s\\n' "$now"; exit 0; }
+exec "$HPO_BACKUP_REAL_DATE" -u -d "@$now" "$format"
+"""
+# Execute the real runtime timer in place, preserving PID/process group and
+# inherited lock descriptors. Only durations are shortened.
+TIMEOUT_SHIM = """#!/bin/sh
+[ "$1" = -k ] && [ "$2" = 2 ] || { echo "hard kill-after is mandatory" >&2; exit 125; }
+limit=$3
+shift 3
+. "$HPO_BACKUP_FAKE_ROOT/timeout.env"
+[ -z "$cap" ] || [ "$limit" -le "$cap" ] || limit=$cap
+HPO_BACKUP_ACTIVE_TIMEOUT=$limit
+export HPO_BACKUP_ACTIVE_TIMEOUT
+if [ -n "$pid_only" ]; then
+    # GNU foreground mode, like BusyBox, signals only the monitored PID.
+    # This forces the stage's independent group watchdog to do real work.
+    exec "$HPO_BACKUP_REAL_TIMEOUT" --foreground -k "$HPO_BACKUP_TEST_GRACE" "$limit" "$@"
+fi
+exec "$HPO_BACKUP_REAL_TIMEOUT" -k "$HPO_BACKUP_TEST_GRACE" "$limit" "$@"
+"""
 
 
 def working_bash() -> str | None:
@@ -71,23 +96,23 @@ class Harness:
             "psql",
             "pg_dump",
             "pg_restore",
-            "date",
             "sleep",
             "sha256sum",
             "mv",
             "openssl",
             "cp",
             "flock",
-            "timeout",
         ):
-            destination = bin_dir / command
             # Same Python as pytest, with no app imports or dependency on python3 on PATH.
-            destination.write_text(
-                f"#!{sys.executable}\n" + SHIM.read_text(encoding="utf-8").split("\n", 1)[1],
-                encoding="utf-8",
-                newline="\n",
+            # Isolated, site-free startup: the worker spawns these per command.
+            self.install(
+                bin_dir / command,
+                f"#!{sys.executable} -IS\n" + SHIM.read_text(encoding="utf-8").split("\n", 1)[1],
             )
-            destination.chmod(0o700)
+        # The clock and timer doubles wrap every bounded command, so they are
+        # POSIX sh rather than an interpreter start per call.
+        self.install(bin_dir / "date", DATE_SHIM)
+        self.install(bin_dir / "timeout", TIMEOUT_SHIM)
         real_flock = shutil.which("flock")
         assert real_flock, "bash environment must provide real flock, not a simulated lock"
         self.env = {
@@ -97,6 +122,8 @@ class Harness:
             "HPO_BACKUP_REAL_FLOCK": real_flock,
             "HPO_BACKUP_REAL_TIMEOUT": shutil.which("timeout") or "",
             "HPO_BACKUP_REAL_SLEEP": shutil.which("sleep") or "",
+            "HPO_BACKUP_REAL_DATE": shutil.which("date") or "",
+            "HPO_BACKUP_TEST_GRACE": str(TEST_GRACE),
             "BACKUP_DIR": str(self.backups),
             "BACKUP_REPLICA_DIR": str(root / "replica"),
             "BACKUP_REPLICA_ENABLED": "false",
@@ -116,9 +143,24 @@ class Harness:
         self.write("config.json", {})
         assert shutil.which("setsid"), "worker runtime must support isolated process groups"
         assert self.env["HPO_BACKUP_REAL_TIMEOUT"] and self.env["HPO_BACKUP_REAL_SLEEP"]
+        assert self.env["HPO_BACKUP_REAL_DATE"]
+
+    @staticmethod
+    def install(destination, text):
+        destination.write_text(text, encoding="utf-8", newline="\n")
+        destination.chmod(0o700)
 
     def write(self, name, value):
         (self.root / name).write_text(json.dumps(value), encoding="utf-8")
+        if name == "config.json":
+            # Sourced by the sh timeout double; sleep-time policy edits never touch these.
+            cap = value.get("timeout_cap")
+            (self.root / "timeout.env").write_text(
+                f"cap={int(cap) if cap else ''}\n"
+                f"pid_only={'1' if value.get('pid_only_timeout') else ''}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
 
     def read(self, name):
         return json.loads((self.root / name).read_text(encoding="utf-8"))

@@ -8,48 +8,58 @@ All filesystem mutations are restricted to the test's exclusively created root.
 
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
+# Every worker command spawns this interpreter (with -I -S), so keep imports
+# minimal: no site/pathlib at startup, heavier modules only where needed.
 import json
 import os
-from pathlib import Path
-import shutil
-import subprocess
 import sys
-import time
-import signal
 
-ROOT = Path(os.environ["HPO_BACKUP_FAKE_ROOT"]).resolve(strict=True)
+ROOT = os.path.realpath(os.environ["HPO_BACKUP_FAKE_ROOT"], strict=True)
+
+
+def path(name: str) -> str:
+    return os.path.join(ROOT, name)
 
 
 def load(name: str, default=None):
-    path = ROOT / name
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    try:
+        with open(path(name), encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        return default
 
 
 def save(name: str, value):
-    path = ROOT / name
-    pending = path.with_suffix(".pending")
-    pending.write_text(json.dumps(value), encoding="utf-8")
-    pending.replace(path)
+    pending = os.path.splitext(path(name))[0] + ".pending"
+    with open(pending, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(value))
+    os.replace(pending, path(name))
 
 
 def event(name: str, **fields):
-    with (ROOT / "events.jsonl").open("a", encoding="utf-8") as stream:
+    with open(path("events.jsonl"), "a", encoding="utf-8") as stream:
         stream.write(json.dumps({"command": name, **fields}) + "\n")
 
 
-def managed(value: str) -> Path:
-    path = Path(value)
-    assert path.resolve().is_relative_to(ROOT), "fake write escaped disposable root"
-    return path
+def managed(value: str) -> str:
+    resolved = os.path.realpath(value)
+    assert os.path.commonpath([resolved, ROOT]) == ROOT, "fake write escaped disposable root"
+    return value
 
 
-def iso(epoch: int) -> str:
-    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def read_bytes(value: str) -> bytes:
+    with open(value, "rb") as stream:
+        return stream.read()
+
+
+def write_bytes(value: str, data: bytes):
+    with open(managed(value), "wb") as stream:
+        stream.write(data)
 
 
 def epoch(value: str) -> int:
+    import datetime as dt
+
     return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
 
 
@@ -63,6 +73,8 @@ def variables(args):
 
 
 def resist(phase):
+    import signal
+
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     save(
         "resistant.json",
@@ -223,31 +235,32 @@ def psql(args, config, now):
 
 
 def main() -> int:
-    command, args = Path(sys.argv[0]).name, sys.argv[1:]
+    command, args = os.path.basename(sys.argv[0]), sys.argv[1:]
     config, now = load("config.json", {}), load("clock.json")
     fail = config.get("fail")
     if command == "psql":
         return psql(args, config, now)
     event(command, args=args)
-    if command == "date":
-        print(now if args[-1] == "+%s" else iso(now))
-    elif command == "pg_dump":
-        path = managed(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--file=")))
-        path.write_bytes(b"synthetic custom archive\n")
+    if command == "pg_dump":
+        write_bytes(
+            next(arg.split("=", 1)[1] for arg in args if arg.startswith("--file=")),
+            b"synthetic custom archive\n",
+        )
         if config.get("resistant") and config.get("resistant_phase", "dump") == "dump":
             resist("dump")
         if fail == "dump":
             return 1
     elif command == "pg_restore":
-        if fail == "toc" or not Path(args[-1]).read_bytes().startswith(b"synthetic"):
+        if fail == "toc" or not read_bytes(args[-1]).startswith(b"synthetic"):
             return 1
     elif command == "sha256sum":
         if config.get("resistant_phase") == "checksum" and args[-1].endswith(".dump.partial"):
             resist("checksum")
         if fail == "checksum" and args[-1].endswith(".dump.partial"):
             return 1
-        data = Path(args[-1]).read_bytes()
-        print(hashlib.sha256(data).hexdigest() + "  " + args[-1])
+        import hashlib
+
+        print(hashlib.sha256(read_bytes(args[-1])).hexdigest() + "  " + args[-1])
     elif command == "mv":
         target = args[-1]
         suffix = {
@@ -257,24 +270,34 @@ def main() -> int:
         }.get(fail)
         if suffix and target.endswith(suffix):
             return 1
-        managed(args[-2]).replace(managed(target))
+        os.replace(managed(args[-2]), managed(target))
     elif command == "openssl":
         if fail == "replica":
             return 1
-        managed(args[args.index("-out") + 1]).write_bytes(b"synthetic encrypted replica")
+        write_bytes(args[args.index("-out") + 1], b"synthetic encrypted replica")
     elif command == "cp":
         if config.get("pause_stage") and ".stage-" in args[-1] and args[-2].endswith(".dump"):
             save("stage_child.json", {"pid": os.getpid()})
-            (ROOT / "copy_entered").touch()
+            import time
+
+            open(path("copy_entered"), "a").close()
             deadline = time.monotonic() + 15
-            while not (ROOT / "copy_release").exists():
+            while not os.path.exists(path("copy_release")):
                 if time.monotonic() >= deadline:
                     return 1
                 time.sleep(0.01)
+        import shutil
+
         shutil.copyfile(args[-2], managed(args[-1]))
     elif command == "sleep":
         if config.get("real_sleep") or (config.get("resistant") and args == ["2"]):
-            os.execv(os.environ["HPO_BACKUP_REAL_SLEEP"], ["sleep", *args])
+            # Real timers keep their order, but the product's fixed 2 s
+            # TERM->KILL grace (settle, stage watchdog) is compressed exactly
+            # as the timeout double compresses kill-after.
+            seconds = float(args[0])
+            if seconds >= 2:
+                seconds += float(os.environ["HPO_BACKUP_TEST_GRACE"]) - 2
+            os.execv(os.environ["HPO_BACKUP_REAL_SLEEP"], ["sleep", str(seconds)])
         count = load("sleeps.json", 0) + 1
         save("sleeps.json", count)
         save("clock.json", now + int(args[0]))
@@ -282,27 +305,12 @@ def main() -> int:
             config["policy"] = config.pop("sleep_policy")
             save("config.json", config)
         return 73 if count >= config.get("stop_after_sleeps", 1) else 0
-    elif command == "timeout":
-        # Execute the real runtime timer in-place, preserving PID/process group
-        # and inherited lock descriptors. Only its duration is shortened.
-        assert args[:2] == ["-k", "2"], "hard kill-after is mandatory"
-        if config.get("timeout_cap"):
-            args[2] = str(min(float(args[2]), config["timeout_cap"]))
-        os.environ["HPO_BACKUP_ACTIVE_TIMEOUT"] = args[2]
-        if config.get("pid_only_timeout"):
-            # GNU foreground mode, like BusyBox, signals only the monitored PID.
-            # This forces the stage's independent group watchdog to do real work.
-            args.insert(0, "--foreground")
-        os.execv(os.environ["HPO_BACKUP_REAL_TIMEOUT"], ["timeout", *args])
     elif command == "flock":
         assert "-w" not in args, "BusyBox flock has no wait-timeout flag"
         # Preserve fd 9's *same open file description*: the real shell remains
         # lock owner after the flock subprocess exits.
-        code = subprocess.run(
-            [os.environ["HPO_BACKUP_REAL_FLOCK"], *args],
-            close_fds=False,
-            check=False,
-        ).returncode
+        real = os.environ["HPO_BACKUP_REAL_FLOCK"]
+        code = os.spawnv(os.P_WAIT, real, ["flock", *args])
         if code:
             event("lock_busy")
         return code

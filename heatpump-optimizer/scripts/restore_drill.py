@@ -137,14 +137,25 @@ class Coordinator:
                 "unix:///var/run/docker.sock"
             ):
                 raise DrillError("local_daemon_required")
-        if root.is_symlink() or not root.is_dir() or root.stat().st_mode & 0o077:
+        if root.is_symlink() or not root.is_dir():
             raise DrillError("private_lease_root_required")
+        owner = root.stat()
+        if owner.st_mode & 0o077:
+            raise DrillError("private_lease_root_required")
+        # A root coordinator container must leave its private audit receipt readable
+        # by the unprivileged owner of the lease root that requested the drill.
+        self.owner = (
+            (owner.st_uid, owner.st_gid)
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and owner.st_uid != 0
+            else None
+        )
         self.budget = budget or Budget()
         self.created_after = time.time()
         self.runner = runner
         self.token = uuid.uuid4().hex
         self.lease = root / self.token
         self.lease.mkdir(mode=0o700)  # exclusive, no adoption or cleanup on collision
+        self.hand_over(self.lease)
         self.source = source_receipt
         self.archive_id = archive_id
         if probe_key is not None and not re.fullmatch(r"backup_roundtrip_[0-9a-f]{32}", probe_key):
@@ -176,7 +187,12 @@ class Coordinator:
     def save(self):
         temporary = self.lease / "receipt.tmp"
         temporary.write_text(json.dumps(self.receipt, sort_keys=True), encoding="utf-8")
+        self.hand_over(temporary)
         temporary.replace(self.lease / "receipt.json")
+
+    def hand_over(self, path: Path):
+        if self.owner is not None:
+            os.chown(path, *self.owner, follow_symlinks=False)
 
     def docker(
         self, *args: str, cap: float = 30, cleanup: bool = False, output: BinaryIO | None = None

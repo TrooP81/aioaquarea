@@ -110,8 +110,10 @@ without bash. A Windows pass with shell skips is not executable-shell evidence.
 
 ### Bounded staging, creation proof and cleanup
 
-The coordinator writes its planned stage identity to its private audit receipt
-**before** source exec, then exclusively reserves `.stage-<lease-token>` with a
+The coordinator's private (0700) lease directory and its audit receipt are, when
+the pinned image runs as root, owned by the unprivileged owner of
+`--lease-root` so the requesting runner/operator can read them. The coordinator
+writes its planned stage identity to its private audit receipt **before** source exec, then exclusively reserves `.stage-<lease-token>` with a
 matching owner receipt. Explicit `run` never creates a missing reservation, so a
 queued exec cannot recreate a stage after cleanup. The source supervisor holds
 a separate control lock inherited by all copy descendants. Copying has an
