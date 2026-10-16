@@ -20,8 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from scripts.restore_drill import IMAGE, LABEL
-from tests.helpers.backup_qualification_command import command_json, command_result
+from scripts.restore_drill import IMAGE, LABEL, run_command
 from tests.e2e.test_manual_cop_postgresql import (
     current_verification_source_proof,
     guard_owned_database,
@@ -55,24 +54,14 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
     leases.mkdir(mode=0o700)
     created: list[str] = []
     started = time.monotonic()
-    last_stderr = ""
 
     def docker(*args, limit=30):
-        nonlocal last_stderr
         remaining = 540 - (time.monotonic() - started)
         assert remaining > 0, "supplementary phase deadline expired"
-        result = command_result(["docker", *args], timeout=min(limit, remaining))
-        last_stderr = result.stderr
-        if last_stderr:
-            print(f"docker {args[0]} stderr: {last_stderr}")
-        return result.stdout.strip()
-
-    def docker_json(*args, limit=30):
-        output = docker(*args, limit=limit)
-        return command_json(output, command=f"docker {args[0]}", stderr=last_stderr)
+        return run_command(["docker", *args], timeout=min(limit, remaining))
 
     def inspect(identity):
-        rows = docker_json("container", "inspect", identity)
+        rows = json.loads(docker("container", "inspect", identity))
         assert len(rows) == 1 and rows[0]["Id"] == identity
         return rows[0]
 
@@ -143,14 +132,16 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
         for name in ("backup_db.sh", "backup_status.sql", "stage_backup.sh"):
             docker("cp", str(scripts / name), f"{worker}:/scripts/{name}")
         docker("exec", worker, "sh", "/scripts/backup_db.sh", "--once", limit=120)
-        binding = docker_json(
-            "exec",
-            worker,
-            "psql",
-            "-XqAt",
-            "-c",
-            "SELECT details_json::jsonb->'last_success' FROM service_heartbeats "
-            "WHERE service='backup'",
+        binding = json.loads(
+            docker(
+                "exec",
+                worker,
+                "psql",
+                "-XqAt",
+                "-c",
+                "SELECT details_json::jsonb->'last_success' FROM service_heartbeats "
+                "WHERE service='backup'",
+            )
         )
         assert binding["archive_id"].startswith("heatpump-")
         source = inspect(worker)

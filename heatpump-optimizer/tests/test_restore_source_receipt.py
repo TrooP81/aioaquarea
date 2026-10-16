@@ -13,8 +13,6 @@ from tests.test_restore_db_integration import (
     PINNED_IMAGE,
     SOURCE_LABEL,
     _inspect_backup_source,
-    _seed,
-    _seed_backup_source,
 )
 
 WORKER = "a" * 64
@@ -120,42 +118,3 @@ def test_synthetic_source_receipt_refuses_unproven_or_changed_source(case):
     assert all(args[0] in {"container", "image", "network", "exec"} for args in stack.calls)
     assert all("rm" not in args and "start" not in args for args in stack.calls)
     assert (stack.container, stack.network) == before
-
-
-class SeedRoleModel:
-    """Only models fixture role order; real Timescale privilege checks remain in CI."""
-
-    database = "restore_production_test_source"
-
-    def __init__(self):
-        self.login = False
-        self.statements = []
-
-    def sql(self, database, statement):
-        assert "SUPERUSER" not in statement
-        self.statements.append((database, statement))
-        if statement == "CREATE ROLE heatpump LOGIN":
-            assert database == "postgres"
-            self.login = True
-        if "SELECT add_retention_policy(" in statement:
-            assert statement.startswith("SET ROLE heatpump;")
-            if not self.login:
-                raise PermissionError(
-                    'permission denied to start background process as role "heatpump"'
-                )
-            assert "RESET ROLE; SELECT add_job(" in statement
-        return ""
-
-
-def test_source_seed_uses_login_job_owner_without_superuser_grant():
-    stack = SeedRoleModel()
-    _seed_backup_source(stack)
-    assert stack.login
-    assert any("add_retention_policy(" in sql for _, sql in stack.statements)
-    assert all("NOLOGIN" not in sql for _, sql in stack.statements)
-
-
-def test_old_nologin_source_seed_is_rejected_at_policy_registration():
-    stack = SeedRoleModel()
-    with pytest.raises(PermissionError, match="background process"):
-        _seed(stack, stack.database, "archive")

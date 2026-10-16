@@ -50,7 +50,7 @@ case $mode in
         setsid sh "$0" bounded-copy "$seconds" <&0 &
         copy_pid=$!
         if wait "$copy_pid"; then result=0; else result=$?; fi
-        kill -s KILL -- "-$copy_pid" 2>/dev/null || true
+        kill -KILL -- "-$copy_pid" 2>/dev/null || true
         printf '%s\n' settled > "$stage/state"
         exit "$result" ;;
     bounded-copy)
@@ -59,7 +59,7 @@ case $mode in
         # fd 8 stays inherited by the watchdog until the entire group is dead.
         group=$$
         trap '' TERM HUP INT
-        (sleep "$(($2+2))"; kill -s KILL -- "-$group") &
+        (sleep "$(($2+2))"; kill -KILL -- "-$group") &
         exec timeout -k 2 "$2" sh "$0" copy ;;
     copy)
         # Keep the timeout's monitored shell alive through TERM so kill-after

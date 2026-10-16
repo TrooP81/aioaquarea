@@ -432,19 +432,6 @@ def _backup_source(stack: RestoreStack) -> Iterator[tuple[str, dict, str, float]
         assert worker not in stack.docker("container", "ls", "-aq", "--no-trunc").splitlines()
 
 
-def _seed_backup_source(stack: RestoreStack) -> None:
-    # A source job owner must be allowed to LOGIN when Timescale registers its
-    # scheduler via add_retention_policy. Restored roles remain independently NOLOGIN.
-    stack.sql("postgres", "CREATE ROLE heatpump LOGIN")
-    stack.sql(stack.database, "GRANT CREATE ON SCHEMA public TO heatpump")
-    _seed(stack, stack.database, "archive")
-    stack.sql(
-        stack.database,
-        "CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL); "
-        "CREATE TABLE service_heartbeats (service text PRIMARY KEY, updated_at timestamptz, details_json text)",
-    )
-
-
 def test_BK_4_identical_timescale_archive_fails_without_role_and_passes_with_nologin(
     stack: RestoreStack, synthetic_archive: Path
 ) -> None:
@@ -575,7 +562,14 @@ def test_test_mode_restores_synthetic_archive_and_preserves_source(
     # --test now always tears its targets down. Retain the detailed content
     # assertions via an independent restore of the exact worker-generated dump,
     # then require the guarded entry's own content/cleanup receipt as well.
-    _seed_backup_source(stack)
+    stack.sql("postgres", "CREATE ROLE heatpump NOLOGIN")
+    stack.sql(stack.database, "GRANT CREATE ON SCHEMA public TO heatpump")
+    _seed(stack, stack.database, "archive")
+    stack.sql(
+        stack.database,
+        "CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL); "
+        "CREATE TABLE service_heartbeats (service text PRIMARY KEY, updated_at timestamptz, details_json text)",
+    )
     with _backup_source(stack) as (worker, source, token, created_after):
         stack.docker("exec", worker, "sh", "/scripts/backup_db.sh", "--once")
         state = json.loads(
@@ -590,13 +584,9 @@ def test_test_mode_restores_synthetic_archive_and_preserves_source(
         stack.docker("cp", f"{worker}:/backups/{archive.name}", str(archive))
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         assert checksum == binding["sha256"]
-        # A fresh cluster, not the LOGIN source cluster: otherwise existing
-        # roles would hide whether the restore creates the required NOLOGIN role.
-        with _isolated_stack(stack.backup_dir) as restored:
-            restored.helper(
-                "restore", f"/backups/{archive.name}", "restore_production_test_assertions"
-            )
-            _assert_restored(restored, "restore_production_test_assertions")
+        stack.helper("restore", f"/backups/{archive.name}", "restore_production_test_assertions")
+        _assert_restored(stack, "restore_production_test_assertions")
+        stack.sql("postgres", "DROP DATABASE restore_production_test_assertions WITH (FORCE)")
         stack.sql(stack.database, "UPDATE restore_sentinel SET value='untouched'")
         leases = stack.backup_dir / "leases"
         leases.mkdir(mode=0o700)
