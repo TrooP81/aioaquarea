@@ -186,6 +186,16 @@ qualification on Windows.
 
 ## Separate deployment/first-backup gate
 
+The separate `restore-drill.yml` synthetic workflow also uses the guarded
+`restore_db.sh --test` entry. Its test creates an anonymous, nonce-labelled worker
+on the disposable source's inspected internal network, runs the actual backup
+worker, and produces a fresh source receipt from immutable Docker inspection and
+independent SQL identity checks. It does not use a prefix or `KEEP_STACK` as
+authority. Detailed content assertions independently restore the exact
+checksum-bound synthetic dump; the guarded entry must additionally produce its
+own verified content/cleanup receipt and leave the source unchanged. No target is
+kept for inspection after that entry: verified teardown remains mandatory.
+
 Before any command capable of starting the worker, obtain approval explicitly
 covering **activation and the immediate first live dump**. Independently inspect
 the active API/poller source, project, exact container/network, database name and

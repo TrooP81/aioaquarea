@@ -2524,6 +2524,7 @@ class SyntheticVerificationEvidence:
             "tests/e2e/test_price_providers.py::test_entsoe",
             "tests/e2e/test_api_panasonic.py::test_capabilities[a]",
         ],
+        "backup-roundtrip": [BACKUP_MODULE + "::test_owned_worker_and_coordinator_image_roundtrip"],
     }
 
     # Inventory fixture-closure obligations; the resource-free supplement node has none.
@@ -2535,7 +2536,9 @@ class SyntheticVerificationEvidence:
 
     def binding(self):
         modules = {node.split("::", 1)[0] for nodes in self.NODES.values() for node in nodes}
-        return {"heatpump-optimizer/" + module: "c" * 64 for module in sorted(modules)}
+        return {"heatpump-optimizer/" + module: "c" * 64 for module in sorted(modules)} | {
+            "heatpump-optimizer/scripts/backup_db.sh": "c" * 64
+        }
 
     def process(self, evidence, name, **changes):
         (evidence / name).mkdir(exist_ok=True)
@@ -2579,6 +2582,7 @@ class SyntheticVerificationEvidence:
         )
 
     def evidence(self, tmp_path):
+        assert set(self.NODES) == set(SEALED_TEST_PHASES), "synthetic phase fixture drifted"
         evidence = tmp_path / "owned" / "evidence"
         evidence.mkdir(parents=True, mode=0o700)
         source = {"commit": self.COMMIT, "source_manifest_sha256": self.DIGEST}
@@ -2604,6 +2608,28 @@ class SyntheticVerificationEvidence:
         )
         for node in self.RECEIPT_REQUIRED:
             self.write_receipt(evidence, node)
+        for node in self.NODES["backup-roundtrip"]:
+            # Fixture construction, like write_receipt below, must not invoke
+            # the publication/lock operations these tests deliberately fault.
+            name = "backup-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json"
+            (evidence / name).write_text(
+                json.dumps(
+                    {
+                        "test": node,
+                        "commit": self.COMMIT,
+                        "source_manifest_sha256": self.DIGEST,
+                        "ownership_token": self.TOKEN,
+                        "created_resources": ["d" * 64],
+                        "source_preserved": True,
+                        "cleanup_verified": True,
+                        "coordinator_verified": True,
+                        "worker_script_sha256": self.binding()[
+                            "heatpump-optimizer/scripts/backup_db.sh"
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
         proof = {"commit": self.COMMIT, "digest": self.DIGEST, "binding": self.binding()}
         return evidence, proof
 
@@ -3183,6 +3209,26 @@ class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
 
 class TestVerificationSeal(SyntheticVerificationEvidence):
     """Seal reconciliation over a synthetic evidence tree; no process or database."""
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["phase", "receipt", "source_preserved", "cleanup_verified", "coordinator_verified"],
+    )
+    async def test_backup_phase_and_bound_cleanup_receipt_remain_required(self, tmp_path, missing):
+        evidence, proof = self.evidence(tmp_path)
+        if missing == "phase":
+            (evidence / "backup-roundtrip" / "process.json").unlink()
+        else:
+            path = next(evidence.glob("backup-receipt-*.json"))
+            if missing == "receipt":
+                path.unlink()
+            else:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+                receipt[missing] = False
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+        with pytest.raises(AssertionError, match="backup"):
+            seal_verification_evidence(evidence, proof)
+        assert not (evidence / "seal.json").exists()
 
     async def test_complete_disjoint_partition_seals(self, tmp_path):
         evidence, proof = self.evidence(tmp_path)
