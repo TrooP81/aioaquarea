@@ -208,49 +208,15 @@ run_production_restore() {
 run_test_restore() {
     archive=$1
     require_completed_archive "$archive"
-    test_project=${RESTORE_TEST_PROJECT:-restore-db-production-test-$$}
-    case $test_project in
-        restore-db-production-test-*) ;;
-        *) echo "RESTORE_TEST_PROJECT must start with restore-db-production-test-" >&2; exit 2 ;;
-    esac
-    test_database=${RESTORE_TEST_DATABASE:-restore_production_test_$$}
-    case $test_database in
-        restore_production_test_*) ;;
-        *) echo "RESTORE_TEST_DATABASE must start with restore_production_test_" >&2; exit 2 ;;
-    esac
-    database_name "$test_database"
-    POSTGRES_DB=${POSTGRES_DB:-restore_production_test_maintenance}
-    case $POSTGRES_DB in
-        restore_production_test_*) ;;
-        *) echo "POSTGRES_DB must start with restore_production_test_ in --test mode" >&2; exit 2 ;;
-    esac
-    database_name "$POSTGRES_DB"
-    RESTORE_PRODUCTION_TEST_BACKUP_DIR=$(CDPATH='' cd -- "$(dirname -- "$archive")" && pwd -P)
-    RESTORE_DISPOSABLE=true
-    RESTORE_ISOLATED_PROJECT=$test_project
-    export POSTGRES_DB RESTORE_PRODUCTION_TEST_BACKUP_DIR RESTORE_DISPOSABLE RESTORE_ISOLATED_PROJECT
-    configure_test_resources
-    test_compose() {
-        docker compose -p "$test_project" -f "$PRODUCTION_TEST_COMPOSE_FILE" "$@"
+    # A prefix/test flag is not ownership proof. No Compose adoption or broad down.
+    : "${RESTORE_SOURCE_RECEIPT:?fresh independently inspected source receipt required}"
+    : "${RESTORE_LEASE_ROOT:?private creation-proven lease root required}"
+    [ "${RESTORE_TEST_KEEP_STACK:-false}" = false ] || {
+        echo "--test requires verified teardown; keeping resources is forbidden" >&2; exit 2;
     }
-    finish_test_restore() {
-        test_status=$?
-        trap - EXIT HUP INT TERM
-        if [ "${RESTORE_TEST_KEEP_STACK:-false}" != "true" ]; then
-            test_compose down -v >/dev/null 2>&1 || true
-        fi
-        exit "$test_status"
-    }
-    trap finish_test_restore EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    test_compose up -d --wait db
-    test_compose run --rm --no-deps -T \
-        -e RESTORE_SOURCE_IMAGE -e RESTORE_SOURCE_TIMESCALE_VERSION -e RESTORE_EXPECTED_REVISION \
-        -e RESTORE_REQUIRED_ROLES -e RESTORE_DISPOSABLE -e RESTORE_ISOLATED_PROJECT \
-        restore-tool sh /scripts/restore_archive.sh restore "/backups/$(basename -- "$archive")" "$test_database"
-    echo "Restored isolated test database: $test_database"
+    exec python3 "$SCRIPT_DIR/restore_drill.py" \
+        --lease-root "$RESTORE_LEASE_ROOT" --source-receipt "$RESTORE_SOURCE_RECEIPT" \
+        --archive-id "$(basename -- "$archive" .dump)"
 }
 
 if ! { [ "$#" -ge 2 ] && [ "$#" -le 3 ]; }; then

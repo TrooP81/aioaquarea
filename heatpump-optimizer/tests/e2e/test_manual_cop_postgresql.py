@@ -543,6 +543,21 @@ def owned_test_network():
 SOURCE_MANIFEST_SCHEMA = "hpo-verification-source-manifest/1"
 SOURCE_MANIFEST_NAME = "source-manifest.json"
 SOURCE_MANIFEST_DIGEST_ENV = "COP_MANUAL_TEST_SOURCE_MANIFEST_SHA256"
+BACKUP_BINDING_PATHS = (
+    "heatpump-optimizer/tests/e2e/test_backup_roundtrip.py",
+    "heatpump-optimizer/scripts/backup_db.sh",
+    "heatpump-optimizer/scripts/backup_status.sql",
+    "heatpump-optimizer/scripts/stage_backup.sh",
+    "heatpump-optimizer/scripts/restore_drill.py",
+    "heatpump-optimizer/scripts/restore_db.sh",
+    "heatpump-optimizer/scripts/restore_archive.sh",
+    "heatpump-optimizer/scripts/verify_backup_isolated.sh",
+    "heatpump-optimizer/Dockerfile.backup",
+    "heatpump-optimizer/Dockerfile.restore-coordinator",
+    "heatpump-optimizer/docker-compose.yml",
+    "heatpump-optimizer/docker-compose.backup.yml",
+    "heatpump-optimizer/docker-compose.test.yml",
+)
 VERIFICATION_BINDING_PATHS = (
     ".github/workflows/optimizer-ci.yml",
     "heatpump-optimizer/tests/e2e/conftest.py",
@@ -574,7 +589,7 @@ VERIFICATION_BINDING_PATHS = (
     "heatpump-optimizer/docs/manual-cop-schema-reset-runbook.md",
     "heatpump-optimizer/tests/test_optimizer_api_contracts.py",
     "heatpump-optimizer/web/e2e/fixtures.ts",
-)
+) + BACKUP_BINDING_PATHS
 VERIFICATION_REPAIR_PATHS = (
     "heatpump-optimizer/tests/e2e/test_ml_lifecycle_verification.py",
     "heatpump-optimizer/tests/e2e/test_api_indoor_forecast.py",
@@ -594,8 +609,8 @@ SOURCE_MANIFEST_DECLARATIONS = (
     "heatpump-optimizer/constraints.txt",
 )
 SOURCE_MANIFEST_MODES = frozenset({"100644", "100755"})
-assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 30
-assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 35
+assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 43
+assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 48
 
 
 def _source_checkout():
@@ -1127,8 +1142,14 @@ def verification_preflight(root, *, owned_sql=True):
 MANUAL_MODULE = "tests/e2e/test_manual_cop_postgresql.py"
 LIFECYCLE_MODULE = "tests/e2e/test_ml_lifecycle_postgresql.py"
 LIFECYCLE_VERIFICATION_MODULE = "tests/e2e/test_ml_lifecycle_verification.py"
+BACKUP_MODULE = "tests/e2e/test_backup_roundtrip.py"
 # Ordinary E2E keeps conftest and ignores exactly these coordinator-owned modules.
-COORDINATOR_MODULES = (MANUAL_MODULE, LIFECYCLE_MODULE, LIFECYCLE_VERIFICATION_MODULE)
+COORDINATOR_MODULES = (
+    MANUAL_MODULE,
+    LIFECYCLE_MODULE,
+    LIFECYCLE_VERIFICATION_MODULE,
+    BACKUP_MODULE,
+)
 REAL_MIGRATION_CLASS = LIFECYCLE_VERIFICATION_MODULE + "::TestOBS5RealMigration"
 SEALED_TEST_PHASES = (
     "migration",
@@ -1138,6 +1159,7 @@ SEALED_TEST_PHASES = (
     "obs5-pg-original",
     "obs5-pg-supplement",
     "ordinary",
+    "backup-roundtrip",
 )
 OBS5_TEST_PHASES = ("obs5-real-migration", "obs5-pg-original", "obs5-pg-supplement")
 REQUIRED_SCHEMA_PHASES = (
@@ -1150,6 +1172,7 @@ REQUIRED_SCHEMA_PHASES = (
     "obs5-primary-check",
     "check-obs5",
     "check-ordinary",
+    "check-backup",
 )
 
 
@@ -1164,6 +1187,7 @@ def _verification_phase_owns(name, nodeid):
         "obs5-pg-original": module == LIFECYCLE_MODULE,
         "obs5-pg-supplement": module == LIFECYCLE_VERIFICATION_MODULE and not real_migration,
         "ordinary": module not in COORDINATOR_MODULES,
+        "backup-roundtrip": module == BACKUP_MODULE,
     }
     assert name in owners, f"unknown verification phase {name}"
     return owners[name]
@@ -1393,7 +1417,11 @@ def _lifecycle_evidence_snapshot(evidence):
     ):
         info = path.lstat()
         records[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
-    paths = set(Path(evidence).glob("obs5-receipt*")) | set(Path(evidence).glob("obs5-*.json"))
+    paths = (
+        set(Path(evidence).glob("obs5-receipt*"))
+        | set(Path(evidence).glob("obs5-*.json"))
+        | set(Path(evidence).glob("backup-receipt*"))
+    )
     for path in paths:
         if path.name == "obs5-scope-seal.json":
             continue
@@ -1442,6 +1470,43 @@ def write_lifecycle_receipt(evidence, receipt):
         assert isinstance(node, str) and node, "lifecycle receipt node is missing"
         name = "obs5-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json"
         _publish_lifecycle_json(evidence / name, receipt)
+
+
+def write_backup_receipt(evidence, receipt):
+    evidence = Path(evidence)
+    with lifecycle_evidence_lock(evidence):
+        assert not (evidence / "seal.json").exists(), "backup receipt store is sealed"
+        node = receipt["test"]
+        assert node.split("::", 1)[0] == BACKUP_MODULE, "foreign backup receipt owner"
+        name = "backup-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json"
+        _publish_lifecycle_json(evidence / name, receipt)
+
+
+def validate_backup_receipts(evidence, nodes, proof, ownership):
+    expected = {
+        "backup-receipt-" + hashlib.sha256(node.encode()).hexdigest()[:32] + ".json": node
+        for node in nodes
+    }
+    paths = list(Path(evidence).glob("backup-receipt*"))
+    assert nodes and {path.name for path in paths} == set(expected), (
+        "backup receipt coverage mismatch"
+    )
+    for path in paths:
+        assert path.is_file() and not path.is_symlink(), "unsafe backup receipt"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert (
+            record["test"] == expected[path.name]
+            and record["ownership_token"] == ownership["token"]
+            and record["commit"] == proof["commit"]
+            and record["source_manifest_sha256"] == proof["digest"]
+            and record["source_preserved"] is True
+            and record["cleanup_verified"] is True
+            and record["coordinator_verified"] is True
+            and record["created_resources"]
+            and len(record["created_resources"]) == len(set(record["created_resources"]))
+            and record["worker_script_sha256"]
+            == proof["binding"]["heatpump-optimizer/scripts/backup_db.sh"]
+        ), "backup receipt source/creation/cleanup mismatch"
 
 
 def atomic_lifecycle_seal(function):
@@ -1621,6 +1686,8 @@ def seal_verification_evidence(evidence=None, proof=None):
     head, processes = validate_bound_verification_evidence(
         evidence, proof, partitions, REQUIRED_SCHEMA_PHASES, "e2e-inventory"
     )
+    ownership = json.loads((evidence.parent / "ownership.json").read_text(encoding="utf-8"))
+    validate_backup_receipts(evidence, partitions["backup-roundtrip"], proof, ownership)
     _publish_lifecycle_json(
         evidence / "seal.json",
         {

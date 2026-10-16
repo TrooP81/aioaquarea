@@ -1,0 +1,241 @@
+# Database backups and isolated restore qualification
+
+**Staged implementation, not activation evidence.** No worker start, live dump,
+Docker drill, production restore, device access or notification delivery is
+authorized by this document.
+
+## Approved policy and recovery boundary
+
+Owner approval recorded 2026-10-16 16:52 covers implementing reviewed Repair 1 and
+the Repair 2 monthly amendment. Monthly means 2,592,000 seconds (30 days UTC).
+Freshness is 32 days, retention 100 days, with a non-relaxable two-eligible-snapshot
+floor and latest-success/verified protections. Nominal RPO is approximately
+30 days; failures can extend it. The owner accepts local-only loss, excluded
+external encryption keys/Compose secrets/configuration/`modeldata`, and one initial
+source/schema restore qualification rather than recurring automatic drills.
+
+The deployment-only primary root is `D:\backups\heatpump-optimizer\`, never
+`D:\backups\`. Replica is disabled and not required. These paths must not be
+created or written during implementation/testing.
+
+## Required qualification before activation
+
+1. Run offline unit checks with the complete disposable environment set before
+   imports. Exercise health histories, merged-policy validation, API/webhook
+   allowlists, retention guards and lifecycle failures.
+2. Execute the existing **owned Linux CI `backend-e2e`** preparation, inventories
+   and all ordinary/manual/lifecycle phases. The supplementary `backup-roundtrip`
+   follows `check-ordinary`, then `check-backup`, then the full seal. It cannot
+   substitute for existing phases, skip/xfail nodes, or fabricate ownership.
+3. Use the pinned coordinator base below. Dockerfile and CI have the same checked-in
+   default; no `HPO_RESTORE_COORDINATOR_BASE_IMAGE` repository variable is required.
+   Its derived image and Unix-socket entry path must qualify on synthetic data
+   before documenting Windows-host support.
+4. Confirm worker tools (`flock`, `timeout` with `-k`, `setsid`, `psql`, `pg_dump`, `pg_restore`,
+   `sha256sum`, and OpenSSL if replica-enabled) on the pinned image. No missing-tool
+   workaround, dependency installation, relaxed restore guard or Timescale catalog
+   filtering is an acceptable passing result. Tool/dependency changes need approval.
+5. Keep only synthetic metadata/receipts in CI evidence. Never upload a household
+   dump, source credential or raw database error.
+
+Native Windows shell/Docker qualification is not established. The Windows-host
+route is a separately approved short-lived Linux coordinator container with no
+network and access to Docker Desktop's local Unix socket. Socket access is
+privileged and must never be mounted into the scheduled worker.
+
+### Coordinator base and rotation
+
+The checked-in default is the official Docker CLI stable release, resolved and
+verified by read-only registry HTTP queries on **2026-10-16**:
+
+```text
+docker:29.9.0-cli@sha256:1a4c7cb63513f349bdad01fcc6e0f3f2f67d37b9da86f14dc0d4a0942eecda00
+```
+
+This is the multi-platform **index** digest, not an image-config digest. The
+inspected Linux/amd64 child is
+`sha256:4caa52207e95c68c3087006eefb3a5f6ca48ad1c0ba3aa3e6843549a0720b7bb`;
+its annotations identify Alpine 3.24. The derived image adds only the authorized
+`python3=3.14.8-r0` package, confirmed in the official Alpine 3.24 main indexes
+for x86_64 and aarch64. The coordinator uses only the standard library and requires
+Python 3.11 or newer; it does not import the application.
+
+The official CLI base avoids separately downloading and maintaining a static
+Docker binary/checksum installation path. The base digest pins its existing tools;
+the exact Python package version fails closed if unavailable. Transitive APK
+dependencies and repository availability are not a fully locked package closure.
+
+To rotate, under a separately reviewed dependency change:
+
+1. Identify the current stable `docker:<version>-cli` official tag. Resolve its
+   registry index using `docker buildx imagetools inspect` or registry HTTP GETs.
+   With HTTP, verify the returned bytes' SHA-256 against `Docker-Content-Digest`.
+   Inspect the Linux child annotations/config to identify its Alpine release;
+   do not substitute an unverified digest or a floating tag.
+2. Read the official matching Alpine main package indexes and select an exact
+   Python version available for the supported architectures. Review compatibility,
+   provenance and security changes; do not silently fall back to an unpinned APK.
+3. Update the Dockerfile ARG, pinned Python APK, the `backend-e2e` environment
+   default in `optimizer-ci.yml`, and this record together. The offline parity
+   test rejects different CI/Dockerfile defaults or an unversioned Python package.
+4. Rerun offline unit/lint/LF checks. After the owner's approval to push/run CI,
+   qualify the derived image and complete owned round-trip/seal. A successful
+   registry query is not build, runtime or restore qualification.
+
+### Executable offline worker tests
+
+`tests/test_backup_worker_execution.py` launches the **actual** `backup_db.sh`
+and `stage_backup.sh` under bash, using disposable directories and PATH doubles
+for PostgreSQL commands, date, sleep, publication/copy/checksum commands and
+optional replication. Real `flock` provides lock semantics; no database,
+container, provider, credential file or household archive is accessed.
+
+The matrix covers first activation, pre-due/due/overdue restarts, persisted-success
+suppression, failure retry spacing, phase/status failures, required/optional replica
+outcomes, retention's two-snapshot floor/protected archives, untrusted inventory
+refusal, policy reload on a bounded wake, and staging-versus-retention contention.
+The PostgreSQL adapter models SQL responses: it does not qualify the SQL engine.
+That remains the owned round-trip's responsibility.
+
+The executable matrix also contains TERM-resistant dump and staging-copy cases:
+deadline and cancellation must leave no live child holding the backup lock, preserve
+the prior successful backup, and record failure/interruption. Staging cleanup must
+leave the synthetic source worker running.
+
+Only a missing/nonfunctional bash permits skipping this matrix locally.
+`backend-unit` includes it in the ordinary full unit command; on Linux with
+`CI=true`, missing bash is a hard failure, not a skip. Missing `flock` fails too.
+The byte-level shell guard and `.gitattributes` `*.sh text eol=lf` check run even
+without bash. A Windows pass with shell skips is not executable-shell evidence.
+
+### Bounded staging, creation proof and cleanup
+
+The coordinator writes its planned stage identity to its private audit receipt
+**before** source exec, then exclusively reserves `.stage-<lease-token>` with a
+matching owner receipt. Explicit `run` never creates a missing reservation, so a
+queued exec cannot recreate a stage after cleanup. The source supervisor holds
+a separate control lock inherited by all copy descendants. Copying has an
+in-container 45-second timeout plus two-second kill-after; the monitored copy shell
+ignores TERM. A separate watchdog in that isolated process group sends group KILL
+at the hard deadline even if its caller dies or BusyBox timeout kills only its
+monitored PID. Cleanup cannot acquire the control lock while that group survives.
+
+Source cleanup waits (bounded to 55 seconds plus kill-after) for the control lock.
+It verifies the owner token, removes only the known files and requires successful
+`rmdir` before acknowledging settlement. It never stops the source worker.
+Missing ownership proof, remaining process/control lock, unexpected contents,
+failed removal or daemon loss records an unresolved source stage and makes
+`cleanup_verified=false`. Local `lease/archive.dump` and `archive.json` are removed
+on both success and failure; only the audit receipt is retained after clean completion.
+
+Target containers are inspected twice: pre-start image/labels/mounts/HostConfig
+network configuration (an empty runtime NetworkID is expected), then post-start
+actual image/network membership. They start with an idle shell, not a database
+initializer or restore. Database launch follows runtime inspection; SQL database
+identity is checked before any restore command. The scratch volume uses a fresh
+random name plus lease/nonce labels; before mounting, its returned name, local
+driver, absence of driver options and post-reservation CreatedAt must all match.
+An adopted/raced or uninspectable volume is never mounted, written or deleted.
+
+The worker image remains the pinned Alpine-based Timescale image. It uses
+BusyBox-compatible `timeout -k 2` and `setsid`, not GNU-only long options.
+The Dockerfile fails its build if kill-after or setsid is unavailable; no new
+package is installed for these controls. Each worker phase/scheduler sleeper has
+its own process group. Settlement sends TERM, waits at most two seconds, then
+sends KILL to that group before reporting interruption. Image/runtime qualification
+is still required; this build assertion is not local Docker execution evidence.
+
+#### Captured-output ownership audit
+
+The staged Compose command is `/bin/sh /scripts/backup_db.sh`; on its pinned
+Alpine-based image this is BusyBox ash, not bash. The worker therefore uses POSIX
+functions/read/case/arithmetic only. No worker command substitution, backtick
+capture or external pipeline remains. SQL policy/due/identity/manifest/protection
+queries, archive/retention/replica checksums, UUID generation and clock reads all
+run through main-shell-owned process groups. Captured results use an exclusively
+created private `.work-<uuid>` directory and builtin reads, not subshells. Each
+invocation reads a fresh UUID from `/proc/sys/kernel/random/uuid`, the same Linux
+kernel interface already required for archive IDs, using POSIX builtin `read`.
+No new image utility or command substitution is needed. `umask 077` and exclusive
+`mkdir` protect the workspace; an existing random name is never adopted and a new
+UUID is tried (at most ten attempts). Other storage failures fail closed.
+
+Cleanup removes only this invocation's known files/directory. SIGKILL/OOM can
+leave an abandoned workspace, but neither a legacy PID-style directory nor a
+UUID-style directory blocks a later invocation. They are deliberately ignored
+by archive retention and staging, never broadly deleted, and do not establish
+untrusted archive inventory or fail health by their mere presence. No workspace
+count/status schema change is introduced by this targeted repair. Abandoned
+workspaces can accumulate; capacity monitoring and any separately authorized
+manual cleanup remain operational responsibilities.
+
+The staging audit differs: captured SQL, manifest reads and archive checksums
+already execute inside its `bounded-copy` group and inherit the control/backup
+locks. They do not launch detached per-capture groups, so the existing independent
+group watchdog covers their descendants. Its owner/state captures read only the
+fixed-size private control files; there is no worker-style hidden `bounded` PGID.
+Staging and the closed coordinator/volume lifecycle fixes are unchanged.
+
+Cancellation regressions use TERM-resistant checksum and captured identity-SQL
+tools as well as `pg_dump`. Each cancellation checks that the effective tool
+timeout exceeds the eight-second shutdown grace (SQL: 20 seconds; checksum/dump:
+60 seconds in the test), then requires group death, lock release, preserved prior
+success and persisted interruption before that grace ends. Both bash and `/bin/sh`
+routes cover captured commands on Linux; this does not establish local ash/runtime
+qualification on Windows.
+
+## Separate deployment/first-backup gate
+
+Before any command capable of starting the worker, obtain approval explicitly
+covering **activation and the immediate first live dump**. Independently inspect
+the active API/poller source, project, exact container/network, database name and
+server identity, PostgreSQL major, Timescale version and Alembic revision.
+The standalone backup-only configuration must name that exact existing network
+and source, with `BACKUP_EXPECTED_SOURCE_ID` matching inspected SQL identity.
+Do not replace/recreate DB or Redis or bring up ordinary Compose wholesale.
+
+Record protected primary and scratch storage, Windows ACLs, at-rest encryption,
+free capacity/headroom and the accepted recovery boundary. `umask 077` is not
+Windows ACL/encryption evidence. The mount refuses implicit host-path creation.
+Explicitly apply the monthly settings policy: new defaults do not overwrite old
+persisted settings. Stage/render images/configuration first without creating a
+running worker. Implementation approval is not deployment authorization.
+
+## Separately approved initial drill
+
+Use only a fresh independently inspected source receipt and exclusively reserved
+private lease root. `verify_backup_isolated.sh` is an explicit launcher;
+`restore_db.sh --test <managed-dump>` delegates the disposable lifecycle to
+`restore_drill.py`. `--test` now requires `RESTORE_SOURCE_RECEIPT` and
+`RESTORE_LEASE_ROOT`; a prefix, open port, `RESTORE_TEST_KEEP_STACK` or test flag
+cannot authorize resource adoption or mutation. Legacy archives without trusted
+managed manifests are not automatically eligible for this qualification route.
+The production/cutover branch remains unchanged.
+
+Archive selection, checksum/manifest validation and copying happen under the
+destination's retention lock. Restore consumes only the staged read-only copy.
+The coordinator reserves a private UUID lease, records exact returned creation
+IDs, verifies image/labels/network/mount/database identity, refuses unverifiable
+capacity and reserves cleanup time. Default lifecycle is 4,500 seconds, startup
+90, restore at most 3,600, final reporting 20, with 120 seconds reserved for cleanup.
+Synthetic CI uses smaller budgets and at least 60 seconds reserved for cleanup.
+
+Success means content verification **and inspected resource absence** followed by
+persisted final source reporting. Killing a client or losing Docker connectivity
+does not prove container work stopped. Never suppress cleanup errors or clean
+unknown objects. Preserve private residual-resource receipts for separately
+approved operator recovery. A failed drill stays degraded; prior success and
+verified history are not erased.
+
+## Observation and rollback
+
+After separately authorized activation/drill, compare readiness and the UI's three
+histories, then observe a second naturally scheduled backup before claiming the
+scheduler operational. UI refresh remains 30 seconds; notifications reuse the
+existing five-minute evaluation cycle and require their existing authorization.
+Whole-host failure can silence that delivery; independent monitoring is separate.
+
+Rollback stops only the approved backup service, retaining archives and corrected
+fail-closed health. It is not a database restore, cutover, schema downgrade or
+license to delete backup artifacts. Age/count protections may retain archives
+past 100 days; disk pressure must fail/alert, never bypass retention protection.

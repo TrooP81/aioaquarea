@@ -1,0 +1,2 @@
+# POSIX scripts must remain executable text on Windows checkouts and Linux CI.
+*.sh text eol=lf

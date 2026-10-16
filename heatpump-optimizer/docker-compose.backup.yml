@@ -1,0 +1,35 @@
+# Standalone backup-only runtime definition. STAGED, NOT ACTIVATED.
+# No database/Redis/app services and no published ports. Never combine with
+# ordinary Compose wholesale against an external active database.
+services:
+  backup:
+    profiles: [ "backup" ]
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    environment:
+      PGHOST: ${BACKUP_SOURCE_HOST:?approved source network alias required}
+      PGDATABASE: ${BACKUP_SOURCE_DATABASE:?approved source database required}
+      PGUSER: ${BACKUP_SOURCE_USER:?approved source role required}
+      PGPASSWORD: ${BACKUP_SOURCE_PASSWORD:?approved source credential required}
+      BACKUP_EXPECTED_SOURCE_ID: ${BACKUP_EXPECTED_SOURCE_ID:?inspected SQL source identity required}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-2592000}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-100}
+      BACKUP_MAX_AGE_SECONDS: ${BACKUP_MAX_AGE_SECONDS:-2764800}
+      BACKUP_TIMEOUT_SECONDS: ${BACKUP_TIMEOUT_SECONDS:-3600}
+      BACKUP_REPLICA_ENABLED: "false"
+      BACKUP_REPLICA_REQUIRED: "false"
+    command: [ "/bin/sh", "/scripts/backup_db.sh" ]
+    volumes:
+      - type: bind
+        source: ${BACKUP_HOST_DIR:?dedicated protected absolute storage root required}
+        target: /backups
+        bind:
+          create_host_path: false
+    networks: [ source ]
+    restart: unless-stopped
+networks:
+  source:
+    external: true
+    name: ${BACKUP_SOURCE_NETWORK:?exact inspected active network required}

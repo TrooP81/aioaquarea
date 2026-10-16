@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:4444"  # Comma-separated allowed origins
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
+    backup_interval_seconds: int = 2592000
+    backup_retention_days: int = 100
+    backup_max_age_seconds: int = 2764800
+    backup_timeout_seconds: int = 3600
     executor_safety_read_reserve: int = Field(default=2, ge=1, le=4)
     panasonic_distributed_read_quota_enabled: bool = False
 
