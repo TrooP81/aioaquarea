@@ -54,6 +54,8 @@ jobs:
       - name: Check backend formatting
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase format -m ruff format --check packages tests migrations
       - name: Run unit tests
+        # Includes test_backup_worker_execution.py: real bash + disposable PATH
+        # shims, with a hard failure rather than a skip when Linux CI lacks bash.
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase unit -m pytest tests --ignore=tests/e2e -q
       - uses: actions/upload-artifact@v4
         if: always()
@@ -69,6 +71,8 @@ jobs:
       run:
         working-directory: heatpump-optimizer
     env:
+      # Keep in sync with Dockerfile.restore-coordinator; no repository variable required.
+      RESTORE_COORDINATOR_BASE_IMAGE: docker:29.9.0-cli@sha256:1a4c7cb63513f349bdad01fcc6e0f3f2f67d37b9da86f14dc0d4a0942eecda00
       DATABASE_URL: postgresql+asyncpg://heatpump:heatpump_test@127.0.0.1:5433/heatpump_test
       REDIS_URL: redis://127.0.0.1:6380/0
       APP_ENVIRONMENT: test
@@ -160,9 +164,13 @@ jobs:
       - name: Compare schema after OBS-5 lifecycle tests
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-obs5 -m alembic check
       - name: Run remaining database-backed E2E tests
-        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_verification.py -q
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_verification.py --ignore=tests/e2e/test_backup_roundtrip.py -q
       - name: Compare schema after ordinary E2E teardown
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-ordinary -m alembic check
+      - name: Qualify backup worker and isolated coordinator on the owned source
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase backup-roundtrip -m pytest --noconftest tests/e2e/test_backup_roundtrip.py -q --tb=short
+      - name: Compare schema after backup roundtrip teardown
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-backup -m alembic check
       - name: Reconcile node inventory and seal verification receipts
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py seal
       - uses: actions/upload-artifact@v4

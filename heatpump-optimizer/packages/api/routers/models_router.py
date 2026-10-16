@@ -1566,15 +1566,13 @@ async def health():
 async def readiness():
     """Readiness includes the data-collection and control service freshness."""
 
-    import os
-
+    from packages.core.backup_health import load_backup_health
     from packages.core.models import ServiceHeartbeatRecord
     from packages.core.device_data_quality import get_device_data_quality
 
     now = dt.datetime.now(dt.timezone.utc)
     service_cutoff = now - dt.timedelta(minutes=3)
-    backup_max_age_seconds = int(os.getenv("BACKUP_MAX_AGE_SECONDS", str(26 * 3600)))
-    backup_cutoff = now - dt.timedelta(seconds=backup_max_age_seconds)
+    backup = await load_backup_health(now=now)
     async with get_session() as session:
         rows = (
             (
@@ -1598,10 +1596,11 @@ async def readiness():
         for service, cutoff in {
             "poller": service_cutoff,
             "optimizer": service_cutoff,
-            "backup": backup_cutoff,
         }.items()
         if by_service.get(service) is None or by_service[service] < cutoff
     ]
+    if not backup["ready"]:
+        stale.append("backup")
     if not device_quality["ready"]:
         stale.append("device_status")
     if not planning_data_quality["control_allowed"]:
@@ -1614,6 +1613,7 @@ async def readiness():
                 "stale": stale,
                 "device_data_quality": _device_data_quality_payload(device_quality),
                 "planning_data_quality": planning_data_quality,
+                "backup": backup,
             },
         )
     return {
@@ -1622,10 +1622,7 @@ async def readiness():
         "data": {
             **_device_data_quality_payload(device_quality),
         },
-        "backup": {
-            "last_success": by_service["backup"].isoformat(),
-            "stale_after_seconds": backup_max_age_seconds,
-        },
+        "backup": backup,
         "planning_data_quality": planning_data_quality,
     }
 

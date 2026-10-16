@@ -504,13 +504,14 @@ esac
         script = SCRIPT.read_text(encoding="utf-8")
         test_body = script.split("run_test_restore() {", 1)[1]
 
-        assert '"$PRODUCTION_TEST_COMPOSE_FILE"' in test_body
-        assert "test_project=${RESTORE_TEST_PROJECT:-restore-db-production-test-$$}" in test_body
-        assert "test_database=${RESTORE_TEST_DATABASE:-restore_production_test_$$}" in test_body
-        assert "up -d --wait db" in test_body
-        assert "restore-tool sh /scripts/restore_archive.sh restore" in test_body
-        assert "RESTORE_DISPOSABLE=true" in test_body
-        assert "test_compose down -v" in test_body
+        assert 'exec python3 "$SCRIPT_DIR/restore_drill.py"' in test_body
+        assert "${RESTORE_SOURCE_RECEIPT:?" in test_body
+        assert "${RESTORE_LEASE_ROOT:?" in test_body
+        assert 'require_completed_archive "$archive"' in test_body
+        assert '--archive-id "$(basename -- "$archive" .dump)"' in test_body
+        assert "keeping resources is forbidden" in test_body
+        assert "test_compose down" not in test_body
+        assert "up -d" not in test_body
         assert '"$COMPOSE_FILE"' not in test_body
         assert "set -x" not in script
 
@@ -617,10 +618,11 @@ esac
                 "RESTORE_VERIFY_MEMORY_BYTES": "1",
             },
         )
-        assert result.returncode == 0, result.stderr
-        assert set(command_log.read_text(encoding="utf-8").splitlines()) == {
-            f"{3 * 1024**3}:{5 * 1024**3}"
-        }
+        # Memory sizing moved to the ownership coordinator (covered by
+        # test_restore_drill). A prefix and memory override alone must not start Docker.
+        assert result.returncode != 0
+        assert "RESTORE_SOURCE_RECEIPT" in result.stderr
+        assert not command_log.exists()
 
     def test_disposable_redirection_works_without_project_backups_directory(
         self, tmp_path: Path

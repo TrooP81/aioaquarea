@@ -110,21 +110,71 @@ restart the API and poller; no migration or Redis cleanup is required.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `BACKUP_INTERVAL_SECONDS` | `86400` | Interval between archives. |
-| `BACKUP_RETENTION_DAYS` | `14` | Days completed archives are kept. |
-| `BACKUP_VERIFY_AFTER_DUMP` | `false` | Forced off in production Compose. Same-instance verification is forbidden; use isolated drills. |
+| `BACKUP_INTERVAL_SECONDS` | `2592000` | Env fallback for `backup_interval_seconds`: fixed 30-day UTC interval, not calendar months. |
+| `BACKUP_RETENTION_DAYS` | `100` | Env fallback for `backup_retention_days`. Age eligibility never overrides protection or the two-snapshot floor. |
+| `BACKUP_MAX_AGE_SECONDS` | `2764800` | Env fallback for `backup_max_age_seconds`: stale at 32 days. Failure degrades health immediately. |
+| `BACKUP_TIMEOUT_SECONDS` | `3600` | Env fallback for `backup_timeout_seconds`; bounded attempt, not an interval-length sleep. |
+| `BACKUP_HOST_DIR` | `./backups` in development only | Approved live value: `D:\backups\heatpump-optimizer\`. Deployment-only; never use the parent `D:\backups\`. The standalone backup definition requires an explicit existing protected bind mount. |
 | `BACKUP_REPLICA_ENABLED` | `false` | Write an encrypted copy to the replica directory. |
+| `BACKUP_REPLICA_HOST_DIR` | `./backups-replica` | Host directory mounted as the replica target. |
 | `BACKUP_REPLICA_REQUIRED` | `false` | Treat a failed replica as a failed backup. |
 | `BACKUP_REPLICA_ENCRYPTION_KEY` | _(empty)_ | Required when replicas are enabled. |
-| `BACKUP_REPLICA_HOST_DIR` | `./backups-replica` | Host directory mounted as the replica target. |
-| `BACKUP_MAX_AGE_SECONDS` | `93600` (26 h) | Read by the API readiness check; an older newest backup is reported stale. |
+
+The four numeric backup settings are edited through the existing settings API,
+not a dedicated settings page. Persisted values take precedence; empty backup
+values fall back to the environment and then the defaults above. A bulk update
+validates the complete merged policy inside the existing settings transaction lock;
+single backup-key writes use the same boundary. Bounds:
+
+| Setting | Minimum | Maximum |
+| --- | ---: | ---: |
+| `backup_interval_seconds` | 3600 | 7776000 |
+| `backup_retention_days` | 2 | 365 |
+| `backup_max_age_seconds` | 3600 | 10368000 |
+| `backup_timeout_seconds` | 60 | 21600 |
+
+Freshness must cover interval + timeout + 120 seconds; retention in seconds must
+strictly exceed the interval and cover freshness. Invalid combinations are rejected
+before any write. Defaults do not overwrite old persisted policies: explicitly set
+the approved monthly policy during separately approved activation.
+
+The worker checks policy/durable success at least every 60 seconds. Its next due
+time is successful snapshot start + interval. Restart before that time does not
+duplicate a backup; overdue restart attempts once, with a five-minute failed-attempt
+retry delay. Unsupported/legacy history is unknown, not proof of first activation
+or successful protection. No heartbeat-time backfill is performed.
+
+Retention holds the same destination lock as archive selection/staging. It deletes
+only validated direct managed sets (dump, manifest, checksum), never recursively.
+Untrusted protection/inventory blocks all archive deletion. Latest successful,
+newest eligible and latest verified archives are protected; at least two eligible
+snapshots must remain after any deletion. Bootstrap may have fewer than two.
+These rules can retain files beyond 100 days; capacity must not override them.
+
+`docker-compose.backup.yml` is a standalone **staged, inactive** definition with
+only a backup service and an explicit existing external source network. Source
+host/database/role/credential and inspected SQL source ID are deployment inputs.
+Do not use ordinary Compose wholesale against external active infrastructure.
+No primary/scratch directory, secret or live deployment is provisioned by these edits.
+Replica remains disabled/not required for the approved local-only deployment.
+
+Readiness and operations alerts share a versioned evidence reader. Successful
+backup, latest attempt and verified restore are separate histories; optional replica
+failure is warning-only. Raw archive IDs/checksums/paths/source identities and
+database errors do not enter public backup summaries or webhook backup details.
+Disabled delivery, empty alerts and loading errors never establish backup health.
+
+See [backup runbook](backup-runbook.md) for qualification/activation boundaries.
 
 ### Restore And Isolated Drills (Phase 1)
 
 These are script/CI inputs, not runtime application settings. See the
 [restore and rollback runbook](../README.md#local-evidence-and-restore-runbook).
-Metadata sidecars, backup-time verification, and backup-health state transitions
-remain Phase 2 work; no migration or API health behavior changes in Phase 1.
+The staged Phase 1 monthly worker publishes manifest/checksum sidecars and versioned
+backup-health histories. Readiness uses a 2764800-second (32-day) successful-snapshot
+freshness default, independently of attempt/verification timestamps. Restore
+verification advances only after verified cleanup and persisted final reporting.
+The implementation is not activated or Docker-qualified by offline unit checks.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -149,10 +199,15 @@ remain Phase 2 work; no migration or API health behavior changes in Phase 1.
 | `BACKUP_VERIFY_DATABASE` | `heatpump_restore_verify` | Fresh isolated candidate name; cannot be live or an existing database. |
 | `BACKUP_VERIFY_TIMEOUT_SECONDS` | `3600` | Single-job verification wall timeout. |
 
-Verifier errors distinguish `verification_resource_failed` (`container_oom`,
+Legacy verifier errors distinguish `verification_resource_failed` (`container_oom`,
 `tmpfs_exhausted`, `postgres_memory`, `timeout`) from `verification_failed` for
-archive/content errors. The artifact is retained. Full Docker-state OOM inspection,
-metadata capacity sizing, and readiness reporting require the Phase 2 launcher.
+archive/content errors. That legacy verifier retains its input artifact and does
+not own the current drill lifecycle or update versioned backup-health histories.
+The staged Phase 1 `restore_drill.py` coordinator already performs metadata-based
+capacity/headroom sizing, guarded target ownership and verified cleanup, and
+persists verification evidence consumed by readiness. Unresolved cleanup/reporting
+cannot establish a verified restore. See the [backup runbook](backup-runbook.md);
+this implementation still requires owned Linux CI qualification before activation.
 
 The weekly workflow requires a dedicated Linux runner labelled `restore-drill`
 and repository variables `RESTORE_DRILL_BACKUP_DIR`,
