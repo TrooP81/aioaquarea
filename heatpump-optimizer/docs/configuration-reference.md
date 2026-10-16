@@ -70,6 +70,7 @@ No historical rows are relabeled or rescaled.
 | `ENTSOE_API_TOKEN` | _(empty)_ | Env fallback for `entsoe_api_token`. |
 | `ENTSOE_AREA` | `10YNL----------L` | Env fallback for `entsoe_area`. |
 | `TIBBER_API_TOKEN` | _(empty)_ | Env fallback for `tibber_api_token`. |
+| `TIBBER_HOME_ID` | _(empty)_ | Exact provider home ID; see installation binding below. |
 | `LATITUDE` / `LONGITUDE` | `52.37` / `4.89` | Env fallbacks for `latitude` / `longitude`. |
 | `SMARTTHINGS_CLIENT_ID` / `SMARTTHINGS_CLIENT_SECRET` | _(empty)_ | Env fallbacks for SmartThings OAuth. |
 | `SMARTTHINGS_REDIRECT_URI` | _(empty)_ | Env fallback for `smartthings_redirect_uri`. |
@@ -327,6 +328,8 @@ Each status response captures one read-only repeatable-read view, then closes it
 | `entsoe_api_token` | secret | env `ENTSOE_API_TOKEN` | |
 | `entsoe_area` | str | env `ENTSOE_AREA` | ENTSO-E bidding zone. |
 | `tibber_api_token` | secret | env `TIBBER_API_TOKEN` | |
+| `tibber_home_id` | str | env `TIBBER_HOME_ID` | Exact selected home. Empty auto-binds only one active subscription. |
+| `tibber_feed_diagnostic` | str, read-only | _(empty)_ | Home-qualified failure code and binding provenance. |
 | `manual_price_eur_per_kwh` | float | `0.25` | Static price per kWh for `manual` (in `manual_price_currency`). |
 | `manual_price_currency` | str | `EUR` | `EUR`, `SEK`, `NOK`, `DKK`, `GBP`, `USD`, `CHF`, `PLN`, `CZK`, `HUF`. |
 | `weather_provider` | str | `open-meteo` | `open-meteo`, `smhi`, or `manual`. |
@@ -508,7 +511,7 @@ Energy/cost are rounded to 3 decimals and tariff averages to 5 decimals.
 These are reporting-only corrections. Feed persistence, frozen rules/MILP price
 inputs, confirmed-interval extraction and the rules observed-rate baseline are
 unchanged. Revert reporting API and web contracts together; no migration is
-needed. Tibber home identity/tariff changes remain a separately approved packet.
+needed. Tibber home identity/tariff changes are documented below and remain subject to their separate HIGH-risk release approval.
 
 
 Reporting `incomplete_reason` (dashboard: `today_cost_incomplete_reason`) is null
@@ -521,3 +524,70 @@ energy can have `unpriced_kwh=0` and `coverage_pct=100` while the whole-window c
 is null: flat channels, missing leading observations or unconfirmed tails remain
 unknown energy, not invented unpriced kWh. The six-hour E2E fixture with heat
 counters 1.2 through 1.7, flat cooling 0 and tank 0.5 has exactly this status.
+
+### Tibber installation binding (P1.6b)
+
+Set `tibber_home_id` through the settings API (or `TIBBER_HOME_ID` before first binding).
+IDs are exact, case-sensitive provider strings; surrounding whitespace is rejected.
+With an empty ID, polling automatically persists the binding **only** when exactly
+one returned home has an active subscription. The read-only diagnostic records
+`single_active_subscription` provenance. This automatic binding is revalidated on
+**every poll** and is valid only while exactly one eligible home exists. If a
+second eligible home appears (or eligibility becomes ambiguous), no prices are
+accepted and `auto_binding_requires_explicit_selection` suspends Tibber planning.
+This suspension is latched, even if only one home is returned again. The owner must
+explicitly write `tibber_home_id` through the settings API, including re-saving the
+same ID, to clear the suspension and record `explicit` provenance atomically.
+Explicit selection remains valid with multiple homes, provided the selected home
+is returned with an active subscription and usable prices. Zero or multiple eligible homes, an
+explicit ID absent from the response, no active subscription, or no prices fail
+closed: polling logs `price_fetch_failed` with a fixed reason code, the diagnostic
+is visible through settings, and current planning reads an unavailable scope.
+Never select the first home or reuse another home's prices. After changing homes,
+planning resumes only when the new installation satisfies normal feed-quality admission.
+
+A poll captures provider/token/home in one settings snapshot before provider I/O.
+A concurrent setting change does not relabel its results: they remain under the
+captured home's scope. Auto-binding uses a transactional compare-and-set on the
+empty setting and cannot overwrite a concurrent explicit selection. Diagnostic
+updates lock/check the captured home and cannot suspend another home's feed.
+
+Migration **037 must run on deployment before the new poller starts**. It adds
+`price_scopes` only; `prices.area` stays `VARCHAR(32)` and no hypertable is altered.
+The canonical identity is UTF-8 compact JSON `["tibber", "<exact home ID>"]`
+(`ensure_ascii=False`, no Unicode/case/whitespace normalization). Its scope is
+`tb:` plus the first 28 lower-case SHA-256 hex characters (31 characters total).
+Registry scope and `(provider, home_id)` keys are unique. In the price-write
+transaction, insert-on-conflict-do-nothing waits for concurrent inserts, then
+verifies the full immutable mapping and tariff metadata; any mismatch rejects
+and rolls back the write. Database triggers reject updates, deletes and truncation.
+Existing `tibber` rows remain untouched and never become a newly bound home's data.
+
+Plans retain scope/source/currency in their immutable input provenance. Historical
+measurement uses that persisted scope even after settings change. Ambiguous legacy
+Tibber plans expose cost `unavailable` with `legacy_tibber_scope_ambiguous`, while
+retaining non-price outcomes; they are never guessed or backfilled.
+
+Amounts remain provider totals, including finite zero and negative values. The
+immutable tariff contract records `provider_total`, source currency,
+`hourly_duration_weighted_v1`, `tibber_provider_total_v1` and application extra fee
+`0`. This owner's Tibber total already includes grid fees; this is **not** a claim
+about all provider contracts. No fee is added here. Grid/extra-fee arithmetic and
+new fee settings belong exclusively to **P2.4**.
+
+Rollback: disable Tibber planning admission before rolling application code back;
+retain the registry, qualified prices and plan provenance. Do not restore first-home
+fallback. Migration downgrade removes only the registry/function, never prices;
+that destructive metadata downgrade is for owned migration qualification, not the
+production rollback procedure. Owned PostgreSQL/Timescale CI must verify 036 to 037
+and downgrade on populated prices; local offline collection is not execution evidence.
+
+
+Native ML forecast materialization resolves the active price scope from its captured
+settings in the caller's database session, before ordering or limiting price rows.
+Its immutable `pricing.area` records that scope; suspended or latched Tibber bindings
+produce `pricing.available=false` and no price points, without legacy/other-home fallback.
+Stats and dashboard costs retain P1.6a's confirmed-interval allocation, nullable/partial-cost semantics and tariff-window methodology, with P1.6b's registry-verified active-scope filtering layered onto every price read. Suspended or latched bindings yield no tariff rows and therefore no fabricated price or cost; finite zero and negative prices remain valid.
+Compatibility poll-now paths persist Tibber prices under the captured fetch identity,
+registering that identity in the same transaction; an in-flight setting change cannot
+relabel those rows. Suspended fetches write no prices.

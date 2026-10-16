@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from packages.core.price_scope import tibber_scope
 from packages.core.planning_data_quality import (
     PlanningInputBatch,
     PriceInput,
@@ -45,7 +46,7 @@ def _batch():
         now,
         start,
         start + dt.timedelta(hours=24),
-        "tibber",
+        tibber_scope("test-home"),
         "tibber",
         "open-meteo",
         prices,
@@ -203,10 +204,16 @@ async def test_R18_loader_selects_context_and_freezes_orm_values(monkeypatch):
         def all(self):
             return self.rows
 
-    session = SimpleNamespace(execute=AsyncMock(side_effect=[Result(prices), Result(weather)]))
+    # Registry proof is checked before any price rows are admitted.
+    registry = SimpleNamespace(provider="tibber", home_id="test-home")
+    proof = SimpleNamespace(scalar_one_or_none=lambda: registry)
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[proof, Result(prices), Result(weather)])
+    )
     settings = AsyncMock(
         return_value={
             "price_provider": "tibber",
+            "tibber_home_id": "test-home",
             "entsoe_area": "foreign-area",
             "weather_provider": "open-meteo",
         }
@@ -220,9 +227,9 @@ async def test_R18_loader_selects_context_and_freezes_orm_values(monkeypatch):
     )
     settings.assert_awaited_once_with(session=session)
     assert frozen == batch
-    price_query, weather_query = [call.args[0] for call in session.execute.await_args_list]
+    _, price_query, weather_query = [call.args[0] for call in session.execute.await_args_list]
     assert price_query.compile().params == {
-        "area_1": "tibber",
+        "area_1": tibber_scope("test-home"),
         "ts_1": batch.start,
         "ts_2": batch.end,
     }

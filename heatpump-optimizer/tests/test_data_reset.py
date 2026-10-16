@@ -20,6 +20,7 @@ from packages.core.models import (
     AuditLogRecord,
     MLLifecycleStateRecord,
     PlanActionRecord,
+    PriceScopeRecord,
     SettingRecord,
     ShowerEventRecord,
     SmartThingsToken,
@@ -107,6 +108,18 @@ class Database:
                 expires_at=NOW,
                 updated_at=NOW,
             ),
+        ]
+        self.tables["price_scopes"] = [
+            PriceScopeRecord(
+                area="tb:" + "a" * 28,
+                provider="tibber",
+                home_id="A",
+                currency="SEK",
+                amount_basis="provider_total",
+                interval_schema="hourly_duration_weighted_v1",
+                tariff_schema_version="tibber_provider_total_v1",
+                application_extra_fee=0,
+            )
         ]
         self.wipes = 0
         self.fail_audit = False
@@ -239,7 +252,7 @@ async def test_RESET2_RESET4_exact_wipe_preserves_every_retained_column(transact
     db = Database()
     retained = {
         name: [reset.row_values(row) for row in db.tables[name]]
-        for name in ("settings", "smartthings_oauth_token")
+        for name in ("settings", "smartthings_oauth_token", "price_scopes")
     }
     manifest = await planned(db)
     result = await apply(db, manifest)
@@ -505,7 +518,7 @@ class GuardSession:
             return Rows(
                 [*reset.WIPE_TABLES, *reset.RETAIN_TABLES] + (["surprise"] if self.unknown else [])
             )
-        return Rows(["036"])
+        return Rows(["037"])
 
     async def execute(self, sql, params=None):
         self.sql.append(str(sql))

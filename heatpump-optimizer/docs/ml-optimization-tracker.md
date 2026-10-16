@@ -48,7 +48,7 @@ Effort estimates are approximate. Data collection takes calendar time.
 | P1.5 | Add automatic restarts for the database and Redis, plus an external heartbeat monitor. | G13 | Agents | ⬜ Not started | Detect when the system stops reporting. |
 | P1.6 | Reporting fixes and selected Tibber home binding, split into P1.6a/P1.6b; reachable complete-cost follow-up P1.6c. | G16 | Agents | See sub-items | Reporting and feed-persistence changes remain separate packets. |
 | P1.6a | Timeline current-hour prices, status labels, scoped stats, half-open windows and reporting-only accounting. | G16 | Agents | 🟢 code complete | Owner chose option A on 2026-10-17: partial-only cost reporting is accepted for now. E2E contract alignment and telemetry_incomplete reason included; merge requires coordinator and green CI. Excludes feed persistence, planner price selection and rules baseline changes. |
-| P1.6b | Selected Tibber home binding/tariff migration (separate HIGH-risk packet). | G16 | Agents | 🔵 In progress | Owner approved (a) on 2026-10-16 22:55; PR #39 is in repair and not approved for merge. |
+| P1.6b | Selected Tibber home binding/tariff migration (separate HIGH-risk packet). | G16 | Agents | 🟢 Code complete; CI green pending | Owner approved integration on 2026-10-17 09:11. PR #39 rebased onto main; final owner release approval required (HIGH). Migration 037; owned PostgreSQL/Timescale qualification required before release. |
 | P1.6c | Reachable complete-cost reporting | P1.6a follow-up | Agents | ⚪ Not started | Needs design (STANDARD). Affirmative zero evidence for legitimately flat channels (no cooling, idle DHW) via a Settings-declared 'channel not used' per installation (modular, multi-house) and/or fresh flat readings; live-edge window ending at the last confirmed reading, labelled 'as of HH:MM'. Why: make complete-cost reporting reachable without treating unknown energy or unconfirmed tails as zero. |
 | P1.7 | Fix planner read-only ORM escapes | G03 follow-up | Agents | 🟢 Done/merged | Owner final release approval: 2026-10-17 09:11. rules_v8 / milp_v2; detached snapshots, rollback regressions, and owned-PG acceptance coverage. Approved for merge after green CI; observe-only policy unchanged (HIGH). |
 
@@ -132,6 +132,8 @@ Requires at least 14 days of heating-season data.
 | 2026-10-16 | Hot water is mainly needed mornings, evenings, and weekends. Colder water is acceptable on work-from-home days. | Current schedule-derived ready-by times already match. Manual boosts must be respected. |
 
 ## Activity log
+
+- 2026-10-17: P1.6b rebased onto P1.6a/main; combined interval-allocated reporting with registry-verified Tibber scope and suspended-binding unavailability across stats/dashboard. Local validation underway; PR #39 CI and final owner release approval pending (HIGH).
 
 - 2026-10-17: P1.6a merge reconciliation restored P1.7 friendly planner labels (`Optimized` / `Optimized + ML`) for legacy and current MILP versions plus the configuration fallback; reporting-only reason labels preserved. Audited P1.7 planner, mock, compatibility-test and tracker changes against main; no other P1.7 reversions found.
 

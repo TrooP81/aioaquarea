@@ -49,7 +49,9 @@ from tests.e2e import consumption_seed  # noqa: E402
 
 
 LEGACY_TABLES = tuple(
-    table for table in Base.metadata.sorted_tables if table.name != "manual_cop_observations"
+    table
+    for table in Base.metadata.sorted_tables
+    if table.name not in {"manual_cop_observations", "price_scopes"}
 )
 for legacy_table in LEGACY_TABLES:
     assert all(
@@ -132,7 +134,7 @@ async def setup_database():
                 assert retained["marker"] == (head,)
                 # Current-head storage keeps local periods only: no stored boundaries,
                 # SQL calendar checks or helper (retained_storage_state checks the shape).
-                assert head == manual_sql.LOCAL_PERIOD_REVISION
+                assert head == manual_sql.CURRENT_HEAD_REVISION
                 assert retained["helper"] is None
                 existing = await connection.run_sync(
                     lambda current: set(inspect(current).get_table_names(schema="public"))

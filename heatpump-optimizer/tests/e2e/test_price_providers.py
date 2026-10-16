@@ -53,6 +53,7 @@ SAMPLE_TIBBER_RESPONSE = {
         "viewer": {
             "homes": [
                 {
+                    "id": "test-home",
                     "currentSubscription": {
                         "priceInfo": {
                             "today": [
@@ -90,7 +91,7 @@ SAMPLE_TIBBER_RESPONSE = {
                                 },
                             ],
                         }
-                    }
+                    },
                 }
             ]
         }
@@ -183,7 +184,18 @@ class TestTibberIntegration:
                 key, ""
             )
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await _fetch_prices_tibber()
 
         # 4 today + 2 tomorrow = 6
@@ -200,7 +212,18 @@ class TestTibberIntegration:
         async def mock_get_setting(key):
             return {"tibber_api_token": "", "price_provider": "tibber"}.get(key, "")
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await _fetch_prices_tibber()
 
         assert prices == []
@@ -215,7 +238,18 @@ class TestTibberIntegration:
         async def mock_get_setting(key):
             return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await _fetch_prices_tibber()
 
         assert prices == []
@@ -228,15 +262,24 @@ class TestTibberIntegration:
                 "viewer": {
                     "homes": [
                         {
+                            "id": "test-home",
                             "currentSubscription": {
                                 "priceInfo": {
                                     "today": [
-                                        {"total": 0.25, "startsAt": "2026-04-30T00:00:00+02:00"},
-                                        {"total": 0.22, "startsAt": "2026-04-30T01:00:00+02:00"},
+                                        {
+                                            "currency": "SEK",
+                                            "total": 0.25,
+                                            "startsAt": "2026-04-30T00:00:00+02:00",
+                                        },
+                                        {
+                                            "currency": "SEK",
+                                            "total": 0.22,
+                                            "startsAt": "2026-04-30T01:00:00+02:00",
+                                        },
                                     ],
                                     "tomorrow": [],
                                 }
-                            }
+                            },
                         }
                     ]
                 }
@@ -249,31 +292,55 @@ class TestTibberIntegration:
         async def mock_get_setting(key):
             return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await _fetch_prices_tibber()
 
         assert len(prices) == 2
 
     @respx.mock
-    async def test_fetch_tibber_skips_unsubscribed_home(self):
-        """Uses the first home that actually has subscription price data."""
+    async def test_fetch_tibber_autobinds_single_active_subscription(self):
+        """Auto-bind only the single active subscription, recording its identity."""
         response = {
             "data": {
                 "viewer": {
                     "homes": [
-                        {"currentSubscription": None},
+                        {"id": "inactive-home", "currentSubscription": None},
                         {
+                            "id": "test-home",
                             "currentSubscription": {
                                 "priceInfo": {
                                     "today": [
-                                        {"total": 0.31, "startsAt": "2026-05-04T00:00:00+02:00"},
-                                        {"total": 0.28, "startsAt": "2026-05-04T01:00:00+02:00"},
+                                        {
+                                            "currency": "SEK",
+                                            "total": 0.31,
+                                            "startsAt": "2026-05-04T00:00:00+02:00",
+                                        },
+                                        {
+                                            "currency": "SEK",
+                                            "total": 0.28,
+                                            "startsAt": "2026-05-04T01:00:00+02:00",
+                                        },
                                     ],
                                     "tomorrow": [
-                                        {"total": 0.22, "startsAt": "2026-05-05T00:00:00+02:00"},
+                                        {
+                                            "currency": "SEK",
+                                            "total": 0.22,
+                                            "startsAt": "2026-05-05T00:00:00+02:00",
+                                        },
                                     ],
                                 }
-                            }
+                            },
                         },
                     ]
                 }
@@ -286,9 +353,28 @@ class TestTibberIntegration:
         async def mock_get_setting(key):
             return {"tibber_api_token": "test-token", "price_provider": "tibber"}.get(key, "")
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await _fetch_prices_tibber()
 
+        from packages.core.settings_service import get_setting
+        from packages.core.price_scope import tibber_scope
+        import json
+
+        assert await get_setting("tibber_home_id") == "test-home"
+        diagnostic = json.loads(await get_setting("tibber_feed_diagnostic"))
+        assert diagnostic["binding_method"] == "single_active_subscription"
+        assert prices.context.area == tibber_scope("test-home")
         assert len(prices) == 3
         assert prices[0][1] == 0.31
         assert prices[2][1] == 0.22
@@ -326,7 +412,18 @@ class TestProviderRouting:
         async def mock_get_setting(key):
             return {"price_provider": "tibber", "tibber_api_token": "test-token"}.get(key, "")
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             prices = await fetch_prices()
 
         assert len(prices) == 6
@@ -342,7 +439,18 @@ class TestProviderRouting:
                 key, ""
             )
 
-        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+        snapshot = {
+            key: await mock_get_setting(key)
+            for key in (
+                "price_provider",
+                "tibber_api_token",
+                "tibber_home_id",
+            )
+        }
+        with (
+            patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting),
+            patch("packages.poller.feeds.get_all_settings", return_value=snapshot),
+        ):
             feed = await fetch_price_feed()
 
         assert feed.currency == "SEK"

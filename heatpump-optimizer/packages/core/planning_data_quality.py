@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from packages.core.database import get_session
 from packages.core.models import PriceRecord, WeatherRecord
+from packages.core.price_scope import resolve_price_area, tariff_metadata
 from packages.core.settings_service import get_all_settings
 from packages.core.time_slots import next_hour_boundary
 
@@ -77,7 +78,7 @@ async def load_planning_input_batch(session, start, end, *, now=None) -> Plannin
     captured_at = now or dt.datetime.now(dt.timezone.utc)
     values = await get_all_settings(session=session)
     provider = values["price_provider"]
-    area = values["entsoe_area"] if provider == "entsoe" else provider
+    area = await resolve_price_area(values, session=session)
     weather_provider = values["weather_provider"] or "open-meteo"
     price_rows = (
         (
@@ -236,6 +237,11 @@ def planning_batch_quality(
         "price_horizon_limited": price_hours < horizon_hours,
         "reoptimization_when_prices_extend": price_hours < horizon_hours and allowed,
         "price": {
+            **(
+                tariff_metadata(next(iter(currencies), ""))
+                if batch.price_provider == "tibber"
+                else {}
+            ),
             "area": batch.area,
             "source": batch.price_provider,
             "currency": next(iter(currencies)) if price_context_valid else None,

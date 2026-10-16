@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import re
 
 import structlog
 from sqlalchemy import func, select, update
@@ -241,7 +242,9 @@ def _validated_planning_quality(plan: object, *, now: dt.datetime) -> dict:
         raise _PlanAdmissionRefused("invalid_price_context")
     if not isinstance(area, str) or not area.strip():
         raise _PlanAdmissionRefused("invalid_price_context")
-    if source in {"tibber", "manual"} and area != source:
+    if source == "manual" and area != "manual":
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if source == "tibber" and not re.fullmatch(r"tb:[0-9a-f]{28}", area):
         raise _PlanAdmissionRefused("invalid_price_context")
     if not isinstance(currency, str) or len(currency) != 3:
         raise _PlanAdmissionRefused("invalid_price_context")

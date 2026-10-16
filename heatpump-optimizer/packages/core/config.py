@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     entsoe_api_token: str = ""
     entsoe_area: str = "10YNL----------L"  # Netherlands default
     tibber_api_token: str = ""
+    tibber_home_id: str = ""
 
     # Weather
     latitude: float = 52.37

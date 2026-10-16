@@ -263,6 +263,18 @@ def feed_http(monkeypatch):
     """An in-memory HTTP boundary; no network or provider credentials."""
     from packages.poller import feeds
 
+    monkeypatch.setattr(
+        feeds,
+        "get_all_settings",
+        AsyncMock(
+            return_value={
+                "price_provider": "tibber",
+                "tibber_api_token": "offline-token",
+                "tibber_home_id": "test-home",
+            }
+        ),
+    )
+    monkeypatch.setattr(feeds, "record_tibber_binding", AsyncMock(return_value=True))
     client = AsyncMock()
     client.__aenter__.return_value = client
     response = MagicMock()
@@ -277,7 +289,10 @@ def _tibber_payload(entries):
         "data": {
             "viewer": {
                 "homes": [
-                    {"currentSubscription": {"priceInfo": {"today": entries, "tomorrow": []}}}
+                    {
+                        "id": "test-home",
+                        "currentSubscription": {"priceInfo": {"today": entries, "tomorrow": []}},
+                    }
                 ]
             }
         }
@@ -351,8 +366,8 @@ def test_S3_R16_invalid_entsoe_units_have_no_schema(unit):
     ("change", "count", "certified"),
     [
         ({}, 1, True),
-        ({"currency": None}, 1, False),
-        ({"currency": "invalid"}, 1, False),
+        ({"currency": None}, 0, False),
+        ({"currency": "invalid"}, 0, False),
         ({"total": float("nan")}, 0, False),
         ({"total": True}, 0, False),
         ({"startsAt": "2026-10-15T00:15:00Z"}, 0, False),
@@ -383,7 +398,9 @@ async def test_S3_R16_tibber_schema_requires_verifiable_hour(
 
     assert len(result.prices) == count
     assert result.source == "tibber"
-    assert result.context.area == "tibber"
+    from packages.core.price_scope import tibber_scope
+
+    assert result.context.area == tibber_scope("test-home")
     assert (result.interval_schema == feeds.PRICE_INTERVAL_SCHEMA) is certified
     assert (result.rejection_reason is not None) is (count == 0)
     if certified:
@@ -442,10 +459,10 @@ async def test_S3_R16_tibber_partial_currency_metadata_is_order_independent(
 
     result = await feeds._fetch_prices_tibber()
 
-    assert len(result) == 2
-    assert [price for _, price in result] == [-0.2, -0.2]
-    assert result.currency == expected_currency
-    assert result.rejection_reason is None
+    assert len(result) == (2 if certified else 0)
+    assert [price for _, price in result] == ([-0.2, -0.2] if certified else [])
+    assert result.currency == (expected_currency if certified else "")
+    assert result.rejection_reason == (None if certified else "unverified_currency")
     assert (result.interval_schema == feeds.PRICE_INTERVAL_SCHEMA) is certified
 
 
@@ -456,8 +473,8 @@ async def test_S3_R16_tibber_partial_currency_metadata_is_order_independent(
         ({"errors": [{"message": "untrusted provider text"}]}, "graphql_error"),
         (_tibber_payload("not-an-entry-list"), "malformed_price_entries"),
         (_tibber_payload(["not-an-entry"]), "malformed_price_entry"),
-        (_tibber_payload([]), None),
-        ({"data": {"viewer": {"homes": []}}}, None),
+        (_tibber_payload([]), "selected_home_has_no_prices"),
+        ({"data": {"viewer": {"homes": []}}}, "selected_home_not_found"),
     ],
 )
 async def test_S3_R16_tibber_rejected_and_empty_are_distinct(
@@ -511,7 +528,11 @@ async def test_S3_R16_tibber_original_structure_types(monkeypatch, feed_http, fi
         and not isinstance(value, list if list_field else dict)
     )
     expected_reason = (
-        ("malformed_price_entries" if list_field else "malformed_response") if wrong_type else None
+        "malformed_price_entries"
+        if list_field and wrong_type
+        else "selected_home_has_no_active_subscription"
+        if field == "currentSubscription" and not isinstance(value, dict)
+        else "selected_home_has_no_prices"
     )
     assert result == []
     assert result.rejection_reason == expected_reason

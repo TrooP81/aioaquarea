@@ -295,7 +295,10 @@ class TestPollPricesErrors:
         ids=["object", "false", "zero", "empty-string", "array", "null", "absent"],
     )
     async def test_S3_R16_original_structures_reach_poller_boundary(self, field, value):
-        home = {"currentSubscription": {"priceInfo": {"today": [], "tomorrow": []}}}
+        home = {
+            "id": "test-home",
+            "currentSubscription": {"priceInfo": {"today": [], "tomorrow": []}},
+        }
         parent = (
             home
             if field == "currentSubscription"
@@ -311,8 +314,14 @@ class TestPollPricesErrors:
         response.json.return_value = {"data": {"viewer": {"homes": [home]}}}
         client = MagicMock(post=AsyncMock(return_value=response))
         session = AsyncMock()
-        config = {"price_provider": "tibber", "tibber_api_token": "offline-token"}
+        config = {
+            "price_provider": "tibber",
+            "tibber_api_token": "offline-token",
+            "tibber_home_id": "test-home",
+        }
         with (
+            patch("packages.poller.feeds.get_all_settings", AsyncMock(return_value=config)),
+            patch("packages.poller.feeds.record_tibber_binding", AsyncMock(return_value=True)),
             patch(
                 "packages.poller.feeds.get_setting",
                 AsyncMock(side_effect=lambda key: config.get(key, "")),
@@ -342,21 +351,21 @@ class TestPollPricesErrors:
             and value != "absent"
             and not isinstance(value, list if list_field else dict)
         )
-        if wrong_type:
-            session_factory.assert_not_called()
-            logger.error.assert_called_once_with(
-                "price_fetch_failed",
-                error="provider_validation_failed",
-                provider="tibber",
-                reason="malformed_price_entries" if list_field else "malformed_response",
-            )
-            logger.info.assert_not_called()
-        else:
-            session_factory.assert_called_once_with()
-            logger.error.assert_not_called()
-            logger.info.assert_called_once_with(
-                "prices_fetched", count=0, provider="tibber", currency=""
-            )
+        reason = (
+            "malformed_price_entries"
+            if list_field and wrong_type
+            else "selected_home_has_no_active_subscription"
+            if field == "currentSubscription" and not isinstance(value, dict)
+            else "selected_home_has_no_prices"
+        )
+        session_factory.assert_not_called()
+        logger.error.assert_called_once_with(
+            "price_fetch_failed",
+            error="provider_validation_failed",
+            provider="tibber",
+            reason=reason,
+        )
+        logger.info.assert_not_called()
 
     @pytest.mark.parametrize("failure", ["http_status", "request", "unexpected"])
     async def test_S3_R16_price_failure_logs_never_include_credentials(self, failure):

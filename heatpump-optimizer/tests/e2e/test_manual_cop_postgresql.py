@@ -155,6 +155,7 @@ def migration_targets():
 
 LEGACY_MANUAL_REVISIONS = ("032", "033", "034", "035")
 LOCAL_PERIOD_REVISION = "036"
+CURRENT_HEAD_REVISION = "037"
 HISTORICAL_HEAD = LEGACY_MANUAL_REVISIONS[-1]
 LEGACY_BOUNDARY_COLUMNS = ("period_start", "period_end")
 LEGACY_CALENDAR_CONSTRAINTS = ("ck_manual_cop_calendar", "ck_manual_cop_period_order")
@@ -176,13 +177,13 @@ async def retained_storage_state(connection):
     )
     assert len(marker) == 1, "retained storage requires exactly one Alembic marker"
     revision = marker[0]
-    assert revision in (*LEGACY_MANUAL_REVISIONS, LOCAL_PERIOD_REVISION), (
+    assert revision in (*LEGACY_MANUAL_REVISIONS, LOCAL_PERIOD_REVISION, CURRENT_HEAD_REVISION), (
         "unknown manual ledger revision"
     )
     helper_oid = (
         await connection.execute(text(f"SELECT to_regprocedure('{HELPER_SIGNATURE}')::oid"))
     ).scalar_one()
-    if revision == LOCAL_PERIOD_REVISION:
+    if revision in {LOCAL_PERIOD_REVISION, CURRENT_HEAD_REVISION}:
         assert helper_oid is None, "036 must not retain the SQL calendar helper"
         helper = None
     else:
@@ -254,7 +255,7 @@ async def retained_storage_state(connection):
         state[key] = tuple((await connection.execute(text(query))).all())
     columns = {row[0] for row in state["columns"]}
     constraints = dict(state["constraints"])
-    if revision == LOCAL_PERIOD_REVISION:
+    if revision in {LOCAL_PERIOD_REVISION, CURRENT_HEAD_REVISION}:
         assert columns.isdisjoint(LEGACY_BOUNDARY_COLUMNS), "036 must not store boundaries"
         assert set(constraints).isdisjoint(LEGACY_CALENDAR_CONSTRAINTS), "036 SQL calendar"
         for name, definition in LOCAL_PERIOD_CONSTRAINTS.items():
@@ -1260,7 +1261,7 @@ def run_primary_head_upgrade(label, *, evidence=None, read_marker=None, run_phas
     read_marker = read_marker or (lambda: asyncio.run(_primary_marker()))
     run_phase = run_phase or run_verification_phase
     head, _ = migration_targets()
-    assert head == LOCAL_PERIOD_REVISION, "reviewed primary head changed"
+    assert head == CURRENT_HEAD_REVISION, "reviewed primary head changed"
     before = read_marker()
     assert before in {None, head}, "unexpected primary migration state"
     run_phase(label + "-upgrade", [sys.executable, "-m", "alembic", "upgrade", "head"])
@@ -1527,8 +1528,8 @@ def validate_bound_verification_evidence(evidence, proof, partitions, schema_pha
         _successful_process(evidence, name)
     head = json.loads((evidence / "obs5-primary-head.json").read_text(encoding="utf-8"))
     assert (
-        head["before"] in {None, LOCAL_PERIOD_REVISION}
-        and head["after"] == head["head"] == LOCAL_PERIOD_REVISION
+        head["before"] in {None, CURRENT_HEAD_REVISION}
+        and head["after"] == head["head"] == CURRENT_HEAD_REVISION
     ), "primary head was not proven"
     processes = [
         json.loads(path.read_text(encoding="utf-8")) for path in evidence.glob("*/process.json")
@@ -2382,9 +2383,9 @@ class TestVerificationSourceManifest:
             with pytest.raises(AssertionError, match="unsupported migration child Alembic"):
                 _migration_child_alembic_invocation(operation, target)
 
-    @pytest.mark.parametrize("before", [None, LOCAL_PERIOD_REVISION])
+    @pytest.mark.parametrize("before", [None, CURRENT_HEAD_REVISION])
     async def test_primary_head_upgrade_runs_upgrade_then_check(self, tmp_path, before):
-        markers = iter([before, LOCAL_PERIOD_REVISION])
+        markers = iter([before, CURRENT_HEAD_REVISION])
         calls = []
         assert (
             run_primary_head_upgrade(
@@ -2393,7 +2394,7 @@ class TestVerificationSourceManifest:
                 read_marker=lambda: next(markers),
                 run_phase=lambda name, arguments: calls.append((name, arguments[1:])),
             )
-            == LOCAL_PERIOD_REVISION
+            == CURRENT_HEAD_REVISION
         )
         assert calls == [
             ("obs5-primary-upgrade", ["-m", "alembic", "upgrade", "head"]),
@@ -2401,8 +2402,8 @@ class TestVerificationSourceManifest:
         ]
         assert json.loads((tmp_path / "obs5-primary-head.json").read_text(encoding="utf-8")) == {
             "before": before,
-            "after": LOCAL_PERIOD_REVISION,
-            "head": LOCAL_PERIOD_REVISION,
+            "after": CURRENT_HEAD_REVISION,
+            "head": CURRENT_HEAD_REVISION,
         }
 
     @pytest.mark.parametrize(
@@ -3313,7 +3314,7 @@ async def calendar_database(request):
     owned_test_environment()
     url = make_url(os.environ["DATABASE_URL"])
     head, _ = migration_targets()
-    assert head == LOCAL_PERIOD_REVISION
+    assert head == CURRENT_HEAD_REVISION
     engine = create_async_engine(url, poolclass=NullPool, echo=False)
     try:
         async with engine.connect() as connection:
@@ -5392,9 +5393,11 @@ class TestManualCOPPostgreSQLMigration:
                 retained = await retained_storage_state(connection)
             # Historical qualification stops at genuine 035: 036 is forward-only, and the
             # workflow's upgrade-head phase then upgrades this populated database to 036.
-            assert head == LOCAL_PERIOD_REVISION
+            assert head == CURRENT_HEAD_REVISION
             assert (
-                ScriptDirectory.from_config(config).get_revision(head).down_revision
+                ScriptDirectory.from_config(config)
+                .get_revision(LOCAL_PERIOD_REVISION)
+                .down_revision
                 == HISTORICAL_HEAD
             )
             # Exactly the nullable, default-free columns 033-035 add to retained legacy tables.
@@ -5456,7 +5459,7 @@ class TestManualCOPPostgreSQLMigration:
 
         child = forward_manual_database
         scripts = ScriptDirectory.from_config(Config("alembic.ini"))
-        assert scripts.get_heads() == [LOCAL_PERIOD_REVISION]
+        assert scripts.get_heads() == [CURRENT_HEAD_REVISION]
         assert {
             revision: scripts.get_revision(revision).down_revision
             for revision in ("034", "035", "036")

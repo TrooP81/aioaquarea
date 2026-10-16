@@ -1343,7 +1343,7 @@ def _admitted_planning_quality(
         captured_at,
         start,
         start + dt.timedelta(hours=horizon_hours),
-        area or price_provider,
+        area or ("tb:" + "a" * 28 if price_provider == "tibber" else price_provider),
         price_provider,
         "open-meteo",
         tuple(
@@ -3156,7 +3156,10 @@ async def test_dashboard_uses_data_quality_threshold_for_status_freshness() -> N
             new=AsyncMock(return_value={"threshold_seconds": 900}),
         ) as get_device_data_quality,
         patch("packages.api.routers.dashboard.get_user_tz", new=AsyncMock(return_value="UTC")),
-        patch("packages.api.routers.dashboard.get_price_area", new=AsyncMock(return_value="FI")),
+        patch(
+            "packages.api.routers.dashboard.get_active_price_context",
+            new=AsyncMock(return_value=SimpleNamespace(area="FI", currency="EUR", source="entsoe")),
+        ),
         patch(
             "packages.api.routers.dashboard.get_space_heating_gate_config",
             new=AsyncMock(return_value=MagicMock()),

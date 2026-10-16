@@ -790,6 +790,7 @@ async def materialize_native_inputs(
     context: dict | None = None,
     raw: bool = False,
 ) -> dict[str, Any] | None:
+    from packages.core.price_scope import UNAVAILABLE_AREA, resolve_price_area
     from packages.core.settings_service import get_all_settings
     from packages.poller.smartthings import get_selected_device_ids
 
@@ -856,21 +857,27 @@ async def materialize_native_inputs(
             .scalars()
             .all()
         )
+        price_area = await resolve_price_area(values, session=session)
         prices = (
-            (
-                await session.execute(
-                    select(PriceRecord)
-                    .where(
-                        PriceRecord.ts >= now - dt.timedelta(hours=1),
-                        PriceRecord.ts <= now + dt.timedelta(hours=24),
-                        PriceRecord.fetched_at <= now,
+            []
+            if price_area == UNAVAILABLE_AREA
+            else (
+                (
+                    await session.execute(
+                        select(PriceRecord)
+                        .where(
+                            PriceRecord.area == price_area,
+                            PriceRecord.ts >= now - dt.timedelta(hours=1),
+                            PriceRecord.ts <= now + dt.timedelta(hours=24),
+                            PriceRecord.fetched_at <= now,
+                        )
+                        .order_by(PriceRecord.ts)
+                        .limit(101)
                     )
-                    .order_by(PriceRecord.ts)
-                    .limit(101)
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
         )
         indoor_query = (
             select(IndoorTempReading)
@@ -914,6 +921,7 @@ async def materialize_native_inputs(
             "reference_sensor": reference_sensor,
             "reference_blocked": reference_blocked,
             "weather_provider": weather_provider,
+            "price_area": price_area,
             "timer": timer,
             "capabilities": capabilities,
         }
@@ -1057,6 +1065,7 @@ def _prepare_native_inputs(data: dict, *, component=None, capabilities=None) -> 
         "timer": timer,
         "weather": [_plain_record(row, WeatherRecord) for row in weather],
         "pricing": {
+            "area": data.get("price_area"),
             "available": bool(prices),
             "points": [_plain_record(row, PriceRecord) for row in prices],
         },

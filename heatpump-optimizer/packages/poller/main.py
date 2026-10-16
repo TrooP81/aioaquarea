@@ -299,6 +299,15 @@ async def poll_prices() -> None:
         before_quality = await get_planning_data_quality() if prices else None
         async with get_session() as session:
             if prices:
+                if feed.source == "tibber":
+                    from packages.core.price_scope import ensure_tibber_scope
+
+                    await ensure_tibber_scope(
+                        session,
+                        area=feed.context.area,
+                        home_id=feed.context.tibber_home_id,
+                        currency=feed.currency,
+                    )
                 stmt = pg_insert(PriceRecord).values(
                     [
                         {
