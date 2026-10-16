@@ -45,7 +45,7 @@ export const LEGACY_SECTION_ALIASES: Record<string, { section: SectionId; hash?:
  * Optimizer layers
  *
  * `optimizer_version` / `active_layer` come back from the API as version strings
- * (e.g. "rules_v3", "milp_v1", "milp_v1+ml"). `configured_layer` and the settings
+ * (e.g. "rules_v8", "milp_v2", "milp_v2+ml"). `configured_layer` and the settings
  * dropdown use the configuration keys ("rules_only", "milp_preferred", "auto").
  * ──────────────────────────────────────────────────────────────────────────── */
 
@@ -53,8 +53,11 @@ export const LAYER_LABELS: Record<string, string> = {
   // Runtime version strings
   rules_v3: "Rules",
   rules_v7: "Rules",
+  rules_v8: "Rules",
   milp_v1: "Optimized",
   "milp_v1+ml": "Optimized + ML",
+  milp_v2: "Optimized",
+  "milp_v2+ml": "Optimized + ML",
   // Configuration keys (shown in a few places as a fallback)
   rules_only: "Rules",
   milp_preferred: "Optimized",
@@ -74,6 +77,12 @@ export const LAYER_TOOLTIPS: Record<string, string> = {
     "Rule-based scheduler: deterministic heuristics using electricity prices, comfort windows and quiet hours.",
   rules_v7:
     "Rule-based scheduler using electricity prices, comfort windows, quiet hours and assumed heating efficiency.",
+  rules_v8:
+    "Rule-based scheduler using electricity prices, comfort windows, quiet hours and assumed heating efficiency.",
+  milp_v2:
+    "Cost optimizer (MILP): searches for the lowest-cost schedule across the whole planning horizon.",
+  "milp_v2+ml":
+    "Cost optimizer using retained machine-learning predictions of electrical heating demand and assumed heating efficiency.",
   milp_v1:
     "Cost optimizer (MILP): searches for the lowest-cost schedule across the whole planning horizon.",
   "milp_v1+ml":

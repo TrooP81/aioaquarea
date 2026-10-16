@@ -1113,7 +1113,7 @@ def optimizer_status_api(monkeypatch, optimizer_status_data_quality):
     monkeypatch.setattr("packages.core.settings_service.get_setting", layer_setting)
     snapshot = AsyncMock(
         return_value={
-            "active_layer": "rules_v7",
+            "active_layer": "rules_v8",
             "effective_layer": "rules",
             "selection_reason": "auto_milp_disabled_cop_retired",
         }
@@ -1269,7 +1269,7 @@ async def test_optimizer_status_data_freshness_uses_real_helper(
     session.commit.assert_not_awaited()
     session.delete.assert_not_awaited()
     assert response["configured_layer"] == layer
-    assert response["active_layer"] == "rules_v7"
+    assert response["active_layer"] == "rules_v8"
     assert response["effective_layer"] == "rules"
     assert response["selection_reason"] == selection_reason
     assert response["build_policy"] == "observe_only"
@@ -1378,7 +1378,7 @@ def _admitted_planning_quality(
     return quality
 
 
-def _admissible_plan(*, version: str = "rules_v7", **quality_options) -> dict:
+def _admissible_plan(*, version: str = "rules_v8", **quality_options) -> dict:
     from packages.core.config import settings
     from packages.ml.thermal import thermal_model
     from packages.optimizer.represented_strategy import (
@@ -1451,7 +1451,7 @@ async def test_diagnostic_has_zero_actions_and_is_never_active(
     from packages.optimizer.executor_core import LearningModeState
     from packages.optimizer.main import run_optimization
 
-    plan = _admissible_plan(version="rules_v7" if planner == "rules" else "milp_v1")
+    plan = _admissible_plan(version="rules_v8" if planner == "rules" else "milp_v2")
     optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     fallback = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     if planner == "fallback":
@@ -2836,7 +2836,7 @@ async def test_default_history_excludes_diagnostics_and_explicit_detail_has_no_o
         created_at=now,
         horizon_start=now,
         horizon_end=now + dt.timedelta(hours=24),
-        optimizer_version="rules_v7",
+        optimizer_version="rules_v8",
         price_currency="SEK",
         price_source="manual",
         plan_json='{"actions": []}',
@@ -3011,7 +3011,7 @@ async def test_optimizer_status_preserves_captured_thermal_even_if_seasonal_repo
     monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
     monkeypatch.setattr(
         "packages.optimizer.main.get_optimizer_status_snapshot",
-        AsyncMock(return_value={"active_layer": "rules_v7"}),
+        AsyncMock(return_value={"active_layer": "rules_v8"}),
     )
     monkeypatch.setattr(
         optimizer, "_learning_mode_status", AsyncMock(return_value={"enabled": False})
@@ -3298,7 +3298,7 @@ async def test_optimizer_status_uses_filtered_demand_training_quality(tmp_path) 
         "reason": "unverified_thermal_output",
     }
     assert response["cop_trained"] is False
-    assert response["fallback_layer"] == "rules_v7"
+    assert response["fallback_layer"] == "rules_v8"
     assert response["thermal_model"] == {
         "lifecycle": response["model_lifecycle"]["thermal"],
         "status": "unavailable",
@@ -4320,7 +4320,7 @@ async def test_optimizer_status_reports_indoor_heating_evidence_for_calibrated_m
         ),
         patch(
             "packages.optimizer.main.get_optimizer_status_snapshot",
-            new=AsyncMock(return_value={"active_layer": "rules_v7"}),
+            new=AsyncMock(return_value={"active_layer": "rules_v8"}),
         ),
         patch(
             "packages.api.routers.optimizer._learning_mode_status",
@@ -4744,7 +4744,7 @@ def lifecycle_status_api(tmp_path, monkeypatch, optimizer_status_data_quality):
     )
     monkeypatch.setattr(
         "packages.optimizer.main.get_optimizer_status_snapshot",
-        AsyncMock(return_value={"active_layer": "rules_v7"}),
+        AsyncMock(return_value={"active_layer": "rules_v8"}),
     )
     monkeypatch.setattr(
         "packages.api.routers.optimizer._learning_mode_status",
@@ -5281,7 +5281,7 @@ async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
         created_at=dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc),
         horizon_start=dt.datetime(2026, 9, 14, 1, tzinfo=dt.timezone.utc),
         horizon_end=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
-        optimizer_version="milp_v1+ml",
+        optimizer_version="milp_v2+ml",
         cost_estimate_eur=3.21,
         price_currency="GBP",
         price_source="octopus",
@@ -5305,7 +5305,7 @@ async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
         "created_at": plan.created_at,
         "horizon_start": plan.horizon_start,
         "horizon_end": plan.horizon_end,
-        "optimizer_version": "milp_v1+ml",
+        "optimizer_version": "milp_v2+ml",
         "cost_estimate_eur": 3.21,
         "price_currency": "GBP",
         "price_source": "octopus",

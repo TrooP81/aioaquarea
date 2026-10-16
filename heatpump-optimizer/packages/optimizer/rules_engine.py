@@ -21,7 +21,7 @@ from packages.core.control_temperature import (
     get_control_temperature,
 )
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
-from packages.core.models import ConsumptionRecord, ShowerEventRecord, SpaceHeatingGateRecord
+from packages.core.models import ConsumptionRecord, ShowerEventRecord
 from packages.core.space_heating_gate import project_gate_states, resolve_effective_gate
 from packages.core.space_heating_baseline import (
     BaselineDutyProfile,
@@ -48,6 +48,8 @@ from packages.ml.comfort_model import comfort_model
 from packages.ml.forecast_quality import evaluate_live_control_gate
 
 from .rule_mixins import DHWRulesMixin, GuardrailRulesMixin, ModeRulesMixin, PreheatRulesMixin
+
+from .data_access import ConsumptionSnapshot, get_gate_snapshot
 
 logger = structlog.get_logger()
 
@@ -102,7 +104,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
     6. Detects holiday mode and suspends actions
     """
 
-    VERSION = "rules_v7"
+    VERSION = "rules_v8"
 
     def __init__(self, cop_model=None):
         self._dhw_cop_model = None
@@ -326,16 +328,8 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 planning_batch_quality(batch) if isinstance(batch, PlanningInputBatch) else None
             )
             last_status = await self._get_last_status(session)
-            gate_row = (
-                (
-                    await session.execute(
-                        select(SpaceHeatingGateRecord).where(
-                            SpaceHeatingGateRecord.device_id == last_status.device_id
-                        )
-                    )
-                ).scalar_one_or_none()
-                if last_status is not None
-                else None
+            gate_row = await get_gate_snapshot(
+                session, last_status.device_id if last_status is not None else None
             )
             outdoor_reading = await resolve_outdoor_temperature(
                 session,
@@ -949,8 +943,9 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                     .scalars()
                     .all()
                 )
-            if len(rows) > 20000:
-                return {**result, "baseline_unavailable_reason": "source_row_budget_exceeded"}
+                if len(rows) > 20000:
+                    return {**result, "baseline_unavailable_reason": "source_row_budget_exceeded"}
+                rows = [ConsumptionSnapshot.from_row(row) for row in rows]
             return observed_rate_baseline(
                 rows, prices, device_id=device_id, timezone_name=timezone_name
             )

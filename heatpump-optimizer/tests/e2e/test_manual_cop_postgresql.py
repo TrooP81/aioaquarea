@@ -5171,7 +5171,7 @@ class TestManualCOPPostgreSQLMigration:
                             horizon_start=stamp,
                             horizon_end=stamp + dt.timedelta(days=1),
                             plan_json='{"fixture":true}',
-                            optimizer_version="rules_v7",
+                            optimizer_version="rules_v8",
                             input_provenance_json='{"cop_source":"assumed_planning_curve"}',
                             price_currency="SEK",
                             price_source="manual",

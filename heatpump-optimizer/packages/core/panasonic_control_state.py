@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any, Literal
 
+from packages.core.device_status_values import DeviceStatusValues
+
 
 _COOLING_MODES = {
     "2",
@@ -44,7 +46,7 @@ def classify_panasonic_operation_mode(mode: Any) -> Literal["heating", "cooling"
     return "other"
 
 
-def panasonic_tank_heating_available(status: Any | None) -> bool:
+def panasonic_tank_heating_available(status: DeviceStatusValues | None) -> bool:
     """Return whether the observed installation can accept forced DHW control."""
 
     if status is None:
@@ -58,7 +60,7 @@ def panasonic_tank_heating_available(status: Any | None) -> bool:
     )
 
 
-def panasonic_zone_heating_available(status: Any | None, zone_id: int = 1) -> bool:
+def panasonic_zone_heating_available(status: DeviceStatusValues | None, zone_id: int = 1) -> bool:
     """Return whether a zone can execute optimizer heat-target commands.
 
     Missing legacy status flags are tolerated only when the complete live
