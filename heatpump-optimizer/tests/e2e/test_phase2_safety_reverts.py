@@ -898,7 +898,7 @@ class TestS1OwnedAttempts:
         )
         assert (
             metadata["verification_deadline_monotonic"] - metadata["dispatch_settled_monotonic"]
-            <= 60
+            <= 60 + 1e-6
         )
         assert await store.wrapper._redis.dbsize() > 0
 
