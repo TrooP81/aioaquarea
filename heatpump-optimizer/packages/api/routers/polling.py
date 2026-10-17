@@ -33,6 +33,32 @@ async def get_polling_wrapper(request: Request) -> AquareaWrapper | None:
     return wrapper
 
 
+async def _captured_price_write_context(feed):
+    if feed.rejection_reason:
+        raise ValueError(feed.rejection_reason)
+    if feed.source == "tibber":
+        if (
+            feed.context is None
+            or feed.context.provider != "tibber"
+            or not feed.context.area
+            or not feed.context.tibber_home_id
+        ):
+            raise ValueError("Missing captured Tibber installation identity")
+        return feed.context.area, feed.context.started_at
+    if feed.context is not None and feed.context.area:
+        return feed.context.area, feed.context.started_at
+    return await get_price_area(), dt.datetime.now(dt.timezone.utc)
+
+
+async def _register_captured_price_scope(db, feed, area):
+    if feed.source == "tibber":
+        from packages.core.price_scope import ensure_tibber_scope
+
+        await ensure_tibber_scope(
+            db, area=area, home_id=feed.context.tibber_home_id, currency=feed.currency
+        )
+
+
 async def _poll_prices_and_weather_legacy(results: dict[str, object]) -> None:
     """Populate poll-now feed results with the legacy persistence semantics."""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -43,9 +69,9 @@ async def _poll_prices_and_weather_legacy(results: dict[str, object]) -> None:
         feed = await fetch_price_feed()
         prices = feed.prices
         if prices:
-            area = await get_price_area()
-            fetched_at = dt.datetime.now(dt.timezone.utc)
+            area, fetched_at = await _captured_price_write_context(feed)
             async with get_session() as db:
+                await _register_captured_price_scope(db, feed, area)
                 for ts, price in prices:
                     stmt = pg_insert(PriceRecord).values(
                         ts=ts,
@@ -54,6 +80,7 @@ async def _poll_prices_and_weather_legacy(results: dict[str, object]) -> None:
                         price_currency=feed.currency,
                         price_source=feed.source,
                         fetched_at=fetched_at,
+                        interval_schema=feed.interval_schema,
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ts", "area"],
@@ -62,6 +89,7 @@ async def _poll_prices_and_weather_legacy(results: dict[str, object]) -> None:
                             "price_currency": feed.currency,
                             "price_source": feed.source,
                             "fetched_at": fetched_at,
+                            "interval_schema": feed.interval_schema,
                         },
                     )
                     await db.execute(stmt)
@@ -293,9 +321,9 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
         if prices:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-            area = await get_price_area()
-            fetched_at = dt.datetime.now(dt.timezone.utc)
+            area, fetched_at = await _captured_price_write_context(feed)
             async with get_session() as db:
+                await _register_captured_price_scope(db, feed, area)
                 for ts, price in prices:
                     stmt = pg_insert(PriceRecord).values(
                         ts=ts,
@@ -304,6 +332,7 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
                         price_currency=feed.currency,
                         price_source=feed.source,
                         fetched_at=fetched_at,
+                        interval_schema=feed.interval_schema,
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ts", "area"],
@@ -312,6 +341,7 @@ async def poll_now(wrapper: AquareaWrapper | None = Depends(get_polling_wrapper)
                             "price_currency": feed.currency,
                             "price_source": feed.source,
                             "fetched_at": fetched_at,
+                            "interval_schema": feed.interval_schema,
                         },
                     )
                     await db.execute(stmt)

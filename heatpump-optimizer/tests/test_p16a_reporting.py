@@ -195,6 +195,7 @@ async def test_P16a_A3_A4_A6_stats_measured_allocator_agree_and_queries_are_scop
         "ts_1": START,
         "ts_2": end,
         "area_1": "tibber",
+        "area_2": "tb:unavailable",
         "price_source_1": "tibber",
         "price_currency_1": "SEK",
     }
@@ -277,7 +278,11 @@ async def test_P16a_A6_dashboard_uses_identical_confirmed_allocation(monkeypatch
         SimpleNamespace(datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta),
     )
     monkeypatch.setattr(dashboard, "get_user_tz", AsyncMock(return_value="UTC"))
-    monkeypatch.setattr(dashboard, "get_price_area", AsyncMock(return_value="tibber"))
+    monkeypatch.setattr(
+        dashboard,
+        "get_active_price_context",
+        AsyncMock(return_value=PriceContext("tibber", "SEK", "tibber")),
+    )
     monkeypatch.setattr(
         dashboard, "get_device_data_quality", AsyncMock(return_value={"threshold_seconds": 900})
     )
@@ -383,7 +388,6 @@ async def test_owned_pg_seeded_energy_can_be_fully_priced_but_telemetry_incomple
         dashboard, "dt", SimpleNamespace(datetime=Clock, timezone=UTC, timedelta=dt.timedelta)
     )
     monkeypatch.setattr(dashboard, "get_user_tz", AsyncMock(return_value="UTC"))
-    monkeypatch.setattr(dashboard, "get_price_area", AsyncMock(return_value="10Y1001A1001A46L"))
     monkeypatch.setattr(
         dashboard,
         "get_active_price_context",

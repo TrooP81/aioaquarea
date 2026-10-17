@@ -131,6 +131,8 @@ jobs:
       # Inventory collects with --noconftest; only the ordinary phase keeps conftest.
       - name: Collect complete E2E verification inventory
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase e2e-inventory -m pytest --noconftest tests/e2e --collect-only -q
+      - name: Verify reviewed migration head pins
+        run: python -m pytest --noconftest tests/test_migration_head_contract.py -q
       - name: Verify migration graph
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase heads -m alembic heads
       - name: Verify legacy reversibility and retained migration refusal

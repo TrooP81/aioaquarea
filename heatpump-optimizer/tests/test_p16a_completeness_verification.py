@@ -80,7 +80,6 @@ async def test_complete_seed_has_positive_certified_cost_through_both_routes(mon
         SimpleNamespace(datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta),
     )
     monkeypatch.setattr(dashboard, "get_user_tz", AsyncMock(return_value="UTC"))
-    monkeypatch.setattr(dashboard, "get_price_area", AsyncMock(return_value=AREA))
     monkeypatch.setattr(
         dashboard,
         "get_active_price_context",

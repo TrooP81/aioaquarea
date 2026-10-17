@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from sqlalchemy import desc, select
 
-from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import PriceRecord
 from packages.core.settings_service import get_string_setting
@@ -20,12 +19,10 @@ class PriceContext:
 
 
 async def get_active_price_area() -> str:
-    provider = await get_string_setting("price_provider")
-    if provider == "entsoe":
-        return (await get_string_setting("entsoe_area")) or settings.entsoe_area
-    if provider == "manual":
-        return "manual"
-    return "tibber"
+    from packages.core.price_scope import resolve_price_area
+    from packages.core.settings_service import get_all_settings
+
+    return await resolve_price_area(await get_all_settings())
 
 
 async def get_active_price_context() -> PriceContext:

@@ -120,13 +120,12 @@ async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
                 .order_by(PlanActionRecord.scheduled_ts)
             )
             actions = actions_result.scalars().all()
-            from packages.api._helpers import get_price_area
             from packages.core.settings_service import get_float_setting, get_user_tz
 
             outcome = await plan_measurement(
                 session,
                 plan=plan,
-                price_area=await get_price_area(),
+                price_area="",
                 comfort_min_c=await get_float_setting("comfort_temp_min"),
                 comfort_max_c=await get_float_setting("comfort_temp_max"),
                 timezone_name=await get_user_tz(),

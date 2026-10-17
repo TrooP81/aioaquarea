@@ -127,6 +127,22 @@ class ConsumptionRecord(Base):
     outdoor_temp_source: Mapped[str | None] = mapped_column(String(32))
 
 
+class PriceScopeRecord(Base):
+    """Immutable installation identity; prices remain in their original scope."""
+
+    __tablename__ = "price_scopes"
+    __table_args__ = (UniqueConstraint("provider", "home_id", name="uq_price_scope_identity"),)
+
+    area: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    home_id: Mapped[str] = mapped_column(Text, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    amount_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    interval_schema: Mapped[str] = mapped_column(String(64), nullable=False)
+    tariff_schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    application_extra_fee: Mapped[float] = mapped_column(Float, nullable=False)
+
+
 class PriceRecord(Base):
     """Electricity spot price in the currency reported by its source."""
 

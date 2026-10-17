@@ -15,7 +15,7 @@ Do not run any command in the Upgrade, Rollback or Manual ledger reset sections 
 
 1. **Exact target.** The database host, database name and environment the command will run against. Approval for one target does not cover another.
 2. **Exact candidate.** The commit SHA and image tag/digest to be deployed, matching the independently reviewed and CI-qualified candidate.
-3. **Exact operation.** Which of upgrade to `036`, ledger reset, or snapshot restore is being done, and in what order.
+3. **Exact operation.** Which of upgrade to current head `037` (including forward-only `036`), ledger reset, or snapshot restore is being done, and in what order.
 4. **Safety-preservation evidence**, collected from the target immediately before the operation:
    - `alembic_version` (expected `035` before an upgrade);
    - the manual row count and the `manual_cop_revision_seq` state;
@@ -49,7 +49,7 @@ Then start **only** the reviewed `036`-compatible candidate (the exact commit an
 
 Check all of the following before reopening the service. If any check fails, keep the service closed and go to Rollback.
 
-- `alembic_version` is `036`.
+- `alembic_version` is current head `037`; `036` is the historical local-period shape transition, not the current head. Migration `037` adds the immutable Tibber registry without changing manual COP storage.
 - The manual row count and the `manual_cop_revision_seq` state are unchanged.
 - `SELECT to_regprocedure('public.manual_cop_calendar_midnight(timestamp without time zone,text)')` returns `NULL`.
 - Every running process reports the approved candidate commit and image; no older build is running.

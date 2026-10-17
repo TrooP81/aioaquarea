@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import json
+import re
 from collections.abc import Iterable
 from zoneinfo import ZoneInfo
 
@@ -527,17 +529,50 @@ async def plan_measurement(
             "note": "The plan window has not started, so no measured outcome exists yet.",
         }
 
+    # A plan's tariff identity is immutable; current settings are never a fallback.
+    try:
+        provenance = json.loads(plan.input_provenance_json or "{}")
+    except (ValueError, TypeError):
+        provenance = {}
+    price = provenance.get("price", {}) if isinstance(provenance, dict) else {}
+    if not isinstance(price, dict):
+        price = {}
+    persisted_area = price.get("area")
+    persisted_source = price.get("source") or plan.price_source
+    ambiguous_tibber = persisted_area == "tibber" or (
+        persisted_source == "tibber"
+        and (
+            not isinstance(persisted_area, str)
+            or not re.fullmatch(r"tb:[0-9a-f]{28}", persisted_area)
+        )
+    )
+    unavailable_scope = not isinstance(persisted_area, str) or ambiguous_tibber
+    price_area = "tb:unavailable" if unavailable_scope else persisted_area
+
     outcome = await measured_window_outcome(
         session,
         start=plan.horizon_start,
         end=end,
         price_area=price_area,
-        price_currency=plan.price_currency,
-        price_source=plan.price_source,
+        price_currency=price.get("currency") or plan.price_currency,
+        price_source=persisted_source,
         comfort_min_c=comfort_min_c,
         comfort_max_c=comfort_max_c,
         timezone_name=timezone_name,
     )
+    if unavailable_scope:
+        outcome["cost"] = {
+            **outcome["cost"],
+            "status": "unavailable",
+            "reason": "legacy_tibber_scope_ambiguous"
+            if ambiguous_tibber
+            else "missing_plan_price_scope",
+            "actual_cost": None,
+            "flat_price_baseline_cost": None,
+            "estimated_price_shift_savings": None,
+            "flat_price_per_kwh": None,
+            "coverage_pct": None,
+        }
     duration = max(1.0, (plan.horizon_end - plan.horizon_start).total_seconds())
     elapsed = min(duration, max(0.0, (end - plan.horizon_start).total_seconds()))
     state = "completed" if end >= plan.horizon_end else "in_progress"

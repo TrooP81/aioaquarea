@@ -107,7 +107,6 @@ async def test_dashboard_retains_historical_tariffs_when_current_hour_is_missing
         SimpleNamespace(datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta),
     )
     monkeypatch.setattr(dashboard, "get_user_tz", AsyncMock(return_value="UTC"))
-    monkeypatch.setattr(dashboard, "get_price_area", AsyncMock(return_value="tibber"))
     monkeypatch.setattr(
         dashboard,
         "get_active_price_context",

@@ -36,9 +36,9 @@ the newly generated exact manifest digest separately.
 
 All rows, values and `updated_at` columns in `settings` survive unchanged, including
 credentials, internal runtime keys, campaign timestamps, maintenance preferences and
-`manual_cop_monitoring_enabled`. All `smartthings_oauth_token` rows/columns survive.
+`manual_cop_monitoring_enabled`. All `smartthings_oauth_token` and immutable `price_scopes` rows/columns survive.
 Equality is checked inside the transaction without logging/exporting values.
-External environment/credentials, schema and Alembic **036** are untouched.
+External environment/credentials, schema and Alembic **037** are untouched.
 All sequences continue; no identity or manual-COP revision sequence is restarted.
 Redis quota/auth state is untouched: never flush Redis.
 
@@ -57,7 +57,7 @@ Unknown/missing public application tables, external referencing foreign keys, un
 sessions or lock/dependency failures abort; no CASCADE, database/schema drop, forced session
 termination, sequence restart or broad fallback is available. Timescale internal storage
 is handled only by Timescale's own truncate implementation, not enumerated or deleted
-separately. The retained Alembic table must contain exactly `036`.
+separately. The retained Alembic table must contain exactly `037`.
 
 Bootstrap exceptions are **one new lifecycle UUID**, with new monotonic tokens, empty
 checkpoints, references and leases, and **two minimal audit records** for terminal
@@ -242,7 +242,7 @@ Mocked UI CG-T8 cases are in `web/e2e/learning-mode.spec.ts`.
 Real storage qualification is explicit-only:
 `python -m pytest tests/isolated_reset_postgresql.py -q` on Linux with normal fixtures.
 It is **required evidence**, not replaced by unit fakes. The Test Engineer must first
-provision a brand-new, isolated, migrated schema-036 Timescale stack using the pinned
+provision a brand-new, isolated, migrated schema-037 Timescale stack using the pinned
 image digest in that test. No shared database/network/bind mounts are accepted.
 Supply `HPO_RESET_TEST_PROOF` pointing to:
 

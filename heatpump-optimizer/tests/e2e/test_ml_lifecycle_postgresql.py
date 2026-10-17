@@ -47,6 +47,7 @@ from packages.ml.lifecycle import (
 )
 from packages.ml.safe_persistence import publish_signed_artifact, verify_signed_artifact
 from tests.e2e.test_manual_cop_postgresql import (
+    CURRENT_HEAD_REVISION,
     current_verification_source_proof,
     guard_owned_database,
     migration_targets,
@@ -138,7 +139,7 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
             async with control.begin() as connection:
                 await guard_owned_database(connection)
                 head, _ = migration_targets()
-                assert head == "036"
+                assert head == CURRENT_HEAD_REVISION
                 assert (
                     await connection.execute(text("SELECT version_num FROM public.alembic_version"))
                 ).scalar_one() == head
@@ -224,7 +225,11 @@ async def _readiness_source_fixture(database, monkeypatch):
                 lambda current, table=model.__table__: table.create(current, checkfirst=True)
             )
     monkeypatch.setattr(database_module, "async_session_factory", database.maker)
-    values = {key: spec.serialize_default() for key, spec in settings_service.SETTING_SPECS.items()}
+    values = {
+        key: spec.serialize_default()
+        for key, spec in settings_service.SETTING_SPECS.items()
+        if not settings_service.SETTINGS_SCHEMA[key].get("read_only")
+    }
     values.update(
         {
             "timezone": "UTC",

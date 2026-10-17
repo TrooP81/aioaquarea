@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -11,7 +12,13 @@ import defusedxml.ElementTree as ElementTree
 import httpx
 
 from packages.core.config import settings
-from packages.core.settings_service import get_setting, get_setting_spec, get_string_setting
+from packages.core.settings_service import (
+    get_all_settings,
+    get_setting,
+    get_setting_spec,
+    get_string_setting,
+)
+from packages.core.price_scope import AUTO_BINDING_SUSPENDED, record_tibber_binding, tibber_scope
 from packages.core.solar import clear_sky_ghi, estimate_ghi
 
 # ENTSO-E Transparency Platform day-ahead prices
@@ -40,6 +47,7 @@ class FetchContext:
     area: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    tibber_home_id: str | None = None
 
 
 PRICE_INTERVAL_SCHEMA = "hourly_duration_weighted_v1"
@@ -262,21 +270,49 @@ def _parse_entsoe_xml(xml_text: str, period_start: dt.datetime) -> ProviderPrice
 
 
 async def _fetch_prices_tibber() -> ProviderPriceList:
-    token = await get_setting("tibber_api_token")
-    if not token:
-        return ProviderPriceList([], currency="EUR", source="tibber")
-    context = FetchContext("tibber", dt.datetime.now(dt.timezone.utc), area="tibber")
+    # A single settings query captures token and binding before any provider I/O.
+    values = await get_all_settings()
+    token = values["tibber_api_token"]
+    captured_home = values.get("tibber_home_id", "")
+    started_at = dt.datetime.now(dt.timezone.utc)
+    context = FetchContext("tibber", started_at)
 
-    def rejected(reason: str) -> ProviderPriceList:
-        # Reasons are fixed codes, never provider messages or credential-bearing URLs.
+    async def rejected(reason: str) -> ProviderPriceList:
+        await record_tibber_binding(captured_home, captured_home, reason)
         return ProviderPriceList(
             [], currency="", source="tibber", context=context, rejection_reason=reason
         )
+
+    if values.get("price_provider") != "tibber":
+        return await rejected("provider_changed_during_capture")
+    if not token:
+        return await rejected("missing_token")
+    if captured_home:
+        try:
+            context = FetchContext(
+                "tibber", started_at, area=tibber_scope(captured_home), tibber_home_id=captured_home
+            )
+        except ValueError:
+            return await rejected("invalid_home_id")
+
+    try:
+        diagnostic = json.loads(values.get("tibber_feed_diagnostic", "") or "{}")
+    except (ValueError, TypeError):
+        return await rejected("invalid_binding_provenance")
+    if not isinstance(diagnostic, dict):
+        return await rejected("invalid_binding_provenance")
+    automatic = (
+        diagnostic.get("home_id") == captured_home
+        and diagnostic.get("binding_method") == "single_active_subscription"
+    )
+    if automatic and diagnostic.get("reason") == AUTO_BINDING_SUSPENDED:
+        return await rejected(AUTO_BINDING_SUSPENDED)
 
     query = """
     {
       viewer {
         homes {
+          id
           currentSubscription {
             priceInfo {
               today {
@@ -307,50 +343,61 @@ async def _fetch_prices_tibber() -> ProviderPriceList:
         data = resp.json()
 
     if not isinstance(data, dict):
-        return rejected("malformed_response")
+        return await rejected("malformed_response")
     if data.get("errors"):
-        return rejected("graphql_error")
-
+        return await rejected("graphql_error")
     payload = data.get("data")
     viewer = payload.get("viewer") if isinstance(payload, dict) else None
     homes = viewer.get("homes") if isinstance(viewer, dict) else None
-    if not isinstance(homes, list):
-        return rejected("malformed_response")
-    if not homes:
-        return ProviderPriceList([], currency="", source="tibber", context=context)
-
-    price_entries: list[dict] = []
+    if not isinstance(homes, list) or any(not isinstance(home, dict) for home in homes):
+        return await rejected("malformed_response")
+    ids = [home.get("id") for home in homes]
+    if any(not isinstance(home_id, str) or not home_id for home_id in ids):
+        return await rejected("missing_home_identity")
+    if len(set(ids)) != len(ids):
+        return await rejected("duplicate_home_identity")
+    eligible = [home for home in homes if isinstance(home.get("currentSubscription"), dict)]
+    if automatic and len(eligible) != 1:
+        return await rejected(AUTO_BINDING_SUSPENDED)
+    selected_home = captured_home
+    if not selected_home:
+        if len(eligible) != 1:
+            return await rejected("home_binding_requires_exactly_one_active_subscription")
+        selected_home = eligible[0]["id"]
+        try:
+            tibber_scope(selected_home)
+        except ValueError:
+            return await rejected("invalid_home_id")
+        if not await record_tibber_binding(captured_home, selected_home, None, auto_bind=True):
+            return await rejected("home_binding_changed_during_fetch")
+        captured_home = selected_home
+    selected = next((home for home in homes if home["id"] == selected_home), None)
+    if selected is None:
+        return await rejected("selected_home_not_found")
+    context = FetchContext(
+        "tibber", started_at, area=tibber_scope(selected_home), tibber_home_id=selected_home
+    )
+    subscription = selected.get("currentSubscription")
+    if not isinstance(subscription, dict):
+        return await rejected("selected_home_has_no_active_subscription")
+    price_info = subscription.get("priceInfo")
+    if not isinstance(price_info, dict):
+        return await rejected("selected_home_has_no_prices")
+    today = price_info.get("today")
+    tomorrow = price_info.get("tomorrow")
+    if (today is not None and not isinstance(today, list)) or (
+        tomorrow is not None and not isinstance(tomorrow, list)
+    ):
+        return await rejected("malformed_price_entries")
+    price_entries = (today or []) + (tomorrow or [])
+    if not price_entries:
+        return await rejected("selected_home_has_no_prices")
     currency = ""
-    for home in homes:
-        if not isinstance(home, dict):
-            return rejected("malformed_response")
-        current_subscription = home.get("currentSubscription")
-        if current_subscription is None:
-            continue
-        if not isinstance(current_subscription, dict):
-            return rejected("malformed_response")
-        price_info = current_subscription.get("priceInfo")
-        if price_info is None:
-            continue
-        if not isinstance(price_info, dict):
-            return rejected("malformed_response")
-        today = price_info.get("today")
-        tomorrow = price_info.get("tomorrow")
-        if (today is not None and not isinstance(today, list)) or (
-            tomorrow is not None and not isinstance(tomorrow, list)
-        ):
-            return rejected("malformed_price_entries")
-        price_entries = (today if today is not None else []) + (
-            tomorrow if tomorrow is not None else []
-        )
-        if price_entries:
-            break
-
     currencies: set[str] = set()
     currency_verified = bool(price_entries)
     for entry in price_entries:
         if not isinstance(entry, dict):
-            return rejected("malformed_price_entry")
+            return await rejected("malformed_price_entry")
         raw = entry.get("currency")
         if raw is None or raw == "":
             currency_verified = False
@@ -359,7 +406,7 @@ async def _fetch_prices_tibber() -> ProviderPriceList:
         else:
             currency_verified = False
     if len(currencies) > 1:
-        return rejected("currency_conflict")
+        return await rejected("currency_conflict")
     currency = next(iter(currencies), "")
     results: list[tuple[dt.datetime, float]] = []
     for price_entry in price_entries:
@@ -368,14 +415,17 @@ async def _fetch_prices_tibber() -> ProviderPriceList:
         ts = _provider_timestamp(starts_at)
         price = _finite_provider_number(total)
         if ts is None or price is None:
-            return rejected("invalid_price_or_timestamp")
+            return await rejected("invalid_price_or_timestamp")
         if (ts.minute, ts.second, ts.microsecond) != (0, 0, 0):
-            return rejected("non_hourly_timestamp")
+            return await rejected("non_hourly_timestamp")
         results.append((ts, price))
 
     results.sort(key=lambda x: x[0])
     if len({ts for ts, _ in results}) != len(results):
-        return rejected("duplicate_timestamp")
+        return await rejected("duplicate_timestamp")
+    if not currency_verified:
+        return await rejected("unverified_currency")
+    await record_tibber_binding(captured_home, selected_home, None)
     return ProviderPriceList(
         results,
         currency=currency,

@@ -8,7 +8,6 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import and_, desc, func, select
 import structlog
 
-from packages.api._helpers import get_price_area
 from packages.api.schemas import (
     ControlStateResponse,
     ConsumptionResponse,
@@ -41,6 +40,7 @@ from packages.core.plan_outcome import (
     effective_source_date,
     hour_start,
 )
+from packages.core.price_scope import UNAVAILABLE_AREA
 from packages.core.pricing import get_active_price_context
 from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
@@ -63,6 +63,7 @@ async def get_dashboard():
     timezone_name = await get_user_tz()
     today_start = local_day_start_utc(now, timezone_name)
     device_quality = await get_device_data_quality(now=now)
+    context = await get_active_price_context()
 
     async with get_session() as session:
         status_result = await session.execute(
@@ -96,7 +97,7 @@ async def get_dashboard():
             else None
         )
 
-        area = await get_price_area()
+        area = context.area
         price_result = await session.execute(
             select(
                 PriceRecord.price_eur_per_kwh,
@@ -108,6 +109,9 @@ async def get_dashboard():
                     PriceRecord.ts <= now,
                     PriceRecord.ts > now - dt.timedelta(hours=1),
                     PriceRecord.area == area,
+                    PriceRecord.area != UNAVAILABLE_AREA,
+                    PriceRecord.price_currency == context.currency,
+                    PriceRecord.price_source == context.source,
                 )
             )
             .order_by(desc(PriceRecord.ts))
@@ -144,6 +148,9 @@ async def get_dashboard():
                     PriceRecord.ts >= today_start,
                     PriceRecord.ts <= now,
                     PriceRecord.area == area,
+                    PriceRecord.area != UNAVAILABLE_AREA,
+                    PriceRecord.price_currency == context.currency,
+                    PriceRecord.price_source == context.source,
                 )
             )
         )
@@ -505,6 +512,7 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
             select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
             .where(PriceRecord.ts >= hour_start(since), PriceRecord.ts < now)
             .where(PriceRecord.area == context.area)
+            .where(PriceRecord.area != UNAVAILABLE_AREA)
             .where(PriceRecord.price_source == context.source)
             .where(PriceRecord.price_currency == context.currency)
         )

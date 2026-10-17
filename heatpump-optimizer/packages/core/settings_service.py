@@ -211,6 +211,17 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "entsoe_area",
         "description": "ENTSO-E bidding zone",
     },
+    "tibber_home_id": {
+        "type": "str",
+        "default_env": "tibber_home_id",
+        "description": "Exact Tibber home ID; empty auto-binds only one active subscription",
+    },
+    "tibber_feed_diagnostic": {
+        "type": "str",
+        "default": "",
+        "read_only": True,
+        "description": "Last Tibber binding diagnostic (installation-qualified)",
+    },
     "tibber_api_token": {
         "type": "secret",
         "default_env": "tibber_api_token",
@@ -600,6 +611,8 @@ def validate_setting_value(key: str, value: str) -> None:
     at the API boundary instead of crashing later in the optimizer/poller).
     """
     spec = get_setting_spec(key)
+    if key == "tibber_feed_diagnostic":
+        raise ValueError("tibber_feed_diagnostic is read-only")
     if SETTINGS_SCHEMA[key].get("read_only") and value != spec.serialize_default():
         raise ValueError(f"{key} is read-only and always {spec.serialize_default()}")
 
@@ -607,6 +620,11 @@ def validate_setting_value(key: str, value: str) -> None:
         if value not in spec.options:
             raise ValueError(f"{key} must be one of {list(spec.options)} (got {value!r})")
         return
+
+    if key == "tibber_home_id" and value:
+        from packages.core.price_scope import tibber_scope
+
+        tibber_scope(value)
 
     if spec.value_type == "json":
         try:
@@ -760,9 +778,11 @@ async def set_setting(key: str, value: str) -> None:
     if key == "seasonal_calibration_enabled":
         await set_settings_bulk({key: value})
         return
-    if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
-        "type"
-    ) in {"int", "float"}:
+    if (
+        key == "tibber_home_id"
+        or SETTINGS_SCHEMA.get(key, {}).get("read_only")
+        or SETTINGS_SCHEMA.get(key, {}).get("type") in {"int", "float"}
+    ):
         validate_setting_value(key, value)
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -773,6 +793,10 @@ async def set_setting(key: str, value: str) -> None:
             set_={"value": value},
         )
         await session.execute(stmt)
+        if key == "tibber_home_id":
+            from packages.core.price_scope import record_explicit_tibber_binding
+
+            await record_explicit_tibber_binding(session, value)
         if key == "ml_maintenance_enabled":
             from packages.ml.lifecycle import update_maintenance_gate
 
@@ -790,9 +814,11 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
 
     updates = dict(updates)
     for key, value in updates.items():
-        if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
-            "type"
-        ) in {"int", "float"}:
+        if (
+            key == "tibber_home_id"
+            or SETTINGS_SCHEMA.get(key, {}).get("read_only")
+            or SETTINGS_SCHEMA.get(key, {}).get("type") in {"int", "float"}
+        ):
             validate_setting_value(key, value)
     if "seasonal_calibration_enabled" in updates and not _parse_bool(
         updates["seasonal_calibration_enabled"]
@@ -840,6 +866,10 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
                 set_={"value": value},
             )
             await session.execute(stmt)
+            if key == "tibber_home_id":
+                from packages.core.price_scope import record_explicit_tibber_binding
+
+                await record_explicit_tibber_binding(session, value)
             if key == "ml_maintenance_enabled":
                 from packages.ml.lifecycle import update_maintenance_gate
 
