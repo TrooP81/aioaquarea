@@ -11,5 +11,8 @@
     "editor.formatOnSave": true,
     "python.formatting.provider": "black",
     "python.linting.pylintEnabled": true,
-    "python.linting.enabled": true
+    "python.linting.enabled": true,
+    "chat.tools.terminal.autoApprove": {
+        "pytest": true
+    }
 }

@@ -3,29 +3,42 @@
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
+from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass
+from weakref import WeakKeyDictionary
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from sqlalchemy import select
 
 from packages.core.config import settings as app_settings
-from packages.core.database import get_session
-from packages.core.models import ConsumptionRecord, WeatherRecord
+from packages.core.database import copy_materialized_rows, get_session
+from packages.core.models import ConsumptionRecord, DeviceStatusRecord, WeatherRecord
+from packages.core.settings_service import get_user_tz
+from packages.ml.lifecycle import LifecycleUnavailable
 from packages.ml.models_common import (
     HAS_SKLEARN,
-    MODEL_DIR,
+    MODEL_DIR as MODEL_DIR,
+    COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS,
     _logger,
+    chronological_fit_holdout,
     evaluate_regression,
-    iter_consumption_intervals,
+    iter_confirmed_zero_intervals,
+    iter_counter_change_intervals,
     make_monotonic_regressor,
-    prune_old_models,
     time_series_cv_mae,
-    write_mae_baseline,
+    time_series_cv_naive_mae,
 )
 
 # Weather samples are typically hourly; only join a consumption interval to a
 # weather observation within this gap, otherwise fall back to defaults.
 MAX_WEATHER_GAP_SECONDS = 2 * 3600
 MIN_TRAINING_SAMPLES = 168
+# Required relative MAE improvement over predicting the historical mean.
+MIN_SKILL_OVER_NAIVE = 0.05
 
 # Physical monotonicity for demand features
 # [outdoor_temp, wind_speed, irradiance, precipitation, humidity, cloud_cover,
@@ -36,6 +49,115 @@ _DEMAND_MONOTONIC_CST = [-1, 1, -1, 0, 0, 0, 0, 0, 0, 0]
 DEMAND_MODEL_ARTIFACT_PREFIX = "demand_model_weather_v3_"
 DEMAND_MODEL_ARTIFACT_GLOB = f"{DEMAND_MODEL_ARTIFACT_PREFIX}*.pkl"
 DEMAND_MAE_BASELINE = "demand_weather_v3"
+DEMAND_COUNTER_CONFIRMATION_ENABLED = False
+DEMAND_LABEL_EMBARGO = dt.timedelta(hours=4)
+DEMAND_HISTORY_WINDOW = dt.timedelta(days=90)
+DEMAND_MAX_MATERIALIZED_ROWS = 50_000
+_PREPROCESSING_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="demand-preprocess")
+
+
+class DemandPreparationBusy(LifecycleUnavailable):
+    pass
+
+
+@dataclass
+class _PreparationFlight:
+    task: asyncio.Task
+    worker_started: asyncio.Event
+    waiters: int = 0
+    joinable: bool = True
+
+
+_PREPARATION_FLIGHTS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _partition_demand_samples(bounds):
+    return chronological_fit_holdout(bounds, holdout_fraction=0.2, embargo=DEMAND_LABEL_EMBARGO)
+
+
+def _demand_sample_counts(prepared: dict) -> dict:
+    bounds = prepared["bounds"]
+    fit, holdout = _partition_demand_samples(bounds)
+    finite = np.isfinite(prepared["features"]).all() and np.isfinite(prepared["targets"]).all()
+    if not finite:
+        return {
+            "availability": "unavailable",
+            "total": None,
+            "train": None,
+            "holdout": None,
+            "minimum_train": MIN_TRAINING_SAMPLES,
+            "minimum_holdout": 24,
+            "remaining_train": None,
+            "remaining_holdout": None,
+            "reason": "nonfinite_training_inputs",
+        }
+    return {
+        "availability": "assessed",
+        "total": len(bounds),
+        "train": len(fit),
+        "holdout": len(holdout),
+        "minimum_train": MIN_TRAINING_SAMPLES,
+        "minimum_holdout": 24,
+        "remaining_train": max(0, MIN_TRAINING_SAMPLES - len(fit)),
+        "remaining_holdout": max(0, 24 - len(holdout)),
+        "reason": "insufficient_train"
+        if len(fit) < MIN_TRAINING_SAMPLES
+        else "insufficient_holdout"
+        if len(holdout) < 24
+        else None,
+    }
+
+
+def build_demand_candidate(data: dict[str, object]) -> dict[str, object] | None:
+    features = np.asarray(data["features"], dtype=float)
+    targets = np.asarray(data["targets"], dtype=float)
+    bounds = data["bounds"]
+    if (
+        len(bounds) != len(targets)
+        or not np.isfinite(features).all()
+        or not np.isfinite(targets).all()
+    ):
+        return None
+    fit, holdout = _partition_demand_samples(bounds)
+    if len(fit) < MIN_TRAINING_SAMPLES or len(holdout) < 24:
+        return None
+    models = {}
+    evaluated = {}
+    for quantile, name in ((0.5, "median"), (0.1, "lower"), (0.9, "upper")):
+        model = make_monotonic_regressor(
+            _DEMAND_MONOTONIC_CST, max_iter=250, loss="quantile", quantile=quantile
+        )
+        model.fit(features[fit], targets[fit])
+        models[name] = model
+        evaluated[name] = model.predict(features[holdout])
+    mae = float(np.mean(np.abs(evaluated["median"] - targets[holdout])))
+    baseline = float(np.mean(targets[fit]))
+    naive_mae = float(np.mean(np.abs(baseline - targets[holdout])))
+    if naive_mae <= 0 or 1 - mae / naive_mae < MIN_SKILL_OVER_NAIVE:
+        return None
+    return {
+        **models,
+        "schema_version": "demand_lifecycle_v1",
+        "metrics": {
+            "mae": mae,
+            "naive_mae": naive_mae,
+            "skill_vs_naive": 1 - mae / naive_mae,
+            "samples": len(targets),
+            "fit_samples": len(fit),
+            "holdout_samples": len(holdout),
+            "unit": "kW",
+            "validation_method": "chronological_embargo_exact_fit",
+        },
+        "baseline_kw": baseline,
+        "device_id": data.get("device_id"),
+        "evaluation": {
+            "features": features[holdout],
+            "predictions": evaluated,
+            "targets": targets[holdout],
+            "fit_label_end": bounds[int(fit[-1])][1].isoformat(),
+            "holdout_issue_start": bounds[int(holdout[0])][0].isoformat(),
+        },
+    }
 
 
 class DemandModel:
@@ -48,7 +170,11 @@ class DemandModel:
         self._model_lower = None  # p10
         self._model_upper = None  # p90
         self._version: str = "untrained"
+        self._metrics: dict[str, float | int | str | None] = {}
         self._last_data_quality: dict[str, object] = self._empty_data_quality()
+        self._qualified_reference = None
+        self._sample_bounds: list[tuple[dt.datetime, dt.datetime]] = []
+        self._sample_devices: set[str] = set()
 
     @staticmethod
     def _empty_data_quality() -> dict[str, object]:
@@ -75,16 +201,33 @@ class DemandModel:
         """Diagnostics from the most recent data preparation pass."""
         return dict(self._last_data_quality)
 
+    @property
+    def metrics(self) -> dict[str, float | int | str | None]:
+        """Persisted forward-chaining validation evidence for the live model."""
+        return dict(self._metrics)
+
+    @property
+    def version(self) -> str:
+        """Version parsed from the currently loaded artifact filename."""
+        return self._version
+
     def reset(self) -> None:
         """Discard the trained model and return to the untrained fallback state."""
         self._model = None
         self._model_lower = None
         self._model_upper = None
         self._version = "untrained"
+        self._metrics = {}
+        self._qualified_reference = None
+
+    def _has_qualified_incumbent(self) -> bool:
+        from packages.ml.lifecycle import reference_is_qualified
+
+        return reference_is_qualified(self._qualified_reference)
 
     @property
     def is_trained(self) -> bool:
-        return self._model is not None
+        return self._model is not None and self._has_qualified_incumbent()
 
     @staticmethod
     def _make_features(
@@ -130,6 +273,8 @@ class DemandModel:
         )
 
     async def train(self) -> dict[str, object]:
+        if not self._has_qualified_incumbent():
+            self.reset()
         if not HAS_SKLEARN:
             raise ImportError("scikit-learn required")
         X, y = await self._prepare_data()
@@ -145,8 +290,24 @@ class DemandModel:
         # accuracy (plain KFold leaks later hours into earlier folds).
         median = self._make_quantile_model(0.5)
         mae, cv_std = time_series_cv_mae(median, X, y)
+        naive_mae = time_series_cv_naive_mae(y)
+        skill = 1.0 - mae / naive_mae if naive_mae > 0 else 0.0
+        if skill < MIN_SKILL_OVER_NAIVE:
+            _logger.warning(
+                "demand_model_no_skill_over_naive",
+                mae=round(mae, 3),
+                naive_mae=round(naive_mae, 3),
+                samples=len(X),
+            )
+            return {
+                "status": "no_skill",
+                "mae": round(mae, 3),
+                "naive_mae": round(naive_mae, 3),
+                "skill_vs_naive": round(skill, 3),
+                "samples": len(X),
+            }
 
-        has_prior = bool(list(MODEL_DIR.glob(DEMAND_MODEL_ARTIFACT_GLOB)))
+        has_prior = self._has_qualified_incumbent()
         decision = evaluate_regression(DEMAND_MAE_BASELINE, mae, has_prior)
         if not decision["deploy"]:
             _logger.warning(
@@ -162,28 +323,14 @@ class DemandModel:
                 "samples": len(X),
             }
 
-        median.fit(X, y)
-        lower = self._make_quantile_model(0.1)
-        lower.fit(X, y)
-        upper = self._make_quantile_model(0.9)
-        upper.fit(X, y)
-
-        self._model = median
-        self._model_lower = lower
-        self._model_upper = upper
-        self._version = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
-        model_path = MODEL_DIR / f"{DEMAND_MODEL_ARTIFACT_PREFIX}{self._version}.pkl"
-        from packages.ml.safe_persistence import safe_dump
-
-        safe_dump({"median": median, "lower": lower, "upper": upper}, model_path)
-        prune_old_models(DEMAND_MODEL_ARTIFACT_GLOB, model_dir=MODEL_DIR)
-        write_mae_baseline("demand", mae)
         return {
-            "version": self._version,
+            "status": "maintenance_required",
+            "samples": len(X),
             "mae": mae,
             "cv_std": cv_std,
             "baseline_mae": decision["baseline_mae"],
-            "samples": len(X),
+            "reason": "diagnostic_only_use_queued_lifecycle",
+            "control_ready": False,
         }
 
     def predict_hourly(self, weather_forecast: list[dict], hours: int = 24) -> list[float]:
@@ -201,7 +348,7 @@ class DemandModel:
             precipitation = weather.get("precipitation", 0.0)
             humidity = weather.get("humidity", 60.0)
             cloud_cover = weather.get("cloud_cover", 0.5)
-            if self._model is not None:
+            if self.is_trained:
                 features = self._make_features(
                     temp,
                     wind,
@@ -240,7 +387,7 @@ class DemandModel:
             precipitation = weather.get("precipitation", 0.0)
             humidity = weather.get("humidity", 60.0)
             cloud_cover = weather.get("cloud_cover", 0.5)
-            if self._model is not None:
+            if self.is_trained:
                 features = self._make_features(
                     temp,
                     wind,
@@ -272,56 +419,283 @@ class DemandModel:
             results.append({"p10": p10, "p50": p50, "p90": p90})
         return results
 
-    async def training_data_quality(self) -> dict[str, object]:
+    async def training_data_quality(self, *, materialized=None, context=None) -> dict[str, object]:
         """Return live, explainable readiness data without training a model."""
-        await self._prepare_data()
+        if materialized is not None:
+            return self._preprocess_materialized({**materialized, "log_quality": False})["quality"]
+        if context is not None:
+            raise ValueError("Captured context requires materialized demand inputs")
+        try:
+            await self._prepare_data()
+        except DemandPreparationBusy:
+            return {
+                **self.last_data_quality,
+                "ready_to_train": False,
+                "training_blocker": "preparation_busy",
+            }
         return self.last_data_quality
 
-    async def _prepare_data(self) -> tuple[np.ndarray, np.ndarray]:
-        async with get_session() as session:
+    async def _prepare_data(
+        self,
+        *,
+        lifecycle_evidence: bool = False,
+        cutoff: dt.datetime | None = None,
+        device_id: str | None = None,
+        weather_provider: str | None = None,
+        worker=None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        loop = asyncio.get_running_loop()
+        key = (lifecycle_evidence, cutoff, device_id, weather_provider, worker)
+        current = _PREPARATION_FLIGHTS.get(loop)
+        if current is not None and current[1].task.done():
+            _PREPARATION_FLIGHTS.pop(loop)
+            current = None
+        if current is not None and (
+            current[0] != key or not current[1].joinable or current[1].task.cancelling()
+        ):
+            raise DemandPreparationBusy("demand_preparation_busy")
+        if current is None:
+            started = asyncio.Event()
+            flight = _PreparationFlight(
+                loop.create_task(
+                    self._materialize_prepared(
+                        lifecycle_evidence=lifecycle_evidence,
+                        cutoff=cutoff,
+                        device_id=device_id,
+                        weather_provider=weather_provider,
+                        worker=worker,
+                        worker_started=started,
+                    )
+                ),
+                started,
+            )
+            _PREPARATION_FLIGHTS[loop] = (key, flight)
+
+            def finished(task):
+                active = _PREPARATION_FLIGHTS.get(loop)
+                if active is not None and active[1] is flight:
+                    _PREPARATION_FLIGHTS.pop(loop)
+                if not task.cancelled():
+                    task.exception()
+
+            flight.task.add_done_callback(finished)
+        else:
+            flight = current[1]
+        flight.waiters += 1
+        try:
+            prepared = await asyncio.shield(flight.task)
+        except asyncio.CancelledError:
+            if lifecycle_evidence and flight.worker_started.is_set():
+                while not flight.task.done():
+                    try:
+                        await asyncio.shield(flight.task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+            raise
+        finally:
+            flight.waiters -= 1
+            if (
+                flight.waiters == 0
+                and not flight.worker_started.is_set()
+                and not flight.task.done()
+            ):
+                flight.joinable = False
+                flight.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await flight.task
+        self._last_data_quality = prepared["quality"]
+        self._sample_bounds = prepared["bounds"]
+        self._sample_devices = prepared["devices"]
+        return prepared["features"], prepared["targets"]
+
+    async def _materialize_training_rows(
+        self,
+        *,
+        cutoff: dt.datetime | None,
+        device_id: str | None = None,
+        weather_provider: str | None = None,
+        lifecycle_evidence: bool = False,
+        session=None,
+        context=None,
+    ):
+        timezone = ZoneInfo(
+            context["settings"]["timezone"] if context is not None else await get_user_tz()
+        )
+        consumption_query = select(
+            ConsumptionRecord.device_id,
+            ConsumptionRecord.ts,
+            ConsumptionRecord.heat_kwh,
+            ConsumptionRecord.cool_kwh,
+            ConsumptionRecord.tank_kwh,
+            ConsumptionRecord.outdoor_temp,
+            ConsumptionRecord.source_date,
+            ConsumptionRecord.source_timezone,
+        )
+        weather_query = select(
+            WeatherRecord.ts,
+            WeatherRecord.temperature,
+            WeatherRecord.wind_speed,
+            WeatherRecord.irradiance,
+            WeatherRecord.precipitation,
+            WeatherRecord.humidity,
+            WeatherRecord.cloud_cover,
+        )
+        status_query = select(DeviceStatusRecord)
+        cutoff = cutoff or dt.datetime.now(dt.timezone.utc)
+        since = cutoff - DEMAND_HISTORY_WINDOW
+        consumption_query = consumption_query.where(
+            ConsumptionRecord.ts >= since, ConsumptionRecord.ts <= cutoff
+        ).limit(DEMAND_MAX_MATERIALIZED_ROWS + 1)
+        weather_query = weather_query.where(
+            WeatherRecord.ts >= since - dt.timedelta(hours=2), WeatherRecord.ts <= cutoff
+        ).limit(DEMAND_MAX_MATERIALIZED_ROWS + 1)
+        status_query = status_query.where(
+            DeviceStatusRecord.ts >= since - dt.timedelta(minutes=15),
+            DeviceStatusRecord.ts <= cutoff,
+        ).limit(DEMAND_MAX_MATERIALIZED_ROWS + 1)
+        if device_id is not None:
+            consumption_query = consumption_query.where(ConsumptionRecord.device_id == device_id)
+            status_query = status_query.where(DeviceStatusRecord.device_id == device_id)
+        if weather_provider is not None:
+            weather_query = weather_query.where(WeatherRecord.source == weather_provider)
+        async with get_session() if session is None else nullcontext(session) as session:
             consumption_rows = (
-                await session.execute(
-                    select(
-                        ConsumptionRecord.ts,
-                        ConsumptionRecord.heat_kwh,
-                        ConsumptionRecord.cool_kwh,
-                        ConsumptionRecord.tank_kwh,
-                        ConsumptionRecord.outdoor_temp,
-                    ).order_by(ConsumptionRecord.ts)
-                )
+                await session.execute(consumption_query.order_by(ConsumptionRecord.ts))
             ).all()
-            weather_rows = (
-                await session.execute(
-                    select(
-                        WeatherRecord.ts,
-                        WeatherRecord.temperature,
-                        WeatherRecord.wind_speed,
-                        WeatherRecord.irradiance,
-                        WeatherRecord.precipitation,
-                        WeatherRecord.humidity,
-                        WeatherRecord.cloud_cover,
-                    ).order_by(WeatherRecord.ts)
-                )
-            ).all()
+            weather_rows = (await session.execute(weather_query.order_by(WeatherRecord.ts))).all()
+            statuses = (
+                (await session.execute(status_query.order_by(DeviceStatusRecord.ts)))
+                .scalars()
+                .all()
+                if lifecycle_evidence
+                else []
+            )
+        if (
+            max(len(consumption_rows), len(weather_rows), len(statuses))
+            > DEMAND_MAX_MATERIALIZED_ROWS
+        ):
+            raise ValueError("Demand materialization overflow")
+        consumption_names = (
+            "device_id",
+            "ts",
+            "heat_kwh",
+            "cool_kwh",
+            "tank_kwh",
+            "outdoor_temp",
+            "source_date",
+            "source_timezone",
+        )
+        weather_names = (
+            "ts",
+            "temperature",
+            "wind_speed",
+            "irradiance",
+            "precipitation",
+            "humidity",
+            "cloud_cover",
+        )
+        return {
+            "consumption_rows": await copy_materialized_rows(
+                consumption_rows, consumption_names, context=context
+            ),
+            "weather_rows": await copy_materialized_rows(
+                weather_rows, weather_names, context=context
+            ),
+            "statuses": await copy_materialized_rows(
+                statuses,
+                [column.name for column in DeviceStatusRecord.__table__.columns],
+                context=context,
+            ),
+            "timezone": timezone,
+            "lifecycle_evidence": lifecycle_evidence,
+            "max_rate_kw": context["demand_max_rate_kw"]
+            if context is not None
+            else self._max_plausible_rate_kw(),
+            "log_quality": context is None,
+        }
+
+    async def _materialize_prepared(
+        self, *, lifecycle_evidence, cutoff, device_id, weather_provider, worker, worker_started
+    ):
+        data = await self._materialize_training_rows(
+            lifecycle_evidence=lifecycle_evidence,
+            cutoff=cutoff,
+            device_id=device_id,
+            weather_provider=weather_provider,
+        )
+        worker_started.set()
+        if worker is not None:
+            return await worker(self._preprocess_materialized, data)
+        else:
+            future = asyncio.get_running_loop().run_in_executor(
+                _PREPROCESSING_EXECUTOR, self._preprocess_materialized, data
+            )
+            try:
+                prepared = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                while not future.done():
+                    try:
+                        await asyncio.shield(future)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if future.done() and not future.cancelled():
+                    with suppress(Exception):
+                        future.result()
+                raise
+            return prepared
+
+    @staticmethod
+    def _preprocess_materialized(data):
+        from packages.ml.safe_persistence import fitting_worker_scope
+
+        processor = DemandModel()
+        with fitting_worker_scope():
+            features, targets = processor._prepare_materialized(**data)
+        return {
+            "features": features,
+            "targets": targets,
+            "quality": processor.last_data_quality,
+            "bounds": processor._sample_bounds,
+            "devices": processor._sample_devices,
+        }
+
+    def _prepare_materialized(
+        self,
+        *,
+        consumption_rows,
+        weather_rows,
+        statuses,
+        timezone,
+        lifecycle_evidence,
+        max_rate_kw=None,
+        log_quality: bool = True,
+    ):
+        self._sample_bounds = []
+        self._sample_devices = set()
         if not consumption_rows:
             self._last_data_quality = self._empty_data_quality()
             return np.array([]), np.array([])
 
-        # Nearest-neighbour weather lookup over ALL weather samples (not exact-hour
-        # buckets) so every usable consumption interval gets matched to real data.
-        weather_seconds = (
-            np.array([w.ts.timestamp() for w in weather_rows]) if weather_rows else np.array([])
-        )
+        weather_rows = sorted(weather_rows, key=lambda row: row.ts)
+        weather_seconds = [row.ts.timestamp() for row in weather_rows]
 
         def _nearest_weather(ts: dt.datetime):
-            if weather_seconds.size == 0:
+            if not weather_seconds:
                 return None
-            idx = int(np.argmin(np.abs(weather_seconds - ts.timestamp())))
+            position = bisect_left(weather_seconds, ts.timestamp())
+            indexes = [
+                index for index in (position - 1, position) if 0 <= index < len(weather_rows)
+            ]
+            idx = min(indexes, key=lambda index: abs(weather_seconds[index] - ts.timestamp()))
             if abs(weather_rows[idx].ts.timestamp() - ts.timestamp()) > MAX_WEATHER_GAP_SECONDS:
                 return None
             return weather_rows[idx]
 
-        max_rate = self._max_plausible_rate_kw()
+        max_rate = self._max_plausible_rate_kw() if max_rate_kw is None else max_rate_kw
         X_list: list[np.ndarray] = []
         y_list: list[float] = []
         intervals = 0
@@ -329,23 +703,76 @@ class DemandModel:
         rejected_nonpositive = 0
         weather_matches = 0
         weather_temperature_fallbacks = 0
-        for interval in iter_consumption_intervals(consumption_rows):
+        counter_diagnostics: dict[str, int] = {}
+        status_by_device = {}
+        for status in statuses:
+            status_by_device.setdefault(status.device_id, []).append(status)
+        status_indexes = {}
+        for device, records in status_by_device.items():
+            ordered = sorted(records, key=lambda row: row.ts)
+            status_indexes[device] = (ordered, [row.ts for row in ordered])
+        positive_intervals = list(
+            iter_counter_change_intervals(
+                consumption_rows,
+                "heat_kwh",
+                timezone,
+                max_interval_hours=4.0,
+                diagnostics=counter_diagnostics,
+                confirm_changes=DEMAND_COUNTER_CONFIRMATION_ENABLED,
+            )
+        )
+        positives_by_device = {}
+        for interval in positive_intervals:
+            positives_by_device.setdefault(interval.device_id, []).append(interval)
+        positive_indexes = {}
+        for device, records in positives_by_device.items():
+            ordered = sorted(records, key=lambda interval: interval.start_ts)
+            latest_end = ordered[0].end_ts
+            ends = []
+            for interval in ordered:
+                latest_end = max(latest_end, interval.end_ts)
+                ends.append(latest_end)
+            positive_indexes[device] = ([interval.start_ts for interval in ordered], ends)
+
+        def positive_overlap(zero):
+            starts, ends = positive_indexes.get(zero.device_id, ([], []))
+            index = bisect_left(starts, zero.end_ts) - 1
+            return index >= 0 and ends[index] > zero.start_ts
+
+        zeros = [
+            zero
+            for zero in iter_confirmed_zero_intervals(
+                consumption_rows, statuses, timezone, status_indexes=status_indexes
+            )
+            if not positive_overlap(zero)
+        ]
+        ordered_intervals = sorted([*positive_intervals, *zeros], key=lambda item: item.end_ts)
+        for interval in ordered_intervals:
             intervals += 1
             # Target is *space-heating* electrical demand only. DHW and cooling
             # are excluded because they violate the model's monotonic physics
             # (DHW is outdoor-independent; cooling demand rises — not falls —
             # with outdoor temperature). Intervals with no space-heating draw
             # are naturally dropped by the rate<=0 guard below.
-            rate = interval.heat_rate_kw
-            if rate <= 0:
+            rate = interval.energy_kwh / interval.elapsed_hours
+            if rate < 0:
                 rejected_nonpositive += 1
                 continue
+            if lifecycle_evidence:
+                from packages.ml.thermal import ThermalModel
+
+                records, times = status_indexes.get(interval.device_id, ([], []))
+                state, _ = ThermalModel._continuous_indoor_state(
+                    records, interval.start_ts, interval.end_ts, status_times=times
+                )
+                if state is None:
+                    continue
             if rate > max_rate:
                 skip_rate_bounds += 1
                 continue
 
-            weather = _nearest_weather(interval.ts)
-            outdoor = interval.outdoor_temp
+            weather = _nearest_weather(interval.end_ts)
+            outdoor = interval.row.outdoor_temp
             wind = 3.0
             irradiance = 0.0
             precipitation = 0.0
@@ -382,14 +809,16 @@ class DemandModel:
                     outdoor,
                     wind,
                     irradiance,
-                    interval.ts.hour,
-                    interval.ts.weekday(),
+                    interval.end_ts.hour,
+                    interval.end_ts.weekday(),
                     precipitation,
                     humidity,
                     cloud_cover,
                 )
             )
             y_list.append(rate)
+            self._sample_bounds.append((interval.start_ts, interval.end_ts))
+            self._sample_devices.add(interval.device_id)
 
         heating_activity_ratio = len(y_list) / intervals if intervals else 0.0
         ready_to_train = len(y_list) >= MIN_TRAINING_SAMPLES
@@ -424,40 +853,96 @@ class DemandModel:
             "training_blocker": training_blocker,
             "seasonal_guidance": seasonal_guidance,
             "ready_to_train": ready_to_train,
+            "counter_zero_delta": counter_diagnostics.get("zero_delta", 0),
+            "confirmed_zero_samples": len(zeros),
+            "counter_midday_decrease": counter_diagnostics.get("midday_decrease", 0),
+            "counter_source_day_reset": counter_diagnostics.get("source_day_reset", 0),
+            "counter_correction_reanchor": counter_diagnostics.get("correction_reanchor", 0),
+            "counter_outside_window": counter_diagnostics.get("outside_window", 0),
+            **{
+                f"counter_{key}": counter_diagnostics.get(key, 0)
+                for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS
+            },
         }
-        _logger.info("demand_training_data_prepared", **self._last_data_quality)
+        log_data_quality = dict(self._last_data_quality)
+        for key in COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS:
+            if not log_data_quality[f"counter_{key}"]:
+                log_data_quality.pop(f"counter_{key}")
+        if log_quality:
+            _logger.info("demand_training_data_prepared", **log_data_quality)
         return np.array(X_list), np.array(y_list)
 
-    def load_latest(self) -> bool:
-        from packages.ml.safe_persistence import safe_load
+    async def materialize_candidate(
+        self,
+        *,
+        cutoff: dt.datetime | None = None,
+        device_id: str | None = None,
+        weather_provider: str | None = None,
+        worker=None,
+    ) -> dict[str, object] | None:
+        features, targets = await self._prepare_data(
+            lifecycle_evidence=True,
+            cutoff=cutoff,
+            device_id=device_id,
+            weather_provider=weather_provider,
+            worker=worker,
+        )
+        if len(self._sample_devices) != 1:
+            return None
+        return {
+            "features": features,
+            "targets": targets,
+            "bounds": self._sample_bounds,
+            "device_id": next(iter(self._sample_devices)),
+        }
 
-        models = sorted(MODEL_DIR.glob(DEMAND_MODEL_ARTIFACT_GLOB))
-        if not models:
-            _logger.info(
-                "demand_model_load_skip", reason="no model files found", dir=str(MODEL_DIR)
-            )
-            return False
-        for path in reversed(models):
-            try:
-                payload = safe_load(path)
-            except ValueError as exc:
-                _logger.warning("demand_model_load_failed", path=str(path), error=str(exc))
-                continue
-            candidate = payload.get("median") if isinstance(payload, dict) else payload
-            if getattr(candidate, "n_features_in_", None) != len(_DEMAND_MONOTONIC_CST):
-                _logger.info(
-                    "demand_model_load_skip", path=str(path), reason="obsolete_feature_schema"
+    async def arefresh_committed(self, *, lifecycle=None, scope: dict | None = None) -> bool:
+        from packages.ml.forecast_quality import (
+            check_exact_fit,
+            materialize_native_inputs,
+            native_scope,
+        )
+        from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
+        authority = lifecycle if lifecycle is not None else Lifecycle()
+        try:
+            state = await authority.read()
+            reference = state.reference("demand")
+            if not reference_is_qualified(reference):
+                raise ValueError("demand_not_qualified")
+            if scope is None:
+                inputs = await materialize_native_inputs(
+                    "demand",
+                    now=dt.datetime.now(dt.timezone.utc),
+                    device_id=reference.manifest["device_id"],
                 )
-                continue
-            self._model = candidate
-            self._model_lower = payload.get("lower") if isinstance(payload, dict) else None
-            self._model_upper = payload.get("upper") if isinstance(payload, dict) else None
-            self._version = path.stem.replace(DEMAND_MODEL_ARTIFACT_PREFIX, "")
-            _logger.info(
-                "demand_model_loaded",
-                version=self._version,
-                path=str(path),
-                has_quantiles=self._model_lower is not None,
+                if inputs is None:
+                    raise ValueError("current_demand_scope_unavailable")
+                scope = native_scope(inputs)
+            if not reference_is_qualified(reference, scope=scope):
+                raise ValueError("demand_scope_mismatch")
+            payload = await authority.load_committed(
+                "demand", expected_hash=reference.artifact_hash
             )
-            return True
-        return False
+            if payload.get("schema_version") != "demand_lifecycle_v1":
+                raise ValueError("demand_schema_mismatch")
+            await asyncio.to_thread(check_exact_fit, "demand", payload)
+            current = (await authority.read()).reference("demand")
+            if current != reference or not reference_is_qualified(current, scope=scope):
+                raise ValueError("demand_authority_changed")
+        except Exception as error:
+            self.reset()
+            _logger.warning("demand_committed_unavailable", error_type=type(error).__name__)
+            return False
+        self._model, self._model_lower, self._model_upper = (
+            payload[name] for name in ("median", "lower", "upper")
+        )
+        self._metrics = dict(payload["metrics"])
+        self._version = reference.artifact_hash
+        self._qualified_reference = reference
+        return True
+
+    def load_latest(self) -> bool:
+        if not self._has_qualified_incumbent():
+            self.reset()
+        return self.is_trained

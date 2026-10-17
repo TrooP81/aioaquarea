@@ -2,39 +2,66 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import (
     DeviceStatusRecord,
     PlanActionRecord,
     ServiceHeartbeatRecord,
+    ShowerEventRecord,
+    SpaceHeatingGateRecord,
 )
 from packages.core.planning_data_quality import get_planning_data_quality
 from packages.core.panasonic_diagnostics import project_panasonic_adapter_state
 from packages.core.service_health import service_heartbeat_details
+from packages.core.safety_reverts import normalize_zone_id, unresolved_revert_predicate
 from packages.core.settings_service import (
     get_bool_setting,
     get_int_setting,
     get_setting,
     set_setting,
 )
+from packages.optimizer.executor_core import SAFETY_ACTION_STUCK_AFTER
 
 logger = structlog.get_logger()
 _WEBHOOK_THROTTLE = dt.timedelta(minutes=30)
+SAFETY_REVERT_PENDING_ALERT_AFTER = dt.timedelta(seconds=120)
+SEASONAL_SAFETY_DEFERRAL_ALERT_AFTER = dt.timedelta(hours=24)
+
+
+async def _safety_revert_cause_hint(now: dt.datetime) -> str:
+    """Best-effort context only; it must never suppress a DB-backed alert."""
+
+    try:
+        if await get_bool_setting("learning_mode_enabled"):
+            return "learning_mode"
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status(now=now)
+        if seasonal.get("observe_only_active") or seasonal.get(
+            "seasonal_blocked_by_unresolved_safety_revert"
+        ):
+            return "seasonal"
+    except Exception:
+        logger.exception("safety_revert_pending_cause_lookup_failed")
+        return "lookup_error"
+    return "unknown"
 
 
 def device_status_is_fresh(
     observed_at: dt.datetime | None,
     *,
     now: dt.datetime,
-    poll_interval_seconds: int,
+    threshold_seconds: int,
 ) -> bool:
     """Return whether a device observation is recent enough to call live."""
 
@@ -42,7 +69,7 @@ def device_status_is_fresh(
         return False
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
-    cutoff = now - dt.timedelta(seconds=max(poll_interval_seconds * 3, 15 * 60))
+    cutoff = now - dt.timedelta(seconds=threshold_seconds)
     return observed_at >= cutoff
 
 
@@ -56,6 +83,7 @@ def _alert(
     plan_id: int | None = None,
     action_id: int | None = None,
     href: str | None = None,
+    details: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "id": alert_id,
@@ -66,6 +94,7 @@ def _alert(
         "plan_id": plan_id,
         "action_id": action_id,
         "href": href,
+        "details": details,
     }
 
 
@@ -78,6 +107,8 @@ def _panasonic_adapter_alert(adapter: dict[str, object]) -> dict[str, object] | 
     }:
         return None
     failures = int(adapter.get("consecutive_failures") or 0)
+    if failures < 3:
+        return None
     detail = f"The Panasonic adaptor has failed {failures} consecutive live-status attempt(s)."
     retry_at = adapter.get("retry_at")
     if retry_at:
@@ -106,15 +137,21 @@ async def get_operational_alerts(
     if not enabled:
         return {"enabled": False, "generated_at": now.isoformat(), "alerts": []}
 
-    poll_interval = await get_int_setting("poll_interval_seconds")
+    poll_interval, device_quality = await asyncio.gather(
+        get_int_setting("poll_interval_seconds"),
+        get_device_data_quality(now=now),
+    )
     service_cutoff = now - dt.timedelta(minutes=3)
     action_since = now - dt.timedelta(hours=24)
+    stale_claim_cutoff = now - SAFETY_ACTION_STUCK_AFTER
     async with get_session() as session:
         heartbeat_rows = (
             (
                 await session.execute(
                     select(ServiceHeartbeatRecord).where(
-                        ServiceHeartbeatRecord.service.in_(["poller", "optimizer"])
+                        ServiceHeartbeatRecord.service.in_(
+                            ["poller", "optimizer", "safety_watchdog"]
+                        )
                     )
                 )
             )
@@ -139,9 +176,55 @@ async def get_operational_alerts(
             .scalars()
             .all()
         )
+        safety_action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(unresolved_revert_predicate(), PlanActionRecord.safety_attempt_count >= 3)
+                .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        pending_unclaimed_safety_action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    unresolved_revert_predicate(),
+                    PlanActionRecord.scheduled_ts <= now - SAFETY_REVERT_PENDING_ALERT_AFTER,
+                    or_(
+                        PlanActionRecord.safety_claimed_at.is_(None),
+                        PlanActionRecord.safety_claimed_at <= stale_claim_cutoff,
+                    ),
+                )
+                .order_by(PlanActionRecord.scheduled_ts, PlanActionRecord.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        blocked_shower_events = (
+            (
+                await session.execute(
+                    select(ShowerEventRecord)
+                    .where(ShowerEventRecord.status == "skipped_unresolved_revert")
+                    .order_by(ShowerEventRecord.started_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        gate_rows = (await session.execute(select(SpaceHeatingGateRecord))).scalars().all()
 
     alerts: list[dict[str, object]] = []
     by_service = {row.service: row for row in heartbeat_rows}
+    watchdog = service_heartbeat_details(by_service.get("safety_watchdog"))
+    if int(watchdog.get("consecutive_failures", 0) or 0) >= 3:
+        alerts.append(
+            _alert(
+                "safety_watchdog_failing",
+                "critical",
+                "Safety watchdog is failing",
+                f"The shower safety watchdog has failed {watchdog['consecutive_failures']} consecutive cycles.",
+                action="Check optimizer database and watchdog logs.",
+            )
+        )
     for service in ("poller", "optimizer"):
         heartbeat = getattr(by_service.get(service), "updated_at", None)
         if heartbeat is None or heartbeat < service_cutoff:
@@ -158,7 +241,7 @@ async def get_operational_alerts(
     adapter = project_panasonic_adapter_state(
         poller_details.get("panasonic_adapter"),
         now=now,
-        stale_after_seconds=max(poll_interval * 3, 15 * 60),
+        stale_after_seconds=int(device_quality["threshold_seconds"]),
     )
     adapter_alert = _panasonic_adapter_alert(adapter)
     if adapter_alert:
@@ -167,7 +250,7 @@ async def get_operational_alerts(
         not device_status_is_fresh(
             latest_device,
             now=now,
-            poll_interval_seconds=poll_interval,
+            threshold_seconds=int(device_quality["threshold_seconds"]),
         )
         and adapter_alert is None
     ):
@@ -191,9 +274,121 @@ async def get_operational_alerts(
                 action="Open Plan history to review the affected actions.",
                 plan_id=affected.plan_id,
                 action_id=affected.id,
-                href=f"/?view=plan&activity=failed#plan-action-{affected.id}",
+                href=f"/?view=timeline&activity=failed#plan-action-{affected.id}",
             )
         )
+    if safety_action is not None:
+        result = service_heartbeat_details(None)
+        try:
+            result = json.loads(safety_action.result_json) if safety_action.result_json else {}
+        except (TypeError, ValueError):
+            pass
+        latest_blocked = (
+            blocked_shower_events[0].started_at.isoformat() if blocked_shower_events else None
+        )
+        payload = json.loads(safety_action.payload_json) if safety_action.payload_json else {}
+        zone = normalize_zone_id(payload.get("zone_id")) if "zone_id" in payload else None
+        age_seconds = max(0, int((now - safety_action.scheduled_ts).total_seconds()))
+        details = {
+            "device_id": safety_action.device_id,
+            "plan_id": safety_action.plan_id,
+            "action_id": safety_action.id,
+            "age_seconds": age_seconds,
+            "attempt_count": safety_action.safety_attempt_count,
+            "last_reason": result.get("reason", "unknown"),
+            "blocked_trigger_count": len(blocked_shower_events),
+            "latest_blocked_trigger_at": latest_blocked,
+        }
+        if zone is not None:
+            details["zone"] = zone
+        alerts.append(
+            _alert(
+                "safety_revert_unresolved",
+                "critical",
+                "Safety revert remains unresolved",
+                (
+                    f"Device {safety_action.device_id}; action #{safety_action.id}; "
+                    f"age {age_seconds} seconds; attempts {safety_action.safety_attempt_count}; "
+                    f"last reason {result.get('reason', 'unknown')}; blocked triggers "
+                    f"{len(blocked_shower_events)} (latest {latest_blocked})."
+                ),
+                action="Investigate the safety revert immediately.",
+                plan_id=safety_action.plan_id,
+                action_id=safety_action.id,
+                href=f"/?view=timeline&activity=safety#plan-action-{safety_action.id}",
+                details=details,
+            )
+        )
+
+    if pending_unclaimed_safety_action is not None:
+        age_seconds = max(
+            0, int((now - pending_unclaimed_safety_action.scheduled_ts).total_seconds())
+        )
+        alerts.append(
+            _alert(
+                "safety_revert_pending_unclaimed",
+                "critical",
+                "Safety revert is pending without an active claim",
+                (
+                    f"Safety action #{pending_unclaimed_safety_action.id} has been due for "
+                    f"{age_seconds} seconds without a current safety claim."
+                ),
+                action="Investigate the safety worker and restore the device state.",
+                plan_id=pending_unclaimed_safety_action.plan_id,
+                action_id=pending_unclaimed_safety_action.id,
+                href=f"/?view=timeline&activity=safety#plan-action-{pending_unclaimed_safety_action.id}",
+                details={
+                    "device_id": pending_unclaimed_safety_action.device_id,
+                    "plan_id": pending_unclaimed_safety_action.plan_id,
+                    "action_id": pending_unclaimed_safety_action.id,
+                    "age_seconds": age_seconds,
+                    "cause_hint": await _safety_revert_cause_hint(now),
+                },
+            )
+        )
+
+    try:
+        from packages.ml.seasonal_learning import get_seasonal_calibration_status
+
+        seasonal = await get_seasonal_calibration_status(now=now)
+        if int(seasonal.get("seasonal_deferred_seconds") or 0) >= int(
+            SEASONAL_SAFETY_DEFERRAL_ALERT_AFTER.total_seconds()
+        ):
+            alerts.append(
+                _alert(
+                    "seasonal_calibration_blocked_by_safety_revert",
+                    "warning",
+                    "Seasonal calibration is blocked by a safety revert",
+                    "Observe-only calibration will resume after the unresolved safety revert closes.",
+                    action="Resolve the outstanding safety revert before collecting seasonal evidence.",
+                )
+            )
+    except Exception:
+        logger.exception("seasonal_calibration_alert_lookup_failed")
+
+    unknown_grace = dt.timedelta(seconds=max(poll_interval * 3, 60 * 60))
+    for gate_row in gate_rows:
+        if gate_row.consecutive_evaluation_failures >= 3:
+            alerts.append(
+                _alert(
+                    f"space_heating_gate_failures_{gate_row.device_id}",
+                    "warning",
+                    "Space-heating gate evaluation is failing",
+                    f"The gate has failed {gate_row.consecutive_evaluation_failures} consecutive evaluations.",
+                    action="Check the latest heat-pump outdoor-temperature readings.",
+                )
+            )
+        unknown_since = gate_row.transitioned_at or gate_row.evaluated_at
+        if gate_row.state == "UNKNOWN" and now - unknown_since >= unknown_grace:
+            alerts.append(
+                _alert(
+                    f"space_heating_gate_unknown_{gate_row.device_id}",
+                    "warning",
+                    "Space-heating gate remains unknown",
+                    "Room-heating increases remain paused until valid gate evidence is collected.",
+                    action="Check the heat-pump outdoor-temperature readings and polling service.",
+                )
+            )
 
     planning_quality = await get_planning_data_quality(now=now)
     if not planning_quality["control_allowed"]:

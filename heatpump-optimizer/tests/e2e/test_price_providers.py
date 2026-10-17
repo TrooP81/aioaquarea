@@ -1,5 +1,6 @@
 """E2E tests: Price provider integration (Tibber and ENTSO-E feeds)."""
 
+import datetime as dt
 from unittest.mock import patch
 
 import pytest
@@ -13,10 +14,17 @@ from packages.poller.feeds import (
     _fetch_prices_tibber,
 )
 
+ENTSOE_UNITS = (
+    "<currency_Unit.name>EUR</currency_Unit.name>"
+    "<price_Measure_Unit.name>MWH</price_Measure_Unit.name>"
+)
+
 
 SAMPLE_ENTSOE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3">
     <TimeSeries>
+        <currency_Unit.name>EUR</currency_Unit.name>
+        <price_Measure_Unit.name>MWH</price_Measure_Unit.name>
         <Period>
             <timeInterval>
                 <start>2026-04-30T00:00Z</start>
@@ -30,6 +38,14 @@ SAMPLE_ENTSOE_XML = """<?xml version="1.0" encoding="UTF-8"?>
         </Period>
     </TimeSeries>
 </Publication_MarketDocument>"""
+ENTSOE_DECLARED_UNITS = (
+    "<currency_Unit.name>EUR</currency_Unit.name>\n"
+    "        <price_Measure_Unit.name>MWH</price_Measure_Unit.name>"
+)
+assert SAMPLE_ENTSOE_XML.count(ENTSOE_DECLARED_UNITS) == 1
+ENTSOE_EXPECTED_HOURS = [
+    dt.datetime(2026, 4, 30, hour, tzinfo=dt.timezone.utc) for hour in range(4)
+]
 
 
 SAMPLE_TIBBER_RESPONSE = {
@@ -101,11 +117,40 @@ class TestEntsoeIntegration:
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await _fetch_prices_entsoe()
 
-        assert len(prices) == 4
-        # 85.00 EUR/MWh = 0.085 EUR/kWh
-        assert abs(prices[0][1] - 0.085) < 0.0001
-        # 45.00 EUR/MWh = 0.045 EUR/kWh
-        assert abs(prices[2][1] - 0.045) < 0.0001
+        assert prices.currency == "EUR" and prices.source == "entsoe"
+        # Declared EUR/MWH: each MWh price divided by 1000 gives EUR/kWh at its UTC hour.
+        assert [hour for hour, _price in prices] == ENTSOE_EXPECTED_HOURS
+        assert [price for _hour, price in prices] == pytest.approx([0.085, 0.0725, 0.045, 0.11])
+
+    @pytest.mark.parametrize(
+        "units",
+        [
+            "",
+            "<currency_Unit.name>EUR</currency_Unit.name>",
+            "<price_Measure_Unit.name>MWH</price_Measure_Unit.name>",
+            ENTSOE_UNITS.replace(">MWH<", ">KWH<"),
+            ENTSOE_UNITS.replace(">EUR<", ">euro<"),
+        ],
+        ids=["no_units", "no_measure", "no_currency", "wrong_measure", "bad_currency"],
+    )
+    @respx.mock
+    async def test_fetch_entsoe_rejects_missing_or_wrong_metadata(self, units):
+        """Undeclared or wrong currency/unit metadata never yields guessed prices."""
+        xml = SAMPLE_ENTSOE_XML.replace(ENTSOE_DECLARED_UNITS, units)
+        assert xml != SAMPLE_ENTSOE_XML
+        respx.get("https://web-api.tp.entsoe.eu/api").mock(return_value=Response(200, text=xml))
+
+        async def mock_get_setting(key):
+            return {
+                "entsoe_api_token": "test-token",
+                "entsoe_area": "10Y1001A1001A46L",
+                "price_provider": "entsoe",
+            }.get(key, "")
+
+        with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
+            prices = await _fetch_prices_entsoe()
+
+        assert list(prices) == [] and prices.source == "entsoe"
 
     @respx.mock
     async def test_fetch_entsoe_empty_token(self):
@@ -268,7 +313,8 @@ class TestProviderRouting:
         with patch("packages.poller.feeds.get_setting", side_effect=mock_get_setting):
             prices = await fetch_prices()
 
-        assert len(prices) == 4
+        assert [hour for hour, _price in prices] == ENTSOE_EXPECTED_HOURS
+        assert [price for _hour, price in prices] == pytest.approx([0.085, 0.0725, 0.045, 0.11])
 
     @respx.mock
     async def test_fetch_prices_routes_to_tibber(self):

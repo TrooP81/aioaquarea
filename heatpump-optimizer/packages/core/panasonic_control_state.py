@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 
 _COOLING_MODES = {
@@ -15,6 +15,15 @@ _COOLING_MODES = {
     "extendedoperationmode.auto_cool",
 }
 
+_HEATING_MODES = {
+    "1",
+    "3",
+    "heat",
+    "auto_heat",
+    "extendedoperationmode.heat",
+    "extendedoperationmode.auto_heat",
+}
+
 
 def _finite_number(value: Any) -> bool:
     return (
@@ -22,6 +31,17 @@ def _finite_number(value: Any) -> bool:
         and isinstance(value, (int, float))
         and math.isfinite(float(value))
     )
+
+
+def classify_panasonic_operation_mode(mode: Any) -> Literal["heating", "cooling", "other"]:
+    """Classify Panasonic operation-mode representations conservatively."""
+
+    normalized = str(mode).strip().lower()
+    if normalized in _HEATING_MODES:
+        return "heating"
+    if normalized in _COOLING_MODES:
+        return "cooling"
+    return "other"
 
 
 def panasonic_tank_heating_available(status: Any | None) -> bool:
@@ -55,8 +75,7 @@ def panasonic_zone_heating_available(status: Any | None, zone_id: int = 1) -> bo
     if str(getattr(status, "device_action", "")).upper() == "COOLING":
         return False
 
-    mode = str(getattr(status, "mode", "")).strip().lower()
-    if mode in _COOLING_MODES:
+    if classify_panasonic_operation_mode(getattr(status, "mode", None)) == "cooling":
         return False
 
     water_temp = getattr(status, f"zone{zone_id}_temp", None)

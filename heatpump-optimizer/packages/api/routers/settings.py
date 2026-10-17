@@ -38,6 +38,7 @@ from packages.core.heat_curve import (
     HeatCurveConfig,
     start_heat_curve_verification,
 )
+from packages.core.space_heating_gate import HeatingGateConfig
 
 router = APIRouter()
 
@@ -64,9 +65,24 @@ class ComfortScheduleUpdate(BaseModel):
     weekend: list[int]
 
 
+async def get_baseline_promotion_readiness() -> bool:
+    """Read promotion evidence without allowing scorer failures to promote."""
+    try:
+        from packages.ml.forecast_quality import get_forecast_scorecard
+
+        scorecard = await get_forecast_scorecard()
+        comparison = scorecard.get("baseline_comparison", {})
+        return comparison.get("promotion_ready") is True
+    except Exception:
+        return False
+
+
 @router.get("/api/settings")
 async def get_settings():
-    values = await get_all_settings()
+    try:
+        values = await get_all_settings()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = {}
     for key, schema in SETTINGS_SCHEMA.items():
         if key.startswith("_"):
@@ -87,7 +103,9 @@ async def get_settings():
 
 @router.put("/api/settings")
 async def update_settings(body: SettingsUpdate):
-    invalid_keys = [k for k in body.settings if k not in SETTINGS_SCHEMA]
+    invalid_keys = [
+        key for key in body.settings if key.startswith("_") or key not in SETTINGS_SCHEMA
+    ]
     if invalid_keys:
         raise HTTPException(status_code=400, detail=f"Unknown settings: {invalid_keys}")
 
@@ -107,6 +125,23 @@ async def update_settings(body: SettingsUpdate):
     if errors:
         raise HTTPException(status_code=400, detail={"invalid_values": errors})
 
+    if "space_heating_baseline_mode" in cleaned:
+        persisted = await get_all_settings()
+        current_mode = persisted.get("space_heating_baseline_mode", "shadow")
+        requested_mode = cleaned["space_heating_baseline_mode"]
+        if current_mode != "on" and requested_mode == "on":
+            if not await get_baseline_promotion_readiness():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Baseline promotion evidence is not ready",
+                )
+
+    gate_setting_keys = {
+        "heat_curve_heating_off_outdoor_c",
+        "space_heating_gate_on_offset_c",
+        "space_heating_gate_off_offset_c",
+        "space_heating_behavior_profile",
+    }
     heat_curve_changed = any(key in HEAT_CURVE_SETTING_KEYS for key in cleaned)
     previous_curve: HeatCurveConfig | None = None
     applied_curve: HeatCurveConfig | None = None
@@ -119,10 +154,32 @@ async def update_settings(body: SettingsUpdate):
         values.update(cleaned)
         try:
             applied_curve = HeatCurveConfig.from_settings(values)
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    await set_settings_bulk(cleaned)
+    if any(key in gate_setting_keys for key in cleaned) and not heat_curve_changed:
+        values = await get_all_settings()
+        values.update(cleaned)
+        try:
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        await set_settings_bulk(cleaned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if heat_curve_changed and applied_curve is not None:
         async with get_session() as session:

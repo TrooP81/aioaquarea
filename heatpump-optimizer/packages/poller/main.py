@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from zoneinfo import ZoneInfo
 
+import httpx
 import structlog
 
 from packages.core.config import settings
 from packages.core.database import get_session
 from packages.core.models import (
     ConsumptionRecord,
-    DeviceStatusRecord,
     FaultRecord,
     OptimizationRequestRecord,
     PriceRecord,
@@ -25,14 +26,18 @@ from packages.core.services import (
 from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.poller.feeds import fetch_price_feed, fetch_weather
 from packages.poller.smartthings import poll_smartthings_temps
-from packages.core.settings_service import get_bool_setting, get_int_setting, get_string_setting
-from packages.core.heating_evidence import classify_space_heating
+from packages.core.settings_service import (
+    get_bool_setting,
+    get_int_setting,
+    get_user_tz,
+)
+from packages.core.device_status_snapshot import build_device_status_record
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
+from packages.core.device_status_ingestion import ingest_device_status
 from packages.core.panasonic_diagnostics import (
     build_panasonic_adapter_state,
     classify_panasonic_adapter_reason,
 )
-from packages.core.panasonic_special_status import optimizer_special_status_supported
 from packages.core.service_health import record_service_heartbeat
 from packages.optimizer.shower_mode import ShowerDetector
 
@@ -74,70 +79,21 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
     try:
         device = await wrapper.refresh_device()
 
-        zones = device.zones
-        zone1 = zones.get(1)
-        zone2 = zones.get(2)
-
-        # Compressor activity
-        direction = device.current_direction.name  # IDLE/PUMP/WATER
-        device_action = device.current_action.name  # OFF/IDLE/HEATING/COOLING/HEATING_WATER
-        defrost_active = device.device_mode_status.name == "DEFROST"
-        heating_evidence = classify_space_heating(
-            operation_status=device.operation_status.value,
-            direction=direction,
-            device_action=device_action,
-            defrost_active=defrost_active,
+        direction = device.current_direction.name
+        device_action = device.current_action.name
+        if await get_bool_setting("ml_maintenance_enabled"):
+            await wrapper.get_active_weekly_timer_slots()
+        record = build_device_status_record(
+            device, timer_provenance=wrapper.cached_native_timer_provenance()
         )
         raw_outdoor_temp = device.temperature_outdoor
-        async with get_session() as session:
-            outdoor = await resolve_outdoor_temperature(
-                session,
-                heat_pump_c=raw_outdoor_temp,
-            )
-
-        record = DeviceStatusRecord(
-            ts=dt.datetime.now(dt.timezone.utc),
-            device_id=device.long_id,
-            mode=str(device.mode),
-            operation_status=device.operation_status.value,
-            outdoor_temp=outdoor.effective_c,
-            heat_pump_outdoor_temp=outdoor.heat_pump_c,
-            outdoor_temp_source=outdoor.source,
-            tank_temp=device.tank.temperature if device.tank else None,
-            tank_target_temp=device.tank.target_temperature if device.tank else None,
-            tank_operation_status=device.tank.operation_status.value if device.tank else None,
-            zone1_temp=zone1.temperature if zone1 else None,
-            zone1_target_temp=zone1.heat_target_temperature if zone1 else None,
-            zone1_heat_min=zone1.heat_min if zone1 else None,
-            zone1_heat_max=zone1.heat_max if zone1 else None,
-            zone2_temp=zone2.temperature if zone2 else None,
-            zone2_target_temp=zone2.heat_target_temperature if zone2 else None,
-            zone2_heat_min=zone2.heat_min if zone2 else None,
-            zone2_heat_max=zone2.heat_max if zone2 else None,
-            quiet_mode=device.quiet_mode.value,
-            powerful_mode=device.powerful_time.value,
-            special_status=device.special_status.value if device.special_status else None,
-            special_status_supported=optimizer_special_status_supported(device),
-            # New compressor/activity fields
-            direction=direction,
-            pump_duty=device.pump_duty,
-            device_action=device_action,
-            defrost_active=defrost_active,
-            space_heating_active=heating_evidence.active,
-            space_heating_evidence=heating_evidence.code,
-            force_dhw=device.force_dhw.value,
-            force_heater=device.force_heater.value,
-            holiday_mode=device.holiday_timer.value,
-            # Zone operation status
-            zone1_operation_status=zone1.operation_status.value if zone1 else None,
-            zone2_operation_status=zone2.operation_status.value if zone2 else None,
-            # Tank limits
-            tank_heat_max=device.tank.heat_max if device.tank else None,
-            tank_heat_min=device.tank.heat_min if device.tank else None,
-        )
 
         async with get_session() as session:
-            session.add(record)
+            outdoor = await resolve_outdoor_temperature(session, heat_pump_c=raw_outdoor_temp)
+            record.outdoor_temp = outdoor.effective_c
+            record.heat_pump_outdoor_temp = outdoor.heat_pump_c
+            record.outdoor_temp_source = outdoor.source
+            await ingest_device_status(session, record)
 
         logger.info(
             "device_status_polled",
@@ -148,8 +104,8 @@ async def poll_device_status(wrapper: AquareaWrapper) -> None:
             outdoor_compensation_c=outdoor.compensation_c,
             action=device_action,
             direction=direction,
-            space_heating_active=heating_evidence.active,
-            heating_evidence=heating_evidence.code,
+            space_heating_active=record.space_heating_active,
+            heating_evidence=record.space_heating_evidence,
         )
 
         # --- Shower mode detection ---
@@ -235,11 +191,51 @@ async def _record_fault(device) -> None:
 
 async def poll_consumption(wrapper: AquareaWrapper) -> None:
     """Poll consumption data and persist."""
+    now = dt.datetime.now(dt.timezone.utc)
+    timezone_name = await get_user_tz()
+    local_now = now.astimezone(ZoneInfo(timezone_name))
+    if settings.panasonic_distributed_read_quota_enabled:
+        try:
+            device = await wrapper.get_device()
+            raw_outdoor_temp = device.temperature_outdoor
+            async with get_session() as session:
+                outdoor = await resolve_outdoor_temperature(
+                    session,
+                    heat_pump_c=raw_outdoor_temp,
+                    at=now,
+                )
+            snapshot = await wrapper.refresh_consumption(local_now)
+            record = ConsumptionRecord(
+                ts=now,
+                device_id=device.long_id,
+                source_date=snapshot.date,
+                source_timezone=timezone_name,
+                heat_kwh=snapshot.heat_kwh,
+                cool_kwh=snapshot.cool_kwh,
+                tank_kwh=snapshot.tank_kwh,
+                outdoor_temp=outdoor.effective_c,
+                heat_pump_outdoor_temp=outdoor.heat_pump_c,
+                outdoor_temp_source=outdoor.source,
+            )
+            async with get_session() as session:
+                session.add(record)
+            logger.info(
+                "consumption_polled",
+                heat=record.heat_kwh,
+                cool=record.cool_kwh,
+                tank=record.tank_kwh,
+                poll_instant=now.isoformat(),
+                timezone=timezone_name,
+                source_date=snapshot.date.isoformat(),
+            )
+        except Exception as e:
+            logger.error("consumption_poll_failed", error=str(e))
+        return
+
     from aioaquarea.statistics import ConsumptionType
 
     try:
         device = await wrapper.get_device()
-        now = dt.datetime.now(dt.timezone.utc)
         raw_outdoor_temp = device.temperature_outdoor
         async with get_session() as session:
             outdoor = await resolve_outdoor_temperature(
@@ -248,13 +244,15 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
                 at=now,
             )
 
-        heat = await device.get_and_refresh_consumption(now, ConsumptionType.HEAT) or 0
-        cool = await device.get_and_refresh_consumption(now, ConsumptionType.COOL) or 0
-        tank = await device.get_and_refresh_consumption(now, ConsumptionType.WATER_TANK) or 0
+        heat = await device.get_and_refresh_consumption(local_now, ConsumptionType.HEAT)
+        cool = await device.get_and_refresh_consumption(local_now, ConsumptionType.COOL)
+        tank = await device.get_and_refresh_consumption(local_now, ConsumptionType.WATER_TANK)
 
         record = ConsumptionRecord(
             ts=now,
             device_id=device.long_id,
+            source_date=local_now.date(),
+            source_timezone=timezone_name,
             heat_kwh=heat,
             cool_kwh=cool,
             tank_kwh=tank,
@@ -265,7 +263,15 @@ async def poll_consumption(wrapper: AquareaWrapper) -> None:
         async with get_session() as session:
             session.add(record)
 
-        logger.info("consumption_polled", heat=heat, cool=cool, tank=tank)
+        logger.info(
+            "consumption_polled",
+            heat=heat,
+            cool=cool,
+            tank=tank,
+            poll_instant=now.isoformat(),
+            timezone=timezone_name,
+            source_date=local_now.date().isoformat(),
+        )
     except Exception as e:
         logger.error("consumption_poll_failed", error=str(e))
 
@@ -277,27 +283,32 @@ async def poll_prices() -> None:
 
     try:
         feed = await fetch_price_feed()
+        if feed.rejection_reason is not None:
+            logger.error(
+                "price_fetch_failed",
+                error="provider_validation_failed",
+                provider=feed.source,
+                reason=feed.rejection_reason,
+            )
+            return
         prices = feed.prices
+        if prices and (
+            feed.context is None or not feed.context.area or feed.context.provider != feed.source
+        ):
+            raise ValueError("Price feed has no coherent fetch context")
         before_quality = await get_planning_data_quality() if prices else None
-        fetched_at = dt.datetime.now(dt.timezone.utc)
-        provider = await get_string_setting("price_provider")
-        if provider == "entsoe":
-            area = (await get_string_setting("entsoe_area")) or settings.entsoe_area
-        elif provider == "manual":
-            area = "manual"
-        else:
-            area = "tibber"
         async with get_session() as session:
             if prices:
                 stmt = pg_insert(PriceRecord).values(
                     [
                         {
                             "ts": ts,
-                            "area": area,
+                            "area": feed.context.area,
                             "price_eur_per_kwh": price,
                             "price_currency": feed.currency,
                             "price_source": feed.source,
-                            "fetched_at": fetched_at,
+                            "fetched_at": feed.context.started_at,
+                            "interval_schema": feed.interval_schema,
                         }
                         for ts, price in prices
                     ]
@@ -307,6 +318,7 @@ async def poll_prices() -> None:
                     set_={
                         "price_eur_per_kwh": stmt.excluded.price_eur_per_kwh,
                         "price_currency": stmt.excluded.price_currency,
+                        "interval_schema": stmt.excluded.interval_schema,
                         "price_source": stmt.excluded.price_source,
                         "fetched_at": stmt.excluded.fetched_at,
                     },
@@ -322,11 +334,15 @@ async def poll_prices() -> None:
         logger.info(
             "prices_fetched",
             count=len(prices),
-            provider=settings.price_provider,
+            provider=feed.source,
             currency=feed.currency,
         )
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "price_fetch_failed", error="http_status_error", status_code=e.response.status_code
+        )
     except Exception as e:
-        logger.error("price_fetch_failed", error=str(e))
+        logger.error("price_fetch_failed", error=type(e).__name__)
 
 
 async def _queue_price_horizon_reoptimization(
@@ -390,7 +406,7 @@ async def poll_weather() -> None:
                     [
                         {
                             "ts": entry["ts"],
-                            "source": entry.get("source", "open-meteo"),
+                            "source": entry["source"],
                             "temperature": entry["temperature"],
                             "irradiance": entry.get("irradiance"),
                             "wind_speed": entry.get("wind_speed"),
@@ -398,6 +414,7 @@ async def poll_weather() -> None:
                             "cloud_cover": entry.get("cloud_cover"),
                             "precipitation": entry.get("precipitation"),
                             "forecast_issued_at": entry.get("forecast_issued_at"),
+                            "units_schema": entry.get("units_schema"),
                         }
                         for entry in weather_data
                     ]
@@ -412,6 +429,7 @@ async def poll_weather() -> None:
                         "cloud_cover": stmt.excluded.cloud_cover,
                         "precipitation": stmt.excluded.precipitation,
                         "forecast_issued_at": stmt.excluded.forecast_issued_at,
+                        "units_schema": stmt.excluded.units_schema,
                     },
                 )
                 await session.execute(stmt)
@@ -441,21 +459,14 @@ async def poll_indoor_temp() -> None:
 
 
 async def retrain_comfort_model() -> None:
-    """Periodically retrain the comfort model from accumulated SmartThings data."""
+    """Compatibility entrypoint: queue automatic comfort maintenance only."""
     try:
-        enabled = await get_bool_setting("use_comfort_model")
-        if not enabled:
-            return
+        from packages.ml.lifecycle import enqueue_maintenance_request
 
-        from packages.ml.comfort_model import comfort_model
-
-        lag_str = await get_string_setting("thermal_lag_minutes")
-        lag = int(lag_str) if lag_str else None
-
-        result = await comfort_model.train(thermal_lag_minutes=lag)
-        logger.info("comfort_model_retrain", **result)
+        result = await enqueue_maintenance_request("comfort", "poller_request", automatic=True)
+        logger.info("comfort_maintenance_requested", request=result)
     except Exception as e:
-        logger.error("comfort_model_retrain_failed", error=str(e))
+        logger.error("comfort_maintenance_request_failed", error_type=type(e).__name__)
 
 
 async def run_seasonal_calibration() -> None:
@@ -470,6 +481,15 @@ async def run_seasonal_calibration() -> None:
         logger.error("seasonal_calibration_cycle_failed", error=str(exc))
 
 
+async def run_ml_maintenance(owner) -> dict:
+    if not await get_bool_setting("ml_maintenance_enabled"):
+        return {"status": "disabled", "reason": "maintenance_disabled"}
+    await run_seasonal_calibration()
+    result = await owner.run()
+    logger.info("ml_maintenance_cycle", **result)
+    return result
+
+
 async def deliver_operational_alerts() -> None:
     """Send changed alerts only when the user configured an HTTPS webhook."""
 
@@ -482,18 +502,26 @@ async def deliver_operational_alerts() -> None:
         logger.error("operational_alert_delivery_failed", error=str(exc))
 
 
-async def main() -> None:
+async def _run_service(wrapper, maintenance, scheduler) -> None:
     """Main entry point for the poller service."""
     from packages.core.logging import configure_logging
+    from packages.ml.lifecycle import enqueue_maintenance_request
 
     configure_logging("poller")
 
     logger.info("poller_starting", poll_interval=settings.poll_interval_seconds)
 
-    wrapper = AquareaWrapper()
     await wrapper.start()
 
-    scheduler = create_scheduler()
+    startup_slot = int(utc_now().timestamp() // (6 * 3600))
+    for component in ("demand", "comfort", "thermal"):
+        await enqueue_maintenance_request(
+            component,
+            "poller_startup",
+            automatic=True,
+            dedup_key=f"startup:{startup_slot}",
+        )
+
     await record_service_heartbeat("poller", poll_interval_seconds=settings.poll_interval_seconds)
 
     scheduler.add_job(
@@ -556,23 +584,17 @@ async def main() -> None:
         next_run_time=utc_after(seconds=20),
     )
 
-    # Comfort model retraining every 6 hours
     scheduler.add_job(
-        retrain_comfort_model,
-        "interval",
-        hours=6,
-        id="comfort_model_retrain",
+        run_ml_maintenance,
+        "cron",
+        hour="0,6,12,18",
+        minute=0,
+        args=[maintenance],
+        timezone="UTC",
+        coalesce=True,
+        max_instances=1,
+        id="ml_maintenance",
         next_run_time=utc_after(minutes=5),
-    )
-
-    # Seasonal learning is opt-in and may only train after the data-quality
-    # checks pass.  A six-hour cadence avoids repeated heavy calibration.
-    scheduler.add_job(
-        run_seasonal_calibration,
-        "interval",
-        hours=6,
-        id="seasonal_calibration",
-        next_run_time=utc_after(minutes=7),
     )
 
     scheduler.add_job(
@@ -604,10 +626,28 @@ async def main() -> None:
         await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
+
+
+async def main() -> None:
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+    from packages.ml.lifecycle import MaintenanceRunner
+
+    wrapper, maintenance, scheduler = None, None, None
+    try:
+        wrapper = AquareaWrapper(read_only=True)
+        maintenance = MaintenanceRunner(timer_reader=wrapper)
+        scheduler = create_scheduler()
+        await _run_service(wrapper, maintenance, scheduler)
     finally:
-        scheduler.shutdown(wait=True)
-        await wrapper.stop()
-        logger.info("poller_stopped")
+
+        async def cleanup():
+            from packages.core.database import engine
+
+            await close_service_resources(
+                scheduler=scheduler, maintenance=maintenance, wrapper=wrapper, engine=engine
+            )
+
+        await finish_owned_cleanup(cleanup)
 
 
 if __name__ == "__main__":

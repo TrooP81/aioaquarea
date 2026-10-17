@@ -14,8 +14,11 @@ set DATABASE_URL=postgresql+asyncpg://heatpump:heatpump_test@localhost:5433/heat
 set REDIS_URL=redis://localhost:6380
 set PRICE_PROVIDER=entsoe
 set ENTSOE_TOKEN=test-token
+set API_TOKEN=test-token
 set AQUAREA_USERNAME=test
 set AQUAREA_PASSWORD=test
+set MODEL_DIR=%TEMP%\heatpump-optimizer-e2e-models-%RANDOM%-%RANDOM%
+mkdir "%MODEL_DIR%" 2>nul
 
 call d:\apps\panasonic\.venv\Scripts\activate.bat
 python -m pytest tests/e2e/ -v

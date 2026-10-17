@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import statistics
 import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
+import numpy as np
 import structlog
 
 from packages.core.config import settings as app_settings
@@ -22,9 +26,32 @@ _logger = structlog.get_logger()
 # missed samples and the average rate over the gap would be unreliable.
 MIN_INTERVAL_HOURS = 0.05  # 3 minutes
 MAX_INTERVAL_HOURS = 2.0
+COUNTER_CONFIRMATION_EPSILON = 0.001
+COUNTER_CONFIRMATION_DIAGNOSTIC_KEYS = (
+    "positive_pending",
+    "positive_confirmed",
+    "positive_replaced",
+    "positive_abandoned",
+    "positive_reverted",
+    "positive_unresolved",
+    "reset_pending",
+    "reset_confirmed",
+    "reset_replaced",
+    "reset_abandoned",
+    "reset_unresolved",
+)
+
+
+def is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and (isinstance(value, int) or math.isfinite(value))
+    )
 
 
 class _ConsumptionRowLike(Protocol):
+    device_id: str
     ts: dt.datetime
     heat_kwh: float | None
     cool_kwh: float | None
@@ -74,31 +101,391 @@ class ConsumptionInterval:
         return self.cool_kwh / self.elapsed_hours if self.elapsed_hours > 0 else 0.0
 
 
-def iter_consumption_intervals(
-    rows: Iterable[_ConsumptionRowLike],
-) -> Iterator[ConsumptionInterval]:
-    """Convert cumulative day-to-date consumption counters into per-interval deltas.
+@dataclass(frozen=True)
+class CounterInterval:
+    """A positive change in one per-device day-to-date cumulative counter."""
 
-    ``rows`` must be ordered by ``ts``. Consecutive readings within the same
-    calendar day are subtracted to recover the energy used during the interval.
-    Pairs that straddle a day boundary (counter reset) or whose elapsed time falls
-    outside ``[MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS]`` are skipped. Negative
-    per-field deltas (mid-day resets / corrections) are clamped to zero.
+    device_id: str
+    start_ts: dt.datetime
+    end_ts: dt.datetime
+    elapsed_hours: float
+    energy_kwh: float
+    row: _ConsumptionRowLike
+    is_reset: bool = False
+
+
+def _aware_utc(ts: dt.datetime) -> dt.datetime:
+    """Normalize database instants so elapsed time is never wall-clock based."""
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=dt.timezone.utc)
+    return ts.astimezone(dt.timezone.utc)
+
+
+def iter_counter_change_intervals(
+    rows: Iterable[_ConsumptionRowLike],
+    counter: str,
+    timezone: ZoneInfo,
+    *,
+    min_interval_hours: float = MIN_INTERVAL_HOURS,
+    max_interval_hours: float = MAX_INTERVAL_HOURS,
+    diagnostics: dict[str, int] | None = None,
+    confirm_changes: bool = False,
+) -> Iterator[CounterInterval]:
+    """Yield valid windows between positive changes in a cumulative counter.
+
+    Anchors are independent for every device and counter. Historical records
+    use the UTC request date to select a daily API entry, so a UTC date change
+    is a source-day reset even when it is not local midnight. Locally selected
+    records reset at local midnight. A same-counter-day decrease is first
+    treated as a transient correction. A second lower reading confirms a
+    revised baseline and safely re-anchors subsequent intervals.
     """
-    prev = None
+
+    def increment(name: str) -> None:
+        if diagnostics is not None:
+            diagnostics[name] = diagnostics.get(name, 0) + 1
+
+    def reset_type(anchor: _ConsumptionRowLike, row: _ConsumptionRowLike) -> str | None:
+        anchor_source_date = getattr(anchor, "source_date", None)
+        row_source_date = getattr(row, "source_date", None)
+        if anchor_source_date is not None and row_source_date is not None:
+            return "source_day_reset" if anchor_source_date != row_source_date else None
+        if anchor.ts.date() != row.ts.date():
+            return "source_day_reset"
+        if anchor.ts.astimezone(timezone).date() != row.ts.astimezone(timezone).date():
+            return "local_day_reset"
+        return None
+
+    def reset_boundary(row: _ConsumptionRowLike, kind: str) -> dt.datetime:
+        end_ts = _aware_utc(row.ts)
+        if kind == "source_day_reset":
+            source_zone = getattr(row, "source_timezone", None)
+            source_date = getattr(row, "source_date", None)
+            if source_zone is not None and source_date is not None:
+                return dt.datetime.combine(
+                    source_date, dt.time.min, tzinfo=ZoneInfo(source_zone)
+                ).astimezone(dt.timezone.utc)
+            return end_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = row.ts.astimezone(timezone)
+        return local_end.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+            dt.timezone.utc
+        )
+
+    def interval(
+        anchor: _ConsumptionRowLike,
+        row: _ConsumptionRowLike,
+        start_ts: dt.datetime,
+        energy_kwh: float,
+        *,
+        is_reset: bool = False,
+    ) -> CounterInterval | None:
+        end_ts = _aware_utc(row.ts)
+        elapsed_hours = (end_ts - start_ts).total_seconds() / 3600.0
+        if not min_interval_hours <= elapsed_hours <= max_interval_hours:
+            increment("outside_window")
+            return None
+        return CounterInterval(
+            anchor.device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row, is_reset
+        )
+
+    if confirm_changes:
+        anchors: dict[str, _ConsumptionRowLike] = {}
+        pending_positive: dict[str, _ConsumptionRowLike] = {}
+        pending_reset: dict[str, tuple[_ConsumptionRowLike, dt.datetime, str]] = {}
+        pending_corrections: dict[str, _ConsumptionRowLike] = {}
+
+        def begin_positive(
+            device_id: str, row: _ConsumptionRowLike, *, replacement: bool = False
+        ) -> None:
+            pending_positive[device_id] = row
+            increment("positive_replaced" if replacement else "positive_pending")
+
+        def begin_reset(device_id: str, row: _ConsumptionRowLike, kind: str) -> None:
+            pending_reset[device_id] = (row, reset_boundary(row, kind), kind)
+            increment("reset_pending")
+            increment(kind)
+
+        for row in rows:
+            device_id = row.device_id
+            value = getattr(row, counter, None)
+            if not is_finite_number(value) or value < 0:
+                anchors.pop(device_id, None)
+                pending_positive.pop(device_id, None)
+                pending_reset.pop(device_id, None)
+                pending_corrections.pop(device_id, None)
+                increment("counter_unavailable")
+                continue
+            anchor = anchors.get(device_id)
+            if anchor is None:
+                anchors[device_id] = row
+                continue
+
+            old_value = getattr(anchor, counter) or 0.0
+            new_value = getattr(row, counter) or 0.0
+            pending = pending_positive.get(device_id)
+            reset = pending_reset.get(device_id)
+
+            if reset is not None:
+                reset_row, boundary, reset_kind = reset
+                newer_reset_kind = reset_type(reset_row, row)
+                if newer_reset_kind is not None:
+                    increment("reset_abandoned")
+                    pending_reset.pop(device_id, None)
+                    begin_reset(device_id, row, newer_reset_kind)
+                    continue
+                reset_value = getattr(reset_row, counter) or 0.0
+                if reset_value - COUNTER_CONFIRMATION_EPSILON <= new_value and (
+                    (
+                        reset_kind == "source_day_reset"
+                        and getattr(anchor, "source_date", None) is not None
+                        and getattr(reset_row, "source_date", None) is not None
+                    )
+                    or new_value < old_value - COUNTER_CONFIRMATION_EPSILON
+                ):
+                    pending_reset.pop(device_id, None)
+                    increment("reset_confirmed")
+                    emitted = interval(anchor, reset_row, boundary, reset_value, is_reset=True)
+                    if emitted is not None:
+                        yield emitted
+                    anchors[device_id] = reset_row
+                    pending_corrections.pop(device_id, None)
+                    if new_value > reset_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                if new_value < reset_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_reset[device_id] = (row, boundary, reset_kind)
+                    increment("reset_replaced")
+                    continue
+                if new_value >= old_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_reset.pop(device_id, None)
+                    increment("reset_abandoned")
+                    if new_value > old_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                continue
+
+            kind = reset_type(anchor, row)
+            pending_reset_kind = reset_type(pending, row) if pending is not None else None
+            if pending_reset_kind is not None:
+                pending_positive.pop(device_id, None)
+                increment("positive_abandoned")
+                begin_reset(device_id, row, pending_reset_kind)
+                continue
+            if kind is not None:
+                if pending is not None:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_abandoned")
+                begin_reset(device_id, row, kind)
+                continue
+
+            if pending is not None:
+                candidate_value = getattr(pending, counter) or 0.0
+                if abs(new_value - old_value) <= COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_reverted")
+                    continue
+                if (
+                    old_value + COUNTER_CONFIRMATION_EPSILON
+                    < new_value
+                    < candidate_value - COUNTER_CONFIRMATION_EPSILON
+                ):
+                    begin_positive(device_id, row, replacement=True)
+                    continue
+                if new_value >= candidate_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_confirmed")
+                    emitted = interval(
+                        anchor,
+                        pending,
+                        _aware_utc(anchor.ts),
+                        candidate_value - old_value,
+                    )
+                    if emitted is not None:
+                        yield emitted
+                    anchors[device_id] = pending
+                    pending_corrections.pop(device_id, None)
+                    if new_value > candidate_value + COUNTER_CONFIRMATION_EPSILON:
+                        begin_positive(device_id, row)
+                    continue
+                if new_value < old_value - COUNTER_CONFIRMATION_EPSILON:
+                    pending_positive.pop(device_id, None)
+                    increment("positive_abandoned")
+                else:
+                    continue
+
+            if abs(new_value - old_value) <= COUNTER_CONFIRMATION_EPSILON:
+                pending_corrections.pop(device_id, None)
+                increment("zero_delta")
+                continue
+            if new_value > old_value:
+                pending_corrections.pop(device_id, None)
+                begin_positive(device_id, row)
+                continue
+            if kind is not None:
+                begin_reset(device_id, row, kind)
+                continue
+            if device_id in pending_corrections:
+                anchors[device_id] = row
+                pending_corrections.pop(device_id, None)
+                increment("correction_reanchor")
+                continue
+            pending_corrections[device_id] = row
+            increment("midday_decrease")
+
+        for device_id in pending_positive:
+            increment("positive_unresolved")
+        for device_id in pending_reset:
+            increment("reset_unresolved")
+        return
+
+    anchors: dict[str, _ConsumptionRowLike] = {}
+    pending_corrections: dict[str, _ConsumptionRowLike] = {}
     for row in rows:
-        if prev is not None and row.ts.date() == prev.ts.date():
-            elapsed = (row.ts - prev.ts).total_seconds() / 3600.0
-            if MIN_INTERVAL_HOURS <= elapsed <= MAX_INTERVAL_HOURS:
-                yield ConsumptionInterval(
-                    ts=row.ts,
-                    elapsed_hours=elapsed,
-                    heat_kwh=max(0.0, (row.heat_kwh or 0.0) - (prev.heat_kwh or 0.0)),
-                    cool_kwh=max(0.0, (row.cool_kwh or 0.0) - (prev.cool_kwh or 0.0)),
-                    tank_kwh=max(0.0, (row.tank_kwh or 0.0) - (prev.tank_kwh or 0.0)),
-                    outdoor_temp=row.outdoor_temp,
-                )
-        prev = row
+        device_id = row.device_id
+        value = getattr(row, counter, None)
+        if not is_finite_number(value) or value < 0:
+            anchors.pop(device_id, None)
+            pending_corrections.pop(device_id, None)
+            increment("counter_unavailable")
+            continue
+        anchor = anchors.get(device_id)
+        if anchor is None:
+            anchors[device_id] = row
+            continue
+
+        old_value = getattr(anchor, counter) or 0.0
+        new_value = getattr(row, counter) or 0.0
+        end_ts = _aware_utc(row.ts)
+        start_ts = _aware_utc(anchor.ts)
+        kind = reset_type(anchor, row)
+        if kind is not None:
+            start_ts = reset_boundary(row, kind)
+            energy_kwh = new_value
+            pending_corrections.pop(device_id, None)
+            increment(kind)
+        elif new_value == old_value:
+            pending_corrections.pop(device_id, None)
+            if diagnostics is not None:
+                diagnostics["zero_delta"] = diagnostics.get("zero_delta", 0) + 1
+            continue
+
+        elif new_value < old_value:
+            if kind is None:
+                if device_id in pending_corrections:
+                    anchors[device_id] = row
+                    pending_corrections.pop(device_id, None)
+                    if diagnostics is not None:
+                        diagnostics["correction_reanchor"] = (
+                            diagnostics.get("correction_reanchor", 0) + 1
+                        )
+                    continue
+                pending_corrections[device_id] = row
+                if diagnostics is not None:
+                    diagnostics["midday_decrease"] = diagnostics.get("midday_decrease", 0) + 1
+                continue
+        else:
+            energy_kwh = new_value - old_value
+            pending_corrections.pop(device_id, None)
+
+        elapsed_hours = (end_ts - start_ts).total_seconds() / 3600.0
+        anchors[device_id] = row
+        if not min_interval_hours <= elapsed_hours <= max_interval_hours:
+            if diagnostics is not None:
+                diagnostics["outside_window"] = diagnostics.get("outside_window", 0) + 1
+            continue
+        yield CounterInterval(device_id, start_ts, end_ts, elapsed_hours, energy_kwh, row)
+
+
+def chronological_fit_holdout(
+    bounds: list[tuple[dt.datetime, dt.datetime]],
+    *,
+    holdout_fraction: float,
+    embargo: dt.timedelta,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not bounds or not 0 < holdout_fraction < 1 or embargo.total_seconds() < 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    if any(
+        start.tzinfo is None or end.tzinfo is None or end <= start for start, end in bounds
+    ) or any(right[1] < left[1] for left, right in zip(bounds, bounds[1:])):
+        raise ValueError("Labels must be chronological timezone-aware intervals")
+    split = int(len(bounds) * (1 - holdout_fraction))
+    if split == 0 or split == len(bounds):
+        return np.array([], dtype=int), np.array([], dtype=int)
+    cutoff = bounds[split][0] - embargo
+    fit = np.asarray([index for index in range(split) if bounds[index][1] <= cutoff])
+    return fit.astype(int), np.arange(split, len(bounds))
+
+
+def iter_confirmed_zero_intervals(
+    rows: Iterable[_ConsumptionRowLike],
+    statuses: Iterable[object],
+    timezone: ZoneInfo,
+    *,
+    status_indexes: dict[str, tuple[list, list]] | None = None,
+) -> Iterator[CounterInterval]:
+    from packages.ml.thermal import ThermalModel
+
+    if status_indexes is None:
+        by_device: dict[str, list] = {}
+        for status in statuses:
+            device_id = getattr(status, "device_id", None)
+            if isinstance(device_id, str):
+                by_device.setdefault(device_id, []).append(status)
+        status_indexes = {}
+        for device_id, records in by_device.items():
+            ordered = sorted(records, key=lambda row: row.ts)
+            status_indexes[device_id] = (ordered, [row.ts for row in ordered])
+    previous = {}
+    for row in sorted(rows, key=lambda item: item.ts):
+        anchor = previous.get(row.device_id)
+        previous[row.device_id] = row
+        if anchor is None:
+            continue
+        start, end = _aware_utc(anchor.ts), _aware_utc(row.ts)
+        hours = (end - start).total_seconds() / 3600
+        source_day = getattr(row, "source_date", None)
+        old_value, value = getattr(anchor, "heat_kwh", None), getattr(row, "heat_kwh", None)
+        if (
+            not MIN_INTERVAL_HOURS <= hours <= 1.0
+            or source_day is None
+            or source_day != getattr(anchor, "source_date", None)
+            or source_day != start.astimezone(timezone).date()
+            or source_day != end.astimezone(timezone).date()
+            or not is_finite_number(old_value)
+            or not is_finite_number(value)
+            or old_value < 0
+            or value < 0
+            or abs(value - old_value) > COUNTER_CONFIRMATION_EPSILON
+        ):
+            continue
+        records, times = status_indexes.get(row.device_id, ([], []))
+        active, _ = ThermalModel._continuous_indoor_state(records, start, end, status_times=times)
+        if active is False:
+            yield CounterInterval(row.device_id, start, end, hours, 0.0, row)
+
+
+def iter_confirmed_counter_changes(
+    rows: Iterable[_ConsumptionRowLike],
+    counter: str,
+    timezone: ZoneInfo,
+    *,
+    diagnostics: dict[str, int] | None = None,
+    confirm_changes: bool = True,
+) -> Iterator[CounterInterval]:
+    """Yield every confirmed counter change before duration-based filtering.
+
+    Session consumers need every tank delta before duration-based filtering;
+    confirmation remains configurable for independent rollback.
+    """
+    yield from iter_counter_change_intervals(
+        rows,
+        counter,
+        timezone,
+        min_interval_hours=0.0,
+        max_interval_hours=float("inf"),
+        diagnostics=diagnostics,
+        confirm_changes=confirm_changes,
+    )
 
 
 try:
@@ -198,6 +585,24 @@ def time_series_cv_mae(model, X, y, max_splits: int = 5) -> tuple[float, float]:
     mean_mae = statistics.fmean(maes)
     std_mae = statistics.pstdev(maes) if len(maes) > 1 else 0.0
     return float(mean_mae), float(std_mae)
+
+
+def time_series_cv_naive_mae(y, max_splits: int = 5) -> float:
+    """MAE of predicting each training fold's mean, on the same folds as ``time_series_cv_mae``."""
+    if not HAS_SKLEARN:
+        raise ImportError("scikit-learn required: pip install scikit-learn")
+
+    import numpy as np
+
+    y = np.asarray(y, dtype=float)
+    n_splits = min(max_splits, len(y) - 1)
+    if n_splits < 2:
+        return float(np.mean(np.abs(y - y.mean())))
+    maes = [
+        float(np.mean(np.abs(y[test_idx] - y[train_idx].mean())))
+        for train_idx, test_idx in TimeSeriesSplit(n_splits=n_splits).split(y)
+    ]
+    return float(statistics.fmean(maes))
 
 
 def make_monotonic_regressor(monotonic_cst, **overrides):

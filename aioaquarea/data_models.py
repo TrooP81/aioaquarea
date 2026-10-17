@@ -121,6 +121,8 @@ class DeviceStatus:
     powerful_time: PowerfulTime
     special_status: SpecialStatus | None
     status_data_mode: StatusDataMode = StatusDataMode.LIVE
+    operation_status_present: bool | None = None
+    operation_status_valid: bool | None = None
 
 
 @dataclass

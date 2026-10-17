@@ -1,14 +1,16 @@
 """Tests for poller error handling paths."""
 
+import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from packages.core.services import (
     PanasonicAdapterBackoffError,
     PanasonicAdapterUnavailableError,
 )
-from packages.poller.feeds import PriceFeed
+from packages.poller.feeds import FetchContext, PriceFeed, ProviderPriceList
 from packages.poller.main import (
     _record_panasonic_adapter_state,
     poll_device_status,
@@ -155,15 +157,242 @@ class TestPollPricesErrors:
         async def fetch_price_feed():
             return PriceFeed([], "EUR", "entsoe")
 
-        async def get_string_setting(key):
-            return {"price_provider": "entsoe"}.get(key, "")
-
         with patch("packages.poller.main.fetch_price_feed", new=fetch_price_feed):
-            with patch("packages.poller.main.get_string_setting", new=get_string_setting):
-                with patch("packages.poller.main.get_session") as mock_session:
-                    mock_ctx = MagicMock()
-                    mock_session.return_value = _AsyncContextManager(mock_ctx)
-                    await poll_prices()
+            with patch("packages.poller.main.get_session") as mock_session:
+                mock_ctx = MagicMock()
+                mock_session.return_value = _AsyncContextManager(mock_ctx)
+                await poll_prices()
+
+    @pytest.mark.parametrize("schema", ["hourly_duration_weighted_v1", None])
+    async def test_S3_R16_persists_fetch_context_and_transports_schema(self, schema):
+        clock = dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc)
+        feed = PriceFeed(
+            [(clock, -0.2)],
+            "SEK",
+            "entsoe",
+            FetchContext("entsoe", clock, area="original-area"),
+            schema,
+        )
+        session = AsyncMock()
+        with (
+            patch("packages.poller.main.fetch_price_feed", AsyncMock(return_value=feed)),
+            patch(
+                "packages.core.settings_service.get_string_setting",
+                AsyncMock(return_value="changed-after-fetch"),
+            ) as settings_reader,
+            patch(
+                "packages.poller.main.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+            patch(
+                "packages.core.planning_data_quality.get_planning_data_quality",
+                AsyncMock(return_value={}),
+            ),
+            patch("packages.poller.main._queue_price_horizon_reoptimization", AsyncMock()),
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_prices()
+
+        session.execute.assert_awaited_once()
+        values = session.execute.await_args.args[0].compile().params
+        assert values["area_m0"] == "original-area"
+        assert values["price_source_m0"] == "entsoe"
+        assert values["price_currency_m0"] == "SEK"
+        assert values["price_eur_per_kwh_m0"] == -0.2
+        assert values["fetched_at_m0"] == clock
+        assert values["interval_schema_m0"] == schema
+        settings_reader.assert_not_awaited()
+        logger.error.assert_not_called()
+        assert logger.info.call_args.kwargs["provider"] == "entsoe"
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            None,
+            FetchContext(
+                "manual",
+                dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc),
+                area="original-area",
+            ),
+        ],
+    )
+    async def test_S3_R16_missing_or_conflicting_context_fails_without_persistence(self, context):
+        clock = dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc)
+        feed = PriceFeed([(clock, 0.2)], "EUR", "entsoe", context)
+        with (
+            patch("packages.poller.main.fetch_price_feed", AsyncMock(return_value=feed)),
+            patch("packages.poller.main.get_session") as session_factory,
+            patch(
+                "packages.core.planning_data_quality.get_planning_data_quality",
+                AsyncMock(),
+            ) as quality,
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_prices()
+
+        session_factory.assert_not_called()
+        quality.assert_not_awaited()
+        logger.error.assert_called_once_with("price_fetch_failed", error="ValueError")
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "currency_conflict",
+            "duplicate_timestamp",
+            "invalid_price_or_timestamp",
+            "non_hourly_timestamp",
+            "graphql_error",
+            "malformed_response",
+            None,
+        ],
+    )
+    async def test_S3_R16_rejected_feed_logs_failure_not_success(self, reason):
+        # Exercise provider-list -> PriceFeed -> poll boundary transport, offline.
+        provider_result = ProviderPriceList(
+            [], currency="", source="tibber", rejection_reason=reason
+        )
+        session = AsyncMock()
+        with (
+            patch("packages.poller.feeds.get_setting", AsyncMock(return_value="tibber")),
+            patch(
+                "packages.poller.feeds._fetch_prices_tibber",
+                AsyncMock(return_value=provider_result),
+            ),
+            patch(
+                "packages.poller.main.get_session",
+                return_value=_AsyncContextManager(session),
+            ) as session_factory,
+            patch(
+                "packages.core.planning_data_quality.get_planning_data_quality",
+                AsyncMock(),
+            ) as quality,
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_prices()
+
+        quality.assert_not_awaited()
+        session.execute.assert_not_awaited()
+        if reason is not None:
+            session_factory.assert_not_called()
+            logger.error.assert_called_once_with(
+                "price_fetch_failed",
+                error="provider_validation_failed",
+                provider="tibber",
+                reason=reason,
+            )
+            logger.info.assert_not_called()
+        else:
+            session_factory.assert_called_once_with()
+            logger.error.assert_not_called()
+            logger.info.assert_called_once_with(
+                "prices_fetched", count=0, provider="tibber", currency=""
+            )
+
+    @pytest.mark.parametrize("field", ["today", "tomorrow", "currentSubscription", "priceInfo"])
+    @pytest.mark.parametrize(
+        "value",
+        [{}, False, 0, "", [], None, "absent"],
+        ids=["object", "false", "zero", "empty-string", "array", "null", "absent"],
+    )
+    async def test_S3_R16_original_structures_reach_poller_boundary(self, field, value):
+        home = {"currentSubscription": {"priceInfo": {"today": [], "tomorrow": []}}}
+        parent = (
+            home
+            if field == "currentSubscription"
+            else home["currentSubscription"]
+            if field == "priceInfo"
+            else home["currentSubscription"]["priceInfo"]
+        )
+        if value == "absent":
+            parent.pop(field, None)
+        else:
+            parent[field] = value
+        response = MagicMock()
+        response.json.return_value = {"data": {"viewer": {"homes": [home]}}}
+        client = MagicMock(post=AsyncMock(return_value=response))
+        session = AsyncMock()
+        config = {"price_provider": "tibber", "tibber_api_token": "offline-token"}
+        with (
+            patch(
+                "packages.poller.feeds.get_setting",
+                AsyncMock(side_effect=lambda key: config.get(key, "")),
+            ),
+            patch(
+                "packages.poller.feeds.httpx.AsyncClient",
+                return_value=_AsyncContextManager(client),
+            ),
+            patch(
+                "packages.poller.main.get_session",
+                return_value=_AsyncContextManager(session),
+            ) as session_factory,
+            patch(
+                "packages.core.planning_data_quality.get_planning_data_quality",
+                AsyncMock(),
+            ) as quality,
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_prices()
+
+        client.post.assert_awaited_once()
+        quality.assert_not_awaited()
+        session.execute.assert_not_awaited()
+        list_field = field in ("today", "tomorrow")
+        wrong_type = (
+            value is not None
+            and value != "absent"
+            and not isinstance(value, list if list_field else dict)
+        )
+        if wrong_type:
+            session_factory.assert_not_called()
+            logger.error.assert_called_once_with(
+                "price_fetch_failed",
+                error="provider_validation_failed",
+                provider="tibber",
+                reason="malformed_price_entries" if list_field else "malformed_response",
+            )
+            logger.info.assert_not_called()
+        else:
+            session_factory.assert_called_once_with()
+            logger.error.assert_not_called()
+            logger.info.assert_called_once_with(
+                "prices_fetched", count=0, provider="tibber", currency=""
+            )
+
+    @pytest.mark.parametrize("failure", ["http_status", "request", "unexpected"])
+    async def test_S3_R16_price_failure_logs_never_include_credentials(self, failure):
+        dummy_token = "dummy-S3-token-never-log"
+        request = httpx.Request(
+            "GET",
+            "https://web-api.tp.entsoe.eu/api",
+            params={"securityToken": dummy_token, "documentType": "A44"},
+        )
+        if failure == "http_status":
+            response = httpx.Response(401, request=request)
+            error = httpx.HTTPStatusError(
+                f"untrusted {request.url}", request=request, response=response
+            )
+            expected = {"error": "http_status_error", "status_code": 401}
+        elif failure == "request":
+            error = httpx.ConnectError(f"untrusted {request.url}", request=request)
+            expected = {"error": "ConnectError"}
+        else:
+            error = ValueError(f"untrusted {request.url}")
+            expected = {"error": "ValueError"}
+        with (
+            patch("packages.poller.main.fetch_price_feed", AsyncMock(side_effect=error)),
+            patch("packages.poller.main.get_session") as session_factory,
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_prices()
+
+        session_factory.assert_not_called()
+        logger.error.assert_called_once_with("price_fetch_failed", **expected)
+        logger.info.assert_not_called()
+        logged = repr(logger.mock_calls)
+        assert dummy_token not in logged
+        assert "securityToken" not in logged
+        assert "documentType" not in logged
+        assert "https://" not in logged
 
 
 class TestPollWeatherErrors:
@@ -173,6 +402,53 @@ class TestPollWeatherErrors:
             mock_fw.side_effect = Exception("DNS lookup failed")
             # Should not raise
             await poll_weather()
+
+    @pytest.mark.parametrize("schema", ["weather_c_mps_wm2_mm_v1", None])
+    async def test_S3_R17_weather_persistence_preserves_provenance(self, schema):
+        clock = dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc)
+        row = {
+            "ts": clock,
+            "source": "smhi",
+            "temperature": 0.0,
+            "wind_speed": 0.0,
+            "irradiance": 0.0,
+            "forecast_issued_at": clock,
+            "units_schema": schema,
+        }
+        session = AsyncMock()
+        with (
+            patch("packages.poller.main.fetch_weather", AsyncMock(return_value=[row])),
+            patch(
+                "packages.poller.main.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_weather()
+
+        session.execute.assert_awaited_once()
+        values = session.execute.await_args.args[0].compile().params
+        assert values["source_m0"] == "smhi"
+        assert values["forecast_issued_at_m0"] == clock
+        assert values["units_schema_m0"] == schema
+        assert values["temperature_m0"] == 0.0
+        logger.error.assert_not_called()
+
+    async def test_S3_R17_missing_source_is_not_defaulted_to_open_meteo(self):
+        row = {"ts": dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc), "temperature": 0.0}
+        session = AsyncMock()
+        with (
+            patch("packages.poller.main.fetch_weather", AsyncMock(return_value=[row])),
+            patch(
+                "packages.poller.main.get_session",
+                return_value=_AsyncContextManager(session),
+            ),
+            patch("packages.poller.main.logger") as logger,
+        ):
+            await poll_weather()
+
+        session.execute.assert_not_awaited()
+        assert logger.error.call_args.args == ("weather_fetch_failed",)
 
 
 class TestPollIndoorTempErrors:

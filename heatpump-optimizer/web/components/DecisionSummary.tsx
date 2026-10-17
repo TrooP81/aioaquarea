@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ACTION_LABELS, formatTime } from "@/lib/constants";
-import { usePlanActions } from "./usePlanActions";
+import { forecastDisplayStatusLabel, formatTime } from "@/lib/constants";
+import { Banner } from "./Banner";
+import { DataAge } from "./DataAge";
 import { useTimeFormat } from "./useTimeFormat";
+import { useRefresh } from "./RefreshContext";
+import type { ControlState } from "@/lib/api-types";
 
 interface DecisionSummaryProps {
   plan: {
@@ -12,6 +15,10 @@ interface DecisionSummaryProps {
     optimizer_version: string;
   } | null;
   indoorTemp: number | null;
+  indoorTimestamp: string | null;
+  indoorStale: boolean;
+  controlState: ControlState | null;
+  onRetry: () => void;
 }
 
 interface ForecastBrief {
@@ -27,51 +34,37 @@ interface ForecastBrief {
   };
 }
 
-function explainReason(payload: Record<string, unknown> | undefined): string {
-  const summary = payload?.user_summary;
-  if (typeof summary === "string" && summary.trim()) return summary;
-  const reason = payload?.reason;
-  if (typeof reason !== "string" || !reason.trim()) return "Scheduled from the latest plan inputs.";
-  const satisfied = reason.match(/^(comfort|setback)_satisfied_forecast_([\d.]+)_target_([\d.]+)$/);
-  if (satisfied) {
-    return `Indoor forecast ${Number(satisfied[2]).toFixed(1)}°C already covers the ${Number(satisfied[3]).toFixed(1)}°C ${satisfied[1] === "comfort" ? "comfort" : "setback"} target.`;
-  }
-  const peak = reason.match(/^comfort_hour_but_peak_price_([\d.]+)$/);
-  if (peak) return `Comfort window, but electricity is expensive at ${Number(peak[1]).toFixed(2)} per kWh.`;
-  const mild = reason.match(/^comfort_hour_but_mild_outdoor_([\d.]+)C$/);
-  if (mild) return `Comfort window with mild outdoor temperature (${Number(mild[1]).toFixed(1)}°C).`;
-  return reason
-    .replace(/_eur_kwh/g, "")
-    .replace(/_/g, " ")
-    .replace(/\b\d+\.\d{3,}\b/g, (value) => Number(value).toFixed(2));
-}
-
-export function DecisionSummary({ plan, indoorTemp }: DecisionSummaryProps) {
-  const { actions, loading: actionsLoading } = usePlanActions(plan?.id);
+export function DecisionSummary({ plan, indoorTemp, indoorTimestamp, indoorStale, controlState, onRetry }: DecisionSummaryProps) {
+  const { refreshEpoch } = useRefresh();
   const [forecast, setForecast] = useState<ForecastBrief | null>(null);
+  const [forecastLoading, setForecastLoading] = useState(true);
+  const [forecastError, setForecastError] = useState<string | null>(null);
+  const [forecastRetry, setForecastRetry] = useState(0);
   const timeFormat = useTimeFormat();
 
   useEffect(() => {
-    let active = true;
-    fetch("/api/thermal/indoor-forecast?hours=24")
-      .then((response) => (response.ok ? response.json() : null))
+    const controller = new AbortController();
+    setForecastLoading(true);
+    setForecastError(null);
+    setForecast(null);
+    fetch("/api/thermal/indoor-forecast?hours=24", { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Forecast returned ${response.status}`);
+        return response.json();
+      })
       .then((data) => {
-        if (active) setForecast(data);
+        if (!controller.signal.aborted) setForecast(data);
       })
       .catch(() => {
-        if (active) setForecast(null);
-      });
-    return () => { active = false; };
-  }, [plan?.id]);
+        if (!controller.signal.aborted) setForecastError("Forecast details could not be loaded.");
+      })
+      .finally(() => { if (!controller.signal.aborted) setForecastLoading(false); });
+    return () => controller.abort();
+  }, [plan?.id, refreshEpoch, forecastRetry]);
 
-  const nextAction = useMemo(
-    () => actions.find((action) => action.status === "pending" && new Date(action.scheduled_ts) > new Date()) ?? null,
-    [actions],
-  );
-  const actionInfo = nextAction ? ACTION_LABELS[nextAction.action_type] : null;
   const assessment = forecast?.comfort_assessment;
-  const modeOnly = assessment?.controllability?.status === "mode_only_no_space_heat";
-  const atRisk = assessment?.state === "at_risk";
+  const atRisk = !forecastLoading && !forecastError && assessment?.state === "at_risk";
+  const onTarget = !forecastLoading && !forecastError && assessment?.state === "on_target";
   const missTime = assessment?.first_miss?.ts
     ? formatTime(assessment.first_miss.ts, timeFormat.hour12)
     : assessment?.first_miss?.hour != null ? `+${assessment.first_miss.hour}h` : null;
@@ -84,46 +77,57 @@ export function DecisionSummary({ plan, indoorTemp }: DecisionSummaryProps) {
       <div className="decision-summary-header">
         <div>
           <span className="decision-summary-kicker">What matters now</span>
-          <h2>{atRisk ? "Comfort needs attention" : "System is following the current plan"}</h2>
+          <h2>{controlState?.headline ?? "Control state unavailable"}</h2>
         </div>
         <span className={`forecast-trust-badge forecast-trust-badge--${forecast?.display_status ?? "unavailable"}`}>
-          {(forecast?.display_status ?? "checking").replace(/_/g, " ")}
+          {forecastDisplayStatusLabel(forecastLoading ? "checking" : forecast?.display_status ?? "unavailable")}
         </span>
       </div>
       <div className="decision-summary-grid">
         <div>
           <span>Now</span>
           <strong>{indoorTemp != null ? `${indoorTemp.toFixed(1)}°C indoors` : "Waiting for indoor sensor"}</strong>
-          <small>{plan ? `Active plan #${plan.id}` : "No active plan"}</small>
+          <DataAge timestamp={indoorTimestamp} stale={indoorStale} />
+          <small>{controlState?.detail ?? "Control state could not be loaded."}</small>
         </div>
         <div>
           <span>Next</span>
-          <strong>
-            {actionsLoading
-              ? "Checking plan…"
-              : nextAction
-                ? `${actionInfo?.label ?? nextAction.action_type} at ${formatTime(nextAction.scheduled_ts, timeFormat.hour12)}`
-                : "No pending command"}
-          </strong>
-          {modeOnly && <small>Mode change only — it does not request room heat</small>}
+          <strong>No ordinary command</strong>
+          <small>Ordinary writes are prohibited in this build.</small>
         </div>
         <div>
           <span>Why</span>
-          <strong>{nextAction ? explainReason(nextAction.payload) : assessment?.summary ?? "No immediate optimizer action is needed."}</strong>
+          <strong>{assessment?.summary ?? (plan ? "Legacy ordinary actions will not be dispatched." : "No immediate optimizer action is needed.")}</strong>
         </div>
         <div>
           <span>Expected impact</span>
           <strong>
             {atRisk
               ? `${assessment?.worst_miss?.shortfall_c?.toFixed(1) ?? "—"}°C below target${missTime ? ` around ${missTime}` : ""}`
-              : "Forecast stays within the active target"}
+              : onTarget ? "Forecast stays within the active target" : "Comfort impact is unavailable until forecast evidence is ready"}
           </strong>
           <div className="decision-summary-actions">
-            <Link className="btn btn-sm" href="/?view=plan">View plan</Link>
+            <Link className="btn btn-sm" href="/?view=timeline">View plan</Link>
             {settingsLink && <Link className="btn btn-sm btn-primary" href={settingsLink}>Review blocker</Link>}
           </div>
         </div>
       </div>
+      {!controlState && (
+        <Banner tone="warning">
+          <p>Control state unavailable.</p>
+          <button className="btn btn-sm" onClick={onRetry}>Retry</button>
+        </Banner>
+      )}
+      {forecastError && (
+        <Banner tone="warning">
+          <p>{forecastError}</p>
+          <button className="btn btn-sm" onClick={() => setForecastRetry((value) => value + 1)}>Retry</button>
+        </Banner>
+      )}
+      {forecastLoading && <p className="text-muted text-sm">Loading forecast details...</p>}
+      {!forecastLoading && !forecastError && !forecast && (
+        <p className="text-muted text-sm">No forecast details are available yet.</p>
+      )}
     </section>
   );
 }

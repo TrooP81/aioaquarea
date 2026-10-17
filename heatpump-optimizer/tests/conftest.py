@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import socket
+import sys
 import tempfile
 import warnings
 from contextlib import suppress
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -17,15 +20,51 @@ TEST_API_TOKEN = "test-token"
 
 os.environ.setdefault("API_TOKEN", TEST_API_TOKEN)
 
-import aioaquarea
+import aioaquarea  # noqa: E402
 
 
-def pytest_configure() -> None:
-    """Force test temp files into a writable repo-local path on Windows."""
+@pytest.fixture
+def optimization_learning_gate(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Keep orchestration tests independent from runtime learning-state storage."""
+    from packages.optimizer.executor_core import LearningModeState
+
+    resolver = AsyncMock(return_value=LearningModeState.INACTIVE)
+    monkeypatch.setattr("packages.optimizer.main.resolve_learning_mode_state", resolver)
+    return resolver
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep model reads and writes inside the test's owned directory."""
+    from packages.core.config import settings
+
+    model_dir = tmp_path / "_isolated_models"
+    model_dir.mkdir()
+    monkeypatch.setattr(settings, "model_dir", str(model_dir))
+    for module_name in (
+        "packages.ml.models_common",
+        "packages.ml.models",
+        "packages.ml.cop_model_core",
+        "packages.ml.demand_model_core",
+        "packages.ml.comfort_model",
+        "packages.ml.thermal",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module, "MODEL_DIR", model_dir)
+    return model_dir
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Honor an explicit disposable temp directory on Windows."""
     if os.name != "nt":
         return
 
-    local_tmp = Path(__file__).resolve().parents[1] / ".pytest_tmp"
+    local_tmp = (
+        Path(config.option.basetemp)
+        if config.option.basetemp
+        else Path(__file__).resolve().parents[1] / ".pytest_tmp"
+    )
     local_tmp.mkdir(parents=True, exist_ok=True)
 
     os.environ["TMPDIR"] = str(local_tmp)
@@ -42,6 +81,29 @@ def pytest_configure() -> None:
         message=r"coroutine 'Connection\._cancel' was never awaited",
         category=RuntimeWarning,
     )
+
+
+@pytest.fixture(autouse=True)
+def offline_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forbid real connections when explicitly running offline verification."""
+    if os.environ.get("HPO_TEST_OFFLINE") != "1":
+        return
+
+    original_connect = socket.socket.connect
+
+    def reject_connection(*_args, **_kwargs):
+        raise AssertionError("Real network access is disabled for offline verification")
+
+    def connect_socketpair_only(connection, address):
+        caller = sys._getframe(1).f_code
+        if caller.co_name == "_fallback_socketpair" and caller.co_filename == socket.__file__:
+            return original_connect(connection, address)
+        return reject_connection(connection, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect_socketpair_only)
+    monkeypatch.setattr(socket.socket, "connect_ex", reject_connection)
+    monkeypatch.setattr(socket, "create_connection", reject_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", reject_connection)
 
 
 def pytest_sessionfinish(session, exitstatus):

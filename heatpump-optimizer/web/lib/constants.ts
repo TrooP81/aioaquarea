@@ -1,3 +1,5 @@
+import type { ModelReportingState } from "./api-types";
+
 /**
  * Shared UI constants and formatting helpers for the Heat Pump Optimizer dashboard.
  *
@@ -24,14 +26,20 @@ export interface Section {
 }
 
 export const SECTIONS = [
-  { id: "overview", label: "Overview", description: "Live readings and the next planned action" },
-  { id: "controls", label: "Controls", description: "Pause, override, or collect learning data" },
-  { id: "plan", label: "Plan", description: "Current schedule, completed actions, and plan revisions" },
-  { id: "charts", label: "Charts", description: "Prices, temperatures, energy use, weather, and predictions" },
-  { id: "status", label: "Models", description: "Optimizer decisions and learning-model health" },
+  { id: "home", label: "Home", description: "Live readings, controls, and operational health" },
+  { id: "timeline", label: "Timeline", description: "Current schedule, outcomes, and plan revisions" },
+  { id: "under-the-hood", label: "Under the hood", description: "Raw charts and optimizer diagnostics" },
 ] as const;
 
 export type SectionId = (typeof SECTIONS)[number]["id"];
+
+export const LEGACY_SECTION_ALIASES: Record<string, { section: SectionId; hash?: string }> = {
+  overview: { section: "home" },
+  controls: { section: "home", hash: "#controls" },
+  plan: { section: "timeline" },
+  charts: { section: "under-the-hood", hash: "#raw-charts" },
+  status: { section: "under-the-hood", hash: "#models" },
+};
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Optimizer layers
@@ -44,6 +52,7 @@ export type SectionId = (typeof SECTIONS)[number]["id"];
 export const LAYER_LABELS: Record<string, string> = {
   // Runtime version strings
   rules_v3: "Rules",
+  rules_v7: "Rules",
   milp_v1: "Optimized",
   "milp_v1+ml": "Optimized + ML",
   // Configuration keys (shown in a few places as a fallback)
@@ -52,18 +61,28 @@ export const LAYER_LABELS: Record<string, string> = {
   auto: "Automatic",
 };
 
+export const MODEL_REPORTING_LABELS: Record<ModelReportingState, string> = {
+  unqualified: "Unqualified",
+  candidate: "Candidate",
+  "qualified-for-reporting": "Qualified for reporting",
+  expired: "Expired",
+  unavailable: "Unavailable",
+};
+
 export const LAYER_TOOLTIPS: Record<string, string> = {
   rules_v3:
     "Rule-based scheduler: deterministic heuristics using electricity prices, comfort windows and quiet hours.",
+  rules_v7:
+    "Rule-based scheduler using electricity prices, comfort windows, quiet hours and assumed heating efficiency.",
   milp_v1:
     "Cost optimizer (MILP): searches for the lowest-cost schedule across the whole planning horizon.",
   "milp_v1+ml":
-    "Cost optimizer enhanced with machine-learning predictions of efficiency (COP) and hot-water demand.",
+    "Cost optimizer using retained machine-learning predictions of electrical heating demand and assumed heating efficiency.",
   rules_only: "Deterministic rule-based scheduling. Most predictable; no ML required.",
   milp_preferred:
     "Use the MILP cost optimizer when possible, falling back to rules on any error.",
   auto:
-    "Use the MILP optimizer once ML models are trained on enough data; otherwise fall back to rules.",
+    "Uses rules while COP is retired; automatic MILP promotion is disabled.",
 };
 
 /** Options for the `optimizer_layer` setting dropdown. */
@@ -79,7 +98,7 @@ export const OPTIMIZER_LAYER_OPTIONS: Record<string, { label: string; descriptio
   auto: {
     label: "Automatic",
     description:
-      "Use the MILP optimizer once ML models are trained on ≥14 days of data; otherwise use rules.",
+      "Uses rules while COP is retired; automatic MILP promotion is disabled.",
   },
 };
 
@@ -136,7 +155,82 @@ export const STATUS_DISPLAY: Record<string, StatusDisplay> = {
   skipped_peak: { text: "Skipped (peak price)", className: "skipped" },
   cancelled: { text: "Cancelled", className: "skipped" },
   expired: { text: "Missed", className: "skipped" },
+  operator_invalidated: { text: "Administratively retired (not physically verified)", className: "skipped" },
 };
+
+function recognizedStatus(code: string | null | undefined, labels: Record<string, string>): string {
+  if (!code || !labels[code]) return `Unrecognized status (${code ?? "unknown"})`;
+  return labels[code];
+}
+
+export function actionStatusLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, Object.fromEntries(Object.entries(STATUS_DISPLAY).map(([key, value]) => [key, value.text])));
+}
+
+export function reasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    automatic: "Automatic scheduling",
+    active_override: "Active pause",
+    learning_mode_active: "Learning mode",
+    observe_only_build: "Ordinary writes prohibited in this build",
+    ready_for_control: "Legacy readiness; reporting only",
+    ready_for_reporting: "Ready for reporting; observation unchanged",
+    await_prospective_reporting_qualification: "Await prospective reporting qualification",
+    await_model_maintenance: "Await model maintenance",
+    collect_space_heating_evidence: "Collect space-heating evidence",
+    await_successful_demand_training: "Await successful demand maintenance",
+    collect_indoor_heating_evidence: "Collect indoor-heating evidence",
+    enable_observe_only_campaign: "Observation campaign is not enabled",
+    wait_for_heating_season: "Wait for heating-season evidence",
+    comfort_at_risk: "Comfort risk forecast",
+    new_plans_paused: "New plans paused",
+    control_state_unavailable: "Control state unavailable",
+    readiness_unavailable: "Readiness unavailable",
+    resolve_current_safety_obligations: "Resolve current safety obligations before training guidance",
+    safety_obligations_unavailable: "Current safety obligations unavailable; not known clear",
+  });
+}
+
+export function outdoorFallbackReasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    weather_unavailable: "Weather data is unavailable",
+    heat_pump_sensor_unavailable: "Heat-pump outdoor sensor is unavailable",
+    weather_stale: "Weather data is stale",
+  });
+}
+
+export function gateStateLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    ALLOWED: "Allowed",
+    BLOCKED: "Blocked",
+    UNKNOWN: "Unknown",
+  });
+}
+
+export function forecastDisplayStatusLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    fresh: "Fresh forecast",
+    aging: "Aging forecast",
+    stale: "Stale forecast",
+    diverged: "Forecast diverged",
+    unavailable: "Forecast unavailable",
+    checking: "Checking forecast",
+  });
+}
+
+export function seasonalReasonLabel(code: string | null | undefined): string {
+  return recognizedStatus(code, {
+    inactive: "Seasonal calibration is inactive",
+    active: "Seasonal calibration is active",
+    observe_only_seasonal_calibration_active: "Observation persists until explicit human exit",
+    waiting_for_recent_outdoor_data: "Waiting for recent outdoor data",
+    available_but_not_enabled: "Observation campaign is not enabled",
+    seasonal_reporting_unavailable: "Seasonal reporting unavailable",
+    blocked_by_unresolved_safety_revert: "Waiting for unresolved safety restores",
+    safety_obligations_unavailable: "Current safety obligations unavailable; not known clear",
+    waiting_for_heating_season: "Waiting for heating season",
+  });
+}
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Payload labels + formatting

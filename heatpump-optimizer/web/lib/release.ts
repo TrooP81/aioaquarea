@@ -16,7 +16,50 @@ export interface ReleaseNote {
  */
 export const RELEASE_HISTORY: readonly ReleaseNote[] = [
   {
-    version: APP_VERSION,
+    version: "0.15.0",
+    released: "2026-10-10",
+    title: "Self-checking models in observe-only mode",
+    changes: [
+      "This build never sends ordinary heat-pump commands; only existing safety restores can run. Turning optimization back on needs a new reviewed release.",
+      "Models maintain themselves when enabled (off by default) and are only trusted after their forecasts beat simple baselines on real outcomes recorded in advance.",
+      "Each model shows whether it is unqualified, a candidate, qualified for reporting, expired, or unavailable; observe-only mode is never ended automatically.",
+      "Thermal, comfort and demand learning no longer mix room sensors, pick samples by direction, or keep models that predict worse than \"no change\".",
+      "The learned COP model is retired, and approximate controller COP readings can be recorded manually without affecting planning.",
+    ],
+  },
+  {
+    version: "0.14.0",
+    released: "2026-10-03",
+    title: "Explainable timelines and safer learning",
+    changes: [
+      "Home, Timeline, and Under the hood replace the old tabs with deep links, a shared refresh, and a timeline that explains prices, comfort, actions, and outcomes.",
+      "Models separates plain-language decision guidance from diagnostics, and the COP and Demand cards now report real readings, validation scores, and training dates.",
+      "When learning mode can't be determined, the active plan is kept and the executor only runs safety restores; executor verification reads use a durable hourly budget.",
+      "COP training ignores brief counter glitches, and daily consumption now follows your local calendar day across midnight and daylight-saving changes.",
+      "Security updates for Next.js (GHSA-vcvr-r3jv-pc5j) and a development dependency; an optional account-wide Panasonic read quota is available but off by default.",
+    ],
+  },
+  {
+    version: "0.13.7",
+    released: "2026-09-23",
+    title: "Dependency maintenance and release provenance",
+    changes: [
+      "Dependency maintenance retains the remediated SoupSieve resolution and closes the historical release-scoped waiver without audit suppressions.",
+      "Backend and dashboard images record the application version and build revision in OCI metadata for deployment verification and rollback.",
+    ],
+  },
+  {
+    version: "0.13.6",
+    released: "2026-09-15",
+    title: "Reliable SmartThings transport and accessible dashboard",
+    changes: [
+      "SmartThings polling now handles transport failures more predictably and preserves validation coverage for stale and malformed sensor data.",
+      "Dashboard and Settings navigation now provide clearer keyboard focus, live status feedback, and reliable error routing.",
+      "Responsive workspace tabs and comfort-schedule editing remain usable on compact screens without hiding the active control.",
+    ],
+  },
+  {
+    version: "0.13.5",
     released: "2026-08-26",
     title: "Reliable SmartThings sensor freshness",
     changes: [

@@ -25,6 +25,7 @@ interface SettingMeta {
   min?: number;
   max?: number;
   step?: number;
+  read_only?: boolean;
 }
 
 type SettingsMap = Record<string, SettingMeta>;
@@ -39,6 +40,10 @@ interface FieldRule {
 }
 
 const FIELD_RULES: Record<string, FieldRule> = {
+  ml_maintenance_enabled: { label: "Model maintenance" },
+  seasonal_calibration_auto_exit: { label: "Automatic observation exit" },
+  space_heating_gate_on_offset_c: { label: "Gate ON offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
+  space_heating_gate_off_offset_c: { label: "Gate OFF offset", unit: "°C", min: -10, max: 10, step: 0.1, inputType: "number" },
   tank_min_temp: { label: "Minimum tank temperature during comfort hours", unit: "°C", min: 20, max: 65, step: 0.5, inputType: "number" },
   tank_min_temp_offpeak: { label: "Minimum tank temperature during off-peak hours", unit: "°C", min: 20, max: 65, step: 0.5, inputType: "number" },
   tank_max_temp: { label: "Maximum tank temperature", unit: "°C", min: 30, max: 65, step: 0.5, inputType: "number" },
@@ -77,7 +82,7 @@ const SETTINGS_TABS = [
     id: "optimizer",
     label: "Optimizer",
     description: "Planning rules, comfort targets, and automatic learning",
-    groups: ["Optimizer Layer", "Optimizer Constraints", "Controller Heat Curve", "Quiet Mode", "Price Sensitivity", "Adaptive Learning", "Seasonal Learning", "Comfort Model", "Shower Mode"],
+    groups: ["Optimizer Layer", "Optimizer Constraints", "Controller Heat Curve", "Space Heating Gate", "Quiet Mode", "Price Sensitivity", "Adaptive Learning", "Seasonal Learning", "Comfort Model", "Shower Mode"],
   },
   {
     id: "data",
@@ -111,7 +116,7 @@ const SETTING_GROUPS = [
   {
     title: "Optimizer Layer",
     description: "Choose which optimization engine drives scheduling",
-    keys: ["optimizer_layer"],
+    keys: ["optimizer_layer", "ml_maintenance_enabled"],
   },
   {
     title: "Price Provider",
@@ -161,6 +166,11 @@ const SETTING_GROUPS = [
     ],
   },
   {
+    title: "Space Heating Gate",
+    description: "Recorded profile and hysteresis offsets used to decide whether room-heating increases are eligible.",
+    keys: ["space_heating_behavior_profile", "space_heating_gate_on_offset_c", "space_heating_gate_off_offset_c"],
+  },
+  {
     title: "Quiet Mode",
     description: "Compressor noise reduction schedule",
     keys: ["quiet_mode_start", "quiet_mode_end"],
@@ -177,7 +187,7 @@ const SETTING_GROUPS = [
   },
   {
     title: "Seasonal Learning",
-    description: "Opt-in observe-only evidence collection during heating weather. It can train locally and end itself only after both demand and indoor-heating evidence are ready.",
+    description: "Observe-only seasonal evidence. Observation persists until explicit human exit; model readiness never enables device writes.",
     keys: ["seasonal_calibration_enabled", "seasonal_calibration_max_outdoor_c", "seasonal_calibration_window_days", "seasonal_calibration_auto_train", "seasonal_calibration_auto_exit"],
   },
   {
@@ -217,10 +227,34 @@ const SETTING_GROUPS = [
   },
 ];
 
+const SETTING_GROUP_BY_KEY = new Map<string, (typeof SETTING_GROUPS)[number]>();
+for (const group of SETTING_GROUPS) {
+  for (const key of group.keys) {
+    if (SETTING_GROUP_BY_KEY.has(key)) throw new Error(`Setting key belongs to multiple groups: ${key}`);
+    SETTING_GROUP_BY_KEY.set(key, group);
+  }
+}
+
 function tabForSetting(key: string): SettingsTabId | null {
-  const group = SETTING_GROUPS.find((candidate) => candidate.keys.includes(key));
+  const group = SETTING_GROUP_BY_KEY.get(key);
   if (!group) return null;
   return (SETTINGS_TABS.find((tab) => tab.groups.includes(group.title as never))?.id ?? null) as SettingsTabId | null;
+}
+
+function isSettingApplicable(key: string, values: Record<string, string>, showAdvanced: boolean): boolean {
+  const group = SETTING_GROUP_BY_KEY.get(key);
+  if (!group || (!showAdvanced && ADVANCED_OPTIMIZER_GROUPS.has(group.title))) return false;
+  if (group.title === "Price Provider") {
+    if (values.price_provider === "manual") return !["entsoe_api_token", "entsoe_area", "tibber_api_token"].includes(key);
+    if (key === "manual_price_eur_per_kwh") return false;
+    if (values.price_provider !== "tibber" && key === "tibber_api_token") return false;
+    if (values.price_provider !== "entsoe" && ["entsoe_api_token", "entsoe_area"].includes(key)) return false;
+  }
+  if (group.title === "Weather Provider" && values.weather_provider !== "manual" && ["manual_outdoor_temp", "manual_wind_speed", "manual_humidity", "manual_irradiance", "manual_precipitation"].includes(key)) return false;
+  if (group.title === "Weather Provider" && values.outdoor_temperature_source !== "weather" && ["outdoor_temperature_weather_offset_c", "outdoor_temperature_weather_max_age_minutes"].includes(key)) return false;
+  if (group.title === "SmartThings Integration" && values.smartthings_enabled !== "true" && key !== "smartthings_enabled") return false;
+  if (group.title === "Comfort Model" && values.use_comfort_model !== "true" && key !== "use_comfort_model") return false;
+  return true;
 }
 
 export default function SettingsPage() {
@@ -234,21 +268,27 @@ export default function SettingsPage() {
   const [apiVersionUnavailable, setApiVersionUnavailable] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTabId>("optimizer");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [pendingErrorKey, setPendingErrorKey] = useState<string | null>(null);
   const currency = useCurrency();
+  const applicableKeys = useMemo(
+    () => new Set(Object.keys(settings).filter((key) => !settings[key].read_only
+      && key !== "seasonal_calibration_auto_exit" && isSettingApplicable(key, editValues, showAdvanced))),
+    [editValues, settings, showAdvanced],
+  );
   const activeTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
   const visibleGroupTitles: readonly string[] = activeTabMeta.groups;
   const dirtyKeys = useMemo(
     () => Object.keys(editValues).filter((key) => {
       const original = settings[key]?.value ?? "";
-      return editValues[key] !== original && !editValues[key].includes("***");
+      return applicableKeys.has(key) && editValues[key] !== original && !editValues[key].includes("***");
     }),
-    [editValues, settings],
+    [applicableKeys, editValues, settings],
   );
   const validationErrors = useMemo(() => {
     const errors: Record<string, string> = {};
     for (const [key, value] of Object.entries(editValues)) {
       const meta = settings[key];
-      if (!meta || value.includes("***")) continue;
+      if (!meta || !applicableKeys.has(key) || value.includes("***")) continue;
       const rule = FIELD_RULES[key] ?? {};
       const numeric = rule.inputType === "number" || ["int", "float", "number"].includes(meta.type);
       if (numeric) {
@@ -285,8 +325,13 @@ export default function SettingsPage() {
       errors.heat_curve_outdoor_cold_c = "Cold outdoor point must be below the warm point.";
     }
     return errors;
-  }, [editValues, settings]);
+  }, [applicableKeys, editValues, settings]);
   const activeTabDirtyCount = dirtyKeys.filter((key) => tabForSetting(key) === activeTab).length;
+  const tabErrorCounts = useMemo(() => Object.keys(validationErrors).reduce<Record<string, number>>((counts, key) => {
+    const tab = tabForSetting(key);
+    if (tab) counts[tab] = (counts[tab] ?? 0) + 1;
+    return counts;
+  }, {}), [validationErrors]);
 
   useEffect(() => {
     fetchSettings();
@@ -322,6 +367,15 @@ export default function SettingsPage() {
       target.scrollIntoView({ block: "start" });
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    if (!pendingErrorKey) return;
+    const input = document.getElementById(`setting-${pendingErrorKey}`);
+    if (input) {
+      input.focus();
+      setPendingErrorKey(null);
+    }
+  }, [activeTab, pendingErrorKey, showAdvanced]);
 
   const fetchApiVersion = async () => {
     try {
@@ -361,8 +415,16 @@ export default function SettingsPage() {
   };
 
   const handleSave = async () => {
-    if (Object.keys(validationErrors).length > 0) {
+    const firstInvalidKey = SETTINGS_TABS.flatMap((tab) => SETTING_GROUPS
+      .filter((group) => tab.groups.includes(group.title as never))
+      .flatMap((group) => group.keys))
+      .find((key) => validationErrors[key] && applicableKeys.has(key));
+    if (firstInvalidKey) {
       setMessage({ text: `Fix ${Object.keys(validationErrors).length} invalid field(s) before saving.`, type: "error" });
+      const errorTab = tabForSetting(firstInvalidKey);
+      if (errorTab) selectTab(errorTab);
+      if (ADVANCED_OPTIMIZER_GROUPS.has(SETTING_GROUP_BY_KEY.get(firstInvalidKey)?.title ?? "")) setShowAdvanced(true);
+      setPendingErrorKey(firstInvalidKey);
       return;
     }
     setSaving(true);
@@ -372,7 +434,7 @@ export default function SettingsPage() {
     const updates: Record<string, string> = {};
     for (const [key, val] of Object.entries(editValues)) {
       const original = settings[key]?.value || "";
-      if (val !== original && !val.includes("***")) {
+      if (applicableKeys.has(key) && val !== original && !val.includes("***")) {
         updates[key] = val;
       }
     }
@@ -390,8 +452,20 @@ export default function SettingsPage() {
         body: JSON.stringify({ settings: updates }),
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Save failed");
+        const errorResponse: unknown = await res.json().catch(() => null);
+        const detail = errorResponse !== null && typeof errorResponse === "object" && "detail" in errorResponse
+          ? errorResponse.detail : undefined;
+        let failureMessage = typeof detail === "string" ? detail : "";
+        if (detail !== null && typeof detail === "object" && "invalid_values" in detail) {
+          const invalidValues = detail.invalid_values;
+          if (invalidValues !== null && typeof invalidValues === "object" && !Array.isArray(invalidValues)) {
+            failureMessage = Object.entries(invalidValues)
+              .filter(([, reason]) => typeof reason === "string")
+              .map(([key, reason]) => `${key}: ${reason}`)
+              .join("; ");
+          }
+        }
+        throw new Error(failureMessage || "Save failed");
       }
       setMessage({ text: `Saved ${Object.keys(updates).length} setting(s)`, type: "success" });
       await fetchSettings();
@@ -401,9 +475,6 @@ export default function SettingsPage() {
       setSaving(false);
     }
   };
-
-  const isManualPriceMode = editValues["price_provider"] === "manual";
-  const isManualWeatherMode = editValues["weather_provider"] === "manual";
 
   const useHeatCurveSuggestion = (suggested: HeatCurveValues) => {
     setEditValues((previous) => ({
@@ -431,34 +502,9 @@ export default function SettingsPage() {
     setMessage({ text: "Unsaved changes discarded", type: "success" });
   };
 
-  const shouldShowKey = (groupTitle: string, key: string): boolean => {
-    // Hide API-specific fields when in manual mode
-    if (groupTitle === "Price Provider") {
-      if (isManualPriceMode && ["entsoe_api_token", "entsoe_area", "tibber_api_token"].includes(key)) return false;
-      if (!isManualPriceMode && key === "manual_price_eur_per_kwh") return false;
-      if (editValues["price_provider"] !== "tibber" && key === "tibber_api_token") return false;
-      if (editValues["price_provider"] !== "entsoe" && ["entsoe_api_token", "entsoe_area"].includes(key)) return false;
-    }
-    if (groupTitle === "Weather Provider") {
-      if (isManualWeatherMode && false) return false; // show manual fields
-      if (!isManualWeatherMode && ["manual_outdoor_temp", "manual_wind_speed", "manual_humidity", "manual_irradiance", "manual_precipitation"].includes(key)) return false;
-      if (
-        editValues["outdoor_temperature_source"] !== "weather"
-        && ["outdoor_temperature_weather_offset_c", "outdoor_temperature_weather_max_age_minutes"].includes(key)
-      ) return false;
-    }
-    if (groupTitle === "SmartThings Integration") {
-      if (editValues["smartthings_enabled"] !== "true" && key !== "smartthings_enabled") return false;
-    }
-    if (groupTitle === "Comfort Model") {
-      if (editValues["use_comfort_model"] !== "true" && key !== "use_comfort_model") return false;
-    }
-    return true;
-  };
-
   if (loading) {
     return (
-      <div className="dashboard">
+      <main id="main-content" className="dashboard" tabIndex={-1}>
         <div className="header">
           <h1>Settings</h1>
           <div className="header-actions">
@@ -467,12 +513,12 @@ export default function SettingsPage() {
           </div>
         </div>
         <p style={{ color: "var(--text-muted)" }}>Loading settings...</p>
-      </div>
+      </main>
     );
   }
 
   return (
-    <div className="dashboard">
+    <main id="main-content" className="dashboard" tabIndex={-1}>
       <div className="header">
         <h1>Settings</h1>
         <div className="header-actions">
@@ -485,7 +531,7 @@ export default function SettingsPage() {
         activeId={activeTab}
         ariaLabel="Settings categories"
         idPrefix="settings"
-        items={SETTINGS_TABS}
+        items={SETTINGS_TABS.map((tab) => ({ ...tab, label: `${tab.label}${tabErrorCounts[tab.id] ? ` (${tabErrorCounts[tab.id]} errors)` : ""}` }))}
         onChange={selectTab}
       />
 
@@ -498,6 +544,8 @@ export default function SettingsPage() {
       {message && (
         <div
           className="override-banner"
+          role={message.type === "error" ? "alert" : "status"}
+          aria-live={message.type === "success" ? "polite" : undefined}
           style={{
             borderColor: message.type === "success" ? "var(--success)" : "var(--danger)",
             background: message.type === "success" ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)",
@@ -519,7 +567,7 @@ export default function SettingsPage() {
           )}
           {Object.keys(validationErrors).length > 0 && <span className="text-danger">{Object.keys(validationErrors).length} field(s) need attention</span>}
         </div>
-        <button className="btn btn-primary" onClick={handleSave} disabled={saving || dirtyKeys.length === 0 || Object.keys(validationErrors).length > 0}>
+        <button className="btn btn-primary" onClick={handleSave} disabled={saving || dirtyKeys.length === 0}>
           {saving ? "Saving..." : `Save ${dirtyKeys.length || ""} change${dirtyKeys.length === 1 ? "" : "s"}`}
         </button>
         <button className="btn" onClick={discardChanges} disabled={dirtyKeys.length === 0}>
@@ -543,226 +591,232 @@ export default function SettingsPage() {
         role="tabpanel"
         aria-labelledby={`settings-tab-${activeTab}`}
       >
-      {activeTab === "optimizer" && <HeatCurveAdvice onUseSuggestion={useHeatCurveSuggestion} />}
-      {activeTab === "optimizer" && (
-        <div className="settings-level-toggle">
-          <div>
-            <strong>{showAdvanced ? "Advanced optimizer settings" : "Essential optimizer settings"}</strong>
-            <span>{showAdvanced ? "Includes model thresholds and seasonal-learning controls." : "Comfort, heat curve, quiet hours, and safe operating limits."}</span>
+        {activeTab === "optimizer" && <HeatCurveAdvice onUseSuggestion={useHeatCurveSuggestion} />}
+        {activeTab === "optimizer" && (
+          <div className="settings-level-toggle">
+            <div>
+              <strong>{showAdvanced ? "Advanced optimizer settings" : "Essential optimizer settings"}</strong>
+              <span>{showAdvanced ? "Includes model thresholds and seasonal-learning controls." : "Comfort, heat curve, quiet hours, and safe operating limits."}</span>
+            </div>
+            <button className="btn btn-sm" onClick={() => setShowAdvanced((value) => !value)}>
+              {showAdvanced ? "Hide advanced" : "Show advanced"}
+            </button>
           </div>
-          <button className="btn btn-sm" onClick={() => setShowAdvanced((value) => !value)}>
-            {showAdvanced ? "Hide advanced" : "Show advanced"}
-          </button>
-        </div>
-      )}
-      {SETTING_GROUPS.filter((group) => activeTab !== "optimizer" || showAdvanced || !ADVANCED_OPTIMIZER_GROUPS.has(group.title)).map((group) => (
-        <div
-          key={group.title}
-          id={slug(group.title)}
-          className="plan-section settings-tab-panel"
-          hidden={!visibleGroupTitles.includes(group.title)}
-        >
-          <h2 className="chart-title">{group.title}</h2>
-          <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-            {group.title === "Price Provider"
-              ? `Configure how electricity prices are fetched (displaying in ${currency.code})`
-              : group.description}
-          </p>
-          {group.title === "Price Provider" && currency.warning && (
-            <p className="text-warning text-sm">⚠ {currency.warning}</p>
-          )}
-
-          {group.title === "SmartThings Integration" && editValues["smartthings_enabled"] === "true" && (
-            <SmartThingsOAuth />
-          )}
-
-          <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-            {group.keys
-              .filter((key) => settings[key] && shouldShowKey(group.title, key))
-              .map((key) => {
-                const meta = settings[key];
-                const rule = FIELD_RULES[key] ?? {};
-                const description =
-                  key === "manual_price_eur_per_kwh"
-                    ? `Static electricity price (${currency.code}/kWh)`
-                    : meta.description;
-                const label = meta.label || rule.label || description;
-                const unit = meta.unit || rule.unit;
-                const inputType = rule.inputType
-                  || (["int", "float", "number"].includes(meta.type) ? "number" : meta.type === "secret" ? "password" : "text");
-                const isBooleanSetting = meta.type === "bool"
-                  || Boolean(meta.options?.includes("true") && meta.options?.includes("false") && meta.options.length === 2);
-                return (
-                  <div key={key} className="settings-form-row">
-                    <div className="settings-field-copy">
-                      <label htmlFor={`setting-${key}`} className="settings-form-label">{label}</label>
-                      {description !== label && <span className="settings-form-hint">{description}</span>}
-                    </div>
-
-                    {key === "smartthings_device_ids" ? (
-                      <SmartThingsSensorSelector
-                        value={editValues[key] || ""}
-                        onChange={(next) =>
-                          setEditValues((prev) => ({ ...prev, [key]: next }))
-                        }
-                      />
-                    ) : key === "comfort_reference_sensor_id" ? (
-                      <SmartThingsSensorSelector
-                        value={editValues[key] || ""}
-                        onChange={(next) =>
-                          setEditValues((prev) => ({ ...prev, [key]: next }))
-                        }
-                        single
-                        title="Reference room for comfort"
-                        emptyMessage="No reference — use robust median of selected sensors"
-                      />
-                    ) : meta.options && !isBooleanSetting ? (
-                      <>
-                        <select
-                          id={`setting-${key}`}
-                          value={editValues[key] || ""}
-                          onChange={(e) =>
-                            setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
-                          }
-                          className="form-select"
-                        >
-                          {meta.options.map((opt) => (
-                            <option key={opt} value={opt}>
-                              {key === "optimizer_layer"
-                                ? (OPTIMIZER_LAYER_OPTIONS[opt]?.label || opt)
-                                : key === "outdoor_temperature_source"
-                                  ? opt === "weather"
-                                    ? "Weather report (recommended)"
-                                    : "Heat-pump sensor"
-                                  : opt}
-                            </option>
-                          ))}
-                        </select>
-                        {key === "optimizer_layer" && OPTIMIZER_LAYER_OPTIONS[editValues[key]] && (
-                          <span className="settings-form-hint">
-                            {OPTIMIZER_LAYER_OPTIONS[editValues[key]].description}
-                          </span>
-                        )}
-                      </>
-                    ) : isBooleanSetting ? (
-                      <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", minHeight: "2.5rem" }}>
-                        <input
-                          id={`setting-${key}`}
-                          type="checkbox"
-                          checked={editValues[key] === "true"}
-                          onChange={(e) =>
-                            setEditValues((prev) => ({ ...prev, [key]: e.target.checked ? "true" : "false" }))
-                          }
-                          style={{ width: "1.1rem", height: "1.1rem", accentColor: "var(--primary)" }}
-                        />
-                        <span className="text-muted text-sm">{editValues[key] === "true" ? "Enabled" : "Disabled"}</span>
-                      </div>
-                    ) : (
-                      <div className="settings-input-wrap">
-                        <input
-                          id={`setting-${key}`}
-                          type={inputType}
-                          value={editValues[key] || ""}
-                          onChange={(e) =>
-                            setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
-                          }
-                          min={rule.min ?? meta.min}
-                          max={rule.max ?? meta.max}
-                          step={rule.step ?? meta.step}
-                          placeholder={meta.description}
-                          className={`form-input ${validationErrors[key] ? "form-input--invalid" : ""}`}
-                          aria-invalid={Boolean(validationErrors[key])}
-                          aria-describedby={validationErrors[key] ? `setting-error-${key}` : undefined}
-                        />
-                        {unit && <span className="settings-input-unit">{unit}</span>}
-                        {validationErrors[key] && <span id={`setting-error-${key}`} className="settings-field-error">{validationErrors[key]}</span>}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-          </div>
-        </div>
-      ))}
-
-      <section id="release-history" className="plan-section release-history settings-tab-panel" hidden={activeTab !== "system"}>
-        <div className="release-history-header">
-          <div>
-            <h2 className="chart-title">Release History</h2>
-            <p className="release-history-intro">
-              Dashboard version <strong>v{APP_VERSION}</strong> is live in the interface you are viewing.
+        )}
+        {SETTING_GROUPS.filter((group) => activeTab !== "optimizer" || showAdvanced || !ADVANCED_OPTIMIZER_GROUPS.has(group.title)).map((group) => (
+          <div
+            key={group.title}
+            id={slug(group.title)}
+            className="plan-section settings-tab-panel"
+            hidden={!visibleGroupTitles.includes(group.title)}
+          >
+            <h2 className="chart-title">{group.title}</h2>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
+              {group.title === "Price Provider"
+                ? `Configure how electricity prices are fetched (displaying in ${currency.code})`
+                : group.description}
             </p>
+            {group.title === "Price Provider" && currency.warning && (
+              <p className="text-warning text-sm">⚠ {currency.warning}</p>
+            )}
+
+            {group.title === "SmartThings Integration" && editValues["smartthings_enabled"] === "true" && (
+              <SmartThingsOAuth />
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+              {group.keys
+                .filter((key) => settings[key] && isSettingApplicable(key, editValues, showAdvanced))
+                .map((key) => {
+                  const meta = settings[key];
+                  const rule = FIELD_RULES[key] ?? {};
+                  const description =
+                    key === "seasonal_calibration_auto_exit"
+                      ? "Always false. Observation persists until explicit human exit; legacy stored values are ineffective."
+                      : key === "manual_price_eur_per_kwh"
+                      ? `Static electricity price (${currency.code}/kWh)`
+                      : meta.description;
+                  const label = meta.label || rule.label || description;
+                  const unit = meta.unit || rule.unit;
+                  const inputType = rule.inputType
+                    || (["int", "float", "number"].includes(meta.type) ? "number" : meta.type === "secret" ? "password" : "text");
+                  const isBooleanSetting = meta.type === "bool"
+                    || Boolean(meta.options?.includes("true") && meta.options?.includes("false") && meta.options.length === 2);
+                  const isReadOnlySetting = meta.read_only || key === "seasonal_calibration_auto_exit";
+                  return (
+                    <div key={key} className="settings-form-row">
+                      <div className="settings-field-copy">
+                        <label htmlFor={`setting-${key}`} className="settings-form-label">{label}</label>
+                        {description !== label && <span className="settings-form-hint">{description}</span>}
+                      </div>
+
+                      {key === "smartthings_device_ids" ? (
+                        <SmartThingsSensorSelector
+                          value={editValues[key] || ""}
+                          onChange={(next) =>
+                            setEditValues((prev) => ({ ...prev, [key]: next }))
+                          }
+                        />
+                      ) : key === "comfort_reference_sensor_id" ? (
+                        <SmartThingsSensorSelector
+                          value={editValues[key] || ""}
+                          onChange={(next) =>
+                            setEditValues((prev) => ({ ...prev, [key]: next }))
+                          }
+                          single
+                          title="Reference room for comfort"
+                          emptyMessage="No reference — use robust median of selected sensors"
+                        />
+                      ) : meta.options && !isBooleanSetting ? (
+                        <>
+                          <select
+                            id={`setting-${key}`}
+                            disabled={isReadOnlySetting}
+                            value={editValues[key] || ""}
+                            onChange={(e) =>
+                              setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
+                            }
+                            className="form-select"
+                          >
+                            {meta.options.map((opt) => (
+                              <option key={opt} value={opt}>
+                                {key === "optimizer_layer"
+                                  ? (OPTIMIZER_LAYER_OPTIONS[opt]?.label || opt)
+                                  : key === "outdoor_temperature_source"
+                                    ? opt === "weather"
+                                      ? "Weather report (recommended)"
+                                      : "Heat-pump sensor"
+                                    : opt}
+                              </option>
+                            ))}
+                          </select>
+                          {key === "optimizer_layer" && OPTIMIZER_LAYER_OPTIONS[editValues[key]] && (
+                            <span className="settings-form-hint">
+                              {OPTIMIZER_LAYER_OPTIONS[editValues[key]].description}
+                            </span>
+                          )}
+                        </>
+                      ) : isBooleanSetting ? (
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", minHeight: "2.5rem" }}>
+                          <input
+                            id={`setting-${key}`}
+                            type="checkbox"
+                            checked={key !== "seasonal_calibration_auto_exit" && editValues[key] === "true"}
+                            disabled={isReadOnlySetting}
+                            onChange={(e) =>
+                              setEditValues((prev) => ({ ...prev, [key]: e.target.checked ? "true" : "false" }))
+                            }
+                            style={{ width: "1.1rem", height: "1.1rem", accentColor: "var(--primary)" }}
+                          />
+                          <span className="text-muted text-sm">{key === "seasonal_calibration_auto_exit" ? "Always disabled" : editValues[key] === "true" ? "Enabled" : "Disabled"}</span>
+                        </div>
+                      ) : (
+                        <div className="settings-input-wrap">
+                          <input
+                            id={`setting-${key}`}
+                            type={inputType}
+                            disabled={isReadOnlySetting}
+                            value={editValues[key] || ""}
+                            onChange={(e) =>
+                              setEditValues((prev) => ({ ...prev, [key]: e.target.value }))
+                            }
+                            min={rule.min ?? meta.min}
+                            max={rule.max ?? meta.max}
+                            step={rule.step ?? meta.step}
+                            placeholder={meta.description}
+                            className={`form-input ${validationErrors[key] ? "form-input--invalid" : ""}`}
+                            aria-invalid={Boolean(validationErrors[key])}
+                            aria-describedby={validationErrors[key] ? `setting-error-${key}` : undefined}
+                          />
+                          {unit && <span className="settings-input-unit">{unit}</span>}
+                          {validationErrors[key] && <span id={`setting-error-${key}`} className="settings-field-error">{validationErrors[key]}</span>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
           </div>
-          <span className="status-badge online">● Live now</span>
+        ))}
+
+        <section id="release-history" className="plan-section release-history settings-tab-panel" hidden={activeTab !== "system"}>
+          <div className="release-history-header">
+            <div>
+              <h2 className="chart-title">Release History</h2>
+              <p className="release-history-intro">
+                Dashboard version <strong>v{APP_VERSION}</strong> is live in the interface you are viewing.
+              </p>
+            </div>
+            <span className="status-badge online">● Live now</span>
+          </div>
+
+          <dl className="release-runtime" aria-label="Running service versions">
+            <div className="release-runtime-item">
+              <dt>Web dashboard</dt>
+              <dd data-testid="dashboard-version">v{APP_VERSION}</dd>
+              <span>Live build</span>
+            </div>
+            <div className="release-runtime-item">
+              <dt>API service</dt>
+              <dd data-testid="api-version">
+                {apiVersion ? `v${apiVersion}` : apiVersionUnavailable ? "Unavailable" : "Checking..."}
+              </dd>
+              <span className={apiVersion && apiVersion !== APP_VERSION ? "release-version-warning" : undefined}>
+                {apiVersion
+                  ? apiVersion === APP_VERSION
+                    ? "Matches dashboard"
+                    : "Different from dashboard"
+                  : apiVersionUnavailable
+                    ? "Could not verify"
+                    : "Checking running service"}
+              </span>
+            </div>
+            <div className="release-runtime-item">
+              <dt>Forecast API contract</dt>
+              <dd data-testid="api-contract">
+                {apiContract ?? (apiVersionUnavailable ? "Unavailable" : "Checking...")}
+              </dd>
+              <span>
+                {apiContract ? "Unified forecast data" : apiVersionUnavailable ? "Could not verify" : "Checking running service"}
+              </span>
+            </div>
+          </dl>
+
+          <ol className="release-list">
+            {RELEASE_HISTORY.map((release, index) => (
+              <li key={release.version} className="release-list-item">
+                <div className="release-list-heading">
+                  <span className="release-version">v{release.version}</span>
+                  {index === 0 && <span className="release-current">Current</span>}
+                  <span className="release-date">{release.released}</span>
+                </div>
+                <h3>{release.title}</h3>
+                <ul>
+                  {release.changes.map((change) => (
+                    <li key={change}>{change}</li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ol>
+        </section>
+
+        <div id="comfort-schedule" className="settings-tab-panel" hidden={activeTab !== "optimizer"}>
+          <ComfortSchedule />
         </div>
 
-        <dl className="release-runtime" aria-label="Running service versions">
-          <div className="release-runtime-item">
-            <dt>Web dashboard</dt>
-            <dd data-testid="dashboard-version">v{APP_VERSION}</dd>
-            <span>Live build</span>
-          </div>
-          <div className="release-runtime-item">
-            <dt>API service</dt>
-            <dd data-testid="api-version">
-              {apiVersion ? `v${apiVersion}` : apiVersionUnavailable ? "Unavailable" : "Checking..."}
-            </dd>
-            <span className={apiVersion && apiVersion !== APP_VERSION ? "release-version-warning" : undefined}>
-              {apiVersion
-                ? apiVersion === APP_VERSION
-                  ? "Matches dashboard"
-                  : "Different from dashboard"
-                : apiVersionUnavailable
-                  ? "Could not verify"
-                  : "Checking running service"}
-            </span>
-          </div>
-          <div className="release-runtime-item">
-            <dt>Forecast API contract</dt>
-            <dd data-testid="api-contract">
-              {apiContract ?? (apiVersionUnavailable ? "Unavailable" : "Checking...")}
-            </dd>
-            <span>
-              {apiContract ? "Unified forecast data" : apiVersionUnavailable ? "Could not verify" : "Checking running service"}
-            </span>
-          </div>
-        </dl>
+        <div id="test-connection" className="settings-tab-panel" hidden={activeTab !== "system"}>
+          <TestConnection editValues={editValues} />
+        </div>
 
-        <ol className="release-list">
-          {RELEASE_HISTORY.map((release, index) => (
-            <li key={release.version} className="release-list-item">
-              <div className="release-list-heading">
-                <span className="release-version">v{release.version}</span>
-                {index === 0 && <span className="release-current">Current</span>}
-                <span className="release-date">{release.released}</span>
-              </div>
-              <h3>{release.title}</h3>
-              <ul>
-                {release.changes.map((change) => (
-                  <li key={change}>{change}</li>
-                ))}
-              </ul>
-            </li>
-          ))}
-        </ol>
-      </section>
+        <div id="logs" className="settings-tab-panel" hidden={activeTab !== "system"}>
+          <LogViewer />
+        </div>
 
-      <div id="comfort-schedule" className="settings-tab-panel" hidden={activeTab !== "optimizer"}>
-        <ComfortSchedule />
+        <div id="reset-data" className="settings-tab-panel" hidden={activeTab !== "system"}>
+          <ResetDataCard />
+        </div>
       </div>
-
-      <div id="test-connection" className="settings-tab-panel" hidden={activeTab !== "system"}>
-        <TestConnection editValues={editValues} />
-      </div>
-
-      <div id="logs" className="settings-tab-panel" hidden={activeTab !== "system"}>
-        <LogViewer />
-      </div>
-
-      <div id="reset-data" className="settings-tab-panel" hidden={activeTab !== "system"}>
-        <ResetDataCard />
-      </div>
-      </div>
-    </div>
+    </main>
   );
 }

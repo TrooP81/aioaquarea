@@ -2,7 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { useCurrency, formatPricePerKwh, formatCostInCurrency } from "./useCurrency";
-import { LAYER_LABELS, LAYER_TOOLTIPS } from "@/lib/constants";
+import { LAYER_LABELS, LAYER_TOOLTIPS, MODEL_REPORTING_LABELS, gateStateLabel } from "@/lib/constants";
+import type { ModelComponent, ModelReportingState, SpaceHeatingGate } from "@/lib/api-types";
+import { DataAge } from "./DataAge";
+import { useRefresh } from "./RefreshContext";
 
 interface DashboardProps {
   data: {
@@ -36,6 +39,7 @@ interface DashboardProps {
     today_cost_priced_amount: number;
     today_cost_coverage_pct: number;
     today_cost_complete: boolean;
+    space_heating_gate?: SpaceHeatingGate | null;
   } | null;
   indoorTemp: number | null;
   indoorSensorCount: number;
@@ -45,9 +49,7 @@ interface DashboardProps {
 
 interface OptimizerBrief {
   active_layer: string;
-  cop_trained: boolean;
-  demand_trained: boolean;
-  thermal_calibrated: boolean;
+  model_states: Record<ModelComponent, ModelReportingState>;
   planningData: { control_allowed: boolean; reasons: string[] } | null;
 }
 
@@ -92,27 +94,46 @@ function formatPumpState(status: PumpStatus | null | undefined): string {
 }
 
 export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReading, latestReading }: DashboardProps) {
+  const { refreshEpoch } = useRefresh();
   const currency = useCurrency();
   const status = data?.current_status;
   const statusFresh = status != null && data?.current_status_fresh !== false;
   const [optBrief, setOptBrief] = useState<OptimizerBrief | null>(null);
+  const [optimizerLoading, setOptimizerLoading] = useState(true);
+  const [optimizerError, setOptimizerError] = useState<string | null>(null);
+  const [optimizerRetry, setOptimizerRetry] = useState(0);
 
   useEffect(() => {
-    fetch("/api/optimizer/status")
-      .then((r) => (r.ok ? r.json() : null))
+    const controller = new AbortController();
+    setOptimizerLoading(true);
+    setOptimizerError(null);
+    fetch("/api/optimizer/status", { signal: controller.signal })
+      .then((r) => {
+        if (!r.ok) throw new Error(`Optimizer status returned ${r.status}`);
+        return r.json();
+      })
       .then((d) => {
-        if (d) {
+        if (!controller.signal.aborted && d) {
           setOptBrief({
             active_layer: d.active_layer,
-            cop_trained: d.cop_model?.trained ?? false,
-            demand_trained: d.demand_model?.trained ?? false,
-            thermal_calibrated: d.thermal_model?.calibrated ?? false,
+            model_states: {
+              demand: d.model_lifecycle?.demand?.status ?? "unavailable",
+              comfort: d.model_lifecycle?.comfort?.status ?? "unavailable",
+              thermal: d.model_lifecycle?.thermal?.status ?? "unavailable",
+            },
             planningData: d.planning_data_quality ?? null,
           });
         }
       })
-      .catch(() => {});
-  }, []);
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setOptBrief(null);
+          setOptimizerError("Optimizer status could not be loaded.");
+        }
+      })
+      .finally(() => { if (!controller.signal.aborted) setOptimizerLoading(false); });
+    return () => controller.abort();
+  }, [refreshEpoch, optimizerRetry]);
 
   return (
     <>
@@ -124,6 +145,7 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           Heat-pump readings are stale · last device sample {formatRelativeTime(status.ts)}.
         </p>
       )}
+      <DataAge timestamp={status?.ts ?? null} stale={Boolean(status && !statusFresh)} />
       <div className="grid">
         <div className="card">
           <div className="card-header">
@@ -243,6 +265,10 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
           <div className="card-subtitle">
             Space heating: {status?.space_heating_active ? "confirmed active" : "not active"}
           </div>
+          <div className="card-subtitle" data-testid="space-heating-gate">
+            Eligibility gate: {gateStateLabel(data?.space_heating_gate?.state)}
+            {data?.space_heating_gate?.profile_id ? ` · ${data.space_heating_gate.profile_id}` : ""}
+          </div>
           {optBrief?.planningData && !optBrief.planningData.control_allowed && (
             <div className="card-subtitle text-warning text-sm" title={optBrief.planningData.reasons.join(" ")}>
               ⚠ New plans paused until fresh price and weather data is available
@@ -255,7 +281,7 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
             <span className="card-title">Optimizer</span>
           </div>
           <div className="card-value" style={{ fontSize: "1.25rem" }}>
-            {optBrief ? (
+            {optimizerLoading ? "Loading..." : optimizerError ? "Unavailable" : optBrief ? (
               <span
                 title={LAYER_TOOLTIPS[optBrief.active_layer] || optBrief.active_layer}
                 className={`opt-layer-badge ${optBrief.active_layer.includes("ml") ? "opt-layer-badge--ml" : optBrief.active_layer.includes("milp") ? "opt-layer-badge--milp" : ""}`}
@@ -265,13 +291,16 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
             ) : "—"}
           </div>
           <div className="card-subtitle">
-            {optBrief ? (
+            {optimizerError ? (
+              <><p>{optimizerError}</p><button className="btn btn-sm" onClick={() => setOptimizerRetry((value) => value + 1)}>Retry</button></>
+            ) : optBrief ? (
               <span className="ml-status-dots">
-                <span className={`status-dot ${optBrief.cop_trained ? "status-dot--ok" : ""}`} title="COP (efficiency) model" />
-                <span className={`status-dot ${optBrief.demand_trained ? "status-dot--ok" : ""}`} title="Demand (hot-water) model" />
-                <span className={`status-dot ${optBrief.thermal_calibrated ? "status-dot--ok" : ""}`} title="Thermal (heat-up rate) model" />
+                {Object.entries(optBrief.model_states).map(([component, state]) => (
+                  <span key={component} className={`status-dot ${state === "qualified-for-reporting" ? "status-dot--ok" : state === "candidate" ? "status-dot--observing" : ""}`} aria-label={`${component === "demand" ? "Demand heating model" : component === "thermal" ? "Thermal heat-up model" : "Comfort forecast model"} ${MODEL_REPORTING_LABELS[state] ?? "Unavailable"}; reporting only`} title={`${component}: ${MODEL_REPORTING_LABELS[state] ?? "Unavailable"}`} />
+                ))}
                 <span className="ml-status-label">
-                  {[optBrief.cop_trained, optBrief.demand_trained, optBrief.thermal_calibrated].filter(Boolean).length}/3 learning models ready
+                  {Object.values(optBrief.model_states).filter((state) => state === "qualified-for-reporting").length}/3 qualified for reporting
+                  {Object.values(optBrief.model_states).includes("unavailable") && "; some states unavailable"}
                 </span>
               </span>
             ) : "Loading..."}

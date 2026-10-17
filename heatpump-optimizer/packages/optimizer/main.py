@@ -11,35 +11,35 @@ from sqlalchemy import func, select, update
 
 from packages.core.database import get_session
 from packages.core.models import (
-    COPRecord,
-    ConsumptionRecord,
     OptimizationRequestRecord,
     PlanActionRecord,
     PlanRecord,
 )
-from packages.core.plan_lifecycle import activate_plan
-from packages.core.planning_data_quality import get_planning_data_quality
-from packages.core.pricing import get_active_price_context
+from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
+from packages.core.planning_data_quality import (
+    MAX_PRICE_AGE,
+    MAX_WEATHER_ISSUE_AGE,
+    MINIMUM_CONTROL_HOURS,
+    get_planning_data_quality,
+)
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.services import AquareaWrapper
-from packages.core.scheduling import create_scheduler, utc_after
+from packages.core.scheduling import create_scheduler, utc_after, utc_now
 from packages.core.settings_service import get_setting
 from packages.optimizer import InfeasibleError, DataIncompleteError, SolverTimeoutError
-from packages.optimizer.actions import ActionType
 from packages.optimizer.rules import RulesOptimizer
 from packages.optimizer.milp import MILPOptimizer
-from packages.optimizer.executor import PlanExecutor
-from packages.ml.models import COPModel, DemandModel
+from packages.optimizer.executor import PlanExecutor, resolve_learning_mode_state
+from packages.optimizer.executor_core import LearningModeState
+from packages.ml.models import DemandModel
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
 
 logger = structlog.get_logger()
 
-# Minimum data history (days) before trusting ML models in auto mode
-ML_MIN_DATA_DAYS = 14
-
 # Cooldown: skip scheduled optimization if a plan was generated recently
 _OPTIMIZATION_COOLDOWN_S = 300  # 5 minutes
-_last_plan_generated_at: float = 0.0
+_last_plan_generated_at: float | None = None
 _PLAN_STABILITY_WINDOW_HOURS = 6
 _OPTIMIZATION_REQUEST_TIMEOUT = dt.timedelta(minutes=30)
 _ABANDONED_REQUEST_ERROR = (
@@ -49,7 +49,27 @@ _executor_shutdown_tasks: set[asyncio.Task[None]] = set()
 _EXECUTOR_SHUTDOWN_WAIT_S = 10
 
 
-def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, object], ...]]:
+def _validate_unique_restore_keys(restore_actions: list[dict]) -> None:
+    """Reject multiple restores that point at the same safety source key."""
+
+    seen_revert_keys: set[str] = set()
+    for action in restore_actions:
+        reverts_action_key = action["reverts_action_key"]
+        if reverts_action_key in seen_revert_keys:
+            raise ValueError(f"duplicate safety restore key: {reverts_action_key}")
+        seen_revert_keys.add(reverts_action_key)
+
+
+def _action_instant(value: str | dt.datetime) -> dt.datetime:
+    instant = dt.datetime.fromisoformat(value) if isinstance(value, str) else value
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(dt.timezone.utc)
+
+
+def _planned_action_signature(
+    action: dict,
+) -> tuple[str, dt.datetime, tuple[tuple[str, object], ...]]:
     """Compare only device-relevant action fields, not changing explanations."""
     payload = action.get("payload") or {}
     relevant = tuple(
@@ -59,12 +79,12 @@ def _planned_action_signature(action: dict) -> tuple[str, str, tuple[tuple[str, 
             if key in payload
         )
     )
-    return str(action["type"]), str(action["ts"]), relevant
+    return str(action["type"]), _action_instant(action["ts"]), relevant
 
 
 def _stored_action_signature(
     action: PlanActionRecord,
-) -> tuple[str, str, tuple[tuple[str, object], ...]]:
+) -> tuple[str, dt.datetime, tuple[tuple[str, object], ...]]:
     payload = json.loads(action.payload_json) if action.payload_json else {}
     relevant = tuple(
         sorted(
@@ -73,7 +93,7 @@ def _stored_action_signature(
             if key in payload
         )
     )
-    return str(action.action_type), action.scheduled_ts.isoformat(), relevant
+    return str(action.action_type), _action_instant(action.scheduled_ts), relevant
 
 
 async def _has_material_near_term_change(session, plan: dict) -> tuple[bool, int | None]:
@@ -118,27 +138,172 @@ async def _has_material_near_term_change(session, plan: dict) -> tuple[bool, int
     )
 
 
+_PRICE_SOURCES = frozenset({"entsoe", "tibber", "manual"})
+_WEATHER_SOURCES = frozenset({"open-meteo", "smhi", "manual"})
+_ADMISSIBLE_DIAGNOSTIC_STATUS = "conditional_feasible"
+
+
+class _PlanAdmissionRefused(ValueError):
+    """Stable refusal reason; never carries the rejected payload."""
+
+
+def _strict_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _PlanAdmissionRefused("invalid_integer_field")
+    return value
+
+
+def _strict_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise _PlanAdmissionRefused("invalid_boolean_field")
+    return value
+
+
+def _aware_instant(value: object) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        instant = value
+    elif isinstance(value, str):
+        try:
+            instant = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise _PlanAdmissionRefused("malformed_clock") from exc
+    else:
+        raise _PlanAdmissionRefused("malformed_clock")
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise _PlanAdmissionRefused("naive_clock")
+    return instant.astimezone(dt.timezone.utc)
+
+
+def _frozen_clock(value: object) -> dt.datetime:
+    """Frozen producer provenance carries ISO strings; plan horizon clocks may be datetimes."""
+    if not isinstance(value, str):
+        raise _PlanAdmissionRefused("malformed_clock")
+    return _aware_instant(value)
+
+
+def _section(quality: dict, key: str) -> dict:
+    value = quality.get(key)
+    if not isinstance(value, dict):
+        raise _PlanAdmissionRefused(f"missing_{key}_provenance")
+    return value
+
+
+def _feed_admission(
+    feed: dict, *, clock_key: str, captured_at: dt.datetime, maximum: dt.timedelta, horizon: int
+) -> int:
+    contiguous = _strict_int(feed.get("contiguous_hours"))
+    if not 0 <= contiguous <= horizon:
+        raise _PlanAdmissionRefused("inconsistent_feed_hours")
+    if _strict_bool(feed.get("complete_horizon")) is not (contiguous >= horizon):
+        raise _PlanAdmissionRefused("inconsistent_feed_completeness")
+    if feed.get("fresh") is not True:
+        raise _PlanAdmissionRefused("feed_not_fresh")
+    clock = _frozen_clock(feed.get(clock_key))
+    elapsed = captured_at - clock
+    if not dt.timedelta(0) <= elapsed <= maximum:
+        raise _PlanAdmissionRefused("feed_clock_out_of_bounds")
+    if _strict_int(feed.get("age_seconds")) != round(elapsed.total_seconds()):
+        raise _PlanAdmissionRefused("inconsistent_feed_age")
+    return contiguous
+
+
+def _validated_planning_quality(plan: object, *, now: dt.datetime) -> dict:
+    """Admit only a ready frozen-batch result whose returned provenance is self-consistent."""
+    if not isinstance(plan, dict):
+        raise _PlanAdmissionRefused("plan_not_mapping")
+    quality = plan.get("planning_data_quality")
+    if not isinstance(quality, dict):
+        raise _PlanAdmissionRefused("missing_planning_data_quality")
+    if quality.get("control_allowed") is not True:
+        raise _PlanAdmissionRefused("control_not_allowed")
+    if quality.get("status") != "ready" or quality.get("reasons") != []:
+        raise _PlanAdmissionRefused("planning_quality_not_ready")
+    status = plan.get("diagnostic_status")
+    if not isinstance(status, str) or status != _ADMISSIBLE_DIAGNOSTIC_STATUS:
+        raise _PlanAdmissionRefused("diagnostic_status_not_admissible")
+
+    captured_at = _frozen_clock(quality.get("captured_at"))
+    if captured_at > now:
+        raise _PlanAdmissionRefused("capture_after_admission")
+    horizon_start = _frozen_clock(quality.get("horizon_start"))
+    if horizon_start != horizon_start.replace(minute=0, second=0, microsecond=0):
+        raise _PlanAdmissionRefused("horizon_start_not_hour_boundary")
+    horizon = _strict_int(quality.get("horizon_hours"))
+    minimum = _strict_int(quality.get("minimum_control_hours"))
+    effective = _strict_int(quality.get("effective_horizon_hours"))
+    if horizon <= 0 or minimum != MINIMUM_CONTROL_HOURS or not minimum <= effective <= horizon:
+        raise _PlanAdmissionRefused("inconsistent_horizon_hours")
+
+    price = _section(quality, "price")
+    weather = _section(quality, "weather")
+    area, source, currency = price.get("area"), price.get("source"), price.get("currency")
+    if not isinstance(source, str) or source not in _PRICE_SOURCES:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if not isinstance(area, str) or not area.strip():
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if source in {"tibber", "manual"} and area != source:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    if not isinstance(currency, str) or len(currency) != 3:
+        raise _PlanAdmissionRefused("invalid_price_context")
+    weather_source = weather.get("source")
+    if not isinstance(weather_source, str) or weather_source not in _WEATHER_SOURCES:
+        raise _PlanAdmissionRefused("invalid_weather_source")
+    price_hours = _feed_admission(
+        price,
+        clock_key="latest_fetched_at",
+        captured_at=captured_at,
+        maximum=MAX_PRICE_AGE,
+        horizon=horizon,
+    )
+    weather_hours = _feed_admission(
+        weather,
+        clock_key="latest_issued_at",
+        captured_at=captured_at,
+        maximum=MAX_WEATHER_ISSUE_AGE,
+        horizon=horizon,
+    )
+    if effective != min(price_hours, weather_hours):
+        raise _PlanAdmissionRefused("inconsistent_effective_horizon")
+    limited = price_hours < horizon
+    if _strict_bool(quality.get("price_horizon_limited")) is not limited:
+        raise _PlanAdmissionRefused("inconsistent_price_limitation")
+    if _strict_bool(quality.get("reoptimization_when_prices_extend")) is not limited:
+        raise _PlanAdmissionRefused("inconsistent_price_limitation")
+    # The producer always emits this key: 900 when price-limited, otherwise null.
+    if "next_publication_check_seconds" not in price:
+        raise _PlanAdmissionRefused("inconsistent_publication_check")
+    publication_check = price["next_publication_check_seconds"]
+    if limited:
+        if _strict_int(publication_check) != 900:
+            raise _PlanAdmissionRefused("inconsistent_publication_check")
+    elif publication_check is not None:
+        raise _PlanAdmissionRefused("inconsistent_publication_check")
+
+    if _aware_instant(plan.get("horizon_start")) != horizon_start:
+        raise _PlanAdmissionRefused("plan_horizon_mismatch")
+    if _aware_instant(plan.get("horizon_end")) != horizon_start + dt.timedelta(hours=effective):
+        raise _PlanAdmissionRefused("plan_horizon_mismatch")
+    return quality
+
+
 _optimization_lock = asyncio.Lock()
 
-# Global ML model instances (loaded once, reused across optimization cycles)
-_cop_model = COPModel()
 _demand_model = DemandModel()
 
 
 def _new_rules_optimizer() -> RulesOptimizer:
-    """Build rules with the loaded DHW-specific COP model, when available."""
-    return RulesOptimizer(cop_model=_cop_model if _cop_model.is_trained else None)
+    """Build rules using planning assumptions, never a COP estimator."""
+    return RulesOptimizer()
 
 
 def _load_ml_models() -> None:
-    """Load the latest ML model checkpoints from disk."""
-    _cop_model.load_latest()
+    """Load only retained model checkpoints from disk."""
     _demand_model.load_latest()
     comfort_model.load_latest()
     thermal_model.load_latest()
     logger.info(
         "ml_models_loaded",
-        cop_trained=_cop_model.is_trained,
+        cop_trained=False,
         demand_trained=_demand_model.is_trained,
         comfort_trained=comfort_model.is_trained,
         thermal_calibrated=thermal_model.params.last_calibrated is not None,
@@ -148,7 +313,7 @@ def _load_ml_models() -> None:
 def _selected_layer_version(layer_name: str) -> str:
     """Map an optimizer selection to the user-facing layer version string."""
     if layer_name == "milp":
-        if _cop_model.is_trained or _demand_model.is_trained:
+        if _demand_model.is_trained:
             return f"{MILPOptimizer.VERSION}+ml"
         return MILPOptimizer.VERSION
     return RulesOptimizer.VERSION
@@ -157,8 +322,33 @@ def _selected_layer_version(layer_name: str) -> str:
 async def get_optimizer_status_snapshot(
     layer: str,
     reload_models: bool = False,
+    *,
+    reporting_inputs: dict | None = None,
 ) -> dict[str, object]:
     """Return the selected layer and loaded model state for the given configuration."""
+    if reporting_inputs is not None:
+        layer_name = "milp" if layer == "milp_preferred" else "rules"
+        demand_trained = bool(reporting_inputs.get("demand_trained"))
+        return {
+            "active_layer": f"{MILPOptimizer.VERSION}+ml"
+            if layer_name == "milp" and demand_trained
+            else MILPOptimizer.VERSION
+            if layer_name == "milp"
+            else RulesOptimizer.VERSION,
+            "ordinary_writes_allowed": False,
+            "control_ready": False,
+            "build_policy": "observe_only",
+            "configured_layer": layer,
+            "effective_layer": layer_name,
+            "selection_reason": "auto_milp_disabled_cop_retired"
+            if layer == "auto"
+            else "configured_layer",
+            "cop_trained": False,
+            "cop_source": "assumed",
+            "cop_measured": False,
+            "demand_trained": demand_trained,
+            "planning_data_quality": reporting_inputs.get("planning_data_quality"),
+        }
     layer_name, _ = await _select_optimizer(layer, reload_models=reload_models)
     try:
         planning_data_quality = await get_planning_data_quality()
@@ -171,7 +361,17 @@ async def get_optimizer_status_snapshot(
         }
     return {
         "active_layer": _selected_layer_version(layer_name),
-        "cop_trained": _cop_model.is_trained,
+        "ordinary_writes_allowed": False,
+        "control_ready": False,
+        "build_policy": "observe_only",
+        "configured_layer": layer,
+        "effective_layer": layer_name,
+        "selection_reason": (
+            "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer"
+        ),
+        "cop_trained": False,
+        "cop_source": "assumed",
+        "cop_measured": False,
         "demand_trained": _demand_model.is_trained,
         "planning_data_quality": planning_data_quality,
     }
@@ -185,77 +385,37 @@ async def _select_optimizer(
     if reload_models:
         _load_ml_models()
 
-    if layer == "rules_only":
-        return "rules", _new_rules_optimizer()
-
-    # milp_preferred or auto: build MILP with ML models if available
-    milp = MILPOptimizer(
-        cop_model=_cop_model if _cop_model.is_trained else None,
-        demand_model=_demand_model if _demand_model.is_trained else None,
-    )
-
     if layer == "milp_preferred":
-        return "milp", milp
+        return "milp", MILPOptimizer(
+            demand_model=_demand_model if _demand_model.is_trained else None,
+        )
 
-    # auto: use MILP only when ML models are trained AND have enough data history
-    if _cop_model.is_trained and _demand_model.is_trained:
-        if await _has_sufficient_ml_data():
-            return "milp", milp
-        else:
-            logger.info(
-                "auto_mode_insufficient_data",
-                required_days=ML_MIN_DATA_DAYS,
-                reason="ML models trained but less than 14 days of data history",
-            )
-
+    if layer == "auto":
+        logger.info(
+            "auto_milp_disabled_cop_retired",
+            configured_layer=layer,
+            effective_layer="rules",
+            cop_source="assumed",
+        )
     return "rules", _new_rules_optimizer()
 
 
-async def _has_sufficient_ml_data() -> bool:
-    """Check that we have at least ML_MIN_DATA_DAYS of COP and consumption history."""
-    from sqlalchemy import func, select
-
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=ML_MIN_DATA_DAYS)
-
-    try:
-        async with get_session() as session:
-            cop_result = await session.execute(
-                select(func.count()).select_from(COPRecord).where(COPRecord.ts >= cutoff)
-            )
-            cop_count = cop_result.scalar() or 0
-
-            cons_result = await session.execute(
-                select(func.count())
-                .select_from(ConsumptionRecord)
-                .where(ConsumptionRecord.ts >= cutoff)
-            )
-            cons_count = cons_result.scalar() or 0
-
-        # Require at least some records spanning the period
-        # 14 days × ~4 COP intervals/day = ~56; ~4 consumption records/day = ~56
-        return cop_count >= 50 and cons_count >= 50
-    except Exception as exc:
-        logger.warning("ml_data_check_failed", error=str(exc))
-        return False
-
-
 async def run_optimization(*, scheduled: bool = False, force_replace: bool = False) -> int | None:
-    """Run the optimizer and store the plan, with layer selection and fallback.
+    """Store a non-executable diagnostic with layer selection and fallback.
 
     Args:
         scheduled: True when called by the hourly scheduler.  If a plan was
             generated recently (within _OPTIMIZATION_COOLDOWN_S), the
             scheduled run is skipped so a manual "Optimize Now" plan isn't
             immediately overwritten.
-        force_replace: True for an explicit manual replan. This bypasses only
-            the near-term plan-stability comparison, so a user-requested
-            safety correction can replace later pending actions as well.
+        force_replace: Retained for request compatibility; diagnostics never
+            reuse, activate, or replace executable plans in this build.
     """
     import time as _time
 
     global _last_plan_generated_at
 
-    if scheduled:
+    if scheduled and _last_plan_generated_at is not None:
         elapsed = _time.monotonic() - _last_plan_generated_at
         if elapsed < _OPTIMIZATION_COOLDOWN_S:
             logger.info(
@@ -266,45 +426,46 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             )
             return None
 
-    # The scheduler and a queued manual request share a process.  Serialising
-    # the complete solve avoids two plans being calculated from the same state;
-    # activate_plan then provides the database-level guard across processes.
+    # Serialize scheduled and queued diagnostic generation within this process.
     async with _optimization_lock:
+        if (
+            scheduled
+            and _last_plan_generated_at is not None
+            and _time.monotonic() - _last_plan_generated_at < _OPTIMIZATION_COOLDOWN_S
+        ):
+            return None
+        try:
+            learning_mode_state = await resolve_learning_mode_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - planner admission must fail closed
+            logger.error(
+                "optimization_learning_mode_check_failed",
+                error_type=type(exc).__name__,
+            )
+            learning_mode_state = LearningModeState.UNKNOWN
+        if learning_mode_state is LearningModeState.UNKNOWN:
+            logger.info("optimization_skipped_learning_state_unknown")
+            # Comfort-model refresh is deferred along with planning during UNKNOWN.
+            return None
         try:
             layer = await get_setting("optimizer_layer") or "rules_only"
+            await _demand_model.arefresh_committed()
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
-
-            # Rules are deliberately kept available as the conservative
-            # fallback.  The richer ML/MILP plan needs a complete, fresh
-            # forecast and price horizon; without it, rules can still make a
-            # safe schedule from their own defensive data checks.
-            if layer_name == "milp":
-                try:
-                    input_quality = await get_planning_data_quality()
-                except Exception as exc:  # noqa: BLE001 - plan generation has its own data checks
-                    logger.warning("planning_data_quality_unavailable", error=str(exc))
-                    input_quality = {
-                        "control_allowed": True,
-                        "status": "unavailable",
-                        "reasons": ["Planning input quality could not be checked."],
-                        "price": {},
-                        "weather": {},
-                    }
-            else:
-                input_quality = {
-                    "control_allowed": True,
-                    "status": "rules_not_gated",
-                    "reasons": [],
-                    "price": {},
-                    "weather": {},
-                }
-
-            if layer_name == "milp" and not input_quality["control_allowed"]:
+            await comfort_model.arefresh_if_changed()
+            try:
+                device_quality = await get_device_data_quality()
+            except Exception as exc:  # noqa: BLE001 - readiness failures must block control
+                logger.error(
+                    "optimization_paused_device_data_quality_check_failed",
+                    reason="quality_check_failed",
+                    error_type=type(exc).__name__,
+                )
+                return None
+            if not device_quality["ready"]:
                 logger.warning(
-                    "optimization_paused_degraded_input_data",
-                    reasons=input_quality["reasons"],
-                    price=input_quality["price"],
-                    weather=input_quality["weather"],
+                    "optimization_paused_device_data_quality",
+                    reasons=device_quality["reasons"],
                 )
                 return None
 
@@ -321,6 +482,13 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                         detail=str(exc),
                     )
                     plan = await _new_rules_optimizer().generate_plan()
+                    if plan is not None:
+                        plan["fallback_diagnostics"] = {
+                            "milp_status": "conditional_infeasible"
+                            if isinstance(exc, InfeasibleError)
+                            else "unproven",
+                            "reason": type(exc).__name__,
+                        }
                 except Exception as exc:
                     logger.error(
                         "milp_unexpected_error_fallback",
@@ -334,14 +502,44 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 logger.info("optimizer_no_plan", reason="insufficient data")
                 return None
 
-            # The active context opens its own short-lived read session. Fetch
-            # it before the lifecycle transaction so no nested DB session is
-            # held while a plan is being activated.
-            price_context = await get_active_price_context()
+            from packages.optimizer.represented_strategy import validate_represented_plan
+
+            try:
+                validate_represented_plan(plan)
+            except (DataIncompleteError, InfeasibleError) as refusal:
+                logger.info(
+                    "optimizer_no_plan", reason="unproven_serialized_strategy", refusal=str(refusal)
+                )
+                return None
+
+            from packages.core.pricing import PriceContext
+
             generated_at = dt.datetime.now(dt.timezone.utc)
+            try:
+                input_quality = _validated_planning_quality(plan, now=generated_at)
+            except _PlanAdmissionRefused as refusal:
+                logger.info(
+                    "optimizer_no_plan",
+                    reason="unvalidated_frozen_input_batch",
+                    refusal=str(refusal),
+                )
+                return None
+            price_input = input_quality["price"]
+            price_context = PriceContext(
+                area=price_input["area"],
+                source=price_input["source"],
+                currency=price_input["currency"],
+            )
             provenance = {
                 "schema_version": 1,
                 "generated_at": generated_at.isoformat(),
+                "optimizer": {
+                    "configured_layer": layer,
+                    "selection_reason": (
+                        "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer"
+                    ),
+                },
+                "heating_efficiency": {"source": "assumed", "measured": False},
                 "price": {
                     "area": price_context.area,
                     "source": price_context.source,
@@ -349,11 +547,11 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 },
                 "input_quality": input_quality,
                 "models": {
-                    "cop_trained": _cop_model.is_trained,
+                    "cop_trained": False,
                     "demand_trained": _demand_model.is_trained,
                     "comfort": {
                         "trained": comfort_model.is_trained,
-                        "control_readiness": comfort_model.control_readiness,
+                        "control_readiness": {"ready": False, "reason": "observe_only_build"},
                         "metrics": comfort_model.metrics,
                     },
                     "thermal": {
@@ -366,6 +564,8 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     },
                 },
             }
+            plan["cop_source"] = "assumed"
+            plan["cop_measured"] = False
             plan["input_provenance"] = provenance
             snapshot = plan.get("forecast_snapshot")
             if isinstance(snapshot, dict):
@@ -383,19 +583,19 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 provenance["price_risk"] = price_risk_summary(
                     snapshot.get("price_forecast", []), input_quality
                 )
+            plan["actions"] = []
+            plan["diagnostic"] = True
+            trace = plan.get("represented_strategy")
+            if isinstance(trace, dict):
+                trace["price_currency"] = price_context.currency
+            replay = plan.get("serialized_replay")
+            if isinstance(replay, dict):
+                replay["price_currency"] = price_context.currency
+            accounting = plan.get("cost_accounting")
+            if isinstance(accounting, dict):
+                accounting["price_currency"] = price_context.currency
+            provenance["execution_policy"] = "observe_only_build"
             async with get_session() as session:
-                if not force_replace:
-                    is_material, existing_plan_id = await _has_material_near_term_change(
-                        session, plan
-                    )
-                    if not is_material and existing_plan_id is not None:
-                        logger.info(
-                            "plan_reuse_no_material_near_term_change",
-                            plan_id=existing_plan_id,
-                            horizon_hours=_PLAN_STABILITY_WINDOW_HOURS,
-                        )
-                        return existing_plan_id
-
                 plan_record = PlanRecord(
                     horizon_start=plan["horizon_start"],
                     horizon_end=plan["horizon_end"],
@@ -409,21 +609,11 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     price_currency=price_context.currency,
                     price_source=price_context.source,
                     input_provenance_json=json.dumps(provenance, default=str),
-                    status="active",
+                    status=DIAGNOSTIC_PLAN_STATUS,
+                    status_reason="observe_only_build",
                 )
-                await activate_plan(session, plan_record)
-
-                for action in plan["actions"]:
-                    action_record = PlanActionRecord(
-                        plan_id=plan_record.id,
-                        scheduled_ts=dt.datetime.fromisoformat(action["ts"]),
-                        action_type=str(ActionType(action["type"])),
-                        payload_json=json.dumps(action.get("payload", {})),
-                        status="pending",
-                    )
-                    add_result = session.add(action_record)
-                    if asyncio.iscoroutine(add_result):
-                        await add_result
+                session.add(plan_record)
+                await session.flush()
 
             _last_plan_generated_at = _time.monotonic()
 
@@ -505,7 +695,7 @@ async def process_pending_optimization_requests() -> None:
         request.plan_id = plan_id
         if plan_id is None:
             request.status = "failed"
-            request.error = "No executable plan could be generated; check data availability."
+            request.error = "No diagnostic plan could be generated; check data availability."
         else:
             request.status = "completed"
             request.error = None
@@ -519,10 +709,35 @@ async def execute_pending_actions(wrapper: AquareaWrapper) -> None:
 
     executor = PlanExecutor(wrapper)
     try:
-        # Never "catch up" a command that belongs to an already-passed price
-        # interval. Expire it before claiming newly due actions instead.
-        await executor.expire_stale_actions()
-        await executor.execute_due_actions()
+        from packages.core.service_health import record_safety_watchdog_result
+        from packages.optimizer.shower_mode import reconcile_shower_expiry
+
+        try:
+            await reconcile_shower_expiry()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - later cycle steps remain independent
+            logger.exception("executor_step_failed", step="reconcile_shower_expiry", error=str(exc))
+            try:
+                await record_safety_watchdog_result(success=False, reason=type(exc).__name__)
+            except Exception as health_exc:  # noqa: BLE001
+                logger.exception("safety_watchdog_health_write_failed", error=str(health_exc))
+        else:
+            try:
+                await record_safety_watchdog_result(success=True)
+            except Exception as health_exc:  # noqa: BLE001
+                logger.exception("safety_watchdog_health_write_failed", error=str(health_exc))
+
+        for step_name, step in (
+            ("expire_stale_actions", executor.expire_stale_actions),
+            ("execute_due_actions", executor.execute_due_actions),
+        ):
+            try:
+                await step()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - each cycle phase is isolated
+                logger.exception("executor_step_failed", step=step_name, error=str(exc))
     finally:
         if current is not None:
             _executor_shutdown_tasks.discard(current)
@@ -565,14 +780,17 @@ async def _shutdown_runtime(scheduler, wrapper: AquareaWrapper) -> None:
                     pending=len(still_pending),
                     timeout_seconds=_EXECUTOR_SHUTDOWN_WAIT_S,
                 )
+                raise RuntimeError("executor ownership unsettled; wrapper disposal forbidden")
 
-            for task in pending:
+            for task in done:
                 _executor_shutdown_tasks.discard(task)
-    finally:
+    except BaseException:
+        raise
+    else:
         await wrapper.stop()
 
 
-async def main() -> None:
+async def _run_service(wrapper, scheduler) -> None:
     """Main entry point for the optimizer service."""
     from packages.core.logging import configure_logging
     from packages.core.service_health import record_service_heartbeat
@@ -580,22 +798,43 @@ async def main() -> None:
     configure_logging("optimizer")
 
     logger.info("optimizer_starting")
+    logger.info(
+        "cop_retired",
+        reason="unverified_thermal_output",
+        cop_source="assumed",
+        cop_measured=False,
+    )
 
     # Load ML model checkpoints so MILP can use them
     _load_ml_models()
 
-    # The comfort model's causal feature schema is versioned separately from
-    # COP and demand. Train it once after a schema upgrade instead of running
-    # an older, leaky checkpoint or waiting for a manual request.
-    if not comfort_model.is_trained:
-        logger.info("comfort_model_initial_training_needed")
-        comfort_result = await comfort_model.train()
-        logger.info("comfort_model_initial_training_finished", **comfort_result)
+    from packages.ml.lifecycle import enqueue_maintenance_request
 
-    wrapper = AquareaWrapper()
+    try:
+        device_quality = await get_device_data_quality()
+    except Exception as exc:  # noqa: BLE001 - training requires verified device readiness
+        logger.error(
+            "comfort_model_initial_training_quality_check_failed",
+            reason="quality_check_failed",
+            error_type=type(exc).__name__,
+        )
+    else:
+        if not device_quality["ready"]:
+            logger.warning(
+                "comfort_model_initial_training_paused", reasons=device_quality["reasons"]
+            )
+        elif not comfort_model.is_trained:
+            logger.info("comfort_model_initial_training_needed")
+            comfort_result = await enqueue_maintenance_request(
+                "comfort",
+                "optimizer_startup",
+                automatic=True,
+                dedup_key="startup:" + utc_now().strftime("%Y-%m-%dT%H"),
+            )
+            logger.info("comfort_model_initial_maintenance_requested", request=comfort_result)
+
     await wrapper.start()
 
-    scheduler = create_scheduler()
     await record_service_heartbeat("optimizer")
 
     async def _scheduled_optimization():
@@ -659,9 +898,24 @@ async def main() -> None:
         await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
+
+
+async def main() -> None:
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+
+    wrapper, scheduler = None, None
+    try:
+        wrapper = AquareaWrapper()
+        scheduler = create_scheduler()
+        await _run_service(wrapper, scheduler)
     finally:
-        await _shutdown_runtime(scheduler, wrapper)
-        logger.info("optimizer_stopped")
+
+        async def cleanup():
+            from packages.core.database import engine
+
+            await close_service_resources(scheduler=scheduler, wrapper=wrapper, engine=engine)
+
+        await finish_owned_cleanup(cleanup)
 
 
 if __name__ == "__main__":

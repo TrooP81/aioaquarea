@@ -46,7 +46,7 @@ interface DeviceSettings {
 const GROUPS: { title: string; keys: string[] }[] = [
   {
     title: "Optimizer",
-    keys: ["optimizer_layer", "price_provider", "weather_provider"],
+    keys: ["optimizer_layer", "price_provider", "weather_provider", "space_heating_baseline_mode", "space_heating_default_fraction"],
   },
   {
     title: "Temperature Limits",
@@ -78,6 +78,8 @@ const DISPLAY_LABELS: Record<string, string> = {
   optimizer_layer: "Optimizer mode",
   price_provider: "Price source",
   weather_provider: "Weather source",
+  space_heating_baseline_mode: "Heating baseline mode",
+  space_heating_default_fraction: "Heating fallback duty",
   tank_min_temp: "Tank min",
   tank_max_temp: "Tank max",
   comfort_temp_min: "Comfort min",

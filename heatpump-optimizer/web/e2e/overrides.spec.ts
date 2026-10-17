@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 const mockDashboard = {
   current_status: {
@@ -68,23 +68,22 @@ test.describe("Override Controls", () => {
         body: JSON.stringify({ ...mockDashboard, has_override: true }),
       })
     );
+    await page.route("**/api/control-state", (route) => route.fulfill({ status: 503 }));
 
     await page.goto("/");
-    await expect(page.locator(".override-banner")).toContainText(
-      "override active"
-    );
+    await expect(page.locator(".banner")).toContainText("Control state unavailable");
   });
 
   test("no override banner when inactive", async ({ page }) => {
     await page.goto("/");
     // The error/override banner should not be visible
-    const banners = page.locator(".override-banner");
+    const banners = page.locator(".banner--danger");
     await expect(banners).toHaveCount(0);
   });
 
   test("controls section is visible", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("tab", { name: "Controls" }).click();
+    await page.getByRole("tab", { name: "Home" }).click();
     // Controls component should render
     await expect(page.locator("text=Controls")).toBeVisible({ timeout: 5000 }).catch(() => {
       // Controls might use different heading text — just verify the page loaded
@@ -134,4 +133,152 @@ test.describe("Override Creation Flow", () => {
     // Page should load without override
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
   });
+});
+
+for (const state of ["paused_by_user", "observing", "holding"] as const) {
+  test(`state-specific copy does not claim automatic dispatch while ${state}`, async ({ page }) => {
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockDashboard) })
+    );
+    await page.route("**/api/control-state", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          state,
+          headline: state === "paused_by_user" ? "Automatic control is paused" : state === "observing" ? "Observation mode is active" : "Automatic control is holding",
+          detail: state === "paused_by_user" ? "Ordinary scheduled actions are skipped; safety reverts may still run." : state === "observing" ? "No actions are dispatched, including safety reverts." : "Ordinary affected actions are held or deferred; safety reverts may still run.",
+          reason_code: state,
+          since: null,
+          until: state === "paused_by_user" ? new Date(Date.now() + 3_600_000).toISOString() : null,
+          override_id: state === "paused_by_user" ? 55 : null,
+          active_override_count: state === "paused_by_user" ? 1 : 0,
+          primary_action: null,
+          notices: [],
+          resolved_at: new Date().toISOString(),
+        }),
+      })
+    );
+
+    const controlResponse = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === "/api/control-state"
+    );
+    await page.goto("/");
+    await expect((await controlResponse).status()).toBe(200);
+
+    await expect(page.locator(".decision-summary")).not.toContainText(/following the current plan|Automatic dispatch remains active/);
+  });
+}
+
+test("control-state fetch failure is presented as unavailable rather than automatic", async ({ page }) => {
+  await page.route("**/api/dashboard", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockDashboard) })
+  );
+  await page.route("**/api/control-state", (route) => route.fulfill({ status: 503 }));
+
+  await page.goto("/");
+
+  await expect(page.locator(".banner--warning")).toContainText("Control state unavailable");
+  await expect(page.locator(".decision-summary")).not.toContainText("System is following the current plan");
+});
+
+test("clear override rejects a non-override endpoint", async ({ page }) => {
+  let unexpectedRequest = false;
+  await page.route("**/api/dashboard", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockDashboard) })
+  );
+  await page.route("**/api/control-state", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        state: "paused_by_user",
+        headline: "Automatic control is paused",
+        detail: "Ordinary scheduled actions are skipped; safety reverts may still run.",
+        reason_code: "active_override",
+        since: null,
+        until: new Date(Date.now() + 3_600_000).toISOString(),
+        override_id: 55,
+        active_override_count: 1,
+        primary_action: { kind: "request", label: "Clear override", endpoint: "/api/not-overrides/55", method: "DELETE" },
+        notices: [],
+        resolved_at: new Date().toISOString(),
+      }),
+    })
+  );
+  await page.route("**/api/not-overrides/55", (route) => {
+    unexpectedRequest = true;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "unexpected" }) });
+  });
+
+  await page.goto("/");
+  const resume = page.getByRole("button", { name: "Clear override" });
+  await expect(resume).toBeVisible();
+  await resume.click();
+  expect(unexpectedRequest).toBe(false);
+  await expect(resume).toBeVisible();
+});
+
+for (const [description, payload] of [
+  ["empty object", {}],
+  ["invalid field types", { state: "automatic", headline: 4, notices: "invalid" }],
+] as const) {
+  test(`malformed control-state payload (${description}) is presented as unavailable`, async ({ page }) => {
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockDashboard) })
+    );
+    await page.route("**/api/control-state", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(payload) })
+    );
+
+    await page.goto("/");
+
+    await expect(page.locator(".banner--warning")).toContainText("Control state unavailable");
+    await expect(page.locator(".decision-summary")).not.toContainText("System is following the current plan");
+  });
+}
+
+test("pause flow previews the end time and clears the override with DELETE then refetch", async ({ page }) => {
+  let paused = false;
+  await page.route("**/api/dashboard", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ...mockDashboard, has_override: paused, override_id: paused ? 55 : null }),
+    })
+  );
+  await page.route("**/api/control-state", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(paused
+        ? { state: "paused_by_user", headline: "User override is active", detail: "Ordinary writes remain prohibited in this build.", reason_code: "active_override", since: new Date().toISOString(), until: new Date(Date.now() + 7_200_000).toISOString(), override_id: 55, active_override_count: 1, primary_action: { kind: "request", label: "Clear override", endpoint: "/api/overrides/55", method: "DELETE" }, notices: [], resolved_at: new Date().toISOString() }
+        : { state: "observing", headline: "Observe-only build", detail: "Ordinary writes remain prohibited in this build.", reason_code: "observe_only_build", since: null, until: null, override_id: null, active_override_count: 0, primary_action: null, notices: [], resolved_at: new Date().toISOString() }),
+    })
+  );
+  await page.route("**/api/overrides", (route) => {
+    if (route.request().method() === "POST") {
+      paused = true;
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "created" }) });
+    }
+    return route.continue();
+  });
+  await page.route("**/api/overrides/55", (route) => {
+    if (route.request().method() === "DELETE") {
+      paused = false;
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "deleted" }) });
+    }
+    return route.continue();
+  });
+
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Home" }).click();
+  await page.getByRole("button", { name: "Pause Optimizer" }).click();
+  await expect(page.locator(".banner").filter({ hasText: /Pause for 2 hours, ending at/ })).toBeVisible();
+  await page.getByRole("button", { name: "Confirm pause" }).click();
+
+  const resume = page.getByRole("button", { name: "Clear override" });
+  await expect(resume).toBeVisible();
+  await resume.click();
+  await expect(resume).toHaveCount(0);
 });

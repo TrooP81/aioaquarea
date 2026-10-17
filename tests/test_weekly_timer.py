@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from aioaquarea.errors import RequestFailedError
 from aioaquarea.weekly_timer import DayOfWeek
 from aioaquarea.weekly_timer_manager import WeeklyTimerManager
 
@@ -32,6 +33,17 @@ async def test_weekly_timer_read_uses_transfer_api_without_write_method() -> Non
         throw_on_error=True,
     )
     assert not hasattr(manager, "set_weekly_timer")
+
+
+@pytest.mark.asyncio
+async def test_weekly_timer_returns_none_for_non_json_error_response() -> None:
+    response = SimpleNamespace(status=500, reason="Internal Error")
+    api_client = SimpleNamespace(
+        request=AsyncMock(side_effect=RequestFailedError(response))
+    )
+    manager = WeeklyTimerManager(api_client)
+
+    assert await manager.get_weekly_timer("device-1") is None
 
 
 def test_weekly_timer_parser_skips_invalid_slots() -> None:

@@ -4,6 +4,7 @@ import datetime as dt
 import logging
 from typing import TYPE_CHECKING
 
+from .errors import RequestFailedError
 from .weekly_timer import DayOfWeek, WeeklyTimerSettings, WeeklyTimerSlot
 
 if TYPE_CHECKING:
@@ -19,16 +20,20 @@ class WeeklyTimerManager:
         self._api_client = api_client
 
     async def get_weekly_timer(self, device_id: str) -> WeeklyTimerSettings | None:
-        response = await self._api_client.request(
-            "POST",
-            "remote/v1/app/common/transfer",
-            json={
-                "apiName": "/remote/v1/api/weeklytimer",
-                "requestMethod": "GET",
-                "bodyParam": {"gwid": device_id},
-            },
-            throw_on_error=True,
-        )
+        try:
+            response = await self._api_client.request(
+                "POST",
+                "remote/v1/app/common/transfer",
+                json={
+                    "apiName": "/remote/v1/api/weeklytimer",
+                    "requestMethod": "GET",
+                    "bodyParam": {"gwid": device_id},
+                },
+                throw_on_error=True,
+            )
+        except RequestFailedError:
+            _LOGGER.warning("Panasonic weekly timer request failed")
+            return None
         if response.content_type != "application/json":
             _LOGGER.warning("Panasonic weekly timer returned a non-JSON response")
             return None
@@ -49,7 +54,9 @@ class WeeklyTimerManager:
             slot = cls._parse_slot(entry)
             if slot is not None:
                 slots.append(slot)
-        return WeeklyTimerSettings(enabled=data.get("enabled") is True, slots=tuple(slots))
+        return WeeklyTimerSettings(
+            enabled=data.get("enabled") is True, slots=tuple(slots)
+        )
 
     @staticmethod
     def _parse_slot(entry: object) -> WeeklyTimerSlot | None:

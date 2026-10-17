@@ -3,26 +3,43 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import structlog
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
 from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
 from packages.core.database import get_session
 from packages.core.models import (
     AuditLogRecord,
+    DeviceStatusRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
     PlanRecord,
+    ShowerEventRecord,
+)
+from packages.core.device_data_quality import get_device_data_quality
+from packages.core.safety_reverts import (
+    UNRESOLVED_STATUSES,
+    restore_baseline_target,
+    serialize_unresolved_revert_summary,
+    unresolved_revert_summary,
+    zone_matches_baseline,
 )
 from packages.core.plan_outcome import measured_window_outcome, plan_measurement
+from packages.core.plan_lifecycle import DIAGNOSTIC_PLAN_STATUS
 
 router = APIRouter()
+logger = structlog.get_logger()
 
 
 class LearningModeUpdate(BaseModel):
     enabled: bool
+
+
+class SafetyRevertResolveRequest(BaseModel):
+    reason: str
 
 
 def _json_object(value: str | None) -> dict[str, object]:
@@ -35,7 +52,7 @@ def _json_object(value: str | None) -> dict[str, object]:
 
 
 @router.get("/api/plans", response_model=list[PlanResponse])
-async def get_plans(limit: int = Query(10, ge=1, le=50)):
+async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bool = False):
     """Get recent optimizer plans."""
     async with get_session() as session:
         count_subq = (
@@ -47,15 +64,20 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
             .subquery()
         )
 
-        result = await session.execute(
+        query = (
             select(PlanRecord, count_subq.c.cnt)
             .outerjoin(count_subq, PlanRecord.id == count_subq.c.plan_id)
             .order_by(desc(PlanRecord.created_at))
             .limit(limit)
         )
+        if not include_diagnostics:
+            query = query.where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
+        result = await session.execute(query)
 
         responses = []
         for p, count in result.all():
+            if not include_diagnostics and p.status == DIAGNOSTIC_PLAN_STATUS:
+                continue
             responses.append(
                 PlanResponse(
                     id=p.id,
@@ -66,7 +88,7 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
                     cost_estimate_eur=p.cost_estimate_eur,
                     price_currency=p.price_currency,
                     price_source=p.price_source,
-                    actions_count=count or 0,
+                    actions_count=0 if p.status == DIAGNOSTIC_PLAN_STATUS else count or 0,
                     status=p.status,
                     status_reason=p.status_reason,
                     superseded_at=p.superseded_at,
@@ -77,31 +99,38 @@ async def get_plans(limit: int = Query(10, ge=1, le=50)):
 
 
 @router.get("/api/plans/{plan_id}", response_model=PlanDetailResponse)
-async def get_plan_detail(plan_id: int):
+async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
     """Get plan details with actions."""
     async with get_session() as session:
-        plan_result = await session.execute(select(PlanRecord).where(PlanRecord.id == plan_id))
+        query = select(PlanRecord).where(PlanRecord.id == plan_id)
+        if not include_diagnostics:
+            query = query.where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
+        plan_result = await session.execute(query)
         plan = plan_result.scalar_one_or_none()
-        if not plan:
+        if not plan or (plan.status == DIAGNOSTIC_PLAN_STATUS and not include_diagnostics):
             raise HTTPException(status_code=404, detail="Plan not found")
 
-        actions_result = await session.execute(
-            select(PlanActionRecord)
-            .where(PlanActionRecord.plan_id == plan_id)
-            .order_by(PlanActionRecord.scheduled_ts)
-        )
-        actions = actions_result.scalars().all()
-        from packages.api._helpers import get_price_area
-        from packages.core.settings_service import get_float_setting, get_user_tz
+        if plan.status == DIAGNOSTIC_PLAN_STATUS:
+            actions = []
+            outcome = {"status": "diagnostic", "execution_allowed": False}
+        else:
+            actions_result = await session.execute(
+                select(PlanActionRecord)
+                .where(PlanActionRecord.plan_id == plan_id)
+                .order_by(PlanActionRecord.scheduled_ts)
+            )
+            actions = actions_result.scalars().all()
+            from packages.api._helpers import get_price_area
+            from packages.core.settings_service import get_float_setting, get_user_tz
 
-        outcome = await plan_measurement(
-            session,
-            plan=plan,
-            price_area=await get_price_area(),
-            comfort_min_c=await get_float_setting("comfort_temp_min"),
-            comfort_max_c=await get_float_setting("comfort_temp_max"),
-            timezone_name=await get_user_tz(),
-        )
+            outcome = await plan_measurement(
+                session,
+                plan=plan,
+                price_area=await get_price_area(),
+                comfort_min_c=await get_float_setting("comfort_temp_min"),
+                comfort_max_c=await get_float_setting("comfort_temp_max"),
+                timezone_name=await get_user_tz(),
+            )
 
     plan_data = _json_object(plan.plan_json)
     provenance = _json_object(plan.input_provenance_json)
@@ -181,7 +210,10 @@ async def get_plan_activity(
         result = await session.execute(
             select(PlanActionRecord, PlanRecord.created_at, PlanRecord.optimizer_version)
             .join(PlanRecord, PlanRecord.id == PlanActionRecord.plan_id)
-            .where(PlanActionRecord.status.in_(statuses))
+            .where(
+                PlanActionRecord.status.in_(statuses),
+                PlanRecord.status != DIAGNOSTIC_PLAN_STATUS,
+            )
             .order_by(
                 desc(func.coalesce(PlanActionRecord.executed_at, PlanActionRecord.scheduled_ts))
             )
@@ -254,6 +286,88 @@ async def get_operations_alerts():
     return await get_operational_alerts()
 
 
+@router.post("/api/operations/safety-reverts/{action_id}/resolve")
+async def resolve_safety_revert(action_id: int, request: SafetyRevertResolveRequest):
+    """Resolve a linked revert only when fresh persisted evidence proves it safe."""
+
+    reason = request.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="reason must be non-empty")
+    now = dt.datetime.now(dt.timezone.utc)
+    quality = await get_device_data_quality(now=now)
+    cutoff = now - dt.timedelta(seconds=int(quality["threshold_seconds"]))
+    async with get_session() as session:
+        action = (
+            await session.execute(
+                select(PlanActionRecord)
+                .where(
+                    PlanActionRecord.id == action_id,
+                    PlanActionRecord.reverts_action_id.is_not(None),
+                    PlanActionRecord.status.in_(UNRESOLVED_STATUSES),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if action is None:
+            raise HTTPException(status_code=404, detail="Safety revert not found")
+        status = (
+            await session.execute(
+                select(DeviceStatusRecord)
+                .where(
+                    DeviceStatusRecord.device_id == action.device_id,
+                    DeviceStatusRecord.ts >= cutoff,
+                )
+                .order_by(DeviceStatusRecord.ts.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if status is None:
+            raise HTTPException(status_code=409, detail="Fresh device status is required")
+        safe = action.action_type == "force_dhw_off" and status.force_dhw == 0
+        if action.action_type == "zone_temp_restore":
+            source = await session.get(PlanActionRecord, action.reverts_action_id)
+            payload = _json_object(action.payload_json)
+            zone_id = int(payload.get("zone_id", 1) or 1)
+            baseline = restore_baseline_target(action)
+            source_payload = _json_object(source.payload_json if source else None)
+            source_baseline = source_payload.get("baseline_temperature")
+            if source_baseline is not None and not zone_matches_baseline(source_baseline, baseline):
+                logger.error(
+                    "safety_restore_baseline_mismatch",
+                    action_id=action.id,
+                    source_action_id=action.reverts_action_id,
+                    source_baseline=source_baseline,
+                    restore_baseline=baseline,
+                )
+                raise HTTPException(status_code=409, detail="Safety restore baseline mismatch")
+            current = getattr(status, f"zone{zone_id}_target_temp", None)
+            safe = zone_matches_baseline(baseline, current)
+        if not safe:
+            raise HTTPException(
+                status_code=409, detail="Persisted status does not prove safe state"
+            )
+        action.status = "executed"
+        action.executed_at = now
+        action.result_json = json.dumps({"reason": "manually_resolved", "note": reason})
+        await session.execute(
+            update(ShowerEventRecord)
+            .where(ShowerEventRecord.activation_action_id == action.reverts_action_id)
+            .values(status="resolved", recovered_at=now)
+        )
+        session.add(
+            AuditLogRecord(
+                actor="authenticated_api",
+                action="manual_safety_revert_resolution",
+                target_device=action.device_id,
+                payload_json=json.dumps(
+                    {"action_id": action.id, "reason": reason, "status_ts": status.ts.isoformat()}
+                ),
+                result="manually_resolved",
+            )
+        )
+    return {"status": "resolved", "action_id": action_id}
+
+
 @router.post("/api/overrides")
 async def create_override(override: OverrideCreate):
     """Create a manual override (pauses optimizer for a period)."""
@@ -301,12 +415,24 @@ async def cancel_override(override_id: int):
     return {"status": "cancelled"}
 
 
-async def _learning_mode_status() -> dict[str, object]:
-    """Return learning-mode state plus how long it has been collecting data."""
-    from packages.core.settings_service import get_bool_setting, get_setting
+async def _learning_mode_status(*, context=None, materialized=None, now=None) -> dict[str, object]:
+    """Read campaign timing and reset history from flat materialized seasonal inputs."""
+    from packages.core.learning_state import get_learning_state_details
+    from packages.core.settings_service import get_setting
 
-    enabled = await get_bool_setting("learning_mode_enabled")
-    since_raw = await get_setting("learning_mode_since")
+    if context is None:
+        learning, seasonal = await get_learning_state_details()
+    else:
+        learning, seasonal = await get_learning_state_details(
+            context=context, materialized=materialized
+        )
+    enabled = learning.manual_enabled
+    since_raw = (
+        await get_setting("learning_mode_since")
+        if context is None
+        else context["settings"]["learning_mode_since"]
+    )
+    now = now or dt.datetime.now(dt.timezone.utc)
     since_iso: str | None = since_raw or None
     days_elapsed: float | None = None
     if enabled and since_iso:
@@ -314,13 +440,43 @@ async def _learning_mode_status() -> dict[str, object]:
             started = dt.datetime.fromisoformat(since_iso)
             if started.tzinfo is None:
                 started = started.replace(tzinfo=dt.timezone.utc)
-            days_elapsed = round(
-                (dt.datetime.now(dt.timezone.utc) - started).total_seconds() / 86400, 2
-            )
+            days_elapsed = round((now - started).total_seconds() / 86400, 2)
         except ValueError:
             since_iso = None
 
-    return {"enabled": enabled, "since": since_iso, "days_elapsed": days_elapsed}
+    if context is None:
+        from packages.core.data_reset import reset_history_summary
+
+        async with get_session(read_only=True) as session:
+            obligations = await unresolved_revert_summary(session, now=now)
+            reset_history = await reset_history_summary(session)
+    else:
+        obligations = (materialized or {}).get("open_revert_obligations", {"count": None})
+        reset_history = (materialized or {}).get("reset_history")
+    if obligations.get("count") is not None:
+        obligations = serialize_unresolved_revert_summary(obligations)
+    sources = ["manual"] if enabled else []
+    if learning.seasonal_active:
+        sources.append("seasonal")
+    return {
+        "enabled": enabled,
+        "build_policy": "observe_only",
+        "ordinary_writes_allowed": False,
+        "optimization_requires_new_build": True,
+        "linked_restores_eligible": not learning.active,
+        "since": since_iso,
+        "days_elapsed": days_elapsed,
+        "effective_active": bool(sources),
+        "sources": sources,
+        "state_reliable": learning.reliable,
+        "open_revert_obligations": obligations,
+        "reset_history": reset_history,
+        "seasonal_blocked_by_unresolved_safety_revert": bool(
+            seasonal.get("seasonal_blocked_by_unresolved_safety_revert")
+        ),
+        "seasonal_first_deferred_at": seasonal.get("seasonal_first_deferred_at"),
+        "seasonal_deferred_seconds": seasonal.get("seasonal_deferred_seconds"),
+    }
 
 
 @router.get("/api/learning-mode")
@@ -330,7 +486,7 @@ async def get_learning_mode():
 
 
 @router.post("/api/learning-mode")
-async def set_learning_mode(body: LearningModeUpdate):
+async def set_learning_mode(body: LearningModeUpdate, force: bool = Query(False)):
     """Enable or disable observe-only learning mode.
 
     While enabled the optimizer keeps generating plans but the executor dispatches
@@ -341,6 +497,16 @@ async def set_learning_mode(body: LearningModeUpdate):
 
     was_enabled = await get_bool_setting("learning_mode_enabled")
     now = dt.datetime.now(dt.timezone.utc)
+    obligation_snapshot: dict[str, object] | None = None
+    if body.enabled:
+        async with get_session() as session:
+            obligation_snapshot = await unresolved_revert_summary(session, now=now)
+        obligation_snapshot = serialize_unresolved_revert_summary(obligation_snapshot)
+        if int(obligation_snapshot["count"]) > 0 and not force:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "unresolved_safety_reverts", "obligations": obligation_snapshot},
+            )
 
     updates = {"learning_mode_enabled": "true" if body.enabled else "false"}
     if body.enabled and not was_enabled:
@@ -355,7 +521,13 @@ async def set_learning_mode(body: LearningModeUpdate):
             AuditLogRecord(
                 actor="user",
                 action="set_learning_mode",
-                payload_json=json.dumps({"enabled": body.enabled}),
+                payload_json=json.dumps(
+                    {
+                        "enabled": body.enabled,
+                        "force": force,
+                        "obligations": obligation_snapshot,
+                    },
+                ),
                 result="enabled" if body.enabled else "disabled",
             )
         )
@@ -366,65 +538,100 @@ async def set_learning_mode(body: LearningModeUpdate):
 @router.get("/api/optimizer/status")
 async def get_optimizer_status():
     """Get the current optimizer layer status, including ML model readiness."""
-    from packages.core.settings_service import get_setting
     from packages.ml.models import MODEL_DIR
-    from packages.ml.thermal import thermal_model
+    from packages.ml.model_status import get_readiness_snapshot, get_model_status
+    from packages.ml.seasonal_learning import get_seasonal_calibration_progress
     from packages.optimizer.main import get_optimizer_status_snapshot
+    from packages.optimizer.rules import RulesOptimizer
 
-    layer = await get_setting("optimizer_layer") or "rules_only"
-    optimizer_status = await get_optimizer_status_snapshot(layer)
-    learning_mode = await _learning_mode_status()
-
-    cop_models = sorted(MODEL_DIR.glob("cop_model_*.pkl"))
-    demand_models = sorted(MODEL_DIR.glob("demand_model_*.pkl"))
-
-    async with get_session() as session:
-        consumption_count = await session.execute(
-            select(func.count()).select_from(PlanActionRecord)
+    snapshot = await get_readiness_snapshot(route="/api/optimizer/status")
+    context = snapshot["context"]
+    layer = (context["settings"].get("optimizer_layer") or "rules_only") if context else None
+    model_lifecycle = snapshot["model_lifecycle"]
+    optimizer_status = await get_optimizer_status_snapshot(
+        layer or "rules_only",
+        reporting_inputs={
+            "demand_trained": model_lifecycle["demand"]["status"] == "qualified-for-reporting"
+        },
+    )
+    if context is not None:
+        learning_mode = await _learning_mode_status(
+            context=context, materialized=snapshot["seasonal_inputs"], now=snapshot["as_of"]
         )
-        total_consumption = consumption_count.scalar() or 0
+    else:
+        learning_mode = {
+            "enabled": False,
+            "effective_active": False,
+            "sources": [],
+            "state_reliable": False,
+            "build_policy": "observe_only",
+            "ordinary_writes_allowed": False,
+            "optimization_requires_new_build": True,
+            "linked_restores_eligible": True,
+            "since": None,
+            "days_elapsed": None,
+            "open_revert_obligations": {"count": None},
+        }
+    cop_model = await get_model_status("cop", MODEL_DIR)
+    demand_model = model_lifecycle["demand"]
+    demand_quality = snapshot["demand_quality"]
+    try:
+        seasonal = await get_seasonal_calibration_progress(snapshot=snapshot)
+    except Exception as error:
+        logger.warning("seasonal_reporting_unavailable", error_type=type(error).__name__)
+        seasonal = {
+            "enabled": None,
+            "observe_only_active": None,
+            "reason": "seasonal_reporting_unavailable",
+            "auto_exit": False,
+            "readiness": snapshot["readiness"],
+            "reporting_ready": False,
+            "next_step": "readiness_unavailable",
+        }
+    seasonal["control_ready"] = False
+    seasonal["auto_exit"] = False
 
-    estimated_days = max(1, total_consumption // 96) if total_consumption > 0 else 0
-    cop_samples = max(0, total_consumption - estimated_days)
-    demand_samples = total_consumption
-
-    def _version_to_iso(prefix: str, models: list) -> str | None:
-        if not models:
-            return None
-        version = models[-1].stem.replace(prefix, "")
-        try:
-            return (
-                dt.datetime.strptime(version, "%Y%m%d_%H%M")
-                .replace(tzinfo=dt.timezone.utc)
-                .isoformat()
-            )
-        except ValueError:
-            return version
-
-    return {
+    response = {
         "configured_layer": layer,
+        "build_policy": "observe_only",
+        "ordinary_writes_allowed": False,
+        "control_ready": False,
+        "optimization_requires_new_build": True,
+        "control_message": "Ordinary writes are prohibited in this build; optimization requires a new reviewed, approved build.",
         "active_layer": optimizer_status["active_layer"],
-        "fallback_layer": "rules_v3",
+        "effective_layer": optimizer_status.get("effective_layer", "rules"),
+        "selection_reason": optimizer_status.get(
+            "selection_reason",
+            "auto_milp_disabled_cop_retired" if layer == "auto" else "configured_layer",
+        ),
+        "fallback_layer": RulesOptimizer.VERSION,
+        "cop_trained": False,
+        "cop_source": "assumed",
+        "cop_measured": False,
         "learning_mode": learning_mode,
-        "cop_model": {
-            "trained": optimizer_status["cop_trained"],
-            "last_trained": _version_to_iso("cop_model_", cop_models),
-            "samples": cop_samples,
-        },
-        "demand_model": {
-            "trained": optimizer_status["demand_trained"],
-            "last_trained": _version_to_iso("demand_model_", demand_models),
-            "samples": demand_samples,
-        },
+        "model_lifecycle": model_lifecycle,
+        "seasonal_calibration": seasonal,
+        "cop_model": cop_model,
+        "demand_model": {**demand_model, "data_quality": demand_quality},
+        "comfort_model": model_lifecycle["comfort"],
         "thermal_model": {
-            "calibrated": thermal_model.params.last_calibrated is not None,
-            "tank_heating_rate": round(thermal_model.params.tank_heating_rate, 2),
-            "confidence": "learned" if thermal_model.params.last_calibrated else "default",
-            "last_calibrated": thermal_model.params.last_calibrated.isoformat()
-            if thermal_model.params.last_calibrated
-            else None,
+            "lifecycle": model_lifecycle["thermal"],
+            "status": model_lifecycle["thermal"]["status"],
+            "control_ready": False,
+            **snapshot["thermal_model"],
         },
     }
+    data_quality = snapshot["device_quality"]
+    if data_quality is None:
+        return response
+    timestamp = data_quality["timestamp"]
+    response["data_freshness"] = {
+        "latest_device_status": timestamp.isoformat() if timestamp else None,
+        "age_seconds": data_quality["age_seconds"],
+        "stale_after_seconds": data_quality["threshold_seconds"],
+        "fresh": data_quality["ready"],
+    }
+    return response
 
 
 @router.post("/api/optimize-now")

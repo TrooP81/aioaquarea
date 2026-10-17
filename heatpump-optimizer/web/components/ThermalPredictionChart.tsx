@@ -46,6 +46,8 @@ interface ThermalStatus {
       indoor_heating_samples: number;
       indoor_cooling_samples: number;
       confidence: string;
+      heating_confidence?: string;
+      cooling_confidence?: string;
       reason?: string | null;
     };
   };
@@ -66,6 +68,8 @@ interface CurveData {
     zone1_temp: number;
     plan_driven?: boolean;
     learning_mode?: boolean;
+    learning_mode_state?: "active" | "inactive" | "unknown";
+    learning_mode_reliable?: boolean;
     plan_id?: number | null;
   };
   curves: {
@@ -86,14 +90,15 @@ interface IndoorForecastData {
   current_indoor: number | null;
   outdoor_temp: number | null;
   forecast: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null }[];
-  forecast_with_plan: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null; space_heating_fraction?: number | null }[];
+  forecast_with_plan: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null; space_heating_fraction?: number | null; baseline_heating_fraction?: number | null; baseline_heating_source?: string | null; space_heating_source?: string | null }[];
   forecast_no_heating: { hour: number; ts?: string; predicted_indoor_temp: number }[];
   target_schedule: { hour: number; ts?: string; target: number; comfort_hour: boolean }[];
   planned_actions: PlannedAction[];
-  forecast_status?: "available" | "unavailable";
+  forecast_status?: "available" | "unavailable" | "fallback" | "legacy";
   forecast_unavailable_reason?: string | null;
+  forecast_quality?: { control_reason?: string; reason?: string };
   comfort_assessment?: {
-    state: "on_target" | "at_risk" | "unavailable";
+    state: "on_target" | "at_risk" | "unavailable" | "degraded" | "conflict" | "room_overheat_suppression";
     summary: string;
     controllability?: { status: string; cutoff_c?: number };
     first_miss?: { ts?: string; predicted_c: number; target_c: number; shortfall_c: number; outdoor_temp_c?: number | null; model_source?: string | null; prediction_interval_status?: string | null };
@@ -101,6 +106,9 @@ interface IndoorForecastData {
     recommendations?: { title: string; summary: string; manual_only: boolean; current_value_c?: number; minimum_candidate_value_c?: number; expected_effect?: string; confidence?: string; verification_required?: boolean }[];
   };
   forecast_provenance?: { current_live_indoor_c?: number | null; plan_start_indoor_c?: number | null; plan_created_at?: string; control_input?: { reference_sensor_label?: string | null; observed_at?: string | null; confidence?: string | null } };
+  observed_history?: { hour: number; ts: string; temperature: number }[];
+  sensor_basis?: { label?: string };
+  space_heating_baseline?: { effective_mode?: "off" | "shadow" | "on" };
 }
 
 interface IndoorTempReading {
@@ -134,7 +142,7 @@ export function ThermalPredictionChart() {
       if (curveRes.ok) setCurves(await curveRes.json());
       if (indoorRes.ok) setIndoorForecast(await indoorRes.json());
       if (historyRes.ok) setIndoorHistory(await historyRes.json());
-    } catch {}
+    } catch { }
   };
 
   const handleCalibrate = async () => {
@@ -143,7 +151,10 @@ export function ThermalPredictionChart() {
     try {
       const res = await fetch("/api/thermal/calibrate", { method: "POST" });
       const data = await res.json();
-      if (data.status === "calibrated") {
+      if (!res.ok) throw new Error("Calibration request failed");
+      if (data.status === "queued" && typeof data.request_id === "string") {
+        setCalibrateResult(`Thermal maintenance queued (${data.request_id}).${data.maintenance_enabled === false ? " Maintenance disabled." : ""}`);
+      } else if (data.status === "calibrated") {
         setCalibrateResult(
           `Calibrated from ${data.samples} samples (${data.tank_heating_samples} heating, ${data.tank_cooling_samples} cooling)`
         );
@@ -151,8 +162,8 @@ export function ThermalPredictionChart() {
       } else {
         setCalibrateResult(data.status || "Calibration failed");
       }
-    } catch {
-      setCalibrateResult("Network error");
+    } catch (error) {
+      setCalibrateResult(error instanceof Error ? error.message : "Network error");
     } finally {
       setCalibrating(false);
     }
@@ -202,7 +213,28 @@ export function ThermalPredictionChart() {
   const indoorChartData = (() => {
     if (!indoorForecast) return [];
 
-    // Bucket actual readings into hourly averages relative to now
+    const observedHistory = indoorForecast.observed_history;
+    if (observedHistory && observedHistory.length > 0) {
+      const historyPoints = observedHistory.map((reading) => ({
+        hour: `${reading.hour}h`,
+        ts: reading.ts,
+        actualIndoor: reading.temperature,
+        indoorWithPlan: undefined as number | undefined,
+        indoorNoHeating: undefined as number | undefined,
+        comfortTarget: undefined as number | undefined,
+      }));
+      const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => ({
+        hour: `+${f.hour}h`,
+        ts: f.ts,
+        actualIndoor: undefined as number | undefined,
+        indoorWithPlan: f.predicted_indoor_temp,
+        indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
+        comfortTarget: indoorForecast.target_schedule[i]?.target,
+      }));
+      return [...historyPoints, ...forecastPoints];
+    }
+
+    // Legacy responses do not yet provide a declared control-basis history.
     const now = Date.now();
     const actualByHour: Record<number, number[]> = {};
     for (const r of indoorHistory) {
@@ -222,7 +254,7 @@ export function ThermalPredictionChart() {
       if (temps && temps.length > 0) {
         const avg = temps.reduce((a, b) => a + b, 0) / temps.length;
         historyPoints.push({
-      hour: `${h}h`,
+          hour: `${h}h`,
           ts: undefined as string | undefined,
           actualIndoor: parseFloat(avg.toFixed(1)),
           indoorWithPlan: undefined as number | undefined,
@@ -246,28 +278,42 @@ export function ThermalPredictionChart() {
   })();
 
   const comfortAssessment = indoorForecast?.comfort_assessment;
+  const forecastUnavailableReason = indoorForecast?.forecast_unavailable_reason;
+  const sensorUnavailable = [
+    "no_trusted_indoor_observation",
+    "no_fresh_selected_sensor_readings",
+    "reference_sensor_not_fresh",
+    "all_sensor_readings_rejected_as_outliers",
+  ].includes(forecastUnavailableReason || "");
   const forecastProvenance = indoorForecast?.forecast_provenance;
+  const sensorBasisLabel = indoorForecast?.sensor_basis?.label || "Indoor temperature";
   const firstComfortMiss = comfortAssessment?.first_miss;
   const missTime = firstComfortMiss?.ts
     ? new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(firstComfortMiss.ts))
     : null;
   const manualAdvice = comfortAssessment?.recommendations?.[0];
+  const comfortWarning = comfortAssessment && ["at_risk", "degraded", "conflict", "room_overheat_suppression"].includes(comfortAssessment.state);
+  const learningModeState = curves?.current.learning_mode_state
+    ?? (curves?.current.learning_mode ? "active" : "inactive");
+  const learningModeUnavailable = learningModeState === "unknown"
+    || curves?.current.learning_mode_reliable === false;
 
   return (
     <div className="plan-section">
       <h2 className="chart-title">Thermal Predictions</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        Predicted temperature evolution based on learned heating/cooling rates.
+        Reporting-only temperature estimates.
         {status?.model_params.last_calibrated
-          ? ` Model calibrated from ${status.model_params.sample_count} samples.`
-          : " Model using defaults (calibrate to learn from your data)."}
-        {curves?.current.learning_mode
-          ? " 🎓 Learning mode is on — the optimizer plans but dispatches nothing, so the tank curve shows expected coasting, not the plan."
-          : curves?.current.plan_driven
-          ? ` Tank (with heating) follows the active plan${
-              curves.current.plan_id ? ` #${curves.current.plan_id}` : ""
-            }'s hot-water schedule.`
-          : ""}
+          ? ` Historical fit: ${status.model_params.sample_count} samples.`
+          : " Default rates."}
+        {learningModeUnavailable
+          ? " Learning-state data is unavailable, so this curve is held from active-plan control."
+          : curves?.current.learning_mode
+            ? " 🎓 Learning mode is on — the optimizer plans but dispatches nothing, so the tank curve shows expected coasting, not the plan."
+            : curves?.current.plan_driven
+              ? ` Tank (with heating) follows the active plan${curves.current.plan_id ? ` #${curves.current.plan_id}` : ""
+              }'s hot-water schedule.`
+              : ""}
       </p>
 
       {/* Summary cards */}
@@ -302,6 +348,7 @@ export function ThermalPredictionChart() {
               {status.predictions.tank_cooling.minutes_until_min
                 ? `${Math.round(status.predictions.tank_cooling.minutes_until_min / 60)}h until min`
                 : "Stable"}
+              {" "}({status.predictions.tank_cooling.confidence})
             </div>
           </div>
 
@@ -326,8 +373,10 @@ export function ThermalPredictionChart() {
               </div>
               <div className="metric-sub">
                 {status.predictions.indoor.indoor_heating_rate}°C/h heat
+                {" "}({status.predictions.indoor.heating_confidence ?? "default"})
                 {" / "}
                 {status.predictions.indoor.indoor_cooling_rate}°C/h cool
+                {" "}({status.predictions.indoor.cooling_confidence ?? "default"})
                 {status.predictions.indoor.indoor_heating_samples > 0
                   ? ` (${status.predictions.indoor.indoor_heating_samples} samples)`
                   : " (defaults)"}
@@ -392,9 +441,15 @@ export function ThermalPredictionChart() {
       )}
 
       {/* Indoor temperature forecast chart */}
+      {indoorForecast?.forecast_quality?.control_reason === "observe_only_build" && (
+        <div className="indoor-temp-card text-muted text-sm" style={{ marginTop: "1.5rem" }}>
+          Observe-only build: heat-pump writes are prohibited, regardless of sensor freshness or forecast quality.
+        </div>
+      )}
       {indoorForecast?.forecast_status === "unavailable" && (
         <div className="indoor-temp-card text-warning text-sm" style={{ marginTop: "1.5rem" }}>
-          Indoor forecast paused: {(indoorForecast.forecast_unavailable_reason || "no_trusted_indoor_observation").replace(/_/g, " ")}. A fresh trusted room reading is required; no default temperature is used.
+          Indoor forecast paused: {(forecastUnavailableReason || "forecast_unavailable").replace(/_/g, " ")}.
+          {sensorUnavailable && " A fresh trusted room reading is required; no default temperature is used."}
         </div>
       )}
       {indoorForecast?.forecast_status !== "unavailable" && indoorChartData.length > 0 && (
@@ -404,10 +459,10 @@ export function ThermalPredictionChart() {
           </h3>
           {comfortAssessment && (
             <div
-              className={comfortAssessment.state === "at_risk" ? "indoor-temp-card text-warning text-sm" : "indoor-temp-card text-muted text-sm"}
+              className={comfortWarning ? "indoor-temp-card text-warning text-sm" : "indoor-temp-card text-muted text-sm"}
               style={{ marginBottom: "0.75rem" }}
             >
-              <strong>{comfortAssessment.state === "at_risk" ? "Comfort risk" : "Comfort outlook"}</strong>
+              <strong>{comfortWarning ? "Comfort warning" : "Comfort outlook"}</strong>
               <div>{comfortAssessment.summary}</div>
               {firstComfortMiss && (
                 <div>
@@ -461,7 +516,7 @@ export function ThermalPredictionChart() {
                 stroke="#10b981"
                 strokeWidth={2}
                 dot={false}
-                name="Actual Indoor"
+                name={sensorBasisLabel}
                 connectNulls
               />
               <Line
@@ -495,27 +550,27 @@ export function ThermalPredictionChart() {
                   a.action_type === "zone_temp_boost"
                     ? `🔥 +${(a.payload.offset as number) ?? 2}°C`
                     : a.action_type === "zone_temp_restore"
-                    ? "⏹️ Restore"
-                    : a.action_type === "force_dhw_on"
-                    ? "🚰 DHW On"
-                    : a.action_type === "force_dhw_off"
-                    ? "🚰 DHW Off"
-                    : a.action_type === "comfort_mode_on"
-                    ? "☀️ Comfort"
-                    : a.action_type === "eco_mode_on"
-                    ? "🌿 Eco"
-                    : a.action_type === "quiet_mode_on"
-                    ? "🔇 Quiet"
-                    : a.action_type === "quiet_mode_off"
-                    ? "🔊 Loud"
-                    : a.action_type.replace(/_/g, " ");
+                      ? "⏹️ Restore"
+                      : a.action_type === "force_dhw_on"
+                        ? "🚰 DHW On"
+                        : a.action_type === "force_dhw_off"
+                          ? "🚰 DHW Off"
+                          : a.action_type === "comfort_mode_on"
+                            ? "☀️ Comfort"
+                            : a.action_type === "eco_mode_on"
+                              ? "🌿 Eco"
+                              : a.action_type === "quiet_mode_on"
+                                ? "🔇 Quiet"
+                                : a.action_type === "quiet_mode_off"
+                                  ? "🔊 Loud"
+                                  : a.action_type.replace(/_/g, " ");
                 const color =
                   a.action_type === "zone_temp_boost" ? "#f59e0b"
                     : a.action_type === "zone_temp_restore" ? "#94a3b8"
-                    : a.action_type.includes("dhw") ? "#3b82f6"
-                    : a.action_type.includes("comfort") ? "#10b981"
-                    : a.action_type.includes("eco") ? "#22c55e"
-                    : "#8b5cf6";
+                      : a.action_type.includes("dhw") ? "#3b82f6"
+                        : a.action_type.includes("comfort") ? "#10b981"
+                          : a.action_type.includes("eco") ? "#22c55e"
+                            : "#8b5cf6";
                 return (
                   <ReferenceLine
                     key={`action-${i}`}

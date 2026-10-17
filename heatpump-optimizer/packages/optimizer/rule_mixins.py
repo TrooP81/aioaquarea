@@ -6,16 +6,63 @@ import datetime as dt
 import math
 from zoneinfo import ZoneInfo
 
+import structlog
+
 from packages.core.heat_curve import HeatCurveConfig
 from packages.core.settings_service import dhw_deadlines_from_schedule, is_comfort_hour
-from packages.ml.cop_model_core import COPModel
 from packages.ml.comfort_model import comfort_model
-from packages.ml.thermal import thermal_model
+from packages.ml.thermal import assumed_heating_efficiency, thermal_model
 from packages.optimizer.actions import ActionType
+
+
+logger = structlog.get_logger()
+
+
+def local_dhw_deadlines_in_horizon(
+    comfort_schedule: dict[str, list[int]],
+    horizon_start: dt.datetime,
+    tz_name: str | None,
+    *,
+    horizon_end: dt.datetime | None = None,
+) -> list[tuple[dt.datetime, int]]:
+    """Return deadlines after the start through the final priced endpoint."""
+    timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
+    if horizon_start.tzinfo is None:
+        horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
+    horizon_end = horizon_end or horizon_start + dt.timedelta(hours=24)
+    local_start = horizon_start.astimezone(timezone)
+    local_end = horizon_end.astimezone(timezone)
+    current_date = local_start.date()
+    deadlines: list[tuple[dt.datetime, int]] = []
+
+    while current_date <= local_end.date():
+        local_noon = dt.datetime.combine(current_date, dt.time(12), tzinfo=timezone)
+        for ready_hour in dhw_deadlines_from_schedule(
+            comfort_schedule, local_noon, tz_name=tz_name
+        ):
+            local_deadline = dt.datetime.combine(current_date, dt.time(ready_hour), tzinfo=timezone)
+            deadline = local_deadline.astimezone(dt.timezone.utc)
+            if horizon_start < deadline <= horizon_end:
+                deadlines.append((deadline, ready_hour))
+        current_date += dt.timedelta(days=1)
+
+    return sorted(deadlines, key=lambda item: item[0])
 
 
 class SharedRuleHelpersMixin:
     COMFORT_SATISFIED_MARGIN_C = 0.3
+
+    @staticmethod
+    def _has_valid_gate_projections(
+        weather: list[tuple[dt.datetime, float]], gate_projections: list | None
+    ) -> bool:
+        """Require a complete, recognised gate decision for every weather hour."""
+        if gate_projections is None or len(gate_projections) != len(weather):
+            return False
+        return all(
+            str(getattr(projection, "state", None)) in {"ALLOWED", "BLOCKED", "UNKNOWN"}
+            for projection in gate_projections
+        )
 
     @staticmethod
     def _zone_boost_targets(
@@ -93,24 +140,14 @@ class SharedRuleHelpersMixin:
         dhw_cop_model=None,
         dhw_target: int | None = None,
     ) -> list[tuple[dt.datetime, float]] | None:
-        """Choose heat-pump hours by electricity cost per delivered thermal kWh.
-
-        The trained COP artifact is DHW-specific, so callers must explicitly
-        supply both that model and a tank target. Space-heating callers use the
-        outdoor-temperature fallback until a separately measured SH COP model
-        exists.
-        """
-        use_ml = dhw_target is not None and dhw_cop_model is not None and dhw_cop_model.is_trained
+        """Rank slots by price per assumed thermal kWh; COP arguments are inert."""
 
         effective_prices = []
         original_prices = {ts: price for ts, price in prices}
         for ts, price in prices:
             outdoor_temp = self._get_outdoor_at(weather, ts, fallback_outdoor_temp)
-            if use_ml:
-                cop = dhw_cop_model.predict_cop(outdoor_temp, int(dhw_target), ts.hour)
-            else:
-                cop = COPModel._default_cop_curve(outdoor_temp)
-            effective_prices.append((ts, price / cop))
+            efficiency = assumed_heating_efficiency(outdoor_temp)
+            effective_prices.append((ts, price / efficiency))
 
         selected = self._find_cheapest_slot(effective_prices, hours_needed)
         if not selected:
@@ -178,6 +215,9 @@ class SharedRuleHelpersMixin:
         current_water_temp: float,
         heat_curve: HeatCurveConfig | None = None,
         weather_full: list[dict] | None = None,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
     ) -> dict[dt.datetime, float]:
         """Predict indoor temperature with no planned space heating.
 
@@ -203,9 +243,11 @@ class SharedRuleHelpersMixin:
         curve = thermal_model.predict_indoor_controlled_curve(
             current_indoor=current_indoor_temp,
             zone_water_temps=zone_water_temps,
-            heating_fractions=[0.0] * len(weather_forecast),
+            heating_fractions=baseline_heating_fractions or [0.0] * len(weather_forecast),
             weather_forecast=weather_forecast,
             hours=len(weather_forecast),
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
         )
         return {ts: float(row["predicted_indoor_temp"]) for ts, row in zip(timestamps, curve)}
 
@@ -236,9 +278,8 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         A heat pump produces more heat per kWh of electricity when outdoor air
         is warmer. Comparing raw spot prices alone can therefore select a cold
         hour that costs more and consumes more electricity for the same tank
-        recharge. ``price / COP`` is the effective price per thermal kWh.
-        When available, the trained COP model provides a tank-target-aware
-        estimate rather than the default outdoor-only curve.
+        recharge. Price divided by the assumed efficiency ratio is a planning
+        estimate per thermal kWh, not a measured COP or a learned DHW model.
         """
         return self._find_lowest_heat_energy_cost_slot(
             prices,
@@ -254,38 +295,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         comfort_schedule: dict[str, list[int]],
         horizon_start: dt.datetime,
         tz_name: str | None,
+        *,
+        horizon_end: dt.datetime | None = None,
     ) -> list[tuple[dt.datetime, int]]:
-        """Return future DHW deadlines as UTC instants with their local hour.
-
-        The comfort schedule stores local wall-clock hours.  Building a
-        deadline with ``horizon_start.replace(hour=...)`` accidentally treats
-        those local hours as UTC, shifting an Amsterdam 08:00 deadline to
-        10:00 in summer.  Enumerating local calendar days also means a plan
-        crossing midnight uses tomorrow's weekday/weekend schedule correctly.
-        """
-        timezone = ZoneInfo(tz_name or "Europe/Amsterdam")
-        if horizon_start.tzinfo is None:
-            horizon_start = horizon_start.replace(tzinfo=dt.timezone.utc)
-        horizon_end = horizon_start + dt.timedelta(hours=24)
-        local_start = horizon_start.astimezone(timezone)
-        local_end = horizon_end.astimezone(timezone)
-        current_date = local_start.date()
-        deadlines: list[tuple[dt.datetime, int]] = []
-
-        while current_date <= local_end.date():
-            local_noon = dt.datetime.combine(current_date, dt.time(12), tzinfo=timezone)
-            for ready_hour in dhw_deadlines_from_schedule(
-                comfort_schedule, local_noon, tz_name=tz_name
-            ):
-                local_deadline = dt.datetime.combine(
-                    current_date, dt.time(ready_hour), tzinfo=timezone
-                )
-                deadline = local_deadline.astimezone(dt.timezone.utc)
-                if horizon_start < deadline < horizon_end:
-                    deadlines.append((deadline, ready_hour))
-            current_date += dt.timedelta(days=1)
-
-        return sorted(deadlines, key=lambda item: item[0])
+        return local_dhw_deadlines_in_horizon(
+            comfort_schedule, horizon_start, tz_name, horizon_end=horizon_end
+        )
 
     def _project_tank_temperature(
         self,
@@ -373,6 +388,8 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         tz_name: str | None = None,
     ) -> list[dict]:
         actions = []
+        if not prices:
+            return actions
         prediction = thermal_model.predict_tank_heating_time(
             current_temp=current_tank_temp,
             target_temp=float(tank_target),
@@ -380,9 +397,12 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         )
         if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
             return actions
-        base_hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        base_hours_needed = max(1, math.ceil(prediction.estimated_hours))
         for deadline, ready_hour in self._local_dhw_deadlines_in_horizon(
-            comfort_schedule, horizon_start, tz_name
+            comfort_schedule,
+            horizon_start,
+            tz_name,
+            horizon_end=prices[-1][0] + dt.timedelta(hours=1),
         ):
             latest_start = thermal_model.optimal_start_time(
                 current_temp=current_tank_temp,
@@ -429,7 +449,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 )
                 hours_needed = max(
                     1,
-                    int(projected_prediction.estimated_hours + 0.9),
+                    math.ceil(projected_prediction.estimated_hours),
                 )
                 off_time = slot_start + dt.timedelta(hours=hours_needed)
                 coast_hours = max(0.0, (deadline - off_time).total_seconds() / 3600.0)
@@ -446,12 +466,35 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     break
                 slot_start = adjusted_start
 
+            projected_tank_temp = self._project_tank_temperature(
+                current_tank_temp,
+                horizon_start,
+                slot_start,
+                tank_target,
+                weather,
+                current_outdoor_temp,
+                actions,
+            )
+            projected_prediction = thermal_model.predict_tank_heating_time(
+                current_temp=projected_tank_temp,
+                target_temp=float(tank_target),
+                outdoor_temp=self._get_outdoor_at(weather, slot_start, current_outdoor_temp),
+            )
+            hours_needed = max(1, math.ceil(projected_prediction.estimated_hours))
+            off_time = slot_start + dt.timedelta(hours=hours_needed)
+            price_hours = {ts for ts, price in prices if math.isfinite(price)}
+            if off_time > deadline or any(
+                slot_start + dt.timedelta(hours=hour) not in price_hours
+                for hour in range(hours_needed)
+            ):
+                continue
             if projected_prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
                 continue
             actions.append(
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.FORCE_DHW_ON),
+                    "action_key": f"dhw:{slot_start.isoformat()}",
                     "payload": {
                         "reason": f"thermal_optimized_before_{ready_hour}:00",
                         "predicted_minutes": round(projected_prediction.estimated_minutes),
@@ -465,6 +508,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": off_time.isoformat(),
                         "type": str(ActionType.FORCE_DHW_OFF),
+                        "reverts_action_key": f"dhw:{slot_start.isoformat()}",
                         "payload": {"reason": "dhw_target_reached"},
                     }
                 )
@@ -536,11 +580,17 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
         if prediction.estimated_minutes <= self.MIN_FORCE_DHW_MINUTES:
             return []
 
-        hours_needed = max(1, int(prediction.estimated_hours + 0.9))
+        hours_needed = max(1, math.ceil(prediction.estimated_hours))
+        price_hours = {ts for ts, price in prices if math.isfinite(price)}
+        if any(
+            slot_start + dt.timedelta(hours=hour) not in price_hours for hour in range(hours_needed)
+        ):
+            return []
         actions: list[dict] = [
             {
                 "ts": slot_start.isoformat(),
                 "type": str(ActionType.FORCE_DHW_ON),
+                "action_key": f"dhw_opportunistic:{slot_start.isoformat()}",
                 "payload": {
                     "reason": (f"opportunistic_cheap_slot_{slot_price:.4f}_eur"),
                     "predicted_minutes": round(prediction.estimated_minutes),
@@ -555,6 +605,7 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.FORCE_DHW_OFF),
+                    "reverts_action_key": f"dhw_opportunistic:{slot_start.isoformat()}",
                     "payload": {"reason": "opportunistic_top_up_complete"},
                 }
             )
@@ -562,6 +613,243 @@ class DHWRulesMixin(SharedRuleHelpersMixin):
 
 
 class PreheatRulesMixin(SharedRuleHelpersMixin):
+    THERMAL_BATTERY_LOOKAHEAD_HOURS = 8
+    THERMAL_BATTERY_MIN_SPREAD_EUR_PER_KWH = 0.02
+
+    def _plan_thermal_battery_charge(
+        self,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        horizon_start: dt.datetime,
+        passive_indoor: dict[dt.datetime, float],
+        current_indoor_temp: float,
+        current_outdoor_temp: float,
+        current_water_temp: float,
+        comfort_temp_target: float,
+        comfort_temp_max: float,
+        heat_curve: HeatCurveConfig | None,
+        weather_full: list[dict] | None,
+        current_zone_target_temp: float | None,
+        current_zone_heat_min: int | None,
+        current_zone_heat_max: int | None,
+        gate_evidence: list[tuple[dt.datetime, object]] | None,
+        *,
+        gate_control_enabled: bool,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
+    ) -> list[dict]:
+        """Bank cheap heat in the building without exceeding the comfort target."""
+
+        def suppress(reason_code: str, **context: object) -> list[dict]:
+            logger.info(
+                "thermal_battery_suppressed",
+                reason_code=reason_code,
+                candidate_count=context.pop("candidate_count", 0),
+                horizon_hours=len(weather),
+                **context,
+            )
+            return []
+
+        if (
+            not prices
+            or current_indoor_temp >= comfort_temp_target - self.COMFORT_SATISFIED_MARGIN_C
+        ):
+            return suppress("comfort_already_satisfied")
+
+        if gate_control_enabled:
+            if gate_evidence is None or not (len(prices) == len(weather) == len(gate_evidence)):
+                return suppress("gate_grid_invalid")
+            timestamps = [timestamp for timestamp, _ in prices]
+            if any(
+                timestamp.tzinfo is None
+                or timestamp.utcoffset() != dt.timedelta(0)
+                or timestamp.minute
+                or timestamp.second
+                or timestamp.microsecond
+                for timestamp in timestamps
+            ) or any(
+                timestamps[index] + dt.timedelta(hours=1) != timestamps[index + 1]
+                for index in range(len(timestamps) - 1)
+            ):
+                return suppress("gate_grid_invalid")
+            if any(
+                price_ts != weather_ts or price_ts != gate_ts
+                for (price_ts, _), (weather_ts, _), (gate_ts, _) in zip(
+                    prices, weather, gate_evidence
+                )
+            ):
+                return suppress("gate_grid_invalid")
+            for _, evidence in gate_evidence:
+                state = getattr(evidence, "state", None)
+                if str(state) not in {"ALLOWED", "BLOCKED"}:
+                    return suppress("gate_grid_invalid")
+            gate_by_ts = dict(gate_evidence)
+        else:
+            gate_by_ts = {}
+
+        effective_prices: list[tuple[dt.datetime, float, float]] = []
+        for timestamp, raw_price in prices:
+            conditions = self._weather_conditions_at(
+                timestamp,
+                weather_full,
+                self._get_outdoor_at(weather, timestamp, current_outdoor_temp),
+            )
+            cop = assumed_heating_efficiency(conditions["outdoor_temp"])
+            if (
+                isinstance(raw_price, bool)
+                or not isinstance(raw_price, (int, float))
+                or not math.isfinite(raw_price)
+                or not math.isfinite(cop)
+                or cop <= 0
+            ):
+                return suppress("invalid_thermal_price")
+            effective_prices.append((timestamp, float(raw_price), float(raw_price) / cop))
+
+        candidate_rows: list[tuple[float, float, dt.datetime, dt.datetime, float, float]] = []
+        for timestamp, raw_price, effective_price in effective_prices:
+            if (
+                gate_control_enabled
+                and str(getattr(gate_by_ts[timestamp], "state", None)) != "ALLOWED"
+            ):
+                continue
+            if passive_indoor.get(timestamp, current_indoor_temp) >= (
+                comfort_temp_target - self.COMFORT_SATISFIED_MARGIN_C
+            ):
+                continue
+            deferred = [
+                (later_ts, later_raw, later_effective)
+                for later_ts, later_raw, later_effective in effective_prices
+                if timestamp
+                < later_ts
+                <= timestamp + dt.timedelta(hours=self.THERMAL_BATTERY_LOOKAHEAD_HOURS)
+                and later_effective - effective_price >= self.THERMAL_BATTERY_MIN_SPREAD_EUR_PER_KWH
+            ]
+            if not deferred:
+                continue
+            max_spread = max(
+                later_effective - effective_price for _, _, later_effective in deferred
+            )
+            deferred_ts, deferred_raw, deferred_effective = min(
+                (
+                    row
+                    for row in deferred
+                    if math.isclose(
+                        row[2] - effective_price, max_spread, rel_tol=0.0, abs_tol=1e-12
+                    )
+                ),
+                key=lambda row: row[0],
+            )
+            candidate_rows.append(
+                (effective_price, max_spread, timestamp, deferred_ts, raw_price, deferred_raw)
+            )
+        if not candidate_rows:
+            return suppress("no_economic_opportunity")
+
+        for offset in (2, 1):
+            boost_targets = self._zone_boost_targets(
+                current_zone_target_temp,
+                current_zone_heat_min,
+                current_zone_heat_max,
+                offset=offset,
+            )
+            if boost_targets is None:
+                continue
+            baseline_temperature, boost_temperature = boost_targets
+            safe_candidates = []
+            for row in candidate_rows:
+                _, _, candidate_ts, _, _, _ = row
+                try:
+                    zone_water_temps = []
+                    weather_forecast = []
+                    for weather_ts, outdoor in weather:
+                        conditions = self._weather_conditions_at(weather_ts, weather_full, outdoor)
+                        weather_forecast.append(conditions)
+                        baseline_supply = (
+                            heat_curve.planned_supply_temperature(conditions["outdoor_temp"])
+                            if heat_curve is not None
+                            else current_water_temp
+                        )
+                        zone_water_temps.append(
+                            baseline_supply + (boost_temperature - baseline_temperature)
+                            if weather_ts == candidate_ts
+                            else baseline_supply
+                        )
+                    curve = thermal_model.predict_indoor_controlled_curve(
+                        current_indoor=current_indoor_temp,
+                        zone_water_temps=zone_water_temps,
+                        heating_fractions=[
+                            max(
+                                (
+                                    baseline_heating_fractions[index]
+                                    if baseline_heating_fractions
+                                    and index < len(baseline_heating_fractions)
+                                    else 0.0
+                                ),
+                                1.0 if weather_ts == candidate_ts else 0.0,
+                            )
+                            for index, (weather_ts, _) in enumerate(weather)
+                        ],
+                        weather_forecast=weather_forecast,
+                        hours=len(weather),
+                        use_learned_forecast=use_learned_forecast,
+                        max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                    )
+                    peak = max(float(point["predicted_indoor_temp"]) for point in curve)
+                    if (
+                        len(curve) == len(weather)
+                        and math.isfinite(peak)
+                        and peak <= comfort_temp_max
+                    ):
+                        safe_candidates.append(row)
+                except (KeyError, TypeError, ValueError, ArithmeticError):
+                    continue
+            if safe_candidates:
+                (
+                    effective_price,
+                    spread,
+                    slot_start,
+                    deferred_ts,
+                    slot_price,
+                    deferred_price,
+                ) = min(safe_candidates, key=lambda row: (row[0], -row[1], row[2]))
+                break
+        else:
+            return suppress("comfort_simulation_rejected", candidate_count=len(candidate_rows))
+
+        return [
+            {
+                "ts": slot_start.isoformat(),
+                "type": str(ActionType.ZONE_TEMP_BOOST),
+                "action_key": f"zone_boost:{slot_start.isoformat()}",
+                "payload": {
+                    "offset": boost_temperature - baseline_temperature,
+                    "baseline_temperature": baseline_temperature,
+                    "temperature": boost_temperature,
+                    "reason": "thermal_battery_cheap_slot",
+                    "price": round(slot_price, 4),
+                    "effective_price": round(effective_price, 4),
+                    "deferred_ts": deferred_ts.isoformat(),
+                    "deferred_price": round(deferred_price, 4),
+                    "thermal_spread": round(spread, 4),
+                    "predicted_indoor": round(
+                        passive_indoor.get(slot_start, current_indoor_temp), 1
+                    ),
+                    "comfort_target": comfort_temp_target,
+                },
+            },
+            {
+                "ts": (slot_start + dt.timedelta(hours=1)).isoformat(),
+                "type": str(ActionType.ZONE_TEMP_RESTORE),
+                "reverts_action_key": f"zone_boost:{slot_start.isoformat()}",
+                "payload": {
+                    "temperature": baseline_temperature,
+                    "boost_temperature": boost_temperature,
+                    "reason": "thermal_battery_charge_complete",
+                },
+            },
+        ]
+
     def _plan_preheat(
         self,
         prices: list[tuple[dt.datetime, float]],
@@ -579,6 +867,14 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         current_zone_target_temp: float | None = None,
         current_zone_heat_min: int | None = None,
         current_zone_heat_max: int | None = None,
+        gate_projections: list | None = None,
+        gate_evidence: list[tuple[dt.datetime, object]] | None = None,
+        comfort_temp_max: float = 22.0,
+        *,
+        gate_control_enabled: bool = False,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
     ) -> list[dict]:
         actions = []
         if not weather:
@@ -592,12 +888,17 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
             current_water_temp,
             heat_curve,
             weather_full,
+            use_learned_forecast,
+            max_passive_change_c_per_hour,
+            baseline_heating_fractions,
         )
         cold_risk: tuple[dt.datetime, float, float] | None = None
-        for ts, outdoor_temp in weather:
+        for index, (ts, outdoor_temp) in enumerate(weather):
             if outdoor_temp is None or outdoor_temp >= 2.0:
                 continue
-            if heat_curve is not None and outdoor_temp >= heat_curve.heating_off_outdoor_c:
+            if gate_projections is not None and (
+                index >= len(gate_projections) or gate_projections[index].state != "ALLOWED"
+            ):
                 continue
             target_indoor = (
                 comfort_temp_target
@@ -611,6 +912,35 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 break
 
         if cold_risk is None:
+            return self._plan_thermal_battery_charge(
+                prices,
+                weather,
+                horizon_start,
+                passive_indoor,
+                current_indoor_temp,
+                current_outdoor_temp,
+                current_water_temp,
+                comfort_temp_target,
+                comfort_temp_max,
+                heat_curve,
+                weather_full,
+                current_zone_target_temp,
+                current_zone_heat_min,
+                current_zone_heat_max,
+                gate_evidence,
+                gate_control_enabled=gate_control_enabled,
+                use_learned_forecast=use_learned_forecast,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                baseline_heating_fractions=baseline_heating_fractions,
+            )
+
+        if gate_control_enabled and not self._has_valid_gate_projections(weather, gate_projections):
+            logger.info(
+                "thermal_battery_suppressed",
+                reason_code="gate_grid_invalid",
+                candidate_count=0,
+                horizon_hours=len(weather),
+            )
             return actions
 
         first_cold, outdoor_at_cold, target_indoor = cold_risk
@@ -661,15 +991,16 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
         # Widen the look-back so the picker can reach overnight off-peak
         # troughs before an early-morning cold hour, matching the DHW rule.
         preheat_window_start = max(first_cold - dt.timedelta(hours=hours_needed + 8), horizon_start)
-        weather_by_ts = {ts: temp for ts, temp in weather}
+
+        gate_by_ts = {
+            timestamp: gate_projections[index]
+            for index, (timestamp, _) in enumerate(weather)
+            if gate_projections is not None and index < len(gate_projections)
+        }
 
         def controller_can_heat(ts: dt.datetime) -> bool:
-            if heat_curve is None:
-                return True
-            outdoor_temp = weather_by_ts.get(ts)
-            if outdoor_temp is None:
-                outdoor_temp = current_outdoor_temp
-            return outdoor_temp < heat_curve.heating_off_outdoor_c
+            evidence = gate_by_ts.get(ts)
+            return evidence is None or evidence.state == "ALLOWED"
 
         window_prices = [
             (ts, p)
@@ -692,6 +1023,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
+                    "action_key": f"zone_preheat:{slot_start.isoformat()}",
                     "payload": {
                         "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
@@ -706,6 +1038,7 @@ class PreheatRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
+                    "reverts_action_key": f"zone_preheat:{slot_start.isoformat()}",
                     "payload": {
                         "temperature": baseline_temperature,
                         "boost_temperature": boost_temperature,
@@ -735,9 +1068,18 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         current_zone_target_temp: float | None = None,
         current_zone_heat_min: int | None = None,
         current_zone_heat_max: int | None = None,
+        gate_projections: list | None = None,
+        *,
+        gate_control_enabled: bool = False,
+        use_learned_forecast: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
+        floor_heating_fractions: list[float] | None = None,
     ) -> list[dict]:
         actions: list[dict] = []
         if not weather:
+            return actions
+        if gate_control_enabled and not self._has_valid_gate_projections(weather, gate_projections):
             return actions
 
         hours = min(24, len(weather))
@@ -761,30 +1103,50 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
         # snapshot.  ``predict_indoor_curve`` treats a warm zone-water target
         # as active heating, which could hide a future comfort miss here while
         # the chart correctly showed the home coasting.
-        curve = thermal_model.predict_indoor_controlled_curve(
+        expected_curve = thermal_model.predict_indoor_controlled_curve(
             current_indoor=current_indoor_temp,
             zone_water_temps=curve_supply_temps,
-            heating_fractions=[0.0] * hours,
+            heating_fractions=baseline_heating_fractions or [0.0] * hours,
             weather_forecast=weather_forecast,
             hours=hours,
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+        )
+        minimum_curve = thermal_model.predict_indoor_controlled_curve(
+            current_indoor=current_indoor_temp,
+            zone_water_temps=curve_supply_temps,
+            heating_fractions=floor_heating_fractions or [0.0] * hours,
+            weather_forecast=weather_forecast,
+            hours=hours,
+            use_learned_forecast=use_learned_forecast,
+            max_passive_change_c_per_hour=max_passive_change_c_per_hour,
         )
 
         for h in range(hours):
             hour_ts = horizon_start + dt.timedelta(hours=h)
             if not is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name):
                 continue
-            if (
-                heat_curve is not None
-                and weather_forecast[h]["outdoor_temp"] >= heat_curve.heating_off_outdoor_c
+            if gate_projections is not None and (
+                h >= len(gate_projections) or gate_projections[h].state != "ALLOWED"
             ):
                 # The controller's own Värme AV threshold prevents space heat,
                 # so do not create an action the pump cannot execute.
                 continue
 
-            predicted_indoor = (
-                curve[h]["predicted_indoor_temp"] if h < len(curve) else current_indoor_temp
+            expected_indoor = (
+                expected_curve[h]["predicted_indoor_temp"]
+                if h < len(expected_curve)
+                else current_indoor_temp
+            )
+            floor_indoor = (
+                minimum_curve[h]["predicted_indoor_temp"]
+                if h < len(minimum_curve)
+                else current_indoor_temp
             )
             target = max(comfort_temp_target, comfort_temp_min)
+            predicted_indoor = (
+                floor_indoor if floor_indoor < comfort_temp_min - 0.3 else expected_indoor
+            )
             if predicted_indoor >= target or target - predicted_indoor < 0.3:
                 continue
 
@@ -800,15 +1162,16 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             # Widen the look-back so the picker can catch overnight off-peak
             # troughs before the guardrail hour, matching DHW and preheat.
             window_start = max(horizon_start, hour_ts - dt.timedelta(hours=hours_needed + 6))
-            weather_by_ts = {ts: temp for ts, temp in weather}
+
+            gate_by_ts = {
+                timestamp: gate_projections[index]
+                for index, (timestamp, _) in enumerate(weather)
+                if gate_projections is not None and index < len(gate_projections)
+            }
 
             def controller_can_heat(ts: dt.datetime) -> bool:
-                if heat_curve is None:
-                    return True
-                outdoor_temp = weather_by_ts.get(ts)
-                if outdoor_temp is None:
-                    outdoor_temp = current_outdoor_temp
-                return outdoor_temp < heat_curve.heating_off_outdoor_c
+                evidence = gate_by_ts.get(ts)
+                return evidence is None or evidence.state == "ALLOWED"
 
             window_prices = [
                 (ts, p)
@@ -842,6 +1205,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": slot_start.isoformat(),
                     "type": str(ActionType.ZONE_TEMP_BOOST),
+                    "action_key": f"zone_guardrail:{slot_start.isoformat()}",
                     "payload": {
                         "offset": boost_temperature - baseline_temperature,
                         "baseline_temperature": baseline_temperature,
@@ -857,6 +1221,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                 {
                     "ts": (slot_start + dt.timedelta(hours=hours_needed)).isoformat(),
                     "type": str(ActionType.ZONE_TEMP_RESTORE),
+                    "reverts_action_key": f"zone_guardrail:{slot_start.isoformat()}",
                     "payload": {
                         "temperature": baseline_temperature,
                         "boost_temperature": boost_temperature,
@@ -875,7 +1240,10 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
             # pessimistic.
             and current_indoor_temp < comfort_temp_target - 0.3
             and not actions
-            and (heat_curve is None or current_outdoor_temp < heat_curve.heating_off_outdoor_c)
+            and (
+                gate_projections is None
+                or (gate_projections and gate_projections[0].state == "ALLOWED")
+            )
         ):
             cooling_pred = thermal_model.predict_indoor_cooling_time(
                 current_temp=current_indoor_temp,
@@ -896,6 +1264,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": horizon_start.isoformat(),
                         "type": str(ActionType.ZONE_TEMP_BOOST),
+                        "action_key": f"zone_cooling:{horizon_start.isoformat()}",
                         "payload": {
                             "offset": boost_temperature - baseline_temperature,
                             "baseline_temperature": baseline_temperature,
@@ -911,6 +1280,7 @@ class GuardrailRulesMixin(SharedRuleHelpersMixin):
                     {
                         "ts": (horizon_start + dt.timedelta(hours=boost_hours)).isoformat(),
                         "type": str(ActionType.ZONE_TEMP_RESTORE),
+                        "reverts_action_key": f"zone_cooling:{horizon_start.isoformat()}",
                         "payload": {
                             "temperature": baseline_temperature,
                             "boost_temperature": boost_temperature,
@@ -1070,9 +1440,17 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
         special_status_supported: bool = False,
         current_special_status: int | None = None,
         zone_control_windows: list[tuple[dt.datetime, dt.datetime]] | None = None,
+        gate_projections: list | None = None,
+        *,
+        gate_control_enabled: bool = False,
+        max_passive_change_c_per_hour: float = 0.5,
+        baseline_heating_fractions: list[float] | None = None,
+        use_learned_forecast: bool = False,
     ) -> list[dict]:
         actions = []
         if not prices or special_status_supported is not True:
+            return actions
+        if gate_control_enabled and not self._has_valid_gate_projections(weather, gate_projections):
             return actions
 
         if current_special_status is None:
@@ -1100,12 +1478,15 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                 current_water_temp,
                 heat_curve,
                 weather_full,
+                max_passive_change_c_per_hour=max_passive_change_c_per_hour,
+                baseline_heating_fractions=baseline_heating_fractions,
+                use_learned_forecast=use_learned_forecast,
             )
             if current_indoor_temp is not None and comfort_temp_target is not None
             else {}
         )
         mild_outdoor_threshold = 5.0
-        for ts, price in prices:
+        for index, (ts, price) in enumerate(prices):
             comparable_ts = (
                 ts.replace(tzinfo=dt.timezone.utc)
                 if ts.tzinfo is None
@@ -1163,12 +1544,12 @@ class ModeRulesMixin(SharedRuleHelpersMixin):
                     target_mode = "eco"
                     reason = "outside_comfort_schedule"
 
-            if (
-                heat_curve is not None
-                and outdoor_temp is not None
-                and outdoor_temp >= heat_curve.heating_off_outdoor_c
-                and target_mode in {"normal", "comfort"}
-            ):
+            gate_state = (
+                gate_projections[index].state
+                if gate_projections is not None and index < len(gate_projections)
+                else None
+            )
+            if gate_state != "ALLOWED" and target_mode in {"normal", "comfort"}:
                 # Normal/Comfort only changes the heating curve. Above the
                 # controller's own Värme AV threshold it cannot request room
                 # heat, so exposing it as a comfort action is misleading.

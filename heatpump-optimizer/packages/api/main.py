@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
+import logging
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,9 +21,11 @@ from packages.api.routers.settings import router as settings_router
 from packages.api.routers.smartthings import router as smartthings_router
 from packages.core.config import settings
 from packages.core.logging import configure_logging
+from packages.core.services import AquareaWrapper
 from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 
 configure_logging("api")
+logger = logging.getLogger(__name__)
 
 if not is_auth_enabled():
     import structlog
@@ -35,11 +39,55 @@ if not is_auth_enabled():
         ),
     )
 
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
+
+    wrapper: AquareaWrapper | None = None
+    failed_wrapper_stopped = True
+    try:
+        configure_logging("api")
+        if settings.panasonic_distributed_read_quota_enabled:
+            wrapper = AquareaWrapper(read_only=True)
+            try:
+                await wrapper.start()
+            except Exception:
+                logger.exception("Panasonic quota wrapper startup failed")
+                # Transfer disposal ownership before awaiting so final cleanup cannot
+                # stop the failed wrapper a second time, including after cancellation.
+                failed_wrapper, wrapper = wrapper, None
+                failed_wrapper_stopped = False
+
+                async def stop_failed_wrapper():
+                    nonlocal failed_wrapper_stopped
+                    await failed_wrapper.stop()
+                    failed_wrapper_stopped = True
+
+                await finish_owned_cleanup(stop_failed_wrapper)
+            else:
+                application.state.aquarea_wrapper = wrapper
+        yield
+    finally:
+
+        async def cleanup():
+            from packages.core.database import engine
+
+            await close_service_resources(
+                wrapper=wrapper, engine=engine if failed_wrapper_stopped else None
+            )
+            if hasattr(application.state, "aquarea_wrapper"):
+                del application.state.aquarea_wrapper
+
+        await finish_owned_cleanup(cleanup)
+
+
 app = FastAPI(
     title="Heat Pump Optimizer API",
     version=APP_VERSION,
     description="API for monitoring and optimizing Panasonic Aquarea heat pump costs",
     dependencies=[Depends(require_auth)],
+    lifespan=lifespan,
 )
 
 app.add_middleware(

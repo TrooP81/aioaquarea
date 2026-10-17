@@ -14,6 +14,7 @@ from aioaquarea.const import AquareaEnvironment
 from aioaquarea.core import AquareaClient
 from aioaquarea.decorators import auth_required
 from aioaquarea.errors import AuthenticationError, AuthenticationErrorCodes
+from aioaquarea.statistics import DateType
 
 
 def _client(environment=AquareaEnvironment.PRODUCTION) -> AquareaClient:
@@ -63,7 +64,9 @@ def test_consumption_manager_uses_client_timezone() -> None:
     assert client._consumption_manager._timezone is timezone
 
 
-def test_production_client_registers_serialized_login_for_api_reauthentication() -> None:
+def test_production_client_registers_serialized_login_for_api_reauthentication() -> (
+    None
+):
     client = _client()
 
     assert client._api_client._refresh_authentication == client.refresh_login
@@ -115,6 +118,40 @@ async def test_auth_decorator_does_not_duplicate_api_token_recovery() -> None:
         await operation(fake_client)
 
     login.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["post_device_zone_heat_temperature", "post_device_zone_cool_temperature"],
+)
+async def test_zone_temperature_methods_login_before_delegating(
+    method_name: str,
+) -> None:
+    client = _client()
+    client.login = AsyncMock()
+    delegated_method = AsyncMock()
+    setattr(client._device_control, method_name, delegated_method)
+
+    await getattr(client, method_name)("device-1", 1, 21)
+
+    client.login.assert_awaited_once()
+    delegated_method.assert_awaited_once_with("device-1", 1, 21)
+
+
+@pytest.mark.asyncio
+async def test_get_device_consumption_logs_in_before_delegating() -> None:
+    client = _client()
+    client.login = AsyncMock()
+    client._consumption_manager.get_device_consumption = AsyncMock(return_value=[])
+
+    result = await client.get_device_consumption("device-1", DateType.DAY, "2026-09-23")
+
+    assert result == []
+    client.login.assert_awaited_once()
+    client._consumption_manager.get_device_consumption.assert_awaited_once_with(
+        "device-1", DateType.DAY, "2026-09-23"
+    )
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,11 @@
 """Tests for thermal model calibration and predictions."""
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
+import pytest
 
 from packages.ml.thermal import ThermalModel, ThermalPrediction
 
@@ -90,30 +92,469 @@ class TestThermalPredictions:
         assert pred.estimated_minutes > 0
         assert pred.confidence == "default"
 
-    def test_zone_cooling_fit_rejects_unsafe_extrapolation(self):
-        # A sparse warm-weather line with a huge negative intercept used to
-        # persist as an impossible standby loss (for example -49 °C/h).
-        samples = [(-50.0 + (2.0 * outdoor), outdoor) for outdoor in range(20, 26)]
 
-        assert ThermalModel._robust_zone_cooling_fit(samples) is None
+def _dhw_cycle_records(cycles, reheat_rate, standby_loss, outdoor=10.0):
+    """Realistic DHW cycles: 40-min reheats, 4 h standby, whole-degree tank readings."""
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    records, tank, minute = [], 44.0, 0
+    for _ in range(cycles):
+        for phase, steps, rate in (("HEATING_WATER", 9, reheat_rate), ("OFF", 49, standby_loss)):
+            for _ in range(steps):
+                rec = _make_status_record(
+                    base + dt.timedelta(minutes=minute), float(round(tank)), outdoor
+                )
+                rec.device_action = phase
+                records.append(rec)
+                tank += rate * 5 / 60
+                minute += 5
+    return records
 
-    def test_invalid_persisted_zone_cooling_is_reset_to_safe_defaults(self):
+
+async def _calibrate_records(model, records):
+    device_result = MagicMock()
+    device_result.scalars.return_value.all.return_value = records
+    empty = MagicMock()
+    empty.scalars.return_value.all.return_value = []
+    empty.scalar_one_or_none.return_value = None
+    calls = [0]
+
+    async def execute(_stmt):
+        calls[0] += 1
+        return device_result if calls[0] == 1 else empty
+
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=execute)
+    with (
+        patch("packages.ml.thermal.get_session") as ctx,
+        patch.object(ThermalModel, "save"),
+    ):
+        ctx.return_value.__aenter__ = AsyncMock(return_value=session)
+        ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        return await model.calibrate()
+
+
+class TestReadinessExtraction:
+    async def test_UR2_SR4_copy_budget_and_cancellation_are_cooperative(self):
+        import asyncio
+        from packages.core.database import copy_materialized_rows
+
+        rows = [SimpleNamespace(temperature=20.0) for _ in range(50_000)]
+        ticks = asyncio.Event()
+        asyncio.get_running_loop().call_soon(ticks.set)
+        copied = await copy_materialized_rows(rows, ["temperature"])
+        assert ticks.is_set() and len(copied) == 50_000
+        count = 0
+
+        def claim(_row):
+            nonlocal count
+            count += 1
+            if count == 20:
+                raise ValueError("owned copy budget")
+
+        with pytest.raises(ValueError, match="owned copy budget"):
+            await copy_materialized_rows(
+                rows, ["temperature"], context={"_readiness_copy_claim": claim}
+            )
+        assert count == 20
+
+    async def test_UR2_SR1_supplied_status_inputs_preserve_S1_clock_and_skip_reload(self):
+        from packages.core import device_data_quality
+        from packages.optimizer import main
+
+        now = dt.datetime(2026, 10, 11, tzinfo=dt.timezone.utc)
+        values = {
+            "aquarea_username": "public-user",
+            "aquarea_password": "public-test",
+            "device_status_max_age_minutes": "15",
+            "poll_interval_seconds": "300",
+        }
+        status = SimpleNamespace(ts=now + dt.timedelta(seconds=1), native_policy_provenance={})
+        with (
+            patch.object(
+                device_data_quality, "get_setting", side_effect=AssertionError("setting reload")
+            ),
+            patch.object(
+                device_data_quality, "get_session", side_effect=AssertionError("status reload")
+            ),
+            patch.object(
+                main, "_select_optimizer", side_effect=AssertionError("shared estimator selection")
+            ),
+            patch.object(
+                main,
+                "get_planning_data_quality",
+                side_effect=AssertionError("later planning snapshot"),
+            ),
+        ):
+            quality = await device_data_quality.get_device_data_quality(
+                now=now, values=values, status=status
+            )
+            selected = await main.get_optimizer_status_snapshot(
+                "auto", reporting_inputs={"demand_trained": False}
+            )
+        assert quality["reasons"] == ["device_status_future"] and quality["ready"] is False
+        assert selected["effective_layer"] == "rules" and selected["control_ready"] is False
+
+    async def test_UR2_SR1_raw_native_inputs_defer_selection_and_borrow_context(self):
+        from packages.ml import forecast_quality
+        from packages.ml.comfort_model import ComfortModel
+        from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+        from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute
+
+        records, readings, weather = TestR06ThermalQualificationRoute.cohort()
+        mapping = {
+            DeviceStatusRecord: records[-25:],
+            IndoorTempReading: readings[-25:],
+            WeatherRecord: weather[-2:],
+        }
+        session = AsyncMock()
+
+        async def execute(statement):
+            rows = mapping.get(statement.column_descriptions[0]["entity"], [])
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+        session.execute.side_effect = execute
+        context = {
+            "settings": {
+                "comfort_reference_sensor_id": "selected-room",
+                "smartthings_device_ids": "selected-room",
+                "weather_provider": "open-meteo",
+                "price_provider": "manual",
+                "timezone": "UTC",
+            }
+        }
+        with (
+            patch.object(
+                forecast_quality, "get_session", side_effect=AssertionError("independent session")
+            ),
+            patch(
+                "packages.core.settings_service.get_all_settings",
+                side_effect=AssertionError("settings reload"),
+            ),
+            patch.object(
+                ComfortModel,
+                "_select_indoor_observations",
+                side_effect=AssertionError("selection before close"),
+            ),
+        ):
+            data = await forecast_quality.materialize_native_inputs(
+                "thermal",
+                now=TestR06ThermalQualificationRoute.NOW,
+                device_id="audit-device",
+                session=session,
+                context=context,
+                raw=True,
+            )
+        assert data is not None and len(data["statuses"]) == 25
+        assert isinstance(data["raw_indoor"][0], SimpleNamespace)
+        session.commit.assert_not_awaited()
+        session.close.assert_not_awaited()
+        prepared = forecast_quality._prepare_native_inputs(
+            data, capabilities=("indoor_heating", "indoor_cooling")
+        )
+        assert prepared is not None and prepared["configured_sensor_ids"] == ["selected-room"]
+
+    async def test_UR1_SR1_demand_partitions_and_supplied_quality_are_pure(self):
+        from packages.ml.demand_model_core import (
+            DemandModel,
+            _demand_sample_counts,
+            _partition_demand_samples,
+        )
+        from packages.ml.models_common import chronological_fit_holdout
+        from tests.test_ml import TestDemandModel
+        from zoneinfo import ZoneInfo
+
+        rows = TestDemandModel._lifecycle_preprocessing_rows(24)
+        data = {
+            "consumption_rows": rows[0]._rows,
+            "weather_rows": rows[1]._rows,
+            "statuses": rows[2]._rows,
+            "timezone": ZoneInfo("UTC"),
+            "lifecycle_evidence": True,
+        }
+        model = DemandModel()
+        before = model.last_data_quality
+        with (
+            patch(
+                "packages.ml.demand_model_core.get_session",
+                side_effect=AssertionError("database read"),
+            ),
+            patch.object(
+                model, "_prepare_data", side_effect=AssertionError("independent preparation")
+            ),
+        ):
+            with patch(
+                "packages.ml.demand_model_core._logger.info",
+                side_effect=AssertionError("reporting log mutation"),
+            ):
+                quality = await model.training_data_quality(
+                    materialized=data, context={"settings": {"timezone": "UTC"}}
+                )
+            prepared = model._preprocess_materialized(data)
+        assert quality == prepared["quality"]
+        assert model.last_data_quality == before
+        actual = _partition_demand_samples(prepared["bounds"])
+        old = chronological_fit_holdout(
+            prepared["bounds"], holdout_fraction=0.2, embargo=dt.timedelta(hours=4)
+        )
+        assert all(np.array_equal(left, right) for left, right in zip(actual, old))
+        counts = _demand_sample_counts(prepared)
+        assert (counts["total"], counts["train"], counts["holdout"]) == (
+            len(prepared["bounds"]),
+            len(old[0]),
+            len(old[1]),
+        )
+        assert counts["minimum_train"] == 168 and counts["minimum_holdout"] == 24
+
+    async def test_UR2_SR1_raw_thermal_materialization_uses_borrowed_session(self):
+        from packages.core.models import DeviceStatusRecord, IndoorTempReading, WeatherRecord
+        from packages.ml.comfort_model import ComfortModel
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        rows = {
+            DeviceStatusRecord: [
+                DeviceStatusRecord(ts=start, device_id="hp-one", outdoor_temp=0.0)
+            ],
+            IndoorTempReading: [
+                IndoorTempReading(
+                    timestamp=start, device_id="room", temperature=20.0, is_stale=False
+                )
+            ],
+            WeatherRecord: [
+                WeatherRecord(
+                    ts=start,
+                    source="open-meteo",
+                    temperature=0.0,
+                    forecast_issued_at=start + dt.timedelta(days=1),
+                )
+            ],
+        }
+        session = AsyncMock()
+
+        async def execute(statement):
+            entity = statement.column_descriptions[0]["entity"]
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows[entity]))
+
+        session.execute.side_effect = execute
+        with (
+            patch(
+                "packages.ml.thermal.get_session", side_effect=AssertionError("independent session")
+            ),
+            patch.object(
+                ComfortModel,
+                "_select_indoor_observations",
+                side_effect=AssertionError("selection inside transaction"),
+            ),
+        ):
+            from packages.ml.thermal import materialize_thermal_inputs
+
+            result = await materialize_thermal_inputs(
+                "hp-one",
+                "room",
+                "open-meteo",
+                start,
+                selected_ids=["room"],
+                session=session,
+                raw=True,
+            )
+        assert result["readings"][0].temperature == 20.0
+        assert isinstance(result["readings"][0], SimpleNamespace)
+        assert result["weather"][0].forecast_issued_at > start
+        assert result["records"][0].outdoor_temp == 0.0
+        session.commit.assert_not_awaited()
+        session.close.assert_not_awaited()
+
+    @pytest.mark.parametrize("heating", [True, False])
+    def test_UR1_SR1_extractor_parity_and_embargo(self, heating):
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        readings = [
+            SimpleNamespace(timestamp=start + dt.timedelta(hours=index), temperature=20 + index / 2)
+            for index in range(101)
+        ]
+        records = [
+            SimpleNamespace(
+                ts=start + dt.timedelta(minutes=15 * index),
+                device_id="hp-one",
+                space_heating_active=heating,
+                outdoor_temp=7.0,
+            )
+            for index in range(401)
+        ]
+        weather = [
+            SimpleNamespace(
+                ts=reading.timestamp,
+                temperature=0.0,
+                forecast_issued_at=start + dt.timedelta(days=30),
+            )
+            for reading in readings
+        ]
+        expected = [
+            (0.5, 0.0, 1.0, readings[index - 1].timestamp, readings[index].timestamp)
+            for index in range(1, 101)
+        ]
         model = ThermalModel()
-        model.params.zone_standby_loss = -49.0
+        before = repr(model.params), dict(model.validation)
+        with (
+            patch.object(model, "_record_indoor_validation") as record,
+            patch.object(ThermalModel, "_fit_rate", side_effect=AssertionError("unexpected fit")),
+            patch("packages.ml.thermal.get_session") as db,
+            patch("packages.ml.thermal.logger.info") as log,
+        ):
+            extracted = model._extract_indoor_rate_samples(readings, records, weather)
+            assert extracted == (expected, []) if heating else extracted == ([], expected)
+            train, holdout = model._partition_rate_samples(expected)
+            assert train == expected[:64]
+            assert holdout == expected[70:]
+            assert len(train) + len(holdout) < len(expected)
+            assert before == (repr(model.params), model.validation)
+            record.assert_not_called()
+            db.assert_not_called()
+            log.assert_not_called()
+            assert model._fit_indoor_rates(readings, records, weather) == extracted
+            record.assert_called_once_with(*extracted)
 
-        model._sanitize_zone_cooling_params()
+    @pytest.mark.parametrize("failure", ["empty", "gap", "device", "mode", "defrost"])
+    def test_UR1_SR1_scoped_zero_and_unknown(self, failure):
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        readings = [
+            SimpleNamespace(timestamp=start + dt.timedelta(minutes=15 * index), temperature=20.0)
+            for index in range(2)
+        ]
+        records = [
+            SimpleNamespace(
+                ts=reading.timestamp,
+                device_id="hp-one",
+                space_heating_active=True,
+                defrost_active=False,
+                outdoor_temp=0.0,
+            )
+            for reading in readings
+        ]
+        if failure == "empty":
+            readings = []
+        elif failure == "gap":
+            records[0].ts -= dt.timedelta(minutes=1)
+            records[-1].ts += dt.timedelta(minutes=1)
+        elif failure == "device":
+            records[-1].device_id = "hp-two"
+        elif failure == "mode":
+            records[-1].space_heating_active = False
+        else:
+            records[-1].defrost_active = True
+        assert ThermalModel._extract_indoor_rate_samples(readings, records, []) == ([], [])
 
-        assert model.params.zone_standby_loss == -0.3
-        assert model.params.calibration_status["zone_cooling"].startswith("rejected_previous")
+
+class TestTankRateValidation:
+    def test_published_fit_is_evaluated_fit(self, isolate_model_dir):
+        from packages.ml import thermal
+        from packages.ml.safe_persistence import safe_load
+
+        model = ThermalModel()
+        samples = [(12.0, 10.0, 0.5)] * 28 + [(11.8, 10.0, 0.5)] * 12
+        with patch.object(model, "_fit_rate", wraps=model._fit_rate) as fit:
+            model._validate_rate_component("tank_heating", samples)
+        assert fit.call_count == 1
+        assert model.params.calibration_status["tank_heating"] == "validated"
+        assert model.params.tank_heating_rate == 12.0
+        with patch.object(thermal, "MODEL_DIR", isolate_model_dir):
+            model.save()
+            payload = safe_load(model._artifact_path())
+        assert payload["schema_version"] == 5
+        assert payload["params"]["tank_heating_rate"] == 12.0
+        assert payload["validation"]["tank_heating"]["evaluated_parameters"] == [12.0, 0.0]
+
+    async def test_insufficient_data_clears_stale_calibration(self):
+        model = ThermalModel()
+        model.params.last_calibrated = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        model.params.tank_heating_rate = 19.0
+        model.params.calibration_status["tank_heating"] = "validated"
+        result = await _calibrate_records(model, [])
+        assert result["status"] == "insufficient_data"
+        assert model.params.last_calibrated is None
+        assert model.params.tank_heating_rate == 4.0
+        assert model.confidence_for("tank_heating") == "default"
+
+    def test_on_off_on_full_interval_is_rejected(self):
+        start = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        records = [
+            SimpleNamespace(
+                ts=start + dt.timedelta(minutes=5 * index),
+                device_id="heatpump-one",
+                space_heating_active=active,
+            )
+            for index, active in enumerate((True, False, True, True))
+        ]
+        state, status = ThermalModel._continuous_indoor_state(
+            records, start, start + dt.timedelta(minutes=15)
+        )
+        assert state is None and status is None
+
+    async def test_reheat_and_standby_rates_are_learned_from_quantised_cycles(self):
+        model = ThermalModel()
+
+        result = await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2))
+
+        assert model.params.calibration_status["tank_heating"] == "validated"
+        assert model.params.calibration_status["tank_cooling"] == "validated"
+        assert 10.0 < model._tank_heating_rate(10.0) < 14.0
+        assert -1.6 < model._tank_loss_rate(10.0) < -0.8
+        assert model.confidence_for("tank_heating") == "default"
+        assert (
+            result["validation"]["tank_heating"]["candidate_mae_c"]
+            < (result["validation"]["tank_heating"]["default_mae_c"])
+        )
+
+    async def test_latched_heating_without_temperature_rise_is_not_learned(self):
+        """A status that stays HEATING_WATER for days must not become a heating rate."""
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        records = []
+        for i in range(600):
+            rec = _make_status_record(base + dt.timedelta(minutes=5 * i), 51.0, 10.0)
+            rec.device_action = "HEATING_WATER"
+            records.append(rec)
+        model = ThermalModel()
+
+        await _calibrate_records(model, records)
+
+        assert model.params.calibration_status["tank_heating"] == "insufficient_samples"
+        assert model.params.tank_heating_rate == 4.0
+        assert model.confidence_for("tank_heating") == "default"
+
+    async def test_previously_learned_rate_is_replaced_by_default_when_rejected(self):
+        model = ThermalModel()
+        model.params.tank_standby_loss = -3.0
+        model.params.zone_heating_rate = 15.0
+
+        await _calibrate_records(model, _dhw_cycle_records(2, 12.0, -1.2))
+
+        assert model.params.tank_standby_loss == -0.5
+        assert model.params.zone_heating_rate == 1.5
+
+    async def test_learned_rate_is_not_extrapolated_beyond_observed_outdoor_range(self):
+        model = ThermalModel()
+
+        await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2, outdoor=10.0))
+
+        assert model.params.rate_outdoor_ranges["tank_heating"] == [10.0, 10.0]
+        assert 10.0 < model._tank_heating_rate(12.0) < 14.0
+        assert model._tank_heating_rate(-10.0) == pytest.approx(4.0 + 0.08 * -10.0)
+
+    def test_outdoor_slope_requires_wide_outdoor_range(self):
+        narrow = [(10.0 + outdoor, outdoor, 0.5) for outdoor in (14.0, 16.0, 18.0, 20.0, 21.0)]
+        wide = [(10.0 - 0.2 * outdoor, outdoor, 0.5) for outdoor in (-5.0, 0.0, 5.0, 10.0, 15.0)]
+
+        assert ThermalModel._fit_rate(narrow)[1] == 0.0
+        assert ThermalModel._fit_rate(wide)[1] == pytest.approx(-0.2)
 
 
 class TestThermalPersistence:
     def test_shared_calibration_round_trip(self, tmp_path):
         from packages.ml import thermal as thermal_module
+        from packages.ml.safe_persistence import safe_load
 
         source = ThermalModel()
         source.params.tank_heating_rate = 6.2
         source.params.indoor_heating_samples = 8
+        source.params.calibration_status = {"indoor_heating": "validated"}
         source.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
 
         with (
@@ -125,11 +566,14 @@ class TestThermalPersistence:
             source.save()
 
             loaded = ThermalModel()
-            assert loaded.load_latest() is True
+            archived = safe_load(source._artifact_path())
+            assert archived["params"]["tank_heating_rate"] == 6.2
+            assert archived["params"]["indoor_heating_samples"] == 8
+            assert loaded.load_latest() is False
 
-        assert loaded.params.tank_heating_rate == 6.2
-        assert loaded.params.indoor_heating_samples == 8
-        assert loaded.confidence_for("indoor_heating") == "learned"
+        assert loaded.params.tank_heating_rate == 4.0
+        assert loaded.params.indoor_heating_samples == 0
+        assert loaded.confidence_for("indoor_heating") == "default"
 
     def test_zone_heating_already_at_target(self):
         model = ThermalModel()
@@ -247,40 +691,17 @@ class TestCalibrate:
         assert result["records"] == 5
 
     async def test_calibrate_with_heating_data(self):
-        """Calibration with records showing clear tank heating."""
+        """Calibration learns the reheat rate from repeated DHW cycles."""
         model = ThermalModel()
+        records = _dhw_cycle_records(20, 5.0, -1.2)
 
-        # Generate 40 records with tank heating (4°C/h at outdoor=10)
-        records = _generate_heating_records(n=40, heating_rate=5.0, outdoor=10.0)
-
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = records
-
-        # Second session (indoor readings) returns empty
-        mock_indoor_result = MagicMock()
-        mock_indoor_result.scalars.return_value.all.return_value = []
-
-        call_count = [0]
-
-        async def _mock_execute(stmt):
-            call_count[0] += 1
-            return mock_result if call_count[0] <= 1 else mock_indoor_result
-
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(side_effect=_mock_execute)
-
-        with patch("packages.ml.thermal.get_session") as mock_ctx:
-            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-            result = await model.calibrate()
+        result = await _calibrate_records(model, records)
 
         assert result["status"] == "calibrated"
-        assert result["samples"] == 40
+        assert result["samples"] == len(records)
         assert result["tank_heating_samples"] > 0
         assert model.params.last_calibrated is not None
-        # Learned rate should be around 5°C/h (at outdoor=10)
-        effective_rate = model._tank_heating_rate(10.0)
-        assert 3.0 < effective_rate < 8.0
+        assert 3.0 < model._tank_heating_rate(10.0) < 8.0
 
     async def test_defrost_intervals_filtered(self):
         """Records with defrost_active=True should be skipped."""
@@ -324,33 +745,20 @@ class TestCalibrate:
         assert result["status"] == "calibrated"
         assert result["defrost_intervals_filtered"] > 0
 
-    async def test_calibrate_confidence_becomes_learned(self):
-        """After calibration, predictions should have confidence='learned'."""
+    async def test_calibrated_confidence_requires_prospective_qualification(self):
+        """Fit validation alone does not qualify tank predictions for reporting."""
+        from tests.test_ml_lifecycle import qualified_reference
+
         model = ThermalModel()
-        records = _generate_heating_records(n=30, heating_rate=4.0, outdoor=10.0)
 
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = records
-
-        mock_indoor_result = MagicMock()
-        mock_indoor_result.scalars.return_value.all.return_value = []
-
-        call_count = [0]
-
-        async def _mock_execute(stmt):
-            call_count[0] += 1
-            return mock_result if call_count[0] <= 1 else mock_indoor_result
-
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(side_effect=_mock_execute)
-
-        with patch("packages.ml.thermal.get_session") as mock_ctx:
-            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-            await model.calibrate()
+        await _calibrate_records(model, _dhw_cycle_records(32, 12.0, -1.2))
 
         pred = model.predict_tank_heating_time(42.0, 50.0, outdoor_temp=10.0)
-        assert pred.confidence == "learned"
+        assert pred.confidence == "default"
+        model._qualified_reference = qualified_reference("thermal", ("tank_heating",))
+        assert (
+            model.predict_tank_heating_time(42.0, 50.0, outdoor_temp=10.0).confidence == "learned"
+        )
 
 
 class TestInternalRates:
@@ -408,6 +816,8 @@ class TestIndoorPredictions:
         assert pred.confidence == "default"
 
     def test_indoor_confidence_requires_indoor_evidence(self):
+        from tests.test_ml_lifecycle import qualified_reference
+
         model = ThermalModel()
         model.params.last_calibrated = dt.datetime.now(dt.timezone.utc)
 
@@ -416,6 +826,15 @@ class TestIndoorPredictions:
         )
 
         model.params.indoor_heating_samples = 5
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "default"
+        )
+
+        model.params.calibration_status["indoor_heating"] = "validated"
+        assert (
+            model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "default"
+        )
+        model._qualified_reference = qualified_reference()
         assert (
             model.predict_indoor_heating_time(19.0, 21.0, outdoor_temp=5.0).confidence == "learned"
         )
@@ -512,6 +931,194 @@ class TestIndoorCurve:
         water_temps = [35.0] * 6
         curve = model.predict_indoor_curve(20.0, water_temps, weather, hours=6)
         assert all(entry["source"] == "linear_rates" for entry in curve)
+
+    def test_curve_interpolates_delta(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 23.0, 26.0, 32.0]
+        comfort.predict_passive_indoor_temp.side_effect = [
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+            (20.0, {"ready": True}),
+        ]
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(12)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[1.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+            )
+
+        assert curve is not None
+        assert curve[0]["predicted_indoor_temp"] == 21.0
+        assert curve[1]["predicted_indoor_temp"] == 22.0
+        assert curve[1]["segment_kind"] == "interpolated"
+        assert curve[2]["predicted_indoor_temp"] == 23.0
+
+    def test_curve_blends_to_anchored_physics(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 22.0, 23.0, 24.0]
+        comfort.predict_passive_indoor_temp.side_effect = [(20.0, {"ready": True})] * 4
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(24)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 24,
+                heating_fractions=[1.0] * 24,
+                weather_forecast=weather,
+                hours=24,
+            )
+
+        assert curve is not None
+        assert curve[11]["predicted_indoor_temp"] == 24.0
+        assert curve[12]["source"] == "comfort_model_physics_continuation"
+        assert curve[12]["segment_kind"] == "physics_continuation"
+
+    def test_no_heat_curve_is_cumulatively_nonincreasing(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [21.0, 22.0, 23.0, 24.0]
+        comfort.predict_passive_indoor_temp.side_effect = [
+            (21.0, {"ready": True}),
+            (22.0, {"ready": True}),
+            (23.0, {"ready": True}),
+            (24.0, {"ready": True}),
+        ]
+        weather = [
+            {"outdoor_temp": 5.0 - hour, "irradiance": 0.0, "hour": hour} for hour in range(12)
+        ]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[0.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+            )
+
+        assert curve is not None
+        assert all(point["source"] == "comfort_model_passive_direct" for point in curve)
+        assert all(
+            current["predicted_indoor_temp"] <= previous["predicted_indoor_temp"]
+            for previous, current in zip(curve, curve[1:])
+        )
+
+    def test_hybrid_curve_passes_configured_passive_change_limit(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True, direct_forecast_horizons_minutes=(60, 180, 360, 720)
+        )
+        comfort.predict_indoor_temp.side_effect = [20.0] * 4
+
+        def passive_forecast(**kwargs):
+            return (
+                20.0 + kwargs["max_change_c_per_hour"] * kwargs["forecast_horizon_minutes"] / 60,
+                {"ready": True},
+            )
+
+        comfort.predict_passive_indoor_temp.side_effect = passive_forecast
+        weather = [{"outdoor_temp": 5.0, "hour": hour} for hour in range(12)]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            curve = model._predict_indoor_hybrid_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0] * 12,
+                heating_fractions=[0.0] * 12,
+                weather_forecast=weather,
+                hours=12,
+                max_passive_change_c_per_hour=0.2,
+            )
+
+        assert curve is not None
+        assert curve[0]["predicted_indoor_temp"] == 20.2
+        assert all(
+            call.kwargs["max_change_c_per_hour"] == 0.2
+            for call in comfort.predict_passive_indoor_temp.call_args_list
+        )
+
+    def test_candidate_curve_requires_complete_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={60: MagicMock()},
+        )
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            candidate = model.predict_indoor_candidate_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[0.0],
+                weather_forecast=[{"outdoor_temp": 5.0, "hour": 1}],
+                hours=1,
+            )
+
+        assert candidate is None
+
+    def test_candidate_curve_allows_controlled_forecast_without_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={},
+        )
+        comfort.predict_indoor_temp.return_value = 20.4
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            candidate = model.predict_indoor_candidate_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[1.0],
+                weather_forecast=[{"outdoor_temp": 5.0, "hour": 1}],
+                hours=1,
+            )
+
+        assert candidate is not None
+        assert candidate[0]["source"] == "comfort_model_controlled"
+
+    def test_live_no_heating_uses_physics_without_passive_artifacts(self):
+        model = ThermalModel()
+        comfort = MagicMock(
+            is_ready_for_control=True,
+            direct_forecast_horizons_minutes=(60, 180, 360, 720),
+            _passive_direct_models={},
+        )
+        comfort.predict_indoor_temp.return_value = 20.4
+        weather = [{"outdoor_temp": 5.0, "hour": 1}]
+
+        with patch("packages.ml.comfort_model.comfort_model", comfort):
+            no_heating = model.predict_indoor_controlled_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[0.0],
+                weather_forecast=weather,
+                hours=1,
+                use_learned_forecast=True,
+            )
+            with_plan = model.predict_indoor_controlled_curve(
+                current_indoor=20.0,
+                zone_water_temps=[35.0],
+                heating_fractions=[1.0],
+                weather_forecast=weather,
+                hours=1,
+                use_learned_forecast=True,
+            )
+
+        assert no_heating[0]["source"] == "linear_controlled"
+        assert with_plan[0]["source"] == "comfort_model_controlled"
 
     def test_indoor_curve_cooling_without_heating(self):
         """With low water temp, indoor should cool toward outdoor."""
@@ -1115,3 +1722,395 @@ class TestCalibrateIndoorRates:
         assert model.params.indoor_cooling_rate == -0.3
         assert model.params.indoor_heating_samples == 0
         assert model.params.indoor_cooling_samples == 0
+
+
+@pytest.fixture(autouse=True)
+def _db_free_thermal_settings(monkeypatch):
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_all_settings",
+        AsyncMock(return_value={"smartthings_device_ids": "", "comfort_reference_sensor_id": ""}),
+    )
+
+
+class TestR09FiniteTrajectories:
+    FAMILIES = (
+        "temperature",
+        "managed_tank",
+        "managed_indoor",
+        "free_float",
+        "planned_tank",
+        "controlled",
+        "legacy",
+        "candidate",
+    )
+
+    @staticmethod
+    def _kernel(monkeypatch, family, current=20.0, outdoor=5.0):
+        from packages.ml.comfort_model import ComfortModel, comfort_model
+        from tests.test_comfort_model import _WindowFeatureSpy
+
+        spy = _WindowFeatureSpy()
+        monkeypatch.setattr(ComfortModel, "is_ready_for_control", property(lambda _self: True))
+        monkeypatch.setattr(comfort_model, "_model", spy)
+        monkeypatch.setattr(comfort_model, "_metrics", {"delta_target": True})
+        monkeypatch.setattr(
+            comfort_model, "_direct_models", {horizon: spy for horizon in (60, 180, 360, 720)}
+        )
+        monkeypatch.setattr(
+            comfort_model,
+            "_passive_direct_models",
+            {horizon: spy for horizon in (60, 180, 360, 720)},
+        )
+        model = ThermalModel()
+        weather = [{"outdoor_temp": outdoor, "hour": hour} for hour in (1, 2, 3)]
+        forecasts = {
+            "temperature": lambda: model.predict_temperature_curve(current, outdoor, 2),
+            "managed_tank": lambda: model.predict_managed_tank_curve(
+                current + 25, outdoor, 50, [40], 2
+            ),
+            "managed_indoor": lambda: model.predict_managed_indoor_curve(current, [20], weather, 2),
+            "free_float": lambda: model.predict_free_float_curve(current, weather, 2),
+            "planned_tank": lambda: model.predict_planned_tank_curve(
+                current + 25, outdoor, 50, [0, 30], 2
+            ),
+            "controlled": lambda: model.predict_indoor_controlled_curve(
+                current, [35], [0, 0.5], weather, 2
+            ),
+            "legacy": lambda: model.predict_indoor_curve(current, [35], weather, 2),
+            "candidate": lambda: model.predict_indoor_candidate_curve(
+                current, [35] * 3, [0.25, 0.5, 0.5], weather, 3
+            ),
+        }
+        return forecasts[family], spy
+
+    @pytest.mark.parametrize("family", FAMILIES)
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+    def test_SC007_nonfinite_initial_state_is_unavailable(self, monkeypatch, family, invalid):
+        forecast, spy = self._kernel(monkeypatch, family, current=invalid)
+        try:
+            curve = forecast()
+        except ValueError:
+            curve = None
+
+        assert curve is None or curve == []
+        assert spy.rows == []
+
+    @pytest.mark.parametrize("family", FAMILIES)
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), True])
+    def test_nonfinite_outdoor_cannot_be_clipped_into_a_usable_curve(
+        self, monkeypatch, family, invalid
+    ):
+        forecast, _ = self._kernel(monkeypatch, family, outdoor=invalid)
+        try:
+            curve = forecast()
+        except ValueError:
+            curve = None
+
+        assert curve is None or curve == []
+
+    @pytest.mark.parametrize("family", FAMILIES)
+    def test_finite_positive_algorithm_paths_produce_complete_trajectories(
+        self, monkeypatch, family
+    ):
+        import json
+
+        forecast, _ = self._kernel(monkeypatch, family)
+        curve = forecast()
+
+        assert curve is not None
+        assert len(curve) == (3 if family == "candidate" else 2)
+        json.dumps(curve, allow_nan=False)
+
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_rate_output_is_not_hidden_by_target_clamping(self, monkeypatch, invalid):
+        model = ThermalModel()
+        monkeypatch.setattr(model, "_tank_heating_rate", MagicMock(return_value=invalid))
+        try:
+            curve = model.predict_temperature_curve(40, 5, hours=1, target_temp=50)
+        except ValueError:
+            curve = None
+
+        assert curve is None or curve == []
+
+
+class TestR08GradualControlledFallback:
+    @pytest.mark.parametrize("fraction", [0.0, 0.5])
+    def test_warm_weather_has_no_instant_outdoor_jump(self, fraction):
+        model = ThermalModel()
+        weather = [{"outdoor_temp": 30.0, "irradiance": 0.0}]
+
+        curve = model.predict_indoor_controlled_curve(20.0, [30.0], [fraction], weather, hours=1)
+
+        assert 20.0 <= curve[0]["predicted_indoor_temp"] < 21.0
+        assert curve[0]["source"] == "linear_controlled"
+        assert model.confidence_for("indoor_cooling") == "default"
+
+    @pytest.mark.parametrize("outdoor", [5.0, 30.0])
+    def test_zero_duty_exactly_matches_gradual_free_float(self, outdoor):
+        model = ThermalModel()
+        weather = [{"outdoor_temp": outdoor, "irradiance": 100.0}]
+
+        controlled = model.predict_indoor_controlled_curve(
+            20.0, [35.0], [0.0] * 3, weather, hours=3
+        )
+        passive = model.predict_free_float_curve(20.0, weather, hours=3)
+
+        assert [row["predicted_indoor_temp"] for row in controlled] == [
+            row["predicted_indoor_temp"] for row in passive
+        ]
+
+
+def test_R10_SC007_legacy_curve_preserves_zero_outdoor(monkeypatch):
+    model = ThermalModel()
+    rate = MagicMock(return_value=0.5)
+    monkeypatch.setattr(model, "_indoor_heating_rate", rate)
+
+    curve = model.predict_indoor_curve(20.0, [35.0], [{"outdoor_temp": 0.0}], hours=1)
+
+    assert curve[0]["predicted_indoor_temp"] == 20.5
+    rate.assert_called_once_with(0.0)
+
+
+class TestR07ThermalSensorSelection:
+    @pytest.mark.parametrize("reference", ["", "selected", "deselected"])
+    async def test_native_training_sql_filters_selected_before_limit(self, monkeypatch, reference):
+        from sqlalchemy.sql import operators, visitors
+        from sqlalchemy.sql.elements import BinaryExpression
+
+        from packages.core.models import IndoorTempReading
+        from packages.ml import thermal
+
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            IndoorTempReading(device_id="selected", timestamp=now, temperature=20, is_stale=False),
+            IndoorTempReading(
+                device_id="deselected", timestamp=now, temperature=28, is_stale=False
+            ),
+            IndoorTempReading(
+                device_id="selected",
+                timestamp=now + dt.timedelta(seconds=1),
+                temperature=30,
+                is_stale=False,
+            ),
+            IndoorTempReading(
+                device_id="selected", timestamp=now, temperature=float("nan"), is_stale=False
+            ),
+        ]
+        monkeypatch.setattr(
+            "packages.poller.smartthings.get_selected_device_ids",
+            AsyncMock(return_value=["selected"]),
+        )
+        statements = []
+
+        async def execute(statement):
+            statements.append(statement)
+            if statement.column_descriptions[0]["entity"] is IndoorTempReading:
+                assert reference != "deselected"
+                predicates = [
+                    node
+                    for criterion in statement._where_criteria
+                    for node in visitors.iterate(criterion)
+                    if isinstance(node, BinaryExpression)
+                    and getattr(node.left, "name", None) == "device_id"
+                    and node.operator is operators.in_op
+                ]
+                assert len(predicates) == 1
+                assert set(predicates[0].right.value) == {"selected"}
+                assert statement._limit_clause.value == 50_001
+                result_rows = rows
+            else:
+                result_rows = []
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: result_rows))
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=SimpleNamespace(execute=execute))
+        context.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(thermal, "get_session", lambda: context)
+
+        result = await thermal.materialize_thermal_inputs(
+            "audit-device", reference, "open-meteo", now
+        )
+
+        assert result["sensor_selection_schema"] == "selected_indoor_sensors_v2"
+        if reference == "deselected":
+            assert result["readings"] == []
+            assert result["indoor_blocker"] == "reference_sensor_not_selected"
+        else:
+            assert [row.temperature for row in result["readings"]] == [20]
+            assert result["selected_sensor_ids"] == ["selected"]
+
+    async def test_legacy_indoor_calibration_uses_selected_and_bounded_sql(self, monkeypatch):
+        from sqlalchemy.sql import operators, visitors
+        from sqlalchemy.sql.elements import BinaryExpression
+
+        from packages.core.models import IndoorTempReading
+        from packages.ml import thermal
+
+        now = dt.datetime.now(dt.timezone.utc)
+        monkeypatch.setattr(
+            "packages.core.settings_service.get_all_settings",
+            AsyncMock(
+                return_value={
+                    "smartthings_device_ids": "selected",
+                    "comfort_reference_sensor_id": "selected",
+                }
+            ),
+        )
+        selected = IndoorTempReading(
+            device_id="selected", timestamp=now, temperature=20, is_stale=False
+        )
+        foreign = IndoorTempReading(
+            device_id="foreign", timestamp=now, temperature=28, is_stale=False
+        )
+        statements = []
+
+        async def execute(statement):
+            statements.append(statement)
+            if statement.column_descriptions[0]["entity"] is IndoorTempReading:
+                predicates = [
+                    node
+                    for criterion in statement._where_criteria
+                    for node in visitors.iterate(criterion)
+                    if isinstance(node, BinaryExpression)
+                    and getattr(node.left, "name", None) == "device_id"
+                    and node.operator is operators.in_op
+                ]
+                assert len(predicates) == 1
+                assert set(predicates[0].right.value) == {"selected"}
+                assert statement._limit_clause.value == 50_001
+                rows = [selected, foreign]
+            else:
+                rows = []
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=SimpleNamespace(execute=execute))
+        context.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(thermal, "get_session", lambda: context)
+        model = ThermalModel()
+        model._fit_indoor_rates = MagicMock(return_value=([], []))
+
+        await model._calibrate_indoor_rates(now - dt.timedelta(hours=2), [SimpleNamespace(ts=now)])
+
+        assert [row.temperature for row in model._fit_indoor_rates.call_args.args[0]] == [20]
+        assert len(statements) == 2
+
+
+class TestIndoorRateValidation:
+    """Indoor rates must come from one consistent series and beat persistence."""
+
+    BASE = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+
+    @staticmethod
+    def _reading(ts, temperature, device_id="room-a"):
+        return SimpleNamespace(timestamp=ts, temperature=temperature, device_id=device_id)
+
+    def _statuses(self, hours, heating_at):
+        return [
+            SimpleNamespace(
+                ts=self.BASE + dt.timedelta(minutes=5 * i),
+                space_heating_active=heating_at(i * 5 / 60),
+                outdoor_temp=5.0,
+            )
+            for i in range(hours * 12)
+        ]
+
+    async def _calibrate(self, readings, statuses, reference_sensor_id=None):
+        model = ThermalModel()
+        results = []
+        for value in (readings, []):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = value
+            result.scalar_one_or_none.return_value = value
+            results.append(result)
+        session = AsyncMock()
+        session.execute = AsyncMock(side_effect=results)
+        with patch("packages.ml.thermal.get_session") as ctx:
+            ctx.return_value.__aenter__ = AsyncMock(return_value=session)
+            ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            await model._calibrate_indoor_rates(
+                self.BASE,
+                statuses,
+                values={
+                    "comfort_reference_sensor_id": reference_sensor_id or "",
+                    "smartthings_device_ids": "",
+                },
+            )
+        model.params.last_calibrated = self.BASE
+        return model
+
+    async def test_interleaved_room_offsets_do_not_create_rates(self):
+        """Four steady rooms ~1 °C apart must not look like heating or cooling."""
+        offsets = {"room-a": 22.5, "room-b": 23.4, "room-c": 23.1, "room-d": 23.3}
+        readings = [
+            self._reading(self.BASE + dt.timedelta(minutes=5 * i), temperature, device)
+            for i in range(48 * 12)
+            for device, temperature in offsets.items()
+        ]
+        statuses = self._statuses(48, lambda hour: int(hour) % 4 < 2)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] != "validated"
+        assert model.params.calibration_status["indoor_cooling"] != "validated"
+        assert model.params.indoor_heating_rate == 0.5
+        assert model.params.indoor_cooling_rate == -0.3
+        assert model.confidence_for("indoor_heating") == "default"
+
+    async def test_sensor_noise_alone_is_rejected(self):
+        """Symmetric noise around a steady room has no skill over persistence."""
+        rng = np.random.default_rng(7)
+        readings = [
+            self._reading(
+                self.BASE + dt.timedelta(minutes=5 * i), round(22.0 + rng.normal(0, 0.2), 1)
+            )
+            for i in range(72 * 12)
+        ]
+        statuses = self._statuses(72, lambda hour: int(hour) % 4 < 2)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] == (
+            "rejected_no_skill_over_baseline"
+        )
+        assert model.params.indoor_heating_rate == 0.5
+        assert model.confidence_for("indoor_heating") == "default"
+        assert model.validation["indoor_heating"]["holdout_samples"] > 0
+
+    async def test_real_heating_response_is_learned(self):
+        """A room that warms 0.6 °C/h with heat on and cools 0.4 °C/h off is validated."""
+        heating_at = lambda hour: int(hour) % 6 < 3  # noqa: E731
+        readings = []
+        temperature = 21.0
+        for i in range(96 * 12):
+            hour = i * 5 / 60
+            readings.append(
+                self._reading(self.BASE + dt.timedelta(minutes=5 * i), round(temperature, 2))
+            )
+            temperature += (0.6 if heating_at(hour) else -0.4) * 5 / 60
+        statuses = self._statuses(96, heating_at)
+
+        model = await self._calibrate(readings, statuses)
+
+        assert model.params.calibration_status["indoor_heating"] == "validated"
+        assert model.params.calibration_status["indoor_cooling"] == "validated"
+        assert abs(model.params.indoor_heating_rate - 0.6) < 0.05
+        assert abs(model.params.indoor_cooling_rate + 0.4) < 0.05
+        assert model.confidence_for("indoor_heating") == "default"
+
+    async def test_reference_sensor_is_used_instead_of_other_rooms(self):
+        """With a configured reference room, other rooms cannot distort the series."""
+        heating_at = lambda hour: int(hour) % 6 < 3  # noqa: E731
+        readings = []
+        temperature = 21.0
+        for i in range(96 * 12):
+            ts = self.BASE + dt.timedelta(minutes=5 * i)
+            readings.append(self._reading(ts, round(temperature, 2), "reference"))
+            readings.append(self._reading(ts, 25.0 + (i % 2) * 2.0, "noisy-room"))
+            temperature += (0.6 if heating_at(i * 5 / 60) else -0.4) * 5 / 60
+        statuses = self._statuses(96, heating_at)
+
+        model = await self._calibrate(readings, statuses, reference_sensor_id="reference")
+
+        assert model.params.calibration_status["indoor_heating"] == "validated"
+        assert abs(model.params.indoor_heating_rate - 0.6) < 0.05

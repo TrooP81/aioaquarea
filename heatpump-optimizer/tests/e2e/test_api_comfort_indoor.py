@@ -5,9 +5,15 @@ import datetime as dt
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.models import IndoorTempReading
+from packages.core.models import (
+    IndoorTempReading,
+    MLArtifactRecord,
+    MLLifecycleStateRecord,
+    MLMaintenanceRequestRecord,
+)
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -108,13 +114,38 @@ class TestComfortModel:
         assert resp.status_code == 409
         assert "not yet trained" in resp.json()["detail"]
 
-    async def test_comfort_model_train_insufficient_data(self, client: AsyncClient):
-        """Training with no status data should return insufficient_data."""
+    async def test_comfort_model_training_queues_without_data_or_authority(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """An empty-data request stays durable and queued while maintenance is off."""
         resp = await client.post("/api/comfort-model/train")
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         data = resp.json()
-        # With no data, the model returns a status indicating insufficient data
-        assert data.get("status") in ("insufficient_data", "error", "trained")
+        assert data["status"] == "queued"
+        assert data["maintenance_enabled"] is False
+        assert data["control_ready"] is False
+        request_status = await client.get(f"/api/ml/requests/{data['request_id']}")
+        assert request_status.status_code == 200
+        assert request_status.json()["status"] == "queued"
+        request_record = await db_session.get(MLMaintenanceRequestRecord, data["request_id"])
+        assert request_record is not None
+        assert request_record.component == "comfort"
+        assert request_record.status == "queued"
+        state = await db_session.get(MLLifecycleStateRecord, 1)
+        assert state is not None
+        assert state.maintenance_enabled is False
+        assert state.lease_owner is None
+        assert state.lease_expires_at is None
+        assert await db_session.scalar(select(func.count()).select_from(MLArtifactRecord)) == 0
+        from packages.ml.lifecycle import Lifecycle, MaintenanceRunner
+
+        runner = MaintenanceRunner(Lifecycle())
+        try:
+            assert (await runner.run())["reason"] == "maintenance_disabled"
+        finally:
+            await runner.close()
+        await db_session.refresh(request_record)
+        assert request_record.status == "queued"
 
 
 @pytest.mark.asyncio(loop_scope="session")

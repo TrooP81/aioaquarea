@@ -9,7 +9,6 @@ import {
   LAYER_LABELS,
   LAYER_TOOLTIPS,
   STATUS_DISPLAY,
-  formatRelativeTime,
   formatTime,
   formatPayload,
 } from "@/lib/constants";
@@ -26,6 +25,9 @@ interface PlanProps {
     horizon_end?: string;
     created_at?: string;
   } | null;
+  controlledActions?: PlanAction[];
+  controlledLoading?: boolean;
+  controlledError?: string | null;
 }
 
 /* ── Time-of-day groups ── */
@@ -62,13 +64,13 @@ function LayerBadge({ version }: { version: string }) {
         background: isMl
           ? "rgba(34,197,94,0.15)"
           : isMilp
-          ? "rgba(59,130,246,0.15)"
-          : "rgba(148,163,184,0.15)",
+            ? "rgba(59,130,246,0.15)"
+            : "rgba(148,163,184,0.15)",
         color: isMl
           ? "var(--success)"
           : isMilp
-          ? "var(--accent)"
-          : "var(--text-muted)",
+            ? "var(--accent)"
+            : "var(--text-muted)",
       }}
     >
       {LAYER_LABELS[version] || version}
@@ -87,7 +89,7 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
         aria-valuenow={completed}
         aria-valuemin={0}
         aria-valuemax={total}
-        aria-label={`${completed} of ${total} actions completed`}
+        aria-label={`${completed} of ${total} recorded actions completed`}
         style={{
           flex: 1,
           height: 6,
@@ -125,11 +127,9 @@ function formatPlanHorizon(start: string | undefined, end: string | undefined, h
 
 function ActionRow({
   action,
-  isNext,
   hour12,
 }: {
   action: PlanAction;
-  isNext: boolean;
   hour12: boolean;
 }) {
   const info = ACTION_LABELS[action.action_type];
@@ -149,7 +149,7 @@ function ActionRow({
 
   return (
     <div
-      className={`plan-action ${isNext ? "plan-action--next" : ""}`}
+      className="plan-action"
       style={{ opacity: isFaded ? 0.6 : 1 }}
     >
       <span className="plan-action-time">{formatTime(action.scheduled_ts, hour12)}</span>
@@ -166,10 +166,7 @@ function ActionRow({
       {hasPayload && (
         <span className="plan-action-payload">{formatPayload(action.payload)}</span>
       )}
-      {isNext && (
-        <span className="plan-action-relative">{formatRelativeTime(action.scheduled_ts)}</span>
-      )}
-      <span className={`plan-action-status ${status.className}`}>{status.text}</span>
+      <span className={`plan-action-status ${status.className}`}>{displayStatus === "pending" ? "Pending (legacy)" : status.text}</span>
       {detail && (
         <span className="plan-action-detail" style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginLeft: "0.5rem" }}>
           — {detail}
@@ -189,9 +186,17 @@ function TimeGroupDivider({ group }: { group: TimeGroup }) {
 
 /* ── Main Component ── */
 
-export function PlanView({ plan }: PlanProps) {
+export function PlanView({
+  plan,
+  controlledActions,
+  controlledLoading,
+  controlledError,
+}: PlanProps) {
   const [showAll, setShowAll] = useState(false);
-  const { actions, loading, error: fetchError } = usePlanActions(plan?.id);
+  const fetchedActions = usePlanActions(plan?.id, controlledActions === undefined);
+  const actions = controlledActions ?? fetchedActions.actions;
+  const loading = controlledLoading ?? fetchedActions.loading;
+  const fetchError = controlledError ?? fetchedActions.error;
   const currency = useCurrency();
   const timeFormat = useTimeFormat();
 
@@ -216,10 +221,6 @@ export function PlanView({ plan }: PlanProps) {
   // replacement. Never render an impossible denominator during that short gap.
   const totalActions = Math.max(plan?.actions_count ?? 0, actions.length);
 
-  const nextAction = actions.find(
-    (a) => a.status === "pending" && new Date(a.scheduled_ts) > now
-  );
-
   // Group actions by time-of-day for display
   const visibleActions = showAll ? actions : actions.slice(0, DEFAULT_VISIBLE);
   const grouped: { group: TimeGroup; actions: PlanAction[] }[] = [];
@@ -240,16 +241,17 @@ export function PlanView({ plan }: PlanProps) {
       <div className="plan-header">
         <div style={{ flex: 1 }}>
           <div className="plan-title-row">
-            <h2 className="chart-title" style={{ margin: 0 }}>Active Plan</h2>
+            <h2 className="chart-title" style={{ margin: 0 }}>Legacy plan (read-only)</h2>
             {plan && <LayerBadge version={plan.optimizer_version} />}
           </div>
 
           {plan ? (
             <>
+              <p className="chart-caption">Ordinary writes are prohibited in this build. Only existing linked restores may run outside positive observation.</p>
               {/* Cost highlight */}
               <div className="plan-cost-highlight">
                 <span className="plan-cost-value">{formatCostInCurrency(plan.cost_estimate_eur, plan.price_currency, currency)}</span>
-                <span className="plan-cost-label">estimated cost</span>
+                <span className="plan-cost-label">stored cost estimate</span>
               </div>
 
               {/* Meta row */}
@@ -267,7 +269,7 @@ export function PlanView({ plan }: PlanProps) {
                   </>
                 )}
                 <span>
-                  {completedCount} done{pendingCount > 0 ? `, ${pendingCount} scheduled` : ""}
+                  Recorded: {completedCount} done{pendingCount > 0 ? `, ${pendingCount} pending` : ""}
                   {sendingCount > 0 ? `, ${sendingCount} sending` : ""}
                   {skippedCount > 0 ? `, ${skippedCount} skipped` : ""}
                 </span>
@@ -277,28 +279,11 @@ export function PlanView({ plan }: PlanProps) {
             </>
           ) : (
             <p className="plan-empty-msg">
-              No active plan. Optimizer will generate one when price data is available.
+              No active plan. This build generates diagnostics only; optimization requires a new reviewed, approved build.
             </p>
           )}
         </div>
       </div>
-
-      {/* ── Next action callout ── */}
-      {nextAction && (
-        <div className="plan-next-callout">
-          <span className="plan-next-badge">NEXT</span>
-          <span className="plan-next-label">
-            <span role="img" aria-label={ACTION_LABELS[nextAction.action_type]?.label || nextAction.action_type}>
-              {ACTION_LABELS[nextAction.action_type]?.emoji || "⚡"}
-            </span>{" "}
-            {ACTION_LABELS[nextAction.action_type]?.label || nextAction.action_type}
-          </span>
-          <span className="plan-next-time">
-            {formatTime(nextAction.scheduled_ts, timeFormat.hour12)}
-            <span className="plan-next-relative"> ({formatRelativeTime(nextAction.scheduled_ts)})</span>
-          </span>
-        </div>
-      )}
 
       {/* ── Loading state ── */}
       {loading && (
@@ -311,7 +296,7 @@ export function PlanView({ plan }: PlanProps) {
 
       {/* ── Error state ── */}
       {fetchError && (
-        <div className="plan-error">
+        <div className="plan-error" role="alert" aria-label="Legacy plan detail error">
           <span>Could not load plan actions: {fetchError}</span>
         </div>
       )}
@@ -326,7 +311,6 @@ export function PlanView({ plan }: PlanProps) {
                 <ActionRow
                   key={action.id}
                   action={action}
-                  isNext={action.id === nextAction?.id}
                   hour12={timeFormat.hour12}
                 />
               ))}

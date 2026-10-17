@@ -223,7 +223,7 @@ def _record_staleness_transition(
 # ------------------------------------------------------------------
 
 
-async def get_selected_device_ids() -> list[str]:
+async def get_selected_device_ids(*, values: dict[str, str] | None = None) -> list[str]:
     """Return the user-selected SmartThings device IDs to poll.
 
     Reads the ``smartthings_device_ids`` setting. An empty value means "no
@@ -232,7 +232,11 @@ async def get_selected_device_ids() -> list[str]:
     that lingering readings from previously-polled sensors do not leak into
     aggregations after the user narrows their selection.
     """
-    raw = await get_setting("smartthings_device_ids")
+    raw = (
+        await get_setting("smartthings_device_ids")
+        if values is None
+        else values.get("smartthings_device_ids", "")
+    )
     if not raw:
         return []
     return [d.strip() for d in raw.split(",") if d.strip()]

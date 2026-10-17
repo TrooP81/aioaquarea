@@ -87,14 +87,10 @@ def project_panasonic_adapter_state(
         status = "unknown"
     observed_at = _as_utc(raw.get("observed_at"))
     retry_at = _as_utc(raw.get("retry_at"))
-    age_seconds = max(0, round((now - observed_at).total_seconds())) if observed_at else None
-    future_skew_seconds = (
-        (observed_at - now).total_seconds() if observed_at and observed_at > now else 0
-    )
+    admissible = observed_at is not None and observed_at <= now
+    age_seconds = round((now - observed_at).total_seconds()) if admissible else None
     state_fresh = (
-        age_seconds is not None
-        and age_seconds <= max(60, stale_after_seconds)
-        and future_skew_seconds <= 60
+        age_seconds is not None and age_seconds <= max(60, stale_after_seconds) and admissible
     )
     device_id = raw.get("device_id")
     reason = raw.get("reason")

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from packages.core.config import settings as env_settings
 from packages.core.database import get_session
-from packages.core.heat_curve import HeatCurveConfig
+from packages.core.heat_curve import HEAT_CURVE_SETTING_KEYS, HeatCurveConfig
+from packages.core.space_heating_gate import HeatingGateConfig
 from packages.core.models import SettingRecord
 
 logger = logging.getLogger(__name__)
@@ -26,17 +29,31 @@ class SettingSpec:
     default: str = ""
     default_env: str | None = None
     options: tuple[str, ...] | None = None
+    min_value: float | None = None
+    max_value: float | None = None
 
     def serialize_default(self) -> str:
+        if self.value_type in {"int", "float"} and self.default != "":
+            self.parse(self.default)
         return self.default
 
     def parse(self, value: str) -> Any:
         if self.value_type in {"str", "secret", "json"}:
             return value
-        if self.value_type == "int":
-            return int(value)
-        if self.value_type == "float":
-            return float(value)
+        if self.value_type in {"int", "float"}:
+            if isinstance(value, bool):
+                raise ValueError(f"{self.key} must be a finite numeric value")
+            try:
+                parsed = int(value) if self.value_type == "int" else float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{self.key} must be a valid {self.value_type}") from exc
+            if isinstance(parsed, float) and not math.isfinite(parsed):
+                raise ValueError(f"{self.key} must be finite")
+            if self.min_value is not None and parsed < self.min_value:
+                raise ValueError(f"{self.key} must be at least {self.min_value}")
+            if self.max_value is not None and parsed > self.max_value:
+                raise ValueError(f"{self.key} must be at most {self.max_value}")
+            return parsed
         if self.value_type == "bool":
             return _parse_bool(value)
         raise ValueError(f"Unsupported setting type: {self.value_type}")
@@ -53,11 +70,24 @@ def _parse_bool(value: str) -> bool:
 
 # Defines which settings are configurable, their types, and env fallbacks.
 SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
+    "ml_maintenance_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": "Enable poller-owned model maintenance for reporting only; never permits device writes",
+    },
+    "manual_cop_monitoring_enabled": {
+        "type": "bool",
+        "default": "false",
+        "description": "Experimental manual controller-COP forecasting only; ledger access remains available",
+    },
     # --- Optimizer layer ---
     "optimizer_layer": {
         "type": "str",
         "default": "rules_only",
-        "description": "Which optimizer layer to use",
+        "description": (
+            "Selects the diagnostic planner. rules_only and auto use rules with assumed heating efficiency while COP is retired. "
+            "milp_preferred explicitly selects MILP with the retained demand model."
+        ),
         "options": ["rules_only", "milp_preferred", "auto"],
     },
     # --- Learning mode ---
@@ -65,9 +95,9 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": "false",
         "description": (
-            "Observe-only training mode: the optimizer still plans but the executor "
-            "dispatches no device commands, so the heat pump runs naturally while data "
-            "is collected for ML training. Toggle off to let the optimizer act."
+            "This build prohibits ordinary writes and generates diagnostic plans only. "
+            "Learning mode also suppresses existing linked safety restores. Turning it off "
+            "does not enable optimization; that requires a new reviewed, approved build."
         ),
     },
     "learning_mode_since": {
@@ -79,9 +109,9 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": "false",
         "description": (
-            "Opt-in, observe-only seasonal calibration. During detected cold weather, "
-            "plans are recorded but no heat-pump commands are sent so natural heating "
-            "data can improve the demand and indoor thermal models."
+            "Opt-in seasonal observation starts during detected cold weather and persists "
+            "until explicit human exit, including after warming or successful maintenance. "
+            "Exiting never enables ordinary writes in this build."
         ),
     },
     "seasonal_calibration_max_outdoor_c": {
@@ -101,8 +131,19 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "seasonal_calibration_auto_exit": {
         "type": "bool",
-        "default": "true",
-        "description": "End seasonal observe-only mode after demand and indoor-heating evidence have both trained successfully",
+        "default": "false",
+        "read_only": True,
+        "description": "Read-only and always false; stored legacy values cannot end observation automatically",
+    },
+    "_seasonal_calibration_campaign_since": {
+        "type": "str",
+        "default": "",
+        "description": "Persisted seasonal observation activation timestamp; cleared only by explicit human exit (internal)",
+    },
+    "_seasonal_calibration_safety_deferred_since": {
+        "type": "str",
+        "default": "",
+        "description": "First unresolved-safety-revert seasonal deferral timestamp (internal)",
     },
     "outcome_experiments_enabled": {
         "type": "bool",
@@ -178,12 +219,10 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     # --- Panasonic credentials ---
     "aquarea_username": {
         "type": "secret",
-        "default_env": "aquarea_username",
         "description": "Panasonic Aquarea username",
     },
     "aquarea_password": {
         "type": "secret",
-        "default_env": "aquarea_password",
         "description": "Panasonic Aquarea password",
     },
     # --- Location ---
@@ -238,6 +277,31 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default_env": "comfort_temp_max",
         "description": "Comfort zone maximum (°C)",
     },
+    "indoor_forecast_min_r2": {
+        "type": "float",
+        "default": "0.15",
+        "description": "Minimum R² required for learned indoor forecast control",
+    },
+    "indoor_forecast_min_persistence_improvement_c": {
+        "type": "float",
+        "default": "0.1",
+        "description": "Minimum improvement over persistence for indoor forecast control (°C)",
+    },
+    "indoor_forecast_max_abs_bias_c": {
+        "type": "float",
+        "default": "0.5",
+        "description": "Maximum absolute bias for learned indoor forecast control (°C)",
+    },
+    "indoor_forecast_gate_passes_required": {
+        "type": "int",
+        "default": "2",
+        "description": "Consecutive passing scorecards required before learned indoor control",
+    },
+    "indoor_forecast_gate_failures_required": {
+        "type": "int",
+        "default": "1",
+        "description": "Consecutive failed scorecards before learned indoor control is disabled",
+    },
     # --- Controller heat curve (recorded from Panasonic controller) ---
     "heat_curve_outdoor_cold_c": {
         "type": "float",
@@ -261,8 +325,37 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "heat_curve_heating_off_outdoor_c": {
         "type": "float",
-        "default": "13",
+        "default": "12",
         "description": "Controller: Värme AV above this outdoor temperature (°C)",
+    },
+    "space_heating_behavior_profile": {
+        "type": "str",
+        "default": "WH_MXC12J9E8_J_DEFAULT",
+        "description": "Room-heating eligibility behavior profile",
+        "options": ["WH_MXC12J9E8_J_DEFAULT"],
+    },
+    "space_heating_baseline_mode": {
+        "type": "str",
+        "default": "shadow",
+        "description": "Historical automatic room-heating baseline rollout mode",
+        "options": ["off", "shadow", "on"],
+    },
+    "space_heating_default_fraction": {
+        "type": "float",
+        "default": "0.35",
+        "description": "Fallback automatic room-heating duty fraction",
+        "min_value": 0.0,
+        "max_value": 1.0,
+    },
+    "space_heating_gate_on_offset_c": {
+        "type": "float",
+        "default": "1",
+        "description": "Room-heating gate ON offset above recorded controller heating-off value (°C)",
+    },
+    "space_heating_gate_off_offset_c": {
+        "type": "float",
+        "default": "3",
+        "description": "Room-heating gate OFF offset above recorded controller heating-off value (°C)",
     },
     "heat_curve_delta_t_c": {
         "type": "float",
@@ -307,6 +400,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "int",
         "default_env": "poll_interval_seconds",
         "description": "Device poll interval (seconds)",
+    },
+    "device_status_max_age_minutes": {
+        "type": "int",
+        "default": "15",
+        "description": "Maximum device-status age for control readiness (minutes, 5-60)",
     },
     # --- Display ---
     "currency": {
@@ -427,6 +525,11 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "",
         "description": "Thermal lag override (minutes). Leave empty to auto-detect from data",
     },
+    "indoor_forecast_max_passive_change_c_per_hour": {
+        "type": "float",
+        "default": "0.5",
+        "description": "Maximum learned passive indoor-temperature change per hour (C)",
+    },
     # --- Comfort schedule ---
     "comfort_schedule": {
         "type": "json",
@@ -460,6 +563,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         default=str(schema.get("default", "")),
         default_env=schema.get("default_env"),
         options=tuple(schema["options"]) if schema.get("options") else None,
+        min_value=schema.get("min_value"),
+        max_value=schema.get("max_value"),
     )
     for key, schema in SETTINGS_SCHEMA.items()
 }
@@ -495,6 +600,8 @@ def validate_setting_value(key: str, value: str) -> None:
     at the API boundary instead of crashing later in the optimizer/poller).
     """
     spec = get_setting_spec(key)
+    if SETTINGS_SCHEMA[key].get("read_only") and value != spec.serialize_default():
+        raise ValueError(f"{key} is read-only and always {spec.serialize_default()}")
 
     if spec.options is not None:
         if value not in spec.options:
@@ -522,12 +629,18 @@ def validate_setting_value(key: str, value: str) -> None:
 
 def _default_setting_value(spec: SettingSpec) -> str:
     if spec.default_env and hasattr(env_settings, spec.default_env):
-        return str(getattr(env_settings, spec.default_env))
-    return spec.serialize_default()
+        value = str(getattr(env_settings, spec.default_env))
+    else:
+        value = spec.serialize_default()
+    if spec.value_type in {"int", "float"} and value != "":
+        spec.parse(value)
+    return value
 
 
-async def get_all_settings() -> dict[str, str]:
+async def get_all_settings(*, session=None) -> dict[str, str]:
     """Load all settings from DB, falling back to env vars."""
+    from contextlib import nullcontext
+
     result: dict[str, str] = {}
 
     # Start with env fallbacks / defaults
@@ -535,18 +648,26 @@ async def get_all_settings() -> dict[str, str]:
         result[key] = _default_setting_value(spec)
 
     # Override with DB values
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
         rows = await session.execute(select(SettingRecord))
         for row in rows.scalars().all():
             if row.key in SETTINGS_SCHEMA:
                 result[row.key] = row.value
 
+    for key, spec in SETTING_SPECS.items():
+        if spec.value_type in {"int", "float"} and result[key] != "":
+            spec.parse(result[key])
+    result["seasonal_calibration_auto_exit"] = "false"
     return result
 
 
-async def get_setting(key: str) -> str:
+async def get_setting(key: str, *, session=None) -> str:
     """Get a single setting value (DB first, then env fallback)."""
-    async with get_session() as session:
+    from contextlib import nullcontext
+
+    if key == "seasonal_calibration_auto_exit":
+        return "false"
+    async with get_session() if session is None else nullcontext(session) as session:
         row = await session.execute(select(SettingRecord).where(SettingRecord.key == key))
         record = row.scalar_one_or_none()
         if record is not None:
@@ -557,25 +678,48 @@ async def get_setting(key: str) -> str:
     return _default_setting_value(spec)
 
 
-async def get_typed_setting(key: str) -> Any:
+async def get_typed_setting(key: str, *, session=None) -> Any:
     spec = get_setting_spec(key)
-    raw_value = await get_setting(key)
+    raw_value = (
+        await get_setting(key) if session is None else await get_setting(key, session=session)
+    )
     if raw_value == "" and spec.value_type not in {"str", "secret", "json"}:
         return spec.parse(spec.serialize_default()) if spec.serialize_default() else None
     return spec.parse(raw_value)
 
 
-async def get_int_setting(key: str) -> int:
-    return int(await get_typed_setting(key))
+async def get_int_setting(key: str, *, session=None) -> int:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
+    return int(value)
 
 
-async def get_float_setting(key: str) -> float:
-    return float(await get_typed_setting(key))
+async def get_float_setting(key: str, *, session=None) -> float:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
+    return float(value)
 
 
 async def get_heat_curve_config() -> HeatCurveConfig:
     """Load and validate the controller heat curve recorded in Settings."""
     return HeatCurveConfig.from_settings(await get_all_settings())
+
+
+async def get_space_heating_gate_config() -> HeatingGateConfig:
+    """Load the recorded controller base and validated gate hysteresis."""
+    values = await get_all_settings()
+    return HeatingGateConfig(
+        profile_id=values["space_heating_behavior_profile"],
+        base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+        on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+        off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+    )
 
 
 async def get_heat_curve_verification_state() -> dict[str, Any]:
@@ -593,8 +737,18 @@ async def set_heat_curve_verification_state(state: dict[str, Any]) -> None:
     await set_setting("_heat_curve_verification_state", json.dumps(state, sort_keys=True))
 
 
-async def get_bool_setting(key: str) -> bool:
-    return bool(await get_typed_setting(key))
+async def get_bool_setting(key: str, *, session=None) -> bool:
+    value = (
+        await get_typed_setting(key)
+        if session is None
+        else await get_typed_setting(key, session=session)
+    )
+    if isinstance(value, str):
+        try:
+            return _parse_bool(value)
+        except ValueError:
+            return False
+    return bool(value)
 
 
 async def get_string_setting(key: str) -> str:
@@ -603,6 +757,13 @@ async def get_string_setting(key: str) -> str:
 
 async def set_setting(key: str, value: str) -> None:
     """Upsert a setting in the DB."""
+    if key == "seasonal_calibration_enabled":
+        await set_settings_bulk({key: value})
+        return
+    if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
+        "type"
+    ) in {"int", "float"}:
+        validate_setting_value(key, value)
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with get_session() as session:
@@ -612,13 +773,64 @@ async def set_setting(key: str, value: str) -> None:
             set_={"value": value},
         )
         await session.execute(stmt)
+        if key == "ml_maintenance_enabled":
+            from packages.ml.lifecycle import update_maintenance_gate
+
+            await update_maintenance_gate(session, _parse_bool(value))
 
 
-async def set_settings_bulk(updates: dict[str, str]) -> None:
-    """Upsert multiple settings."""
+async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
+    """Atomically validate and upsert multiple settings.
+
+    Heat-curve and gate settings are one configuration: no concurrent bulk
+    writer may persist a valid individual value that makes the combined
+    thresholds invalid.
+    """
+    from contextlib import nullcontext
+
+    updates = dict(updates)
+    for key, value in updates.items():
+        if SETTINGS_SCHEMA.get(key, {}).get("read_only") or SETTINGS_SCHEMA.get(key, {}).get(
+            "type"
+        ) in {"int", "float"}:
+            validate_setting_value(key, value)
+    if "seasonal_calibration_enabled" in updates and not _parse_bool(
+        updates["seasonal_calibration_enabled"]
+    ):
+        updates["_seasonal_calibration_campaign_since"] = ""
+        updates["_seasonal_calibration_safety_deferred_since"] = ""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    async with get_session() as session:
+    async with get_session() if session is None else nullcontext(session) as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {
+                "key": int.from_bytes(
+                    hashlib.sha256(b"settings:heat-gate").digest()[:8], "big", signed=True
+                )
+            },
+        )
+        values = {key: _default_setting_value(spec) for key, spec in SETTING_SPECS.items()}
+        rows = await session.execute(select(SettingRecord))
+        values.update({row.key: row.value for row in rows.scalars() if row.key in values})
+        values.update(updates)
+        if updates.get("_seasonal_calibration_campaign_since") and not _parse_bool(
+            values["seasonal_calibration_enabled"]
+        ):
+            updates.pop("_seasonal_calibration_campaign_since")
+        if any(
+            key in HEAT_CURVE_SETTING_KEYS
+            or key.startswith("space_heating_gate_")
+            or key == "space_heating_behavior_profile"
+            for key in updates
+        ):
+            HeatCurveConfig.from_settings(values)
+            HeatingGateConfig(
+                profile_id=values["space_heating_behavior_profile"],
+                base_c=float(values["heat_curve_heating_off_outdoor_c"]),
+                on_offset_c=float(values["space_heating_gate_on_offset_c"]),
+                off_offset_c=float(values["space_heating_gate_off_offset_c"]),
+            )
         for key, value in updates.items():
             if key not in SETTINGS_SCHEMA:
                 continue
@@ -628,6 +840,10 @@ async def set_settings_bulk(updates: dict[str, str]) -> None:
                 set_={"value": value},
             )
             await session.execute(stmt)
+            if key == "ml_maintenance_enabled":
+                from packages.ml.lifecycle import update_maintenance_gate
+
+                await update_maintenance_gate(session, _parse_bool(value))
 
 
 async def get_comfort_schedule() -> dict[str, list[int]]:
@@ -715,6 +931,7 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
     from packages.core.models import DeviceStatusRecord
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    timezone_name = await get_user_tz()
 
     async with get_session() as session:
         from sqlalchemy import select
@@ -736,7 +953,7 @@ async def get_learned_usage(days: int = 14) -> dict[str, dict[int, float]]:
     }
 
     for ts, action in rows:
-        local = _to_local(ts)
+        local = _to_local(ts, tz_name=timezone_name)
         day_type = "weekday" if local.weekday() < 5 else "weekend"
         hour = local.hour
         total_counts[day_type][hour] += 1

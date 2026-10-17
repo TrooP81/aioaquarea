@@ -13,13 +13,22 @@ from packages.core.version import API_CONTRACT_VERSION, APP_VERSION
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_api_contract_identifies_local_calendar_manual_cop_contract():
+    """Unknown manual-COP scope and derived period boundaries are a new API contract."""
+    assert API_CONTRACT_VERSION == "2026-10-12.1"
+    assert APP_VERSION == "0.15.0"
+
+
 def test_release_version_is_consistent_across_services():
     """The dashboard and API must report the same release version."""
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     web_package = json.loads((PROJECT_ROOT / "web" / "package.json").read_text(encoding="utf-8"))
+    web_lock = json.loads((PROJECT_ROOT / "web" / "package-lock.json").read_text(encoding="utf-8"))
 
     assert pyproject["project"]["version"] == APP_VERSION
     assert web_package["version"] == APP_VERSION
+    assert web_lock["version"] == APP_VERSION
+    assert web_lock["packages"][""]["version"] == APP_VERSION
     assert app.version == APP_VERSION
 
 
@@ -31,6 +40,30 @@ def test_release_version_is_embedded_in_container_builds():
         contents = dockerfile.read_text(encoding="utf-8")
         assert f"ARG APP_VERSION={APP_VERSION}" in contents
         assert 'org.opencontainers.image.version="${APP_VERSION}"' in contents
+
+    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert compose.count(f"APP_VERSION: ${{APP_VERSION:-{APP_VERSION}}}") == 5
+
+    configuration_reference = (PROJECT_ROOT / "docs" / "configuration-reference.md").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        f"| `APP_VERSION` / `BUILD_REVISION` | `{APP_VERSION}` / `unknown` |"
+        in configuration_reference
+    )
+
+
+def test_backend_image_installs_the_qualified_dependency_constraints():
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert (
+        "COPY heatpump-optimizer/pyproject.toml heatpump-optimizer/constraints.txt ./" in dockerfile
+    )
+    assert 'pip install --no-cache-dir -c constraints.txt -e ".[all]"' in dockerfile
+    installer_upgrade = "python -m pip install --no-cache-dir --upgrade pip==26.2.0"
+    assert installer_upgrade in dockerfile
+    assert dockerfile.index(installer_upgrade) < dockerfile.index(
+        'pip install --no-cache-dir -c constraints.txt -e ".[all]"'
+    )
 
 
 @pytest.mark.asyncio

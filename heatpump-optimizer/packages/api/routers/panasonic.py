@@ -4,16 +4,41 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sqlalchemy import select
 
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import DeviceStatusRecord, ServiceHeartbeatRecord
 from packages.core.panasonic_capabilities import build_panasonic_capabilities
 from packages.core.service_health import service_heartbeat_details
-from packages.core.settings_service import get_int_setting
+from packages.core.resilience import ReadQuotaCategory
+from packages.core.services import AquareaWrapper
 
 router = APIRouter()
+
+
+@router.get("/api/panasonic/read-quota")
+async def panasonic_read_quota(request: Request):
+    """Return quota capacity without exposing Panasonic account identity."""
+
+    wrapper = getattr(request.app.state, "aquarea_wrapper", None)
+    if wrapper is None:
+        status = await AquareaWrapper(read_only=True).get_rate_limit_status()
+    else:
+        status = await wrapper.get_rate_limit_status()
+    return {
+        "enabled": status.enabled,
+        "reliable": status.reliable,
+        "remaining": int(status.remaining) if status.remaining is not None else None,
+        "capacity": status.capacity,
+        "manual_required": status.manual_required,
+        "retry_after_seconds": status.retry_after_seconds,
+        "counters": {
+            category.value: status.counters.get(category, 0) for category in ReadQuotaCategory
+        },
+        "observed_at": status.observed_at,
+    }
 
 
 @router.get("/api/panasonic/capabilities")
@@ -28,10 +53,11 @@ async def panasonic_capabilities():
         ).scalar_one_or_none()
         poller_heartbeat = await session.get(ServiceHeartbeatRecord, "poller")
 
+    device_quality = await get_device_data_quality()
     return build_panasonic_capabilities(
         latest_status=latest_status,
         poller_heartbeat=poller_heartbeat,
-        poll_interval_seconds=await get_int_setting("poll_interval_seconds"),
+        device_status_threshold_seconds=int(device_quality["threshold_seconds"]),
         adapter_state=service_heartbeat_details(poller_heartbeat).get("panasonic_adapter"),
         now=dt.datetime.now(dt.timezone.utc),
     )

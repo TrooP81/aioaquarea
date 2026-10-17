@@ -3,9 +3,97 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class ManualCOPRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(strict=True, pattern=r"^(0|[1-9][0-9]*)$", max_length=19)
+
+    @field_validator("expected_revision")
+    @classmethod
+    def revision_fits_bigint(cls, value: str) -> str:
+        if int(value) > 9223372036854775807:
+            raise ValueError("Revision exceeds the positive bigint range")
+        return value
+
+
+class ManualCOPPut(ManualCOPRevision):
+    value: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    observed_at: AwareDatetime
+    completeness: Literal["partial", "closed", "unknown"]
+    timezone: str = Field(strict=True, min_length=1, max_length=128)
+
+
+class ManualCOPObservationResponse(BaseModel):
+    """A user-entered controller estimate for a local calendar day or month.
+
+    ``period_start``/``period_end`` are derived from the local period and the
+    confirmed timezone; they are not stored. The measurement scope is unknown:
+    any domestic-hot-water inclusion is user-reported and unverified, so no
+    whole-system or measured COP is claimed.
+    """
+
+    device_id: str
+    granularity: Literal["day", "month"]
+    period_date: dt.date
+    timezone: str
+    period_start: AwareDatetime
+    period_end: AwareDatetime
+    value: float = Field(gt=0, allow_inf_nan=False)
+    observed_at: AwareDatetime
+    completeness: Literal["partial", "closed", "unknown"]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    revision: str = Field(strict=True, pattern=r"^[1-9][0-9]*$", max_length=19)
+    source: Literal["controller_estimate"] = "controller_estimate"
+    acquisition: Literal["manual_entry"] = "manual_entry"
+    scope: Literal["unknown"] = "unknown"
+    measured: Literal[False] = False
+    accuracy: Literal["approximate"] = "approximate"
+    energy_boundary: Literal["unknown"] = "unknown"
+
+
+class ManualCOPProjection(BaseModel):
+    value: float = Field(gt=0, allow_inf_nan=False)
+    lower: float = Field(gt=0, allow_inf_nan=False)
+    upper: float = Field(gt=0, allow_inf_nan=False)
+    log_daily_trend: float = Field(allow_inf_nan=False)
+    daily_trend_pct: float = Field(allow_inf_nan=False)
+    band_label: Literal["experimental empirical log-error band, uncalibrated"]
+
+
+class ManualCOPMonitoringResponse(BaseModel):
+    status: Literal["disabled", "no_data", "insufficient_data", "stale", "ready", "unavailable"]
+    reason: str
+    issue_at: AwareDatetime
+    timezone: str | None
+    local_issue_at: AwareDatetime | None
+    target_date: dt.date | None
+    fingerprint: str
+    counts: dict[str, int | list[int]]
+    forecast: ManualCOPProjection | None
+
+    @model_validator(mode="after")
+    def forecast_matches_status(self) -> ManualCOPMonitoringResponse:
+        if (self.status == "ready") != (self.forecast is not None):
+            raise ValueError("Only ready monitoring has forecast values")
+        return self
+
+
+class ManualCOPListResponse(BaseModel):
+    devices: list[str]
+    default_timezone: str
+    device_id: str | None
+    granularity: Literal["day", "month"]
+    issue_at: AwareDatetime
+    observations: list[ManualCOPObservationResponse]
+    next_before: dt.date | None
+    forecasting_enabled: bool
+    monitoring: ManualCOPMonitoringResponse
 
 
 class DeviceStatusResponse(BaseModel):
@@ -180,8 +268,42 @@ class DashboardResponse(BaseModel):
     today_cost_coverage_pct: float = 0
     today_cost_complete: bool = False
     active_plan: Optional[PlanResponse] = None
+    space_heating_gate: dict = Field(default_factory=dict)
     has_override: bool = False
     override_id: Optional[int] = None
+
+
+class ControlStateNoticeResponse(BaseModel):
+    code: str
+    severity: Literal["info", "warning", "danger"]
+    detail: str
+
+
+class ControlStateActionResponse(BaseModel):
+    kind: Literal["link", "request"]
+    label: str
+    href: str | None = None
+    endpoint: str | None = None
+    method: str | None = None
+
+
+class ControlStateResponse(BaseModel):
+    state: Literal["paused_by_user", "observing", "holding", "comfort_at_risk", "automatic"]
+    headline: str
+    detail: str
+    reason_code: str
+    since: dt.datetime | None = None
+    until: dt.datetime | None = None
+    override_id: int | None = None
+    active_override_count: int = 0
+    primary_action: ControlStateActionResponse | None = None
+    notices: list[ControlStateNoticeResponse] = Field(default_factory=list)
+    resolved_at: dt.datetime
+    model_lifecycle: dict[str, dict[str, object]] = Field(default_factory=dict)
+    build_policy: Literal["observe_only"] = "observe_only"
+    control_ready: Literal[False] = False
+    ordinary_writes_allowed: Literal[False] = False
+    optimization_requires_new_build: Literal[True] = True
 
 
 class SettingsUpdate(BaseModel):
@@ -225,6 +347,9 @@ class IndoorForecastPointResponse(BaseModel):
     source: str | None = None
     model_source: str | None = None
     space_heating_fraction: float | None = Field(default=None, ge=0, le=1)
+    baseline_heating_fraction: float | None = Field(default=None, ge=0, le=1)
+    baseline_heating_source: str | None = None
+    space_heating_source: str | None = None
     prediction_lower_c: float | None = None
     prediction_upper_c: float | None = None
     prediction_interval_status: str | None = None
@@ -281,7 +406,7 @@ class IndoorForecastResponse(BaseModel):
     price_forecast: list[IndoorForecastPriceResponse]
     planned_actions: list[IndoorForecastActionResponse]
     forecast_source: str
-    forecast_status: str = "available"
+    forecast_status: str = "unavailable"
     forecast_unavailable_reason: str | None = None
     plan_id: int | None = None
     plan_created_at: dt.datetime | None = None
@@ -291,3 +416,9 @@ class IndoorForecastResponse(BaseModel):
     plan_age_seconds: int | None = None
     sensor_age_seconds: int | None = None
     current_vs_plan_delta_c: float | None = None
+    space_heating_gate: dict = Field(default_factory=dict)
+    observed_history: list[dict] = Field(default_factory=list)
+    sensor_basis: dict = Field(default_factory=dict)
+    room_comfort: dict = Field(default_factory=dict)
+    forecast_quality: dict = Field(default_factory=dict)
+    space_heating_baseline: dict = Field(default_factory=dict)

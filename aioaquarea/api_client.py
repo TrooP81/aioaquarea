@@ -1,6 +1,6 @@
+from collections.abc import Awaitable, Callable
 import datetime as dt
 import logging
-from collections.abc import Awaitable, Callable
 from typing import Optional
 import urllib.parse
 
@@ -8,7 +8,12 @@ import aiohttp
 
 from .auth import CCAppVersion, PanasonicRequestHeader, PanasonicSettings
 from .const import AQUAREA_SERVICE_BASE, AQUAREA_SERVICE_DEMO_BASE, AquareaEnvironment
-from .errors import ApiError, AuthenticationError, AuthenticationErrorCodes
+from .errors import (
+    ApiError,
+    AuthenticationError,
+    AuthenticationErrorCodes,
+    RequestFailedError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,7 +70,6 @@ class AquareaAPIClient:
         method: str,
         url: str = None,
         external_url: str = None,
-        referer: str = AQUAREA_SERVICE_BASE,
         throw_on_error=True,
         content_type: str = "application/json",
         headers: Optional[dict] = None,
@@ -109,6 +113,8 @@ class AquareaAPIClient:
             )
 
             if resp.content_type != "application/json":
+                if resp.status >= 400:
+                    raise RequestFailedError(resp)
                 return resp
 
             data = await resp.json()
@@ -153,7 +159,9 @@ class AquareaAPIClient:
                     )
                     try:
                         await callback()
-                    except Exception as exc:  # noqa: BLE001 - fall through to full login
+                    except (
+                        Exception
+                    ) as exc:  # noqa: BLE001 - fall through to full login
                         self._logger.warning(
                             "Panasonic %s recovery failed: %s",
                             recovery_name,

@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 const mockPrices = Array.from({ length: 48 }, (_, i) => ({
   ts: new Date(Date.now() - (12 - i) * 3600000).toISOString(),
@@ -58,6 +58,7 @@ const mockDashboard = {
   today_cost_eur: 1.23,
   active_plan: {
     id: 42,
+    status: "active",
     optimizer_version: "rules_v1",
     cost_estimate_eur: 2.85,
     price_currency: "EUR",
@@ -70,8 +71,8 @@ const mockIndoorForecast = {
   current_indoor: 21.5,
   outdoor_temp: 5,
   forecast_with_plan: [
-    { hour: 1, predicted_indoor_temp: 21.3 },
-    { hour: 2, predicted_indoor_temp: 21.1 },
+    { hour: 1, ts: mockWeather[13].ts, predicted_indoor_temp: 21.3 },
+    { hour: 2, ts: mockWeather[14].ts, predicted_indoor_temp: 21.1 },
   ],
   forecast_no_heating: [
     { hour: 1, predicted_indoor_temp: 21.2 },
@@ -82,12 +83,12 @@ const mockIndoorForecast = {
     { hour: 2, target: 20.5, comfort_hour: true },
   ],
   weather_forecast: [
-    { ts: new Date(Date.now() + 3600000).toISOString(), outdoor_temp: 5, wind_speed: 3, irradiance: 0, precipitation: 0 },
-    { ts: new Date(Date.now() + 7200000).toISOString(), outdoor_temp: 4.8, wind_speed: 3.1, irradiance: 0, precipitation: 0.4 },
+    { ts: mockWeather[13].ts, outdoor_temp: 5, wind_speed: 3, irradiance: 0, precipitation: 0 },
+    { ts: mockWeather[14].ts, outdoor_temp: 4.8, wind_speed: 3.1, irradiance: 0, precipitation: 0.4 },
   ],
   price_forecast: [
-    { ts: new Date(Date.now() + 3600000).toISOString(), price_eur_per_kwh: 0.08 },
-    { ts: new Date(Date.now() + 7200000).toISOString(), price_eur_per_kwh: 0.11 },
+    { ts: mockWeather[13].ts, price_eur_per_kwh: 0.08 },
+    { ts: mockWeather[14].ts, price_eur_per_kwh: 0.11 },
   ],
   forecast_source: "active_plan",
   plan_id: 42,
@@ -190,18 +191,10 @@ test.describe("Price Chart", () => {
 
   test("renders price chart section", async ({ page }) => {
     await page.goto("/");
-    const chartsTab = page.getByRole("tab", { name: "Charts" });
+    const chartsTab = page.getByRole("tab", { name: "Under the hood" });
     const comfortChart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
     await chartsTab.click();
-    try {
-      await expect(comfortChart).toBeVisible({ timeout: 5000 });
-    } catch {
-      // Next dev can reload once while compiling the initial client bundle.
-      // Re-select the tab after that reload so this test checks the chart, not
-      // the development-server startup race.
-      await chartsTab.click();
-      await expect(comfortChart).toBeVisible({ timeout: 5000 });
-    }
+    await expect(comfortChart).toBeVisible({ timeout: 5000 });
     await expect(comfortChart.getByText("Indoor Comfort, Weather & Price — 2h", { exact: true })).toBeVisible();
     await expect(comfortChart.locator(".recharts-area-area")).toHaveCount(1);
     // Additional weather/price overlays are allowed; the core comfort view
@@ -215,7 +208,7 @@ test.describe("Price Chart", () => {
     page.on("pageerror", (error) => pageErrors.push(error));
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Charts" }).click();
+    await page.getByRole("tab", { name: "Under the hood" }).click();
     await page.getByText("Show raw weather, price and temperature history").click();
 
     const priceChart = page.getByRole("region", { name: "Electricity price chart" });
@@ -240,6 +233,43 @@ test.describe("Price Chart", () => {
     expect(pageErrors.map((error) => error.message)).toEqual([]);
   });
 
+  test("unavailable comfort evidence never claims the forecast is on target", async ({ page }) => {
+    await page.route("**/api/thermal/indoor-forecast*", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...mockIndoorForecast, forecast_status: "unavailable", forecast_unavailable_reason: "missing_trusted_input",
+        forecast_with_plan: [], forecast_no_heating: [], target_schedule: [], comfort_assessment: { state: "unavailable" },
+      }),
+    }));
+    await page.goto("/");
+    const summary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(summary).toContainText("Comfort impact is unavailable until forecast evidence is ready");
+    await expect(summary).not.toContainText("Forecast stays within the active target");
+    await page.getByRole("tab", { name: "Under the hood" }).click();
+    const chart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
+    await expect(chart).toContainText("Comfort forecast unavailable.");
+    await expect(chart.locator(".recharts-wrapper")).toHaveCount(0);
+  });
+
+  test("combined comfort chart reports errors and retries without a page reload", async ({ page }) => {
+    let fail = true;
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.route("**/api/thermal/indoor-forecast*", (route) => route.fulfill({
+      status: fail ? 503 : 200, contentType: "application/json",
+      body: JSON.stringify(fail ? { detail: { code: "forecast_unavailable" } } : mockIndoorForecast),
+    }));
+    await page.goto("/?view=under-the-hood");
+    const chart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
+    await expect(chart).toContainText("Comfort forecast could not be loaded.");
+    await expect(chart.locator(".recharts-wrapper")).toHaveCount(0);
+    fail = false;
+    await chart.getByRole("button", { name: "Retry", exact: true }).click();
+    await expect(chart.locator(".recharts-line-curve")).toHaveCount(4);
+    await expect(chart).toContainText("Forecast evidence only");
+    expect(errors).toEqual([]);
+  });
+
   test("page renders all main sections", async ({ page }) => {
     await page.goto("/");
     // Wait for main content to load
@@ -251,18 +281,19 @@ test.describe("Price Chart", () => {
   test("switches between dashboard workspaces without scrolling through all sections", async ({ page }) => {
     await page.goto("/");
 
-    const planTab = page.getByRole("tab", { name: "Plan" });
+    const planTab = page.getByRole("tab", { name: "Timeline" });
     await expect(planTab).toHaveAttribute("aria-selected", "false");
     await planTab.click();
 
     await expect(planTab).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("heading", { name: "What actually happened" })).toBeVisible();
-    await expect(page.locator("#dashboard-panel-overview")).toBeHidden();
+    await expect(page.locator("#dashboard-panel-home")).toBeHidden();
 
-    const modelsTab = page.getByRole("tab", { name: "Models" });
+    const modelsTab = page.getByRole("tab", { name: "Under the hood" });
     await modelsTab.click();
     await expect(modelsTab).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByRole("heading", { name: "How the optimizer is deciding" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Why it decides", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Show diagnostics" })).toBeVisible();
   });
 });
 
@@ -334,22 +365,25 @@ test.describe("Plan View", () => {
     await page.goto("/");
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
 
-    // Next action card should be visible in dashboard area
-    await expect(page.locator(".next-action-card").first()).toBeVisible({ timeout: 10000 });
+    // An active legacy plan must not override the build's no-command policy.
+    const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(decisionSummary).toBeVisible({ timeout: 10000 });
+    await expect(decisionSummary).toContainText("Observe-only build");
+    await expect(decisionSummary).toContainText("Legacy ordinary actions will not be dispatched.");
 
-    await page.getByRole("tab", { name: "Plan" }).click();
+    await page.getByRole("tab", { name: "Timeline" }).click();
 
-    // Active Plan section should show the plan header
-    await expect(page.getByRole("heading", { name: "Active Plan" })).toBeVisible();
+    // Even an active stored plan is presented as read-only in this build.
+    await expect(page.getByRole("heading", { name: "Legacy plan (read-only)", exact: true })).toBeVisible();
     await expect(page.locator(".plan-cost-value")).toContainText("EUR");
     await expect(page.locator(".plan-cost-value")).not.toContainText("kr");
 
-    // Should show human-readable status "Scheduled" instead of raw "pending"
-    await expect(page.locator("#dashboard-panel-plan .plan-action-status", { hasText: "Scheduled" }).first()).toBeVisible({ timeout: 5000 });
+    // Pending legacy actions must never be represented as scheduled dispatches.
+    await expect(page.locator("#dashboard-panel-timeline .plan-action-status", { hasText: "Pending (legacy)" }).first()).toBeVisible({ timeout: 5000 });
 
     // Should show human-readable action label
     await expect(
-      page.locator("#dashboard-panel-plan .plan-action-type").getByText("Heat hot water"),
+      page.locator("#dashboard-panel-timeline .plan-action-type").getByText("Heat hot water"),
     ).toBeVisible();
   });
 
@@ -375,8 +409,15 @@ test.describe("Plan View", () => {
     // Should not crash — page loads normally
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     await expect(page.locator(".status-badge.online")).toBeVisible();
-    // Empty next action card should be present
-    await expect(page.locator(".next-action-card--empty")).toBeVisible({ timeout: 5000 });
+    // Absence of a plan must not imply permission to send ordinary commands.
+    const decisionSummary = page.getByRole("region", { name: "Current optimizer decision" });
+    await expect(decisionSummary).toBeVisible({ timeout: 5000 });
+    await expect(decisionSummary).toContainText("No ordinary command");
+    await expect(decisionSummary).toContainText("Ordinary writes are prohibited in this build.");
+    await page.getByRole("tab", { name: "Timeline" }).click();
+    await expect(page.locator("#dashboard-panel-timeline").getByText("No active plan. This build generates diagnostics only; optimization requires a new reviewed, approved build.", { exact: true })).toBeVisible();
+    await expect(page.locator("#dashboard-panel-timeline .plan-cost-value")).toHaveCount(0);
+    await expect(page.locator("#dashboard-panel-timeline .plan-action-type")).toHaveCount(0);
   });
 
   test("shows error state when plan actions fail to load", async ({ page }) => {
@@ -402,7 +443,7 @@ test.describe("Plan View", () => {
     );
 
     await page.goto("/");
-    await page.getByRole("tab", { name: "Plan" }).click();
+    await page.getByRole("tab", { name: "Timeline" }).click();
     await expect(page.locator("h1")).toContainText("Heat Pump Optimizer");
     // Should display error message instead of empty list
     await expect(page.locator(".plan-error")).toBeVisible({ timeout: 5000 });

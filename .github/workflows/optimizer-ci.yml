@@ -17,32 +17,74 @@ permissions:
 jobs:
   backend-unit:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: heatpump-optimizer
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
-      - run: python -m pip install -e ".[all,dev]"
-      - run: python -m ruff check packages tests migrations
-      - run: python -m ruff format --check packages tests migrations
-      - name: Run unit tests
-        env:
-          MODEL_DIR: ${{ runner.temp }}/heatpump-optimizer-models
-        run: python -m pytest tests --ignore=tests/e2e -q
-
-  backend-e2e:
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: heatpump-optimizer
     env:
-      DATABASE_URL: postgresql+asyncpg://heatpump:heatpump_test@localhost:5432/heatpump_test
-      REDIS_URL: redis://localhost:6379/0
+      APP_ENVIRONMENT: test
+      API_TOKEN: test-token
+      SECRET_KEY: deployment-verify-public-test-secret
+      DATABASE_URL: postgresql+asyncpg://heatpump:heatpump_test@127.0.0.1:5433/heatpump_test
+      REDIS_URL: redis://127.0.0.1:6380/0
+      PRICE_PROVIDER: entsoe
+      ENTSOE_API_TOKEN: test-token
+      ENTSOE_AREA: 10Y1001A1001A46L
+      AQUAREA_USERNAME: test@test.com
+      AQUAREA_PASSWORD: testpass
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/heatpump-optimizer
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Export owned unit model directory
+        run: echo "MODEL_DIR=$RUNNER_TEMP/hpo-unit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/models" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]"
+      - run: python -m pip install -c constraints.txt --no-deps tzdata==2026.4
+      - name: Prepare disposable unit profile
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py prepare-unit
+      - name: Lint backend
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase lint -m ruff check packages tests migrations
+      - name: Check backend formatting
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase format -m ruff format --check packages tests migrations
+      - name: Run unit tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py unit-phase unit -m pytest tests --ignore=tests/e2e -q
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-unit-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hpo-unit-${{ github.run_id }}-${{ github.run_attempt }}/evidence
+          if-no-files-found: error
+
+  backend-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: heatpump-optimizer
+    env:
+      DATABASE_URL: postgresql+asyncpg://heatpump:heatpump_test@127.0.0.1:5433/heatpump_test
+      REDIS_URL: redis://127.0.0.1:6380/0
+      APP_ENVIRONMENT: test
+      API_TOKEN: test-token
+      SECRET_KEY: deployment-verify-public-test-secret
+      PRICE_PROVIDER: entsoe
+      ENTSOE_API_TOKEN: test-token
+      ENTSOE_AREA: 10Y1001A1001A46L
+      TIBBER_API_TOKEN: ""
+      AQUAREA_USERNAME: test@test.com
+      AQUAREA_PASSWORD: testpass
+      LATITUDE: "59.3293"
+      LONGITUDE: "18.0686"
+      COP_MANUAL_TEST_OWNED: cop-manual-mon-${{ github.run_id }}-${{ github.run_attempt }}
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/heatpump-optimizer
+      PYTHONDONTWRITEBYTECODE: "1"
     services:
       postgres:
         image: timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57
@@ -51,39 +93,84 @@ jobs:
           POSTGRES_USER: heatpump
           POSTGRES_PASSWORD: heatpump_test
         ports:
-          - 5432:5432
+          - "127.0.0.1:5433:5432"
         options: >-
           --health-cmd "pg_isready -U heatpump -d heatpump_test"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 18
       redis:
-        image: redis:7.4.2-alpine
+        image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
         ports:
-          - 6379:6379
+          - "127.0.0.1:6380:6379"
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
+      - name: Export owned e2e model directory
+        run: echo "MODEL_DIR=$RUNNER_TEMP/cop-manual-mon-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/models" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
-      - run: python -m pip install -e ".[all,dev]"
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]"
+      - run: python -m pip install -c constraints.txt --no-deps tzdata==2026.4
+      - name: Prove owned job services and prepare test profile
+        env:
+          COP_MANUAL_TEST_SERVICE_CONTEXT: ${{ toJSON(job.services) }}
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py prepare
+      - name: Collect complete manual verification inventory
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase manual-inventory -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py --collect-only -q
+      # The seal partitions this complete E2E inventory into disjoint owned phases.
+      # Inventory collects with --noconftest; only the ordinary phase keeps conftest.
+      - name: Collect complete E2E verification inventory
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase e2e-inventory -m pytest --noconftest tests/e2e --collect-only -q
       - name: Verify migration graph
-        run: python -m alembic heads
-      - name: Apply and compare database schema
-        run: |
-          python -m alembic upgrade head
-          python -m alembic downgrade 020
-          python -m alembic upgrade head
-          python -m alembic check
-      - name: Run database-backed E2E tests
-        run: python -m pytest tests/e2e -q
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase heads -m alembic heads
+      - name: Verify legacy reversibility and retained migration refusal
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase migration -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py::TestManualCOPPostgreSQLMigration -q
+      - name: Apply discovered head
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase upgrade-head -m alembic upgrade head
+      - name: Compare schema after migration
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-migration -m alembic check
+      - name: Run calendar, ownership, API and committed reset tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase manual -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py -k "not TestManualCOPPostgreSQLMigration and not test_sequence_exhaustion_is_503_and_never_wraps" -q
+      - name: Compare schema after manual tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-manual -m alembic check
+      - name: Verify sequence exhaustion as last manual mutation
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase exhaustion -m pytest --noconftest tests/e2e/test_manual_cop_postgresql.py::TestManualCOPPostgreSQLAPI::test_sequence_exhaustion_is_503_and_never_wraps -q
+      - name: Compare schema after exhaustion
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-exhaustion -m alembic check
+      # OBS-5 runs here on this prepared profile and canonical source manifest only;
+      # tests/e2e/run_obs5_verification.ps1 is UNSUPPORTED (fixed historical fingerprint).
+      - name: Verify OBS-5 genuine 032/033 migration on an owned child database
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-real-migration -m pytest --noconftest tests/e2e/test_ml_lifecycle_verification.py::TestOBS5RealMigration -q
+      - name: Prove guarded primary head before OBS-5 lifecycle phases
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py primary-head obs5-primary
+      - name: Run original OBS-5 lifecycle PostgreSQL tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-pg-original -m pytest --noconftest tests/e2e/test_ml_lifecycle_postgresql.py -q
+      - name: Run supplementary OBS-5 lifecycle PostgreSQL tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase obs5-pg-supplement -m pytest --noconftest tests/e2e/test_ml_lifecycle_verification.py -k "not TestOBS5RealMigration" -q
+      - name: Compare schema after OBS-5 lifecycle tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-obs5 -m alembic check
+      - name: Run remaining database-backed E2E tests
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_verification.py -q
+      - name: Compare schema after ordinary E2E teardown
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-ordinary -m alembic check
+      - name: Reconcile node inventory and seal verification receipts
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py seal
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-e2e-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cop-manual-mon-${{ github.run_id }}-${{ github.run_attempt }}/evidence
+          if-no-files-found: error
 
   web:
     runs-on: ubuntu-latest
@@ -148,9 +235,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: heatpump-optimizer/pyproject.toml
+          cache-dependency-path: |
+            heatpump-optimizer/pyproject.toml
+            heatpump-optimizer/constraints.txt
       - run: python -m pip install --upgrade "pip>=26.1.2"
-      - run: python -m pip install -e ".[all,dev]" pip-audit
+      - run: python -m pip install -c constraints.txt -e ".[all,dev]" pip-audit
       - run: python -m pip_audit
       - name: Prepare Compose validation environment
         run: cp .env.example .env

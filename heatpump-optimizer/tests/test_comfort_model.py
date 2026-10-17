@@ -1,13 +1,142 @@
 """Tests for the comfort model (indoor air temperature prediction)."""
 
+import asyncio
 import datetime as dt
+import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
 
 from packages.core.heat_curve import HeatCurveConfig, effective_zone_target_temperature
-from packages.ml.comfort_model import ComfortModel, MIN_TRAINING_ROWS
+from packages.ml.comfort_model import (
+    COMFORT_MODEL_PROJECTION_EPSILON,
+    _MONOTONIC_CST,
+    PASSIVE_FEATURE_NAMES,
+    CONTROLLED_FEATURE_NAMES,
+    ComfortModelCandidate,
+    WindowDataset,
+    _IndoorObservation,
+    build_candidate_bundle,
+    build_window_dataset,
+    ComfortModel,
+    MIN_TRAINING_ROWS,
+    _confirmed_absent,
+)
+
+
+class _AsyncContextManager:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _timestamped_dataset(features, targets):
+    start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    bounds = [
+        (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+        for index in range(len(targets))
+    ]
+    return WindowDataset({60: (features, targets)}, {}, {"device_id": "heatpump"}, {60: bounds})
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "1", "2", "3", "heat", "AUTO_COOL", "bad"])
+def test_comfort_training_labels_unchanged_by_canonical_classifier(mode):
+    status = SimpleNamespace(
+        operation_status=0,
+        mode=mode,
+        direction="PUMP",
+        pump_duty=1,
+        device_action="OFF",
+        defrost_active=False,
+        zone1_operation_status=1,
+        zone2_operation_status=None,
+    )
+
+    assert _confirmed_absent(status) is (str(mode) not in {"1", "3"})
+
+
+def test_direct_prediction_rejects_nearest_horizon():
+    model = ComfortModel()
+    model._model = MagicMock()
+    model._direct_models = {60: MagicMock()}
+
+    prediction = model.predict_indoor_temp(
+        zone_water_temp=35.0,
+        outdoor_temp=5.0,
+        indoor_temp=20.0,
+        forecast_horizon_minutes=120,
+    )
+
+    assert prediction is None
+
+
+class _TrainingLease:
+    def __init__(self, *, health=True, commit_error=None, rollback_error=None):
+        self.health = health
+        self.commit_error = commit_error
+        self.rollback_error = rollback_error
+        self.committed = False
+        self.rolled_back = False
+        self.invalidated = False
+
+    async def commit(self):
+        if self.commit_error:
+            raise self.commit_error
+        self.committed = True
+
+    async def rollback(self):
+        self.rolled_back = True
+        if self.rollback_error:
+            raise self.rollback_error
+
+    async def invalidate(self):
+        self.invalidated = True
+
+    async def health_check(self):
+        return self.health
+
+    async def close(self):
+        return None
+
+
+class _TrainingLock:
+    reason = "acquired"
+
+    async def acquire(self):
+        return _TrainingLease()
+
+
+class _FixedTrainingLock:
+    reason = "acquired"
+
+    def __init__(self, lease):
+        self.lease = lease
+
+    async def acquire(self):
+        return self.lease
+
+
+class _UnavailableTrainingLock:
+    reason = "training_lock_unavailable"
+
+    async def acquire(self):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _db_free_training_lock(monkeypatch):
+    monkeypatch.setattr(
+        "packages.ml.comfort_model.PostgresTrainingLock.acquire", _TrainingLock().acquire
+    )
 
 
 class TestComfortModelUntrained:
@@ -26,15 +155,355 @@ class TestComfortModelUntrained:
         assert result is None
 
 
+class TestComfortArtifactRefresh:
+    def test_AC8_3_missing_artifact_reports_reason(self, tmp_path, monkeypatch):
+        model = ComfortModel()
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        assert model.refresh_if_changed() is False
+        assert model.artifact_refresh_reason == "unqualified_legacy_artifact"
+        assert model.is_trained is False
+
+    async def test_AC8_3_bad_committed_artifact_falls_back_without_directory_adoption(
+        self, tmp_path, monkeypatch
+    ):
+        from packages.ml.comfort_model import build_candidate
+        from packages.ml.lifecycle import LifecycleSnapshot
+        from tests.test_ml_lifecycle import qualified_reference
+
+        model = ComfortModel()
+        features, targets, _ = _inverted_dataset()
+        candidate = build_candidate(_timestamped_dataset(features, targets), None)
+        payload = model._candidate_artifact(candidate)
+        reference = qualified_reference("comfort", ("indoor",))
+        authority = AsyncMock()
+        authority.read.return_value = LifecycleSnapshot(
+            "epoch", 7, 8, True, None, None, (reference,)
+        )
+        authority.load_committed.return_value = payload
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        legacy_load = MagicMock(side_effect=AssertionError("directory adoption"))
+        monkeypatch.setattr("packages.ml.safe_persistence.safe_load", legacy_load)
+        good_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"
+        bad_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_2.pkl"
+        good_path.write_bytes(b"good")
+
+        assert await model.arefresh_committed(
+            lifecycle=authority, scope=reference.manifest["scope"]
+        )
+        assert model._model is candidate.model
+        bad_path.write_bytes(b"partial")
+        authority.load_committed.side_effect = ValueError("bad HMAC")
+        assert not await model.arefresh_committed(
+            lifecycle=authority, scope=reference.manifest["scope"]
+        )
+        assert model._model is None and model.is_trained is False
+        assert model.artifact_refresh_reason == "lifecycle_unavailable"
+        legacy_load.assert_not_called()
+
+
+class _WindowFeatureSpy:
+    def __init__(self):
+        self.rows = []
+
+    def predict(self, features):
+        rows = np.asarray(features, dtype=float)
+        self.rows.append(rows.copy())
+        return 0.1 * rows[:, 0]
+
+
+class TestR05WindowServing:
+    @staticmethod
+    def _model():
+        model = ComfortModel()
+        spy = _WindowFeatureSpy()
+        model._model = spy
+        model._direct_models = {60: spy}
+        model._passive_direct_models = {180: spy}
+        model._metrics = {
+            "delta_target": True,
+            "passive_horizons": {"180": {"status": "trained", "mae": 0.1, "persistence_mae": 0.8}},
+        }
+        return model, spy
+
+    def test_forward_uses_exact_trained_lift_and_time_context(self):
+        model, spy = self._model()
+        expected = ComfortModel._controlled_window_features(
+            mean_supply_lift=15.0,
+            mean_target_lift=20.0,
+            window_heat_fraction=1.0,
+            final_hour_heat_fraction=1.0,
+            outdoor_temp=5.0,
+            wind_speed=3.0,
+            irradiance=0.0,
+            precipitation=0.0,
+            humidity=60.0,
+            cloud_cover=0.5,
+            hour=3,
+            issue_indoor_temp=20.0,
+            issue_indoor_trend=-0.25,
+        )
+
+        prediction = model.predict_indoor_temp(
+            35.0,
+            5.0,
+            indoor_temp=20.0,
+            zone_target_temp=40.0,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+            hour=3,
+            indoor_trend_c_per_hour=-0.25,
+            forecast_horizon_minutes=60,
+        )
+
+        np.testing.assert_array_equal(spy.rows[0][0], expected)
+        assert prediction == pytest.approx(21.5)
+
+    def test_inverse_uses_the_same_forward_lift_schema(self):
+        model, spy = self._model()
+
+        required = model.required_zone_temp(21.5, 5.0, indoor_temp=20.0, hour=3)
+
+        assert required == pytest.approx(35.0, abs=0.6)
+        assert spy.rows[0][0, :4].tolist() == [0.0, 0.0, 1.0, 1.0]
+        assert spy.rows[0][0, 10] == pytest.approx(np.sin(2 * np.pi * 3 / 24))
+
+    def test_passive_serving_uses_zero_heat_lifts(self):
+        model, spy = self._model()
+
+        prediction, readiness = model.predict_passive_indoor_temp(
+            outdoor_temp=8.0, indoor_temp=21.0, forecast_horizon_minutes=180
+        )
+
+        expected = ComfortModel._passive_window_features(
+            ComfortModel._controlled_window_features(
+                mean_supply_lift=0.0,
+                mean_target_lift=0.0,
+                window_heat_fraction=0.0,
+                final_hour_heat_fraction=0.0,
+                outdoor_temp=8.0,
+                wind_speed=3.0,
+                irradiance=0.0,
+                precipitation=0.0,
+                humidity=60.0,
+                cloud_cover=0.5,
+                hour=12,
+                issue_indoor_temp=5.0,
+                issue_indoor_trend=0.0,
+            )
+        )
+        np.testing.assert_array_equal(spy.rows[0][0], expected)
+        assert readiness["ready"] is True
+        assert prediction == 21.0
+
+    @pytest.mark.parametrize("field", ["indoor_temp", "zone_target_temp"])
+    def test_missing_required_controlled_context_is_unavailable(self, field):
+        model, spy = self._model()
+        inputs = dict(
+            zone_water_temp=35.0,
+            outdoor_temp=5.0,
+            indoor_temp=20.0,
+            zone_target_temp=40.0,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+        )
+        inputs[field] = None
+
+        assert model.predict_indoor_temp(**inputs) is None
+        assert spy.rows == []
+
+
+class TestR33PassiveFiniteValidity:
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "indoor_temp",
+            "outdoor_temp",
+            "wind_speed",
+            "irradiance",
+            "precipitation",
+            "humidity",
+            "cloud_cover",
+            "forecast_horizon_minutes",
+            "max_change_c_per_hour",
+        ],
+    )
+    def test_invalid_inputs_refuse_before_estimator(self, field, value):
+        import json
+
+        model, spy = TestR05WindowServing._model()
+        inputs = dict(
+            outdoor_temp=8.0,
+            indoor_temp=21.0,
+            wind_speed=3.0,
+            irradiance=0.0,
+            precipitation=0.0,
+            humidity=60.0,
+            cloud_cover=0.5,
+            forecast_horizon_minutes=180,
+            max_change_c_per_hour=0.5,
+        )
+        inputs[field] = value
+
+        prediction, readiness = model.predict_passive_indoor_temp(**inputs)
+
+        assert prediction is None
+        assert readiness["ready"] is False
+        assert spy.rows == []
+        json.dumps(readiness, allow_nan=False)
+
+    @pytest.mark.parametrize("field", ["mae", "persistence_mae"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_invalid_validation_metrics_never_report_ready(self, field, value):
+        import json
+
+        model, spy = TestR05WindowServing._model()
+        model._metrics["passive_horizons"]["180"][field] = value
+
+        prediction, readiness = model.predict_passive_indoor_temp(
+            outdoor_temp=8.0, indoor_temp=21.0, forecast_horizon_minutes=180
+        )
+
+        assert prediction is None
+        assert readiness["ready"] is False
+        assert spy.rows == []
+        json.dumps(readiness, allow_nan=False)
+
+
+class TestR09ComfortInverseValidity:
+    @pytest.mark.parametrize("target", [float("nan"), float("inf"), float("-inf"), True, None])
+    def test_invalid_target_refuses_before_estimator(self, target):
+        model, spy = TestR05WindowServing._model()
+
+        result = model.required_zone_temp(target, 5.0, indoor_temp=20.0, hour=3)
+
+        assert result is None
+        assert spy.rows == []
+
+
+class TestR07SelectedSensorMaterialization:
+    @pytest.mark.parametrize(
+        ("reference", "selected", "expected"),
+        [
+            ("", "selected", 20.0),
+            ("", "other", 28.0),
+            ("selected", "selected", 20.0),
+            ("other", "selected", None),
+        ],
+    )
+    async def test_historical_selection_filters_before_limit(
+        self, monkeypatch, reference, selected, expected
+    ):
+        from sqlalchemy.sql import operators, visitors
+        from sqlalchemy.sql.elements import BinaryExpression
+
+        from packages.core.models import IndoorTempReading
+        from packages.ml import comfort_model as module
+
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            IndoorTempReading(device_id="selected", timestamp=now, temperature=20, is_stale=False)
+        ]
+        rows += [
+            IndoorTempReading(
+                device_id="other",
+                timestamp=now + dt.timedelta(seconds=offset),
+                temperature=28,
+                is_stale=False,
+            )
+            for offset in (1, 2, 3)
+        ]
+        monkeypatch.setattr(
+            module,
+            "get_all_settings",
+            AsyncMock(
+                return_value={
+                    "comfort_reference_sensor_id": reference,
+                    "smartthings_device_ids": selected,
+                    "weather_provider": "open-meteo",
+                }
+            ),
+        )
+        statements = []
+
+        async def execute(statement):
+            statements.append(statement)
+            if statement.column_descriptions[0]["entity"] is IndoorTempReading:
+                predicates = [
+                    node
+                    for criterion in statement._where_criteria
+                    for node in visitors.iterate(criterion)
+                    if isinstance(node, BinaryExpression)
+                    and getattr(node.left, "name", None) == "device_id"
+                    and node.operator is operators.in_op
+                ]
+                assert len(predicates) == 1
+                assert set(predicates[0].right.value) == {selected}
+                assert statement._limit_clause.value == 50_001
+                result_rows = rows
+            else:
+                result_rows = []
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: result_rows))
+
+        monkeypatch.setattr(
+            module, "get_session", lambda: _AsyncContextManager(SimpleNamespace(execute=execute))
+        )
+        data = await ComfortModel()._materialize_window_dataset(
+            data_cutoff=now + dt.timedelta(seconds=4), device_id="audit-device", raw=True
+        )
+
+        if expected is None:
+            assert isinstance(data, WindowDataset)
+            assert data.evidence["blocker"] == "reference_sensor_not_selected"
+            assert statements == []
+        else:
+            assert data["readings"][0].temperature == expected
+            assert data["source_sensor_count"] == 1
+            assert data["sensor_selection_schema"] == "selected_indoor_sensors_v2"
+
+    def test_equal_sensor_weight_and_nonfinite_observation_filter(self):
+        from packages.core.models import IndoorTempReading
+
+        now = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
+        rows = [
+            IndoorTempReading(
+                device_id="selected",
+                timestamp=now + dt.timedelta(seconds=offset),
+                temperature=20,
+                is_stale=False,
+            )
+            for offset in (0, 1, 2)
+        ]
+        rows += [
+            IndoorTempReading(
+                device_id="other",
+                timestamp=now + dt.timedelta(seconds=3),
+                temperature=28,
+                is_stale=False,
+            ),
+            IndoorTempReading(
+                device_id="invalid", timestamp=now, temperature=float("nan"), is_stale=False
+            ),
+        ]
+
+        observations, _, count = ComfortModel._select_indoor_observations(rows, "")
+
+        assert count == 2
+        assert observations[0].temperature == 24.0
+
+
 class TestPassiveDirectForecastReadiness:
     def test_direct_passive_forecast_can_be_ready_without_heating_control(self):
         model = ComfortModel()
         model._model = MagicMock()
-        model._direct_models = {60: MagicMock()}
+        model._passive_direct_models = {60: MagicMock()}
         model._metrics = {
-            "direct_horizons": {"60": {"status": "trained", "mae": 0.6}},
+            "passive_horizons": {"60": {"status": "trained", "mae": 0.6, "persistence_mae": 0.8}},
             # No active heating evidence: full heating control remains blocked.
             "active_heating_rows": 0,
+            "active_input_buckets": 4,
+            "active_input_range_c": 3.0,
         }
 
         assert model.is_ready_for_control is False
@@ -47,12 +516,31 @@ class TestPassiveDirectForecastReadiness:
     def test_direct_passive_forecast_rejects_poor_validation(self):
         model = ComfortModel()
         model._model = MagicMock()
-        model._direct_models = {60: MagicMock()}
-        model._metrics = {"direct_horizons": {"60": {"status": "trained", "mae": 1.2}}}
+        model._passive_direct_models = {60: MagicMock()}
+        model._metrics = {"passive_horizons": {"60": {"status": "trained", "mae": 1.2}}}
 
         readiness = model.passive_forecast_readiness(60)
         assert readiness["ready"] is False
         assert readiness["reason"] == "direct_forecast_mae_above_threshold"
+
+    def test_direct_passive_forecast_must_beat_persistence(self):
+        model = ComfortModel()
+        model._model = MagicMock()
+        model._passive_direct_models = {60: MagicMock()}
+        model._metrics = {
+            "passive_horizons": {
+                "60": {"status": "trained", "mae": 0.178, "persistence_mae": 0.126}
+            }
+        }
+
+        readiness = model.passive_forecast_readiness(60)
+        assert readiness["ready"] is False
+        assert readiness["reason"] == "direct_forecast_not_better_than_persistence"
+
+        model._metrics["passive_horizons"]["60"].pop("persistence_mae")
+        assert model.passive_forecast_readiness(60)["reason"] == (
+            "direct_forecast_not_compared_to_persistence"
+        )
 
 
 class TestComfortControlReadiness:
@@ -70,13 +558,19 @@ class TestComfortControlReadiness:
         assert model.control_readiness["reason"] == "insufficient_active_heating_evidence"
 
         model._metrics["active_heating_rows"] = 20
+        model._metrics["active_input_buckets"] = 4
+        model._metrics["active_input_range_c"] = 3.0
         model._metrics["baseline_mae"] = 0.3
         assert model.control_readiness["reason"] == "not_better_than_persistence_baseline"
 
         model._metrics["baseline_mae"] = 0.4
-        assert model.is_ready_for_control is True
+        assert model.is_ready_for_control is False
+        assert model.control_readiness["reason"] == "observe_only"
 
-    def test_control_margin_is_bounded_by_validated_mae(self):
+        model._metrics.pop("baseline_mae")
+        assert model.control_readiness["reason"] == "persistence_baseline_missing"
+
+    def test_validated_reporting_metrics_never_grant_control_margin(self):
         model = ComfortModel()
         model._model = object()
         model._metrics = {
@@ -84,11 +578,34 @@ class TestComfortControlReadiness:
             "mae": 0.6,
             "r2": 0.3,
             "active_heating_rows": 30,
+            "active_input_buckets": 4,
+            "active_input_range_c": 3.0,
             "baseline_mae": 0.8,
         }
 
-        assert model.is_ready_for_control is True
-        assert model.control_margin_c == 0.45
+        assert model.is_ready_for_control is False
+        assert model.control_margin_c == 0.0
+
+    def test_AC9_3_requires_heat_input_variance(self):
+        model = ComfortModel()
+        model._model = object()
+        model._metrics = {
+            "validated": True,
+            "mae": 0.3,
+            "r2": 0.5,
+            "active_heating_rows": 20,
+            "active_input_buckets": 3,
+            "active_input_range_c": 3.0,
+            "baseline_mae": 0.5,
+        }
+
+        assert model.control_readiness["reason"] == "insufficient_heat_input_variance"
+        model._metrics["active_input_buckets"] = 4
+        model._metrics["active_input_range_c"] = 2.9
+        assert model.control_readiness["reason"] == "insufficient_heat_input_variance"
+        model._metrics["active_input_range_c"] = 3.0
+        assert model.is_ready_for_control is False
+        assert model.control_readiness["reason"] == "observe_only"
 
 
 class TestComfortModelFeatures:
@@ -96,7 +613,7 @@ class TestComfortModelFeatures:
         curve = HeatCurveConfig()
 
         assert effective_zone_target_temperature(-5.0, 5.0, config=curve) == 47.0
-        assert effective_zone_target_temperature(-5.0, 20.0, config=curve) == 20.0
+        assert effective_zone_target_temperature(-5.0, 20.0, config=curve) == 23.0
         assert effective_zone_target_temperature(42.0, 5.0, config=curve) == 42.0
 
     def test_make_features_shape(self):
@@ -166,6 +683,255 @@ class TestComfortModelFeatures:
         assert no_heat[13] == -0.4
         assert active[13] == 0.4
 
+    def test_recent_heat_fraction_uses_component_evidence(self):
+        statuses = [
+            MagicMock(
+                space_heating_active=None,
+                operation_status=0,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="OFF",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+            ),
+            MagicMock(space_heating_active=False),
+        ]
+
+        fraction = ComfortModel._recent_heat_fraction(
+            statuses, np.array([0.0, 300.0]), latest_index=1, feature_time=300.0
+        )
+
+        assert fraction == 0.5
+
+    def test_dataset_summarizes_complete_heating_window(self):
+        base_time = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        readings = [
+            SimpleNamespace(timestamp=base_time, temperature=20.0, device_id="sensor-1"),
+            SimpleNamespace(
+                timestamp=base_time + dt.timedelta(hours=1),
+                temperature=20.5,
+                device_id="sensor-1",
+            ),
+        ]
+        statuses = [
+            SimpleNamespace(
+                ts=base_time,
+                space_heating_active=None,
+                operation_status=1,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="HEATING",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+            SimpleNamespace(
+                ts=base_time + dt.timedelta(minutes=15),
+                space_heating_active=True,
+                operation_status=1,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="HEATING",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+            SimpleNamespace(
+                ts=base_time + dt.timedelta(minutes=30),
+                space_heating_active=True,
+                operation_status=1,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="HEATING",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+            SimpleNamespace(
+                ts=base_time + dt.timedelta(minutes=45),
+                space_heating_active=True,
+                operation_status=1,
+                mode="1",
+                direction="PUMP",
+                pump_duty=1,
+                device_action="HEATING",
+                defrost_active=False,
+                zone1_operation_status=1,
+                zone2_operation_status=0,
+                zone1_temp=35.0,
+                zone1_target_temp=40.0,
+                outdoor_temp=5.0,
+            ),
+        ]
+
+        weather = [
+            SimpleNamespace(
+                ts=base_time + dt.timedelta(hours=1),
+                temperature=5.0,
+                wind_speed=2.0,
+                irradiance=100.0,
+                precipitation=0.0,
+                humidity=60.0,
+                cloud_cover=0.5,
+            )
+        ]
+        dataset = build_window_dataset(
+            [_IndoorObservation(row.timestamp, row.temperature) for row in readings],
+            statuses,
+            weather,
+            (60,),
+        )
+        features, targets = dataset.controlled[60]
+        assert len(features) == len(targets) == 1
+        assert targets.tolist() == [0.5]
+        assert features[0, :4].tolist() == [15.0, 20.0, 1.0, 1.0]
+
+    def test_incomplete_window_evidence_is_rejected(self):
+        start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        readings = [
+            _IndoorObservation(start, 20.0),
+            _IndoorObservation(start + dt.timedelta(hours=1), 20.5),
+        ]
+        statuses = [SimpleNamespace(ts=start, space_heating_active=True)]
+        weather = [SimpleNamespace(ts=start + dt.timedelta(hours=1), temperature=5.0)]
+        dataset = build_window_dataset(readings, statuses, weather, (60,))
+        assert len(dataset.controlled[60][1]) == 0
+        assert dataset.evidence["rejected_incomplete_windows"] >= 1
+
+    def test_passive_window_rejects_unconfirmed_status_gap(self):
+        start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+        readings = [
+            _IndoorObservation(start, 20.0),
+            _IndoorObservation(start + dt.timedelta(hours=3), 20.5),
+        ]
+        statuses = [
+            SimpleNamespace(ts=start + dt.timedelta(minutes=minutes), operation_status=0)
+            for minutes in range(0, 181, 12)
+            if minutes != 72
+        ]
+        weather = [SimpleNamespace(ts=start + dt.timedelta(hours=3), temperature=5.0)]
+
+        dataset = build_window_dataset(readings, statuses, weather, (180,))
+
+        assert len(dataset.controlled[180][1]) == 1
+        assert len(dataset.passive[180][1]) == 0
+
+    def test_delta_constraint_vector_exact(self):
+        assert _MONOTONIC_CST == [1, 1, 1, 1, 1, -1, 1, 0, 0, -1, 0, 0, -1, 0]
+
+    def test_passive_schema_has_no_clock_features(self):
+        assert "hour_sin" not in PASSIVE_FEATURE_NAMES
+        assert "hour_cos" not in PASSIVE_FEATURE_NAMES
+
+    def test_bounded_projection_satisfies_both_constraints(self):
+        projected = ComfortModel.project_delta_curve(np.random.RandomState(4).normal(size=31))
+        assert projected is not None
+        assert np.all(np.diff(projected) <= 1e-10)
+        assert np.all(np.diff(projected) >= -(1 - COMFORT_MODEL_PROJECTION_EPSILON) - 1e-10)
+
+    def test_projection_is_deterministic(self):
+        raw = np.random.RandomState(12).normal(size=31)
+        np.testing.assert_allclose(
+            ComfortModel.project_delta_curve(raw), ComfortModel.project_delta_curve(raw)
+        )
+
+    def test_projection_failure_falls_back(self):
+        assert ComfortModel.project_delta_curve(np.array([np.nan] * 31)) is None
+
+    def test_passive_hourly_change_uses_configured_limit(self):
+        assert ComfortModel._clamp_passive_change(3.0, 3.0, 0.25) == 0.75
+        assert ComfortModel._clamp_passive_change(-3.0, 3.0, 0.25) == -0.75
+
+    def test_candidate_builder_does_not_mutate_model_instance(self):
+        model = ComfortModel()
+        dataset = build_window_dataset([], [], [], (60,))
+        build_candidate_bundle(dataset)
+        assert model.is_trained is False
+
+    def test_published_fit_is_evaluated_fit(self):
+        import pickle
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        features = np.zeros((500, 14))
+        features[:, 1] = np.tile([5.0, 6.0, 8.0, 9.0, 10.0], 100)
+        features[:, 2] = 1.0
+        features[:, 12] = 21.0
+        targets = features[:, 1] * 0.05
+        bounds = [
+            (start + dt.timedelta(hours=index), start + dt.timedelta(hours=index + 1))
+            for index in range(len(targets))
+        ]
+        dataset = WindowDataset({60: (features, targets)}, {}, {}, {60: bounds})
+        bundle = build_candidate_bundle(dataset)
+        evaluated = bundle["evaluation"]["controlled:60"]
+        restored = pickle.loads(pickle.dumps(bundle["controlled_models"][60]))
+        np.testing.assert_array_equal(
+            restored.predict(evaluated["features"]), evaluated["predictions"]
+        )
+        fit_end = dt.datetime.fromisoformat(evaluated["fit_label_end"])
+        holdout_start = dt.datetime.fromisoformat(evaluated["holdout_issue_start"])
+        assert fit_end + dt.timedelta(hours=12) <= holdout_start
+        assert bundle["metrics"]["direct_horizons"]["60"]["fit_samples"] >= 100
+
+    def test_sensor_and_counter_evidence_are_device_scoped(self):
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        dataset = build_window_dataset(
+            [
+                _IndoorObservation(start, 20.0),
+                _IndoorObservation(start + dt.timedelta(hours=1), 20.5),
+            ],
+            [
+                SimpleNamespace(ts=start, device_id="one"),
+                SimpleNamespace(ts=start, device_id="two"),
+            ],
+            [],
+            (60,),
+        )
+        assert len(dataset.controlled[60][1]) == 0
+        assert dataset.evidence["blocker"] == "device_scope_unavailable"
+
+    def test_passive_model_never_trains_keeps_physics_fallback_indefinitely(self):
+        dataset = build_window_dataset([], [], [], (60, 180, 360, 720))
+        bundle = build_candidate_bundle(dataset)
+        model = ComfortModel()
+        model._model = MagicMock()
+        model._passive_direct_models = bundle["passive_models"]
+        model._training_notice = bundle["notice"]
+        assert model.passive_forecast_readiness(60)["reason"] == "passive_model_unavailable"
+        assert (
+            model.training_notice
+            == "passive_model_unavailable:no_zero_heating_windows;passive_forecast=physics_fallback"
+        )
+
+    def test_projected_final_temperature_is_monotone_at_and_beyond_knots(self):
+        class DeltaModel:
+            def predict(self, features):
+                return -np.asarray(features)[:, 12] * 3.0
+
+        model = ComfortModel()
+        model._model = DeltaModel()
+        model._metrics = {"delta_target": True}
+        predictions = [
+            model.predict_indoor_temp(0.0, 5.0, indoor_temp=issue)
+            for issue in (3.0, 20.0, 22.0, 23.8, 25.3, 27.0, 38.0)
+        ]
+        assert all(current is not None for current in predictions)
+        assert all(current < following for current, following in zip(predictions, predictions[1:]))
+
 
 class TestComfortModelTrained:
     """Tests with a synthetically trained model."""
@@ -188,25 +954,24 @@ class TestComfortModelTrained:
         humidity = rng.uniform(30, 95, n)
         cloud_cover = rng.uniform(0, 1, n)
         hours = rng.randint(0, 24, n)
-        # Previous indoor temp — slightly correlated with target
-        prev_indoor = 0.3 * water_temps + 0.2 * outdoor_temps + 10.0 + rng.normal(0, 2.0, n)
-
-        X = np.column_stack(
+        X = np.vstack(
             [
-                water_temps,
-                water_temps,
-                np.ones(n),
-                np.ones(n),
-                outdoor_temps,
-                wind,
-                irradiance,
-                precipitation,
-                humidity,
-                cloud_cover,
-                np.sin(2.0 * np.pi * hours / 24.0),
-                np.cos(2.0 * np.pi * hours / 24.0),
-                prev_indoor,
-                np.zeros(n),
+                ComfortModel._controlled_window_features(
+                    mean_supply_lift=water_temps[index] - 20.0,
+                    mean_target_lift=water_temps[index] - 20.0,
+                    window_heat_fraction=1.0,
+                    final_hour_heat_fraction=1.0,
+                    outdoor_temp=outdoor_temps[index],
+                    wind_speed=wind[index],
+                    irradiance=irradiance[index],
+                    precipitation=precipitation[index],
+                    humidity=humidity[index],
+                    cloud_cover=cloud_cover[index],
+                    hour=int(hours[index]),
+                    issue_indoor_temp=20.0,
+                    issue_indoor_trend=0.0,
+                )
+                for index in range(n)
             ]
         )
         # Simplified thermal relationship
@@ -235,49 +1000,304 @@ class TestComfortModelTrained:
         model._metrics = {"mae": 0.5, "r2": 0.95}
         return model
 
+    @staticmethod
+    def _predict(model, water, outdoor):
+        return model.predict_indoor_temp(
+            water,
+            outdoor,
+            indoor_temp=20.0,
+            zone_target_temp=water,
+            space_heating_fraction=1.0,
+            recent_heat_fraction=1.0,
+            hour=12,
+        )
+
     def test_is_trained(self, trained_model):
         assert trained_model.is_trained is True
 
     def test_predict_indoor_temp(self, trained_model):
         # water=35, outdoor=5 → expected ≈ 0.3*35 + 0.2*5 + 10 = 21.5
-        result = trained_model.predict_indoor_temp(35.0, 5.0)
+        result = self._predict(trained_model, 35.0, 5.0)
         assert result is not None
         assert 18.0 < result < 25.0  # reasonable range
 
     def test_predict_higher_water_temp_gives_higher_indoor(self, trained_model):
-        low = trained_model.predict_indoor_temp(25.0, 5.0)
-        high = trained_model.predict_indoor_temp(50.0, 5.0)
+        low = self._predict(trained_model, 25.0, 5.0)
+        high = self._predict(trained_model, 50.0, 5.0)
         assert high > low
 
     def test_predict_higher_outdoor_gives_higher_indoor(self, trained_model):
-        cold = trained_model.predict_indoor_temp(35.0, -5.0)
-        warm = trained_model.predict_indoor_temp(35.0, 20.0)
+        cold = self._predict(trained_model, 35.0, -5.0)
+        warm = self._predict(trained_model, 35.0, 20.0)
         assert warm > cold
 
     def test_required_zone_temp_inverse(self, trained_model):
         # Ask for 21 °C indoor, should return a water temp
-        water = trained_model.required_zone_temp(21.0, 5.0)
+        water = trained_model.required_zone_temp(21.0, 5.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert 25.0 <= water <= 55.0
 
         # Verify: predicting with that water temp should give ~21 °C
-        predicted = trained_model.predict_indoor_temp(water, 5.0)
+        predicted = self._predict(trained_model, water, 5.0)
         assert abs(predicted - 21.0) < 1.0
 
     def test_required_zone_temp_clamps_at_max(self, trained_model):
         # Request impossibly high indoor temp → should return MAX_ZONE_WATER_TEMP
-        water = trained_model.required_zone_temp(40.0, -10.0)
+        water = trained_model.required_zone_temp(40.0, -10.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert water == 65.0  # MAX_ZONE_WATER_TEMP
 
     def test_required_zone_temp_clamps_at_min(self, trained_model):
         # Request very low indoor temp on warm day → should return MIN_ZONE_WATER_TEMP
-        water = trained_model.required_zone_temp(10.0, 25.0)
+        water = trained_model.required_zone_temp(10.0, 25.0, indoor_temp=20.0, hour=12)
         assert water is not None
         assert water == 20.0  # MIN_ZONE_WATER_TEMP
 
 
 class TestComfortModelTraining:
+    @pytest.mark.asyncio
+    async def test_lock_unavailable_skips_without_starting_worker(self):
+        model = ComfortModel(lock_strategy=_UnavailableTrainingLock())
+        model._materialize_window_dataset = AsyncMock()
+
+        result = await model.train()
+
+        assert result == {"status": "training_skipped", "reason": "training_lock_unavailable"}
+        model._materialize_window_dataset.assert_not_awaited()
+        assert model.training_notice == "training_lock_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_same_process_concurrent_train_returns_training_in_progress(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        model = ComfortModel(lock_strategy=_TrainingLock())
+
+        async def slow_materialize():
+            started.set()
+            await release.wait()
+            return WindowDataset({}, {}, {})
+
+        model._materialize_window_dataset = slow_materialize
+        first = asyncio.create_task(model.train())
+        await started.wait()
+        second = await model.train()
+        release.set()
+
+        assert second == {"status": "training_in_progress"}
+        assert (await first)["status"] == "insufficient_data"
+
+    @staticmethod
+    def _candidate() -> ComfortModelCandidate:
+        return ComfortModelCandidate(
+            model=SimpleNamespace(name="new"),
+            direct_models={60: SimpleNamespace(name="new")},
+            passive_direct_models={},
+            metrics={"direct_horizons": {"60": {"mae": 0.2, "r2": 0.4, "samples": 100}}},
+            samples=100,
+            thermal_lag_minutes=60,
+            training_notice=None,
+        )
+
+    @staticmethod
+    def _dataset() -> WindowDataset:
+        empty = (np.array([]), np.array([]))
+        return WindowDataset({60: empty, 180: empty, 360: empty, 720: empty}, {}, {})
+
+    @staticmethod
+    def _artifact_writer(tmp_path):
+        def write(_artifact, _path):
+            temp = tmp_path / "candidate.tmp"
+            temp.write_bytes(b"candidate")
+            return temp
+
+        def publish(temp, path):
+            temp.replace(path)
+
+        return write, publish
+
+    @pytest.mark.asyncio
+    async def test_failed_candidate_does_not_mutate_active_state(self, monkeypatch):
+        model = ComfortModel()
+        active = object()
+        model._model = active
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", MagicMock(side_effect=ValueError())
+        )
+
+        with pytest.raises(ValueError):
+            await model.train()
+
+        assert model._model is active
+
+    @pytest.mark.asyncio
+    async def test_commit_failure_never_installs_candidate(self, tmp_path, monkeypatch):
+        lease = _TrainingLease(commit_error=RuntimeError("commit"))
+        model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        write, publish = self._artifact_writer(tmp_path)
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = publish
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", lambda *_: self._candidate()
+        )
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        result = await model.train()
+
+        assert result["reason"] == "training_lock_finalize_failed"
+        assert model._model is None and model.is_trained is False
+        assert lease.invalidated is True
+
+    @pytest.mark.asyncio
+    async def test_commit_cancellation_invalidates_and_propagates(self, tmp_path, monkeypatch):
+        lease = _TrainingLease(commit_error=asyncio.CancelledError())
+        model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        write, publish = self._artifact_writer(tmp_path)
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = publish
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", lambda *_: self._candidate()
+        )
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        with pytest.raises(asyncio.CancelledError):
+            await model.train()
+
+        assert lease.invalidated is True
+        assert lease.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_rollback_failure_invalidates_lock(self, monkeypatch):
+        lease = _TrainingLease(rollback_error=RuntimeError("rollback"))
+        model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", MagicMock(side_effect=ValueError())
+        )
+
+        with pytest.raises(RuntimeError, match="rollback"):
+            await model.train()
+
+        assert lease.invalidated is True
+
+    @pytest.mark.asyncio
+    async def test_health_failure_discards_temp_artifact(self, tmp_path, monkeypatch):
+        lease = _TrainingLease(health=False)
+        model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        write, publish = self._artifact_writer(tmp_path)
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = publish
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", lambda *_: self._candidate()
+        )
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        result = await model.train()
+
+        assert result["status"] == "training_skipped"
+        assert not (tmp_path / "candidate.tmp").exists()
+        assert not list(tmp_path.glob("*.pkl"))
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_temp_write_rolls_back_without_publish(
+        self, tmp_path, monkeypatch
+    ):
+        lease = _TrainingLease()
+        model = ComfortModel(lock_strategy=_FixedTrainingLock(lease))
+        active = object()
+        model._model = active
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        started = threading.Event()
+        release = threading.Event()
+
+        def write(_artifact, _path):
+            temp = tmp_path / "candidate.tmp"
+            temp.write_bytes(b"candidate")
+            started.set()
+            release.wait(timeout=2)
+            return temp
+
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = MagicMock()
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", lambda *_: self._candidate()
+        )
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        task = asyncio.create_task(model.train())
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert lease.rolled_back is True
+        assert model._model is active
+        model._publish_candidate_temp.assert_not_called()
+        assert not (tmp_path / "candidate.tmp").exists()
+
+    @pytest.mark.asyncio
+    async def test_slow_candidate_build_keeps_heartbeat_advancing(self, tmp_path, monkeypatch):
+        model = ComfortModel()
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        write, publish = self._artifact_writer(tmp_path)
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = publish
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+
+        def slow_candidate(*_):
+            time.sleep(0.08)
+            return self._candidate()
+
+        monkeypatch.setattr("packages.ml.comfort_model.build_candidate", slow_candidate)
+        ticks = 0
+        running = True
+
+        async def heartbeat():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        await model.train()
+        running = False
+        await heartbeat_task
+
+        assert ticks >= 3
+
+    @pytest.mark.asyncio
+    async def test_compatible_gate_is_carried_and_v7_schema_mismatch_resets(
+        self, tmp_path, monkeypatch
+    ):
+        model = ComfortModel()
+        model._materialize_window_dataset = AsyncMock(return_value=self._dataset())
+        write, publish = self._artifact_writer(tmp_path)
+        model._write_candidate_temp = write
+        model._publish_candidate_temp = publish
+        monkeypatch.setattr(
+            "packages.ml.comfort_model.build_candidate", lambda *_: self._candidate()
+        )
+        monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        model._metrics = {
+            "forecast_quality_feature_schema": "weather_delta_v7_window_heat_controlled",
+            "forecast_quality_gate_schema": "indoor_forecast_v4_delta_window_heat",
+            "forecast_quality_gate": {
+                "schema": "indoor_forecast_v4_delta_window_heat",
+                "required_horizons": [1, 3, 6, 12, 24],
+                "pass_streak": 2,
+            },
+        }
+
+        await model.train()
+        assert model.metrics["forecast_quality_gate"]["pass_streak"] == 2
+        model._metrics["forecast_quality_feature_schema"] = "older_schema"
+        await model.train()
+        assert "forecast_quality_gate" not in model.metrics
+
     @pytest.mark.asyncio
     async def test_train_insufficient_data(self):
         model = ComfortModel()
@@ -294,23 +1314,82 @@ class TestComfortModelTraining:
         assert model.is_trained is False
 
     @pytest.mark.asyncio
-    async def test_retraining_never_replaces_a_worse_checkpoint(self, monkeypatch):
+    async def test_retraining_never_replaces_a_less_skilful_checkpoint(self):
         model = ComfortModel()
         previous_checkpoint = object()
         model._model = previous_checkpoint
-        X = np.tile(np.arange(14, dtype=float), (MIN_TRAINING_ROWS, 1))
-        y = np.linspace(20.0, 30.0, MIN_TRAINING_ROWS)
-
-        async def mock_build(*args, **kwargs):
-            return X, y, len(X)
-
-        model._build_dataset = mock_build
-        monkeypatch.setattr("packages.ml.comfort_model.read_mae_baseline", lambda name: 0.0)
+        model._metrics = {"skill_vs_persistence": 0.99}
+        X, y, _ = _inverted_dataset()
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
 
         result = await model.train(thermal_lag_minutes=60)
 
         assert result["status"] == "regressed"
+        assert result["prior_skill_vs_persistence"] == 0.99
         assert model._model is previous_checkpoint
+
+    def test_candidate_records_persistence_baseline_and_skill(self):
+        from packages.ml.comfort_model import build_candidate
+
+        rng = np.random.default_rng(3)
+        features = rng.normal(size=(200, len(CONTROLLED_FEATURE_NAMES)))
+        features[:, 2] = 1.0
+        targets = rng.normal(0.0, 0.2, size=200)
+        dataset = _timestamped_dataset(features, targets)
+
+        candidate = build_candidate(dataset, None)
+
+        horizon = candidate.metrics["direct_horizons"]["60"]
+        assert horizon["persistence_mae"] == pytest.approx(
+            float(np.mean(np.abs(targets[160:]))), abs=1e-3
+        )
+        assert candidate.metrics["baseline_mae"] == horizon["persistence_mae"]
+        assert candidate.metrics["skill_vs_persistence"] == pytest.approx(
+            1.0 - horizon["mae"] / horizon["persistence_mae"], abs=1e-3
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("feature_schema", "required_horizons", "preserved"),
+        [
+            ("causal_v4_hourly_heat_and_trend", [1, 3, 6, 12, 24], False),
+            ("obsolete_schema", [1, 3, 6, 12, 24], False),
+            ("causal_v4_hourly_heat_and_trend", [1, 3, 6, 12], False),
+        ],
+    )
+    async def test_retrain_preserves_gate_only_for_matching_schema_and_horizons(
+        self, monkeypatch, feature_schema, required_horizons, preserved
+    ):
+        X, y, n_rows = _inverted_dataset()
+        model = ComfortModel()
+        model._metrics = {
+            "forecast_quality_feature_schema": feature_schema,
+            "forecast_quality_gate": {
+                "schema": "indoor_forecast_v3",
+                "required_horizons": required_horizons,
+                "pass_streak": 1,
+                "failure_streak": 0,
+                "status": "observing",
+            },
+            "forecast_quality_gate_evaluation_id": "scorecard-1",
+        }
+
+        async def fake_build():
+            return X, y, n_rows
+
+        model._build_dataset = fake_build
+        model._train_direct_forecasts = AsyncMock(return_value=({}, {}))
+        model._save = lambda: None
+        monkeypatch.setattr("packages.ml.comfort_model.write_mae_baseline", lambda *_: None)
+
+        await model._train_with_current_lag()
+
+        if preserved:
+            assert model.metrics["forecast_quality_gate"]["pass_streak"] == 1
+            assert model.metrics["forecast_quality_gate_evaluation_id"] == "scorecard-1"
+        else:
+            assert "forecast_quality_gate" not in model.metrics
+            assert "forecast_quality_gate_evaluation_id" not in model.metrics
 
 
 class TestThermalLag:
@@ -384,7 +1463,7 @@ def _inverted_dataset(n=300, seed=0):
         ]
     )
     # Inverted relationship: higher water temp -> lower indoor temp.
-    y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n)
+    y = 30.0 - 0.2 * water + 0.05 * outdoor + rng.normal(0, 0.3, n) - prev_indoor
     return X, y, n
 
 
@@ -396,10 +1475,7 @@ class TestComfortModelMonotonicity:
         X, y, n = _inverted_dataset()
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
 
         result = await model.train(thermal_lag_minutes=30)
@@ -415,31 +1491,29 @@ class TestComfortModelMonotonicity:
             prev = pred
 
     @pytest.mark.asyncio
-    async def test_higher_current_indoor_never_lowers_prediction(self):
+    async def test_higher_current_indoor_never_increases_delta_prediction(self):
         X, y, n = _inverted_dataset(seed=1)
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
         await model.train(thermal_lag_minutes=30)
 
         low = model.predict_indoor_temp(40.0, 5.0, indoor_temp=20.0)
         high = model.predict_indoor_temp(40.0, 5.0, indoor_temp=26.0)
-        assert high >= low - 1e-6
+        assert high is not None and low is not None
+        assert high - 26.0 <= low - 20.0 + 1e-6
 
     @pytest.mark.asyncio
     async def test_metrics_report_out_of_sample_validation(self):
         X, y, n = _inverted_dataset(seed=2)
         model = ComfortModel()
 
-        async def fake_build():
-            return X, y, n
-
-        model._build_dataset = fake_build
+        model._materialize_window_dataset = AsyncMock(return_value=_timestamped_dataset(X, y))
         model._save = lambda: None
         result = await model.train(thermal_lag_minutes=30)
         assert result["validated"] is True
         assert "mae" in result and "r2" in result
+        assert result["direct_horizons"]["60"]["fit_samples"] >= 100
+        assert result["direct_horizons"]["60"]["embargo_hours"] == 12
+        assert model.is_ready_for_control is False

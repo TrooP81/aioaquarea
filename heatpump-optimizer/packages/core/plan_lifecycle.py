@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models import PlanActionRecord, PlanRecord
 
 ACTIVE_PLAN_STATUS = "active"
+DIAGNOSTIC_PLAN_STATUS = "diagnostic"
 SUPERSEDED_PLAN_STATUS = "superseded"
 CANCELLED_ACTION_STATUS = "cancelled"
 
@@ -27,6 +28,27 @@ async def activate_plan(
     index (added by migration 015) is the final cross-process guard for the
     first-ever plan, when there is no existing row to lock.
     """
+
+    if plan.status == DIAGNOSTIC_PLAN_STATUS:
+        raise ValueError("Diagnostic plans cannot be activated")
+    active_ids = await supersede_active_plan(session, reason=reason)
+    plan.status = ACTIVE_PLAN_STATUS
+    session.add(plan)
+    await session.flush()
+    if active_ids:
+        await session.execute(
+            update(PlanRecord)
+            .where(PlanRecord.id.in_(active_ids))
+            .values(superseded_by_plan_id=plan.id)
+        )
+
+
+async def supersede_active_plan(
+    session: AsyncSession,
+    *,
+    reason: str = "replaced_by_new_optimization",
+) -> list[int]:
+    """Supersede active plans while retaining explicitly linked restores."""
 
     now = dt.datetime.now(dt.timezone.utc)
     active_rows = (
@@ -47,6 +69,7 @@ async def activate_plan(
                 and_(
                     PlanActionRecord.plan_id.in_(active_ids),
                     PlanActionRecord.status == "pending",
+                    PlanActionRecord.reverts_action_id.is_(None),
                 )
             )
             .values(
@@ -67,16 +90,7 @@ async def activate_plan(
             )
         )
 
-    plan.status = ACTIVE_PLAN_STATUS
-    session.add(plan)
-    await session.flush()
-
-    if active_ids:
-        await session.execute(
-            update(PlanRecord)
-            .where(PlanRecord.id.in_(active_ids))
-            .values(superseded_by_plan_id=plan.id)
-        )
+    return active_ids
 
 
 def active_plan_query(now: dt.datetime):

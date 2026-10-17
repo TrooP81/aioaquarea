@@ -41,7 +41,7 @@ test.describe("Live indoor forecast", () => {
   });
 
   test("chart paints the indoor forecast section in the live UI", async ({ page }) => {
-    await page.goto("/?view=charts");
+    await page.goto("/?view=under-the-hood");
     await expect(page.getByRole("heading", { name: "Thermal Predictions" })).toBeVisible({ timeout: 15000 });
     // The thermal predictions block must render its SVG chart with live curves.
     const charts = page.locator("svg");

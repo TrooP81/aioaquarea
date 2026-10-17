@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -11,10 +12,6 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
-
-    # Panasonic Aquarea
-    aquarea_username: str = ""
-    aquarea_password: str = ""
 
     # Price feed
     price_provider: str = "entsoe"  # "entsoe" or "tibber"
@@ -48,9 +45,11 @@ class Settings(BaseSettings):
     secret_key: str = "change-this-to-a-random-string"
     api_token: str = "disabled"  # Set to a strong token to enable API auth; "disabled" = no auth
     model_dir: str = "/app/models"
-    cors_origins: str = "http://localhost:3500"  # Comma-separated allowed origins
+    cors_origins: str = "http://localhost:4444"  # Comma-separated allowed origins
     log_level: str = "INFO"
     poll_interval_seconds: int = 300
+    executor_safety_read_reserve: int = Field(default=2, ge=1, le=4)
+    panasonic_distributed_read_quota_enabled: bool = False
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

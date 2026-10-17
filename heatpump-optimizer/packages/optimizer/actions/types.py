@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -36,3 +36,13 @@ class VerifyResult:
             "expected_value": self.expected_value,
             "reason": self.reason,
         }
+
+
+@dataclass(slots=True)
+class VerificationObservation:
+    force_dhw: Any = None
+    quiet_mode: Any = None
+    special_status: Any = None
+    tank_temperature: Any = None
+    tank_target_temperature: Any = None
+    zone_targets: dict[int, Any] = field(default_factory=dict)

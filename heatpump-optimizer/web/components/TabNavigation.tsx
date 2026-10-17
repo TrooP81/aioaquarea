@@ -1,6 +1,6 @@
 "use client";
 
-import type { KeyboardEvent } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 
 export interface TabItem<T extends string> {
   id: T;
@@ -24,9 +24,24 @@ export function TabNavigation<T extends string>({
   items,
   onChange,
 }: TabNavigationProps<T>) {
+  const tabRefs = useRef(new Map<T, HTMLButtonElement>());
+
+  useEffect(() => {
+    const activeTab = tabRefs.current.get(activeId);
+    if (!activeTab) return;
+    activeTab.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+  }, [activeId]);
+
   const selectTab = (id: T) => {
     onChange(id);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({
+      top: 0,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>, currentId: T) => {
@@ -55,6 +70,11 @@ export function TabNavigation<T extends string>({
           role="tab"
           aria-controls={`${idPrefix}-panel-${item.id}`}
           aria-selected={activeId === item.id}
+          tabIndex={activeId === item.id ? 0 : -1}
+          ref={(element) => {
+            if (element) tabRefs.current.set(item.id, element);
+            else tabRefs.current.delete(item.id);
+          }}
           onClick={() => selectTab(item.id)}
           onKeyDown={(event) => handleKeyDown(event, item.id)}
         >

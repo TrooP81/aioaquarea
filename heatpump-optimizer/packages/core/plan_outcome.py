@@ -11,6 +11,7 @@ about what the available telemetry can prove.
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Iterable
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,100 @@ MATCHED_WEATHER_MAX_OUTDOOR_DELTA_C = 2.0
 MATCHED_WEATHER_MAX_WINDOWS = 8
 
 
+def confirmed_energy_intervals(records, timezone_name="UTC", *, device_id=None):
+    """Recover confirmed per-channel deltas without treating missing counters as zero."""
+    from packages.ml.models_common import iter_counter_change_intervals
+
+    rows = sorted(
+        (row for row in records if device_id is None or row.device_id == device_id),
+        key=lambda row: row.ts,
+    )
+    timezone = ZoneInfo(timezone_name)
+    return [
+        interval
+        for counter in ("heat_kwh", "cool_kwh", "tank_kwh")
+        for interval in iter_counter_change_intervals(rows, counter, timezone, confirm_changes=True)
+    ]
+
+
+def duration_allocated_cost(records, prices, *, start, end, timezone_name="UTC"):
+    """Estimate tariff exposure by uniform allocation within confirmed meter intervals."""
+    slots: list[tuple[dt.datetime, float]] = []
+    for interval in confirmed_energy_intervals(records, timezone_name):
+        left, right = max(start, interval.start_ts), min(end, interval.end_ts)
+        while left < right:
+            slot = hour_start(left)
+            stop = min(right, slot + dt.timedelta(hours=1))
+            fraction = (stop - left).total_seconds() / (
+                interval.end_ts - interval.start_ts
+            ).total_seconds()
+            slots.append((slot, interval.energy_kwh * fraction))
+            left = stop
+    result = cost_outcome(
+        slots,
+        {
+            hour_start(timestamp): float(price)
+            for timestamp, price in prices.items()
+            if isinstance(price, (int, float))
+            and not isinstance(price, bool)
+            and math.isfinite(price)
+        },
+    )
+    return {
+        **result,
+        "allocation_basis": "uniform_duration_within_confirmed_counter_intervals",
+        "tariff_allocation_estimated": True,
+        "command_attribution_supported": False,
+        "allocation_status": "estimated" if slots else "unavailable",
+    }
+
+
+def observed_rate_baseline(records, prices, *, device_id, timezone_name="UTC"):
+    """Estimate an unshifted baseline, never the cost of a serialized strategy."""
+    intervals = confirmed_energy_intervals(records, timezone_name, device_id=device_id)
+    windows = sorted((interval.start_ts, interval.end_ts) for interval in intervals)
+    elapsed_hours = 0.0
+    right = None
+    for start, end in windows:
+        if right is None or start > right:
+            elapsed_hours += (end - start).total_seconds() / 3600
+        elif end > right:
+            elapsed_hours += (end - right).total_seconds() / 3600
+        right = max(right, end) if right is not None else end
+    energy = sum(interval.energy_kwh for interval in intervals)
+    valid_prices = bool(prices) and all(
+        isinstance(price, (int, float)) and not isinstance(price, bool) and math.isfinite(price)
+        for _, price in prices
+    )
+    timestamps = [hour_start(timestamp) for timestamp, _ in prices]
+    contiguous = (
+        valid_prices
+        and len(set(timestamps)) == len(timestamps)
+        and all(
+            later - earlier == dt.timedelta(hours=1)
+            for earlier, later in zip(timestamps, timestamps[1:])
+        )
+    )
+    rate = energy / elapsed_hours if elapsed_hours > 0 else None
+    return {
+        "strategy_cost": None,
+        "strategy_cost_reason": "serialized_strategy_replay_unavailable",
+        "unshifted_baseline_cost": rate * sum(price for _, price in prices)
+        if rate is not None and contiguous
+        else None,
+        "baseline_basis": "confirmed_interval_rate_uniform_hourly_allocation",
+        "baseline_estimated": True,
+        "measured_interval_kwh": energy,
+        "measured_interval_hours": elapsed_hours,
+        "confirmed_channel_intervals": len(intervals),
+        "baseline_unavailable_reason": None
+        if rate is not None and contiguous
+        else "no_confirmed_intervals"
+        if rate is None
+        else "incomplete_or_invalid_price_horizon",
+    }
+
+
 def hour_start(value: dt.datetime) -> dt.datetime:
     """Return an aware timestamp rounded down to the market-price hour."""
 
@@ -43,12 +138,26 @@ def counter_value(record: ConsumptionRecord) -> float:
     return float(record.heat_kwh or 0) + float(record.cool_kwh or 0) + float(record.tank_kwh or 0)
 
 
+def effective_source_date(record: ConsumptionRecord) -> dt.date:
+    """Return Panasonic source-day provenance with a UTC fallback for legacy rows."""
+
+    source_date = getattr(record, "source_date", None)
+    if source_date is not None:
+        return source_date
+    timestamp = record.ts
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    return timestamp.astimezone(dt.timezone.utc).date()
+
+
 def cumulative_counter_delta(current: float, previous: float, *, day_changed: bool) -> float:
     """Return a positive interval delta, accounting for a daily counter reset."""
 
+    if day_changed:
+        return current
     if current >= previous:
         return current - previous
-    return current if day_changed else 0.0
+    return 0.0
 
 
 def cumulative_intervals(
@@ -60,14 +169,13 @@ def cumulative_intervals(
     The first post-reset value is the energy accumulated since local midnight.
     """
 
-    timezone = ZoneInfo(timezone_name)
     intervals: list[tuple[dt.datetime, float]] = []
-    previous: ConsumptionRecord | None = None
+    previous_by_device: dict[str, ConsumptionRecord] = {}
     for record in sorted(records, key=lambda row: row.ts):
+        device_id = getattr(record, "device_id", "legacy_single_device")
+        previous = previous_by_device.get(device_id)
         if previous is not None:
-            day_changed = (
-                record.ts.astimezone(timezone).date() != previous.ts.astimezone(timezone).date()
-            )
+            day_changed = effective_source_date(record) != effective_source_date(previous)
             # Meter counters arrive as floats; round only the interval to
             # prevent binary representation noise from leaking into costs/UI.
             delta = round(
@@ -80,7 +188,7 @@ def cumulative_intervals(
             )
             if delta > 0:
                 intervals.append((record.ts, delta))
-        previous = record
+        previous_by_device[device_id] = record
     return intervals
 
 
@@ -312,7 +420,9 @@ async def measured_window_outcome(
     ]
     comparison_intervals = cumulative_intervals(comparison_meter_rows, timezone_name)
     return {
-        "cost": cost_outcome(intervals, prices),
+        "cost": duration_allocated_cost(
+            meter_rows, prices, start=start, end=end, timezone_name=timezone_name
+        ),
         "comfort": comfort_outcome(readings, comfort_min_c, comfort_max_c),
         "weather_matched_comparison": weather_matched_energy_comparison(
             current_intervals=intervals,

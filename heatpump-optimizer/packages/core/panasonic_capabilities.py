@@ -26,20 +26,20 @@ def build_panasonic_capabilities(
     *,
     latest_status: Any | None,
     poller_heartbeat: Any | None,
-    poll_interval_seconds: int,
+    device_status_threshold_seconds: int,
     adapter_state: dict[str, object] | None = None,
     now: dt.datetime | None = None,
 ) -> dict[str, object]:
     """Describe mapped commands without opening another Panasonic session."""
 
     now = _as_utc(now) or dt.datetime.now(dt.timezone.utc)
-    stale_after_seconds = max(int(poll_interval_seconds), 60)
+    stale_after_seconds = max(int(device_status_threshold_seconds), 60)
     status_at = _as_utc(getattr(latest_status, "ts", None))
     heartbeat_at = _as_utc(getattr(poller_heartbeat, "updated_at", None))
     adapter = project_panasonic_adapter_state(
         adapter_state,
         now=now,
-        stale_after_seconds=max(int(poll_interval_seconds) * 3, 15 * 60),
+        stale_after_seconds=stale_after_seconds,
     )
 
     if heartbeat_at is None:
@@ -57,7 +57,7 @@ def build_panasonic_capabilities(
     else:
         reason = "available"
 
-    commands_allowed = reason == "available"
+    observation_available = reason == "available"
     observed_device = latest_status is not None
     has_tank = (
         _observed(
@@ -111,8 +111,11 @@ def build_panasonic_capabilities(
         return {
             "integration_supported": True,
             "device_supported": device_supported,
-            "available": commands_allowed and device_supported is True,
-            "policy": policy,
+            "available": observation_available
+            and device_supported is True
+            and policy == "manual_only",
+            "policy": "observe_only_build" if policy == "automatic_with_plan" else policy,
+            "ordinary_automation_allowed": False,
             "values": values or [],
         }
 
@@ -127,9 +130,7 @@ def build_panasonic_capabilities(
         "observed_range": tank_temperature_limits,
         "whole_degrees_only": True,
     }
-    tank_temperature_command["available"] = (
-        commands_allowed and has_tank is True and tank_temperature_limits is not None
-    )
+    tank_temperature_command["available"] = False
     zone_temperature_command = command(
         policy="automatic_with_plan",
         values=zones,
@@ -139,7 +140,7 @@ def build_panasonic_capabilities(
         "observed_ranges": zone_ranges,
         "whole_degrees_only": True,
     }
-    zone_temperature_command["available"] = commands_allowed and bool(zones) and bool(zone_ranges)
+    zone_temperature_command["available"] = False
     special_status_supported = (
         getattr(latest_status, "special_status_supported", None) if observed_device else None
     )
@@ -152,7 +153,10 @@ def build_panasonic_capabilities(
             "write_preflight_required": True,
         },
         "availability": {
-            "commands_allowed": commands_allowed,
+            "commands_allowed": False,
+            "observation_available": observation_available,
+            "ordinary_automation_allowed": False,
+            "execution_policy": "observe_only_build",
             "reason": reason,
             "last_live_status_at": status_at.isoformat() if status_at else None,
             "poller_heartbeat_at": heartbeat_at.isoformat() if heartbeat_at else None,

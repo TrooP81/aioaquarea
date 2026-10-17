@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import copy
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from types import SimpleNamespace
 
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -27,13 +30,43 @@ engine = create_async_engine(
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
+async def copy_materialized_rows(rows, column_names, *, context=None):
+    """Copy loaded values cooperatively without retaining ORM/session objects."""
+    copied = []
+    claim = (context or {}).get("_readiness_copy_claim")
+    for index, row in enumerate(rows):
+        item = SimpleNamespace(
+            **{name: copy.deepcopy(getattr(row, name, None)) for name in column_names}
+        )
+        if claim is not None:
+            claim(item)
+        copied.append(item)
+        if index % 256 == 255:
+            await asyncio.sleep(0)
+    return copied
+
+
 @asynccontextmanager
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_factory() as session:
+async def get_session(
+    *, read_only: bool = False, isolation_level: str | None = None
+) -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_factory(autoflush=not read_only) as session:
         try:
+            if read_only or isolation_level is not None:
+                options = {}
+                if isolation_level is not None:
+                    options["isolation_level"] = isolation_level
+                if read_only:
+                    options["postgresql_readonly"] = True
+                await session.connection(execution_options=options)
+            if read_only:
+                await session.execute(text("SET LOCAL statement_timeout = '2s'"))
             yield session
-            await session.commit()
-        except Exception:
+            if read_only:
+                await session.rollback()
+            else:
+                await session.commit()
+        except BaseException:
             await session.rollback()
             raise
 

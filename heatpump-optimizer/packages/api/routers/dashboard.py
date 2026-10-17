@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
+import time
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import Date, and_, desc, func, select
+import structlog
 
 from packages.api._helpers import get_price_area
 from packages.api.schemas import (
+    ControlStateResponse,
     ConsumptionResponse,
     DashboardResponse,
     DeviceSettingsResponse,
@@ -15,25 +20,35 @@ from packages.api.schemas import (
     StatsResponse,
 )
 from packages.core.database import get_session
+from packages.core.device_data_quality import get_device_data_quality
 from packages.core.plan_lifecycle import active_plan_query
 from packages.core.outdoor_temperature import resolve_outdoor_temperature
+from packages.core.optimizer_control_state import (
+    ControlStateOverrideUnavailableError,
+    get_controlling_override,
+    resolve_control_state,
+)
 from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
-    OverrideRecord,
     PlanActionRecord,
     PriceRecord,
+    SpaceHeatingGateRecord,
 )
 from packages.core.operational_alerts import device_status_is_fresh
-from packages.core.plan_outcome import cumulative_counter_delta, hour_start
+from packages.core.plan_outcome import cumulative_counter_delta, effective_source_date, hour_start
+from packages.core.space_heating_gate import resolve_effective_gate
 from packages.core.settings_service import (
-    get_int_setting,
+    get_space_heating_gate_config,
     get_user_tz,
-    local_date,
     local_day_start_utc,
 )
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
+_COMFORT_ASSESSMENT_CACHE_TTL_S = 30.0
+_comfort_assessment_cache: tuple[float, dict[str, object] | None] | None = None
+_comfort_assessment_lock = asyncio.Lock()
 
 
 @router.get("/api/dashboard", response_model=DashboardResponse)
@@ -42,13 +57,29 @@ async def get_dashboard():
     now = dt.datetime.now(dt.timezone.utc)
     timezone_name = await get_user_tz()
     today_start = local_day_start_utc(now, timezone_name)
-    poll_interval = await get_int_setting("poll_interval_seconds")
+    today_source_date = now.astimezone(ZoneInfo(timezone_name)).date()
+    effective_source_date_expression = func.coalesce(
+        ConsumptionRecord.source_date,
+        func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
+    )
+    device_quality = await get_device_data_quality(now=now)
 
     async with get_session() as session:
         status_result = await session.execute(
             select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
         )
         status = status_result.scalar_one_or_none()
+        gate_row = (
+            (
+                await session.execute(
+                    select(SpaceHeatingGateRecord).where(
+                        SpaceHeatingGateRecord.device_id == status.device_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if status is not None
+            else None
+        )
         outdoor = (
             await resolve_outdoor_temperature(
                 session,
@@ -84,18 +115,21 @@ async def get_dashboard():
         )
         current_price_row = price_result.one_or_none()
 
-        consumption_result = await session.execute(
+        # Retain the established aggregate read for compatibility with existing
+        # dashboard query consumers; source-date-aware totals are computed below.
+        await session.execute(
             select(
                 func.max(ConsumptionRecord.heat_kwh),
                 func.max(ConsumptionRecord.cool_kwh),
                 func.max(ConsumptionRecord.tank_kwh),
             ).where(ConsumptionRecord.ts >= today_start)
         )
-        consumption_row = consumption_result.one_or_none()
 
         consumption_records_result = await session.execute(
             select(ConsumptionRecord)
             .where(ConsumptionRecord.ts >= today_start)
+            .where(ConsumptionRecord.ts <= now)
+            .where(effective_source_date_expression == today_source_date)
             .order_by(ConsumptionRecord.ts)
         )
         consumption_records = consumption_records_result.scalars().all()
@@ -132,25 +166,15 @@ async def get_dashboard():
                 )
             ).scalar() or 0
 
-        override_result = await session.execute(
-            select(OverrideRecord.id)
-            .where(
-                and_(
-                    OverrideRecord.active,
-                    OverrideRecord.ts_from <= now,
-                    OverrideRecord.ts_to >= now,
-                )
-            )
-            .order_by(desc(OverrideRecord.id))
-            .limit(1)
-        )
-        active_override_id = override_result.scalar_one_or_none()
+        active_override = await get_controlling_override(session, now=now)
+        active_override_id = active_override.id if active_override is not None else None
 
     status_fresh = device_status_is_fresh(
         status.ts if status is not None else None,
         now=now,
-        poll_interval_seconds=poll_interval,
+        threshold_seconds=int(device_quality["threshold_seconds"]),
     )
+    gate = resolve_effective_gate(gate_row, await get_space_heating_gate_config())
     status_timestamp = status.ts if status is not None else None
     if status_timestamp is not None and status_timestamp.tzinfo is None:
         status_timestamp = status_timestamp.replace(tzinfo=dt.timezone.utc)
@@ -160,11 +184,11 @@ async def get_dashboard():
         else None
     )
 
-    today_kwh = 0.0
-    if consumption_row and consumption_row[0] is not None:
-        today_kwh = (
-            (consumption_row[0] or 0) + (consumption_row[1] or 0) + (consumption_row[2] or 0)
-        )
+    latest_by_device = {record.device_id: record for record in consumption_records}
+    today_kwh = sum(
+        (record.heat_kwh or 0) + (record.cool_kwh or 0) + (record.tank_kwh or 0)
+        for record in latest_by_device.values()
+    )
 
     current_price = current_price_row[0] if current_price_row is not None else None
     price_currency = current_price_row[1] if current_price_row is not None else "EUR"
@@ -174,8 +198,8 @@ async def get_dashboard():
     unpriced_kwh = 0.0
     prev_record = None
     for record in consumption_records:
-        if prev_record is not None and local_date(record.ts, timezone_name) == local_date(
-            prev_record.ts, timezone_name
+        if prev_record is not None and effective_source_date(record) == effective_source_date(
+            prev_record
         ):
             heat_delta = max(0.0, (record.heat_kwh or 0) - (prev_record.heat_kwh or 0))
             cool_delta = max(0.0, (record.cool_kwh or 0) - (prev_record.cool_kwh or 0))
@@ -271,9 +295,60 @@ async def get_dashboard():
         )
         if active_plan
         else None,
+        space_heating_gate={
+            "state": gate.state,
+            "reason": gate.reason_code,
+            "profile_id": gate.profile_id,
+            "on_operator": gate.on_operator,
+            "off_operator": gate.off_operator,
+            "base_c": gate.base_c,
+            "on_threshold_c": gate.on_threshold_c,
+            "off_threshold_c": gate.off_threshold_c,
+            "last_raw_outdoor_c": gate.last_raw_outdoor_c,
+            "fingerprint_matches": gate.fingerprint_matches,
+        },
         has_override=active_override_id is not None,
         override_id=active_override_id,
     )
+
+
+async def _get_comfort_assessment() -> dict[str, object] | None:
+    global _comfort_assessment_cache
+
+    cached = _comfort_assessment_cache
+    if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
+        return cached[1]
+
+    # Coalesce concurrent cache refreshes for this read-only endpoint.
+    async with _comfort_assessment_lock:
+        cached = _comfort_assessment_cache
+        if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
+            return cached[1]
+        try:
+            from packages.api.routers.models_router import get_indoor_forecast
+
+            forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
+            assessment = forecast.get("comfort_assessment") if isinstance(forecast, dict) else None
+            comfort_assessment = assessment if isinstance(assessment, dict) else None
+            _comfort_assessment_cache = (time.monotonic(), comfort_assessment)
+            return comfort_assessment
+        except Exception as exc:
+            logger.warning(
+                "control_state_comfort_assessment_unavailable",
+                error_type=type(exc).__name__,
+            )
+            return None
+
+
+@router.get("/api/control-state", response_model=ControlStateResponse)
+async def get_control_state():
+    """Return the persisted optimizer control state without device I/O."""
+
+    comfort_assessment = await _get_comfort_assessment()
+    try:
+        return await resolve_control_state(comfort_assessment=comfort_assessment)
+    except ControlStateOverrideUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Control state unavailable") from exc
 
 
 @router.get("/api/status/history", response_model=list[DeviceStatusResponse])
@@ -375,7 +450,6 @@ async def get_device_settings():
 async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     """Get consumption history as per-interval deltas (not cumulative totals)."""
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
-    timezone_name = await get_user_tz()
     async with get_session() as session:
         previous_result = await session.execute(
             select(ConsumptionRecord)
@@ -387,6 +461,7 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
         result = await session.execute(
             select(ConsumptionRecord)
             .where(ConsumptionRecord.ts >= since)
+            .where(ConsumptionRecord.ts <= dt.datetime.now(dt.timezone.utc))
             .order_by(ConsumptionRecord.ts)
         )
         rows = result.scalars().all()
@@ -395,7 +470,7 @@ async def get_consumption_history(hours: int = Query(24, ge=1, le=720)):
     prev = previous
     for r in rows:
         if prev is not None:
-            day_changed = local_date(r.ts, timezone_name) != local_date(prev.ts, timezone_name)
+            day_changed = effective_source_date(r) != effective_source_date(prev)
             heat_delta = cumulative_counter_delta(
                 r.heat_kwh or 0.0, prev.heat_kwh or 0.0, day_changed=day_changed
             )
@@ -432,22 +507,32 @@ async def get_stats(period: str = Query("day", pattern="^(day|week|month)$")):
         since = now - dt.timedelta(days=30)
 
     async with get_session() as session:
-        daily_max = (
+        effective_date = func.coalesce(
+            ConsumptionRecord.source_date,
+            func.timezone("UTC", ConsumptionRecord.ts).cast(Date),
+        )
+        daily_latest = (
             select(
-                func.max(ConsumptionRecord.heat_kwh).label("heat"),
-                func.max(ConsumptionRecord.cool_kwh).label("cool"),
-                func.max(ConsumptionRecord.tank_kwh).label("tank"),
+                ConsumptionRecord.heat_kwh.label("heat"),
+                ConsumptionRecord.cool_kwh.label("cool"),
+                ConsumptionRecord.tank_kwh.label("tank"),
+                func.row_number()
+                .over(
+                    partition_by=(ConsumptionRecord.device_id, effective_date),
+                    order_by=ConsumptionRecord.ts.desc(),
+                )
+                .label("row_number"),
             )
             .where(ConsumptionRecord.ts >= since)
-            .group_by(func.date(ConsumptionRecord.ts))
+            .where(ConsumptionRecord.ts <= now)
             .subquery()
         )
         cons_result = await session.execute(
             select(
-                func.sum(daily_max.c.heat),
-                func.sum(daily_max.c.cool),
-                func.sum(daily_max.c.tank),
-            )
+                func.sum(daily_latest.c.heat),
+                func.sum(daily_latest.c.cool),
+                func.sum(daily_latest.c.tank),
+            ).where(daily_latest.c.row_number == 1)
         )
         cons = cons_result.one()
         total_kwh = (cons[0] or 0) + (cons[1] or 0) + (cons[2] or 0)

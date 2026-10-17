@@ -18,8 +18,8 @@ const SCOPES: ScopeOption[] = [
   },
   {
     key: "energy",
-    label: "Energy & COP history",
-    description: "Consumption records and computed COP values",
+    label: "Energy history",
+    description: "Consumption records only; retired COP history is retained",
     feedsModels: true,
   },
   {
@@ -58,11 +58,40 @@ interface ResetResult {
   deleted_models: string[];
 }
 
+function resetErrorMessage(data: unknown): string {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return "Reset failed";
+  const detail = (data as Record<string, unknown>).detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (typeof detail !== "object" || detail === null || Array.isArray(detail)) return "Reset failed";
+  const refusal = detail as Record<string, unknown>;
+  if (refusal.code === "unresolved_safety_reverts") {
+    const actionId = refusal.action_id;
+    const action = typeof actionId === "number" && Number.isSafeInteger(actionId) && actionId > 0
+      ? ` (action ${actionId})` : "";
+    return `Reset blocked: an unresolved safety restore${action} must be settled first.`;
+  }
+  if (refusal.code === "ml_lifecycle_unavailable") {
+    return "Reset unavailable: model lifecycle storage could not be reached. Try again later.";
+  }
+  if (refusal.code === "manual_cop_reset_unavailable") {
+    return "Manual COP reset unavailable: nothing was deleted. Try again later.";
+  }
+  return "Reset failed";
+}
+
+const MANUAL_COP_RESET_MESSAGE =
+  "Delete every manual controller-COP reading for all devices and turn experimental COP forecasting off? " +
+  "Revision tokens are never reused. All other data, settings, models, COP history and pending safety restores are kept. " +
+  "This cannot be undone.";
+
 export function ResetDataCard() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ResetResult | null>(null);
+  const [manualSubmitting, setManualSubmitting] = useState(false);
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [manualDeleted, setManualDeleted] = useState<number | null>(null);
 
   const allSelected = selected.size === SCOPES.length;
 
@@ -92,8 +121,8 @@ export function ResetDataCard() {
     if (selected.size === 0) return;
     const scopes = SCOPES.filter((s) => selected.has(s.key)).map((s) => s.label);
     const message = allSelected
-      ? "Start completely fresh? This permanently deletes ALL collected data and trained models. Settings and your SmartThings connection are kept. This cannot be undone."
-      : `Permanently delete the following? This cannot be undone.\n\n- ${scopes.join("\n- ")}`;
+      ? "Reset all resettable data and affected retained models? COP history, COP artifacts and all model baselines are kept. Manual controller-COP readings and their revision sequence are kept, along with settings and your SmartThings connection. This cannot be undone."
+      : `Permanently delete the following? COP history, COP artifacts and all model baselines are kept. Manual controller-COP readings and their revision sequence are kept. This cannot be undone.\n\n- ${scopes.join("\n- ")}`;
     if (!confirm(message)) return;
 
     setSubmitting(true);
@@ -107,7 +136,7 @@ export function ResetDataCard() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setError(data.detail || "Reset failed");
+        setError(resetErrorMessage(data));
         return;
       }
       setResult(await res.json());
@@ -116,6 +145,37 @@ export function ResetDataCard() {
       setError(err instanceof Error ? err.message : "Reset failed");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleManualReset = async () => {
+    if (!confirm(MANUAL_COP_RESET_MESSAGE)) return;
+    setManualSubmitting(true);
+    setManualError(null);
+    setManualDeleted(null);
+    try {
+      const res = await fetch("/api/admin/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scopes: ["manual_cop"] }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setManualError(resetErrorMessage(data));
+        return;
+      }
+      const data: unknown = await res.json();
+      const deleted = typeof data === "object" && data !== null
+        ? (data as Record<string, unknown>).total_rows_deleted : undefined;
+      if (typeof deleted !== "number" || !Number.isSafeInteger(deleted) || deleted < 0) {
+        setManualError("Manual COP reset response is invalid");
+        return;
+      }
+      setManualDeleted(deleted);
+    } catch (err: unknown) {
+      setManualError(err instanceof Error ? err.message : "Reset failed");
+    } finally {
+      setManualSubmitting(false);
     }
   };
 
@@ -130,8 +190,10 @@ export function ResetDataCard() {
         Danger Zone — Reset Data
       </h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        Permanently delete collected data so models can train from scratch. Your settings,
-        credentials, and SmartThings connection are always kept. This cannot be undone.
+        Permanently delete selected data and reset affected retained models. COP history,
+        COP artifacts and all model baselines are retained. Manual controller-COP readings
+        and their revision sequence are also retained, along with settings, credentials
+        and your SmartThings connection. This cannot be undone.
       </p>
 
       <label
@@ -146,7 +208,7 @@ export function ResetDataCard() {
         }}
       >
         <input type="checkbox" checked={allSelected} onChange={toggleAll} />
-        Start everything fresh (select all)
+        Select all resettable data
       </label>
 
       <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
@@ -173,7 +235,7 @@ export function ResetDataCard() {
 
       {modelsWillReset && (
         <p style={{ fontSize: "0.75rem", color: "var(--warning, orange)", marginTop: "0.75rem" }}>
-          ⓘ Trained ML models (COP, demand, comfort, thermal) will also be reset, since the data
+          ⓘ Retained models (demand, comfort, thermal) will also be reset, since the data
           they learned from is being cleared.
         </p>
       )}
@@ -189,7 +251,7 @@ export function ResetDataCard() {
         >
           <p style={{ color: "var(--success)", fontSize: "0.85rem" }}>
             Deleted {result.total_rows_deleted} record(s)
-            {result.models_reset ? " and reset trained models." : "."}
+            {result.models_reset ? " and reset retained models." : "."}
           </p>
         </div>
       )}
@@ -206,6 +268,35 @@ export function ResetDataCard() {
       >
         {submitting ? "Resetting..." : "Reset Selected Data"}
       </button>
+
+      <div
+        data-testid="manual-cop-reset"
+        style={{ marginTop: "1.5rem", paddingTop: "1rem", borderTop: "1px solid var(--border)" }}
+      >
+        <h3 style={{ fontSize: "0.95rem", margin: "0 0 0.5rem" }}>Manual controller-COP ledger</h3>
+        <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
+          Separate from the scopes above and never included in &quot;Select all&quot;. Deletes the
+          manual COP readings of every device and turns experimental COP forecasting off.
+          Revision tokens are never reused; other data, settings, models and pending safety
+          restores are kept.
+        </p>
+        {manualError && (
+          <p role="alert" style={{ color: "var(--danger)", fontSize: "0.8rem" }}>{manualError}</p>
+        )}
+        {manualDeleted !== null && (
+          <p role="status" style={{ color: "var(--success)", fontSize: "0.85rem" }}>
+            Deleted {manualDeleted} manual reading(s); experimental COP forecasting is off.
+          </p>
+        )}
+        <button
+          className="btn"
+          onClick={handleManualReset}
+          disabled={manualSubmitting || submitting}
+          style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+        >
+          {manualSubmitting ? "Resetting..." : "Reset manual COP readings"}
+        </button>
+      </div>
     </div>
   );
 }

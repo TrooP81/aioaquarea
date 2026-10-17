@@ -6,6 +6,8 @@ name = "pypi"
 [packages]
 aiohttp = ">=3.14.3,<4.0"
 strenum = "*"
+beautifulsoup4 = ">=4.12,<5.0"
+soupsieve = ">=2.9,<3.0"
 
 [dev-packages]
 pylint = "*"
@@ -13,6 +15,8 @@ black = "*"
 isort = "*"
 pytest = "*"
 pytest-asyncio = "*"
+build = ">=1.2"
+twine = ">=5.0"
 
 [requires]
 python_version = "3.10"

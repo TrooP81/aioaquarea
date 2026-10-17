@@ -68,6 +68,18 @@ async def test_panasonic_request_header_includes_expected_fields():
     assert headers["x-cfc-api-key"]
 
 
+@pytest.mark.asyncio
+async def test_app_version_init_retries_failures_then_caches_success():
+    app_version = CCAppVersion()
+    app_version.refresh = AsyncMock(side_effect=[False, True])
+
+    await app_version.init()
+    await app_version.init()
+    await app_version.init()
+
+    assert app_version.refresh.await_count == 2
+
+
 def test_generate_random_string_uses_requested_length():
     value = generate_random_string(43)
 
@@ -215,9 +227,7 @@ async def test_login_rejects_missing_csrf_cookie_before_credentials_are_posted()
         AquareaEnvironment.PRODUCTION,
         logging.getLogger(__name__),
     )
-    authorization = DummyResponse(
-        headers={"Location": "authorize?state=state-123"}
-    )
+    authorization = DummyResponse(headers={"Location": "authorize?state=state-123"})
 
     with pytest.raises(AuthenticationError, match="CSRF cookie"):
         await authenticator._login(authorization, "user", "password")

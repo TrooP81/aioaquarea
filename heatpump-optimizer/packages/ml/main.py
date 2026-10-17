@@ -7,65 +7,64 @@ import asyncio
 import structlog
 
 from packages.core.scheduling import create_scheduler
-from packages.ml.models import COPModel, DemandModel
+from packages.ml.models import DemandModel
 
 logger = structlog.get_logger()
 
-# Global model instances
-cop_model = COPModel()
 demand_model = DemandModel()
 
 
-async def retrain_models() -> None:
-    """Retrain all ML models on latest data."""
-    logger.info("ml_retrain_starting")
+async def retrain_models(*, automatic: bool = False, source: str = "ml_entrypoint") -> dict | None:
+    """Request Demand maintenance; only the poller may fit it."""
+    from packages.ml.lifecycle import enqueue_maintenance_request
 
-    cop_result = await cop_model.train()
-    logger.info("cop_model_trained", **cop_result)
-
-    demand_result = await demand_model.train()
-    logger.info("demand_model_trained", **demand_result)
+    result = await enqueue_maintenance_request("demand", source, automatic=automatic)
+    logger.info("demand_maintenance_requested", request=result)
+    return result
 
 
 async def main() -> None:
-    """ML service main loop — retrains weekly, serves predictions via the API."""
+    """Queue startup and weekly Demand requests; never fit inside this service."""
     from packages.core.logging import configure_logging
+    from packages.core.runtime_ownership import close_service_resources, finish_owned_cleanup
 
-    configure_logging("ml")
-
-    # Load latest models on startup
-    cop_model.load_latest()
-    demand_model.load_latest()
-    logger.info("ml_models_loaded", cop=cop_model.is_trained, demand=demand_model.is_trained)
-
-    # A missing model is common after an intentional feature or target-schema
-    # upgrade. Train immediately rather than leaving the optimiser on an old
-    # checkpoint or waiting for the weekly maintenance window. If there is not
-    # yet enough data, the train methods return a safe insufficient-data result
-    # and the rules layer remains active.
-    if not cop_model.is_trained or not demand_model.is_trained:
-        logger.info("ml_initial_training_needed")
-        await retrain_models()
-
-    scheduler = create_scheduler()
-
-    # Retrain weekly
-    scheduler.add_job(
-        retrain_models,
-        "cron",
-        day_of_week="sun",
-        hour=3,
-        timezone="UTC",
-        id="retrain",
-    )
-
-    scheduler.start()
-
+    scheduler = None
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        configure_logging("ml")
+
+        logger.info("cop_retired", reason="unverified_thermal_output", cop_source="assumed")
+        demand_model.load_latest()
+        logger.info("ml_models_loaded", demand=demand_model.is_trained)
+
+        await retrain_models(automatic=True, source="ml_startup")
+
+        scheduler = create_scheduler()
+
+        scheduler.add_job(
+            retrain_models,
+            "cron",
+            day_of_week="sun",
+            hour=3,
+            timezone="UTC",
+            id="retrain",
+            kwargs={"automatic": True, "source": "ml_schedule"},
+        )
+
+        scheduler.start()
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+    finally:
+
+        async def cleanup():
+            from packages.core.database import engine
+
+            await close_service_resources(scheduler=scheduler, engine=engine)
+
+        await finish_owned_cleanup(cleanup)
 
 
 if __name__ == "__main__":
