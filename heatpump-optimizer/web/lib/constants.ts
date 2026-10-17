@@ -54,13 +54,13 @@ export const LAYER_LABELS: Record<string, string> = {
   rules_v3: "Rules",
   rules_v7: "Rules",
   rules_v8: "Rules",
-  milp_v1: "MILP",
-  "milp_v1+ml": "MILP + ML",
-  milp_v2: "MILP",
-  "milp_v2+ml": "MILP + ML",
+  milp_v1: "Optimized",
+  "milp_v1+ml": "Optimized + ML",
+  milp_v2: "Optimized",
+  "milp_v2+ml": "Optimized + ML",
   // Configuration keys (shown in a few places as a fallback)
   rules_only: "Rules",
-  milp_preferred: "MILP",
+  milp_preferred: "Optimized",
   auto: "Automatic",
 };
 

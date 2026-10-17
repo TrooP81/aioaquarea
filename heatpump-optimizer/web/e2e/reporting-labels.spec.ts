@@ -2,10 +2,12 @@ import { test, expect } from "./fixtures";
 import { forecastDisplayStatusLabel, reasonLabel, LAYER_LABELS } from "../lib/constants";
 
 // These are the same mappings used by the mocked dashboard/status views.
-test("reporting labels name algorithms and preserve unknown fallback", async () => {
-    expect(LAYER_LABELS.milp_v1).toBe("MILP");
-    expect(LAYER_LABELS["milp_v1+ml"]).toBe("MILP + ML");
-    expect(LAYER_LABELS.milp_preferred).toBe("MILP");
+test("reporting labels preserve planner compatibility and unknown fallback", async () => {
+    expect(LAYER_LABELS.milp_v1).toBe("Optimized");
+    expect(LAYER_LABELS["milp_v1+ml"]).toBe("Optimized + ML");
+    expect(LAYER_LABELS.milp_v2).toBe("Optimized");
+    expect(LAYER_LABELS["milp_v2+ml"]).toBe("Optimized + ML");
+    expect(LAYER_LABELS.milp_preferred).toBe("Optimized");
     expect(reasonLabel("reference_sensor")).toBe("Reference sensor");
     expect(reasonLabel("forecast_unavailable_or_legacy")).toBe("Forecast unavailable or legacy");
     expect(reasonLabel("future_reason")).toContain("future_reason");

@@ -133,6 +133,8 @@ Requires at least 14 days of heating-season data.
 
 ## Activity log
 
+- 2026-10-17: P1.6a merge reconciliation restored P1.7 friendly planner labels (`Optimized` / `Optimized + ML`) for legacy and current MILP versions plus the configuration fallback; reporting-only reason labels preserved. Audited P1.7 planner, mock, compatibility-test and tracker changes against main; no other P1.7 reversions found.
+
 - 2026-10-17: P1.6a owner chose option A (partial-only cost reporting accepted for now); committed repair-loop-2 plus verifier tests, rebased onto merged P1.7/main preserving all rows/activity, and added P1.6c reachable complete-cost reporting for STANDARD design. PR #36 remains unmerged pending coordinator and green CI.
 
 - 2026-10-17: P1.7 final owner release approval recorded (09:11); rebased onto main and approved for merge after green CI.
