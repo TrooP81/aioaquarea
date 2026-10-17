@@ -41,7 +41,7 @@ from tests.e2e.test_manual_cop_postgresql import (
     _publish_lifecycle_json,
     atomic_lifecycle_seal,
     lifecycle_evidence_lock,
-    LOCAL_PERIOD_REVISION,
+    CURRENT_HEAD_REVISION,
     OBS5_SCHEMA_PHASES,
     OBS5_TEST_PHASES,
     SOURCE_MANIFEST_DIGEST_ENV,
@@ -130,7 +130,7 @@ class TestOBS5RealMigration:
         receipt = owned_test_environment()
         _source_receipt(receipt)
         head, _ = migration_targets()
-        assert head == LOCAL_PERIOD_REVISION
+        assert head == CURRENT_HEAD_REVISION
         with owned_test_network():
             primary = await _primary_state()
             async with owned_migration_child("obsreal") as child:
@@ -460,7 +460,7 @@ def seal_obs5_scope(evidence, proof, current, completed, read_marker):
     head, processes = validate_bound_verification_evidence(
         evidence, proof, partitions, OBS5_SCHEMA_PHASES, "obs5-inventory"
     )
-    assert read_marker() == LOCAL_PERIOD_REVISION, "primary head was not proven"
+    assert read_marker() == CURRENT_HEAD_REVISION, "primary head was not proven"
     seal = {
         "scope": "OBS-5 only; not full backend release qualification",
         "passed": True,
@@ -627,14 +627,14 @@ class TestOBS5ScopeSeal(SyntheticVerificationEvidence):
 
     def obs5(self, tmp_path):
         evidence, proof = self.evidence(tmp_path)
-        return evidence, proof, lambda: LOCAL_PERIOD_REVISION
+        return evidence, proof, lambda: CURRENT_HEAD_REVISION
 
     async def test_complete_bound_obs5_evidence_seals_obs_scope_only(self, tmp_path):
         evidence, proof, marker = self.obs5(tmp_path)
         seal = seal_obs5_scope(evidence, proof, dict(proof), OBS5_RUNNER_PHASES, marker)
         assert seal["passed"] and seal["scope"].startswith("OBS-5 only")
         assert seal["partitions"] == {name: sorted(self.NODES[name]) for name in OBS5_TEST_PHASES}
-        assert seal["primary_head"]["after"] == LOCAL_PERIOD_REVISION
+        assert seal["primary_head"]["after"] == CURRENT_HEAD_REVISION
         assert json.loads((evidence / "obs5-scope-seal.json").read_text(encoding="utf-8")) == seal
         assert not self.receipt_path(evidence, self.NODES["obs5-pg-supplement"][1]).exists()
 

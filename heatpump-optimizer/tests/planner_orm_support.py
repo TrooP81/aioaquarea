@@ -93,7 +93,7 @@ def planning_rows(*, layer="rules_only", gate="valid"):
         "smartthings_device_ids": "p17-room",
         "device_status_max_age_minutes": "15",
         "poll_interval_seconds": "300",
-        "price_provider": "tibber",
+        "price_provider": "entsoe",
         "entsoe_area": "SE3",
         "weather_provider": "open-meteo",
         "timezone": "UTC",
@@ -112,10 +112,10 @@ def planning_rows(*, layer="rules_only", gate="valid"):
             [
                 PriceRecord(
                     ts=ts,
-                    area="tibber",
+                    area="SE3",
                     price_eur_per_kwh=0.2,
                     price_currency="EUR",
-                    price_source="tibber",
+                    price_source="entsoe",
                     fetched_at=now,
                     interval_schema="hourly_duration_weighted_v1",
                 ),

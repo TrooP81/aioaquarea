@@ -144,7 +144,7 @@ remain Phase 2 work; no migration or API health behavior changes in Phase 1.
 | `RUN_DOCKER_RESTORE_TESTS` | off | Set to `1` to run the synthetic tmpfs Docker gate. No published ports or external networks. |
 | `RUN_REAL_BACKUP_RESTORE_TESTS` | off | Additionally set to `1` only on an authorized trusted host. Restores newest complete dump without cutover. |
 | `RESTORE_REAL_BACKUP_DIR` | project backups | Trusted-host read-only real archive directory. Never mount a live volume. |
-| `RESTORE_REAL_EXPECTED_REVISION` | `030` (recorded legacy evidence) | Explicit trusted source revision for the real drill; update when the source revision changes. |
+| `RESTORE_REAL_EXPECTED_REVISION` | _(required for real drill)_ | Exact trusted revision of that archive, not automatically the application head. Reviewed head and synthetic archive marker are `037`; historical `030` restore evidence remains historical. |
 | `BACKUP_VERIFY_ISOLATED` | off | Must be exactly `true`. No bypass flag. |
 | `BACKUP_LIVE_DATABASE` | `heatpump` | Verifier rejects this name in both `PGDATABASE` and `BACKUP_VERIFY_DATABASE`; also always rejects `PGHOST=db`. |
 | `BACKUP_VERIFY_DATABASE` | `heatpump_restore_verify` | Fresh isolated candidate name; cannot be live or an existing database. |

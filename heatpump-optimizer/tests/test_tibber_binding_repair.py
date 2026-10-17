@@ -148,3 +148,30 @@ async def test_owner_cannot_clear_provenance_without_explicit_home_write(binding
         else:
             await settings_service.set_setting("tibber_feed_diagnostic", "")
     assert values == before
+
+
+async def test_obs_readiness_fixture_does_not_write_read_only_diagnostic(monkeypatch):
+    from packages.core import database as database_module
+    from tests.e2e.test_ml_lifecycle_postgresql import _readiness_source_fixture
+
+    class SettingsCaptured(Exception):
+        pass
+
+    captured = {}
+
+    async def capture_and_stop(values):
+        captured.update(values)
+        raise SettingsCaptured
+
+    connection = SimpleNamespace(run_sync=AsyncMock())
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=connection)
+    context.__aexit__ = AsyncMock(return_value=False)
+    database = SimpleNamespace(engine=SimpleNamespace(begin=lambda: context), maker=object())
+    monkeypatch.setattr(database_module, "async_session_factory", database.maker)
+    monkeypatch.setattr(settings_service, "set_settings_bulk", capture_and_stop)
+    with pytest.raises(SettingsCaptured):
+        await _readiness_source_fixture(database, monkeypatch)
+    assert "tibber_feed_diagnostic" not in captured
+    assert not any(settings_service.SETTINGS_SCHEMA[key].get("read_only") for key in captured)
+    assert captured["weather_provider"] == "open-meteo"

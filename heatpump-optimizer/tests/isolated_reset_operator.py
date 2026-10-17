@@ -118,7 +118,7 @@ async def test_RESET1_to_RESET6_real_operator_stages_replay_and_refusals(tmp_pat
             assert await session.scalar(text("SELECT count(*) FROM settings")) == 0
             assert (
                 await session.scalars(text("SELECT version_num FROM alembic_version"))
-            ).all() == ["036"]
+            ).all() == ["037"]
             now = await session.scalar(text("SELECT CURRENT_TIMESTAMP"))
             oid = await session.scalar(
                 text("SELECT oid FROM pg_database WHERE datname=current_database()")
@@ -385,7 +385,7 @@ async def test_RESET1_to_RESET6_real_operator_stages_replay_and_refusals(tmp_pat
             assert fresh.next_maintenance_at is None and fresh.last_demand_attempt_at is None
             assert (
                 await session.scalars(text("SELECT version_num FROM alembic_version"))
-            ).all() == ["036"]
+            ).all() == ["037"]
         from packages.ml.lifecycle import Lease, LeaseLost, Lifecycle
 
         with pytest.raises(LeaseLost):

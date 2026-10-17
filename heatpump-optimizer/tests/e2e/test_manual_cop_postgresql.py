@@ -552,6 +552,8 @@ VERIFICATION_BINDING_PATHS = (
     "heatpump-optimizer/migrations/versions/032_manual_cop_observations.py",
     "heatpump-optimizer/tests/conftest.py",
     "heatpump-optimizer/migrations/versions/036_manual_cop_local_periods.py",
+    "heatpump-optimizer/migrations/versions/037_tibber_price_scopes.py",
+    "heatpump-optimizer/tests/test_migration_head_contract.py",
     "heatpump-optimizer/packages/core/models/__init__.py",
     "heatpump-optimizer/packages/core/cop_monitoring.py",
     "heatpump-optimizer/packages/api/routers/feeds.py",
@@ -592,8 +594,8 @@ SOURCE_MANIFEST_DECLARATIONS = (
     "heatpump-optimizer/constraints.txt",
 )
 SOURCE_MANIFEST_MODES = frozenset({"100644", "100755"})
-assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 28
-assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 33
+assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 30
+assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 35
 
 
 def _source_checkout():
@@ -2528,7 +2530,10 @@ class SyntheticVerificationEvidence:
         for name in REQUIRED_SCHEMA_PHASES:
             self.process(evidence, name)
         (evidence / "obs5-primary-head.json").write_text(
-            json.dumps({"before": None, "after": "036", "head": "036"}), encoding="utf-8"
+            json.dumps(
+                {"before": None, "after": CURRENT_HEAD_REVISION, "head": CURRENT_HEAD_REVISION}
+            ),
+            encoding="utf-8",
         )
         for node in self.RECEIPT_REQUIRED:
             self.write_receipt(evidence, node)
@@ -3042,7 +3047,11 @@ class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
                 seal_verification_evidence(evidence, proof)
             elif path == "obs":
                 verification.seal_obs5_scope(
-                    evidence, proof, current(), verification.OBS5_RUNNER_PHASES, lambda: "036"
+                    evidence,
+                    proof,
+                    current(),
+                    verification.OBS5_RUNNER_PHASES,
+                    lambda: CURRENT_HEAD_REVISION,
                 )
             else:
                 assert verification._run_owned_verification(prepared=True) == 0
@@ -3083,7 +3092,7 @@ class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
             )
 
             async def marker():
-                return "036"
+                return CURRENT_HEAD_REVISION
 
             def immediate(coroutine):
                 try:
@@ -3114,7 +3123,7 @@ class TestVerificationSeal(SyntheticVerificationEvidence):
         seal = json.loads((evidence / "seal.json").read_text(encoding="utf-8"))
         assert (seal["commit"], seal["source_manifest_sha256"]) == (self.COMMIT, self.DIGEST)
         assert seal["partitions"] == {name: sorted(nodes) for name, nodes in self.NODES.items()}
-        assert seal["primary_head"]["after"] == "036"
+        assert seal["primary_head"]["after"] == CURRENT_HEAD_REVISION
         # The resource-free supplement node needs (and has) no lifecycle receipt.
         free = self.NODES["obs5-pg-supplement"][1]
         assert free not in self.RECEIPT_REQUIRED
@@ -5392,7 +5401,7 @@ class TestManualCOPPostgreSQLMigration:
             async with engine.connect() as connection:
                 retained = await retained_storage_state(connection)
             # Historical qualification stops at genuine 035: 036 is forward-only, and the
-            # workflow's upgrade-head phase then upgrades this populated database to 036.
+            # workflow's upgrade-head phase then upgrades this populated database to 037.
             assert head == CURRENT_HEAD_REVISION
             assert (
                 ScriptDirectory.from_config(config)
@@ -5447,7 +5456,7 @@ class TestManualCOPPostgreSQLMigration:
                     if target == HISTORICAL_HEAD:
                         for table, columns in additions.items():
                             next_positions[table] += len(columns)
-            # No historical `alembic check`: 035 differs from the current 036 metadata by
+            # No historical `alembic check`: 035 differs from the current 037 metadata by
             # design. The explicit catalog, row and sequence comparisons above replace it.
         finally:
             await engine.dispose()

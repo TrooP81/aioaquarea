@@ -38,6 +38,8 @@ jobs:
           else
             echo "shellcheck NOT_RUN: tool unavailable"
           fi
+      # Synthetic archive and expected marker are both reviewed head 037.
+      # Real backup expectations below remain explicit per-archive configuration.
       - name: Synthetic Timescale restore and worker release gate
         run: >-
           python -m pytest tests/test_restore_db.py tests/test_verify_backup.py

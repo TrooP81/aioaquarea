@@ -46,7 +46,7 @@ class RestoreStack:
             "RESTORE_PRODUCTION_TEST_BACKUP_DIR": backup_dir.as_posix(),
             "RESTORE_SOURCE_IMAGE": PINNED_IMAGE,
             "RESTORE_SOURCE_TIMESCALE_VERSION": "2.26.4",
-            "RESTORE_EXPECTED_REVISION": "030",
+            "RESTORE_EXPECTED_REVISION": "037",
             "RESTORE_REQUIRED_ROLES": "heatpump",
             "RESTORE_DISPOSABLE": "true",
             "RESTORE_ISOLATED_PROJECT": self.project,
@@ -212,7 +212,7 @@ def _seed(stack: RestoreStack, database: str, sentinel: str) -> None:
         f"""
         SET ROLE heatpump;
         CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY);
-        INSERT INTO alembic_version VALUES ('030');
+        INSERT INTO alembic_version VALUES ('037');
         CREATE TABLE plans (id integer PRIMARY KEY);
         INSERT INTO plans VALUES (1);
         CREATE TABLE restore_sentinel (value text);
@@ -275,7 +275,7 @@ def synthetic_archive(stack: RestoreStack) -> Path:
 
 
 def _assert_restored(stack: RestoreStack, database: str) -> None:
-    assert stack.sql(database, "SELECT version_num FROM alembic_version") == "030"
+    assert stack.sql(database, "SELECT version_num FROM alembic_version") == "037"
     assert stack.sql(database, "SELECT value FROM restore_sentinel") == "archive"
     assert stack.sql(database, "SHOW timescaledb.restoring") == "off"
     assert stack.sql(database, "SELECT count(*) FROM timescaledb_information.hypertables") == "4"
@@ -473,9 +473,9 @@ def test_BK_13_latest_real_backup_restores_without_filters_or_errors() -> None:
     archive = archives[-1]
     original_stat = archive.stat()
     with _isolated_stack(backup_dir) as disposable:
-        disposable.environment["RESTORE_EXPECTED_REVISION"] = os.environ.get(
-            "RESTORE_REAL_EXPECTED_REVISION", "030"
-        )
+        disposable.environment["RESTORE_EXPECTED_REVISION"] = os.environ[
+            "RESTORE_REAL_EXPECTED_REVISION"
+        ]
         result = disposable.helper("restore", f"/backups/{archive.name}", "real_backup_candidate")
         assert "ERROR:" not in result.stderr
         assert "pg_restore: error:" not in result.stderr
