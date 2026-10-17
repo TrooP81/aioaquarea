@@ -59,9 +59,12 @@ interface DashboardData {
   today_cost_currency: string;
   today_cost_priced_kwh: number;
   today_cost_unpriced_kwh: number;
-  today_cost_priced_amount: number;
-  today_cost_coverage_pct: number;
+  today_cost_priced_amount: number | null;
+  today_cost_coverage_pct: number | null;
   today_cost_complete: boolean;
+  today_telemetry_status?: "complete" | "incomplete" | "unavailable";
+  today_cost_incomplete_reason?: "telemetry_unavailable" | "telemetry_incomplete" | "tariff_incomplete" | null;
+  today_cost_allocation_basis?: string;
   active_plan: {
     id: number;
     status?: string;

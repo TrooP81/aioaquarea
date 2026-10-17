@@ -243,11 +243,27 @@ class OverrideCreate(BaseModel):
 
 class StatsResponse(BaseModel):
     period: str
-    total_kwh: float
-    total_cost_eur: float
+    window_start: dt.datetime
+    window_end: dt.datetime
+    price_area: str
+    price_source: str
+    price_currency: str
+    # Legacy field names; monetary values are in price_currency, not converted EUR.
+    total_kwh: Optional[float] = None
+    total_cost_eur: Optional[float] = None
     avg_cop: Optional[float] = None
-    avg_price_eur_kwh: float
+    avg_price_eur_kwh: Optional[float] = None
     savings_vs_baseline_eur: Optional[float] = None
+    telemetry_status: Literal["complete", "incomplete", "unavailable"]
+    incomplete_reason: Optional[
+        Literal["telemetry_unavailable", "telemetry_incomplete", "tariff_incomplete"]
+    ] = None
+    complete: bool
+    priced_kwh: float
+    unpriced_kwh: float
+    coverage_pct: Optional[float] = None
+    partial_priced_amount: Optional[float] = None
+    allocation_basis: str
 
 
 class DashboardResponse(BaseModel):
@@ -264,8 +280,13 @@ class DashboardResponse(BaseModel):
     today_cost_currency: str = "EUR"
     today_cost_priced_kwh: float = 0
     today_cost_unpriced_kwh: float = 0
-    today_cost_priced_amount: float = 0
-    today_cost_coverage_pct: float = 0
+    today_telemetry_status: Literal["complete", "incomplete", "unavailable"] = "unavailable"
+    today_cost_incomplete_reason: Optional[
+        Literal["telemetry_unavailable", "telemetry_incomplete", "tariff_incomplete"]
+    ] = None
+    today_cost_allocation_basis: str = "uniform_duration_within_confirmed_counter_intervals"
+    today_cost_priced_amount: Optional[float] = None
+    today_cost_coverage_pct: Optional[float] = None
     today_cost_complete: bool = False
     active_plan: Optional[PlanResponse] = None
     space_heating_gate: dict = Field(default_factory=dict)

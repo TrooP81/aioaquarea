@@ -48,6 +48,7 @@ def confirmed_energy_intervals(records, timezone_name="UTC", *, device_id=None):
 
 def duration_allocated_cost(records, prices, *, start, end, timezone_name="UTC"):
     """Estimate tariff exposure by uniform allocation within confirmed meter intervals."""
+    records = list(records)
     slots: list[tuple[dt.datetime, float]] = []
     for interval in confirmed_energy_intervals(records, timezone_name):
         left, right = max(start, interval.start_ts), min(end, interval.end_ts)
@@ -68,9 +69,49 @@ def duration_allocated_cost(records, prices, *, start, end, timezone_name="UTC")
             and not isinstance(price, bool)
             and math.isfinite(price)
         },
+        start=start,
+        end=end,
+    )
+    # Completeness is stricter than energy-priced coverage. Missing/flat channels
+    # cannot certify zero total use (the existing zero contract is heating-only).
+    from packages.ml.models_common import iter_counter_change_intervals
+
+    devices = {row.device_id for row in records if row.ts <= end}
+    telemetry_complete = bool(devices) and end > start
+    for device in devices:
+        rows = sorted((row for row in records if row.device_id == device), key=lambda row: row.ts)
+        for counter in ("heat_kwh", "cool_kwh", "tank_kwh"):
+            right = start
+            for interval in iter_counter_change_intervals(
+                rows, counter, ZoneInfo(timezone_name), confirm_changes=True
+            ):
+                if interval.end_ts <= start or interval.start_ts >= end:
+                    continue
+                if interval.start_ts > right:
+                    break
+                right = max(right, interval.end_ts)
+            telemetry_complete = telemetry_complete and right >= end
+    complete = telemetry_complete and result["tariff_complete"]
+    incomplete_reason = (
+        "telemetry_unavailable"
+        if not slots
+        else "telemetry_incomplete"
+        if not telemetry_complete
+        else "tariff_incomplete"
+        if not result["tariff_complete"]
+        else None
     )
     return {
         **result,
+        "telemetry_status": "complete"
+        if telemetry_complete
+        else "incomplete"
+        if slots
+        else "unavailable",
+        "complete": complete,
+        "incomplete_reason": incomplete_reason,
+        "total_cost": result["actual_cost"] if complete else None,
+        "partial_priced_amount": result["actual_cost"],
         "allocation_basis": "uniform_duration_within_confirmed_counter_intervals",
         "tariff_allocation_estimated": True,
         "command_attribution_supported": False,
@@ -195,9 +236,28 @@ def cumulative_intervals(
 def cost_outcome(
     intervals: Iterable[tuple[dt.datetime, float]],
     prices: dict[dt.datetime, float],
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
 ) -> dict[str, float | int | None]:
     """Price metered energy and compare it with a flat-price load-shift baseline."""
 
+    intervals = list(intervals)
+    if start is None and intervals:
+        start = min(hour_start(timestamp) for timestamp, _ in intervals)
+    if end is None and intervals:
+        end = max(hour_start(timestamp) for timestamp, _ in intervals) + dt.timedelta(hours=1)
+    weights = {
+        timestamp: (
+            min(end, timestamp + dt.timedelta(hours=1)) - max(start, timestamp)
+        ).total_seconds()
+        for timestamp in prices
+        if start is not None
+        and end is not None
+        and timestamp < end
+        and timestamp + dt.timedelta(hours=1) > start
+    }
+    prices = {timestamp: prices[timestamp] for timestamp in weights}
     measured_kwh = 0.0
     priced_kwh = 0.0
     cost = 0.0
@@ -209,16 +269,22 @@ def cost_outcome(
         priced_kwh += kwh
         cost += kwh * price
 
-    coverage = 100.0 if measured_kwh <= 0.0001 else 100.0 * priced_kwh / measured_kwh
+    coverage = None if measured_kwh <= 0 else 100.0 * priced_kwh / measured_kwh
     available_prices = list(prices.values())
-    flat_price = sum(available_prices) / len(available_prices) if available_prices else None
+    flat_price = (
+        (sum(prices[ts] * weight for ts, weight in weights.items()) / sum(weights.values()))
+        if weights
+        else None
+    )
     baseline = flat_price * priced_kwh if flat_price is not None else None
     savings = baseline - cost if baseline is not None and priced_kwh > 0 else None
     return {
+        "tariff_complete": measured_kwh > 0
+        and math.isclose(priced_kwh, measured_kwh, abs_tol=1e-9),
         "measured_kwh": round(measured_kwh, 3),
         "priced_kwh": round(priced_kwh, 3),
         "unpriced_kwh": round(max(0.0, measured_kwh - priced_kwh), 3),
-        "coverage_pct": round(max(0.0, min(100.0, coverage)), 1),
+        "coverage_pct": round(max(0.0, min(100.0, coverage)), 1) if coverage is not None else None,
         "actual_cost": round(cost, 3) if priced_kwh > 0 else None,
         "flat_price_baseline_cost": round(baseline, 3) if baseline is not None else None,
         "estimated_price_shift_savings": round(savings, 3) if savings is not None else None,
@@ -356,8 +422,8 @@ async def measured_window_outcome(
         (
             await session.execute(
                 select(ConsumptionRecord)
-                .where(ConsumptionRecord.ts >= start - dt.timedelta(hours=1))
-                .where(ConsumptionRecord.ts <= end)
+                .where(ConsumptionRecord.ts >= start - dt.timedelta(hours=2))
+                .where(ConsumptionRecord.ts <= end + dt.timedelta(hours=2))
                 .order_by(ConsumptionRecord.ts)
             )
         )
@@ -401,7 +467,7 @@ async def measured_window_outcome(
     prices_query = (
         select(PriceRecord.ts, PriceRecord.price_eur_per_kwh)
         .where(PriceRecord.ts >= hour_start(start))
-        .where(PriceRecord.ts <= hour_start(end))
+        .where(PriceRecord.ts < end)
         .where(PriceRecord.area == price_area)
     )
     if price_currency:

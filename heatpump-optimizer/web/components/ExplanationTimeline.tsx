@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useCurrency, formatPricePerKwh } from "./useCurrency";
 import { useTimeFormat, formatTime } from "./useTimeFormat";
 import { ACTION_LABELS, STATUS_DISPLAY } from "@/lib/constants";
@@ -45,10 +46,15 @@ function forecastSourceNote(forecast: Record<string, unknown> | null): string | 
 export function ExplanationTimeline({ points, actions, forecast, controlState }: { points: TimelinePoint[]; actions: TimelineAction[]; forecast: Record<string, unknown> | null; controlState: ControlState | null }) {
     const currency = useCurrency();
     const time = useTimeFormat();
-    const now = Date.now();
+    const [now, setNow] = useState(() => Date.now());
+    useEffect(() => {
+        const timer = setInterval(() => setNow(Date.now()), 1_000);
+        return () => clearInterval(timer);
+    }, []);
     const start = now - 24 * 3_600_000;
     const end = now + 24 * 3_600_000;
     const pricePoints = points.filter((point) => point.price != null);
+    const currentPrice = pricePoints.find((point) => point.timestamp <= now && now < point.timestamp + 3_600_000)?.price;
     const maxPrice = Math.max(...pricePoints.map((point) => point.price ?? 0), 1);
     const percent = (value: number) => `${Math.max(0, Math.min(100, ((value - start) / (end - start)) * 100))}%`;
     const currentActions = actions.filter((action) => {
@@ -109,7 +115,7 @@ export function ExplanationTimeline({ points, actions, forecast, controlState }:
                     <div className="timeline-axis"><span>{formatTime(new Date(start), time.hour12)}</span><span>Now</span><span>{formatTime(new Date(end), time.hour12)}</span></div>
                 </div>
             </div>
-            {pricePoints.length > 0 && <p className="timeline-price-summary">Current price series: {formatPricePerKwh(pricePoints[pricePoints.length - 1].price, currency)} ({currency.priceLabel}).</p>}
+            <p className="timeline-price-summary">Current hour price: {currentPrice != null ? `${formatPricePerKwh(currentPrice, currency)} (${currency.priceLabel})` : "Unavailable"}.</p>
         </section>
     );
 }

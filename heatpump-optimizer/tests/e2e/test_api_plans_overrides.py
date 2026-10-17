@@ -128,7 +128,13 @@ class TestStats:
         assert resp.status_code == 200
         data = resp.json()
         assert data["period"] == "day"
-        assert data["total_kwh"] == 0
+        # P1.6a design lines 46-51: absent intervals do not prove zero use.
+        assert data["total_kwh"] is None
+        assert data["total_cost_eur"] is None
+        assert data["telemetry_status"] == "unavailable"
+        assert data["incomplete_reason"] == "telemetry_unavailable"
+        assert data["complete"] is False
+        assert data["coverage_pct"] is None
 
     async def test_stats_day_with_data(self, client: AsyncClient, seed_consumption, seed_prices):
         resp = await client.get("/api/stats?period=day")
@@ -136,7 +142,19 @@ class TestStats:
         data = resp.json()
         assert data["period"] == "day"
         assert data["total_kwh"] > 0
-        assert data["total_cost_eur"] > 0
+        # P1.6a design lines 46-49: complete total requires full meter coverage,
+        # not just prices. Seeds have flat cool/tank counters and only six hours.
+        assert data["total_cost_eur"] is None
+        assert data["telemetry_status"] == "incomplete"
+        assert data["incomplete_reason"] == "telemetry_incomplete"
+        assert data["complete"] is False
+        assert data["priced_kwh"] == data["total_kwh"]
+        assert data["unpriced_kwh"] == 0
+        assert data["coverage_pct"] == 100
+        assert data["partial_priced_amount"] > 0
+        assert data["price_area"] == "10Y1001A1001A46L"
+        assert data["price_currency"] == "EUR"
+        assert data["price_source"] == "legacy"
         assert data["avg_price_eur_kwh"] > 0
 
     async def test_stats_week(self, client: AsyncClient):

@@ -178,6 +178,8 @@ export function actionStatusLabel(code: string | null | undefined): string {
 
 export function reasonLabel(code: string | null | undefined): string {
   return recognizedStatus(code, {
+    reference_sensor: "Reference sensor",
+    forecast_unavailable_or_legacy: "Forecast unavailable or legacy",
     automatic: "Automatic scheduling",
     active_override: "Active pause",
     learning_mode_active: "Learning mode",
@@ -218,6 +220,7 @@ export function gateStateLabel(code: string | null | undefined): string {
 
 export function forecastDisplayStatusLabel(code: string | null | undefined): string {
   return recognizedStatus(code, {
+    degraded: "Degraded forecast",
     fresh: "Fresh forecast",
     aging: "Aging forecast",
     stale: "Stale forecast",

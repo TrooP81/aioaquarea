@@ -36,9 +36,12 @@ interface DashboardProps {
     today_cost_currency: string;
     today_cost_priced_kwh: number;
     today_cost_unpriced_kwh: number;
-    today_cost_priced_amount: number;
-    today_cost_coverage_pct: number;
+    today_cost_priced_amount: number | null;
+    today_cost_coverage_pct: number | null;
     today_cost_complete: boolean;
+  today_telemetry_status?: "complete" | "incomplete" | "unavailable";
+  today_cost_incomplete_reason?: "telemetry_unavailable" | "telemetry_incomplete" | "tariff_incomplete" | null;
+  today_cost_allocation_basis?: string;
     space_heating_gate?: SpaceHeatingGate | null;
   } | null;
   indoorTemp: number | null;
@@ -234,13 +237,20 @@ export function Dashboard({ data, indoorTemp, indoorSensorCount, lastFreshReadin
             <span className="card-title">Today&apos;s Consumption</span>
           </div>
           <div className="card-value kwh">
-            {data?.today_kwh?.toFixed(1) ?? "0"} kWh
+            {data?.today_telemetry_status === "unavailable" || data?.today_kwh == null
+              ? "Unavailable"
+              : `${data.today_kwh.toFixed(1)} kWh`}
           </div>
           <div className="card-subtitle">
-            {data?.today_cost_complete
+            {data?.today_telemetry_status === "unavailable" || data == null
+              ? "Telemetry unavailable"
+              : data.today_cost_complete
               ? `Cost: ${formatCostInCurrency(data.today_cost_eur, data.today_cost_currency, currency)}`
-              : `Known cost: ${formatCostInCurrency(data?.today_cost_priced_amount, data?.today_cost_currency, currency)} · ${data?.today_cost_coverage_pct ?? 0}% priced`}
+              : `Known cost: ${formatCostInCurrency(data?.today_cost_priced_amount, data?.today_cost_currency, currency)} · ${data?.today_cost_coverage_pct != null ? `${data.today_cost_coverage_pct}% priced` : "Price coverage unavailable"}`}
           </div>
+          {data?.today_telemetry_status === "incomplete" && (
+            <div className="card-subtitle text-warning text-sm">Partial confirmed energy; telemetry incomplete</div>
+          )}
           {!data?.today_cost_complete && (data?.today_cost_unpriced_kwh ?? 0) > 0 && (
             <div className="card-subtitle text-warning text-sm">
               {(data?.today_cost_unpriced_kwh ?? 0).toFixed(1)} kWh awaiting price data

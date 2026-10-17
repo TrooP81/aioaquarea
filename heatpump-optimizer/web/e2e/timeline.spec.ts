@@ -4,7 +4,7 @@ const now = Date.now();
 const iso = (offsetHours: number) => new Date(now + offsetHours * 3_600_000).toISOString();
 
 async function timelineFixture(page: import("@playwright/test").Page) {
-    await page.route("**/api/prices?hours=48", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify([{ ts: iso(-1), price_eur_per_kwh: 0.12 }, { ts: iso(1), price_eur_per_kwh: 0.42 }]) }));
+    await page.route("**/api/prices?hours=48", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify([{ ts: new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString(), price_eur_per_kwh: 0.12 }, { ts: iso(1), price_eur_per_kwh: 0.42 }]) }));
     await page.route("**/api/indoor-temp?hours=24", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify([{ timestamp: iso(-1), temperature: 20.2 }]) }));
     await page.route("**/api/thermal/indoor-forecast?hours=24", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ forecast_with_plan: [{ hour: 1, ts: iso(1), predicted_indoor_temp: 20.6 }], forecast_no_heating: [], target_schedule: [{ hour: 1, target: 21, comfort_hour: true }], planned_actions: [], weather_forecast: [], price_forecast: [], forecast_status: "available" }) }));
     await page.route("**/api/settings", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ comfort_temp_min: { value: "20" }, comfort_temp_max: { value: "22" } }) }));
@@ -258,7 +258,7 @@ test("timeline does not fabricate values when every source is empty", async ({ p
     await page.route("**/api/settings", (route) => route.fulfill({ contentType: "application/json", body: "{}" }));
     await page.goto("/?view=timeline");
     await expect(page.getByTestId("explanation-timeline")).toBeVisible();
-    await expect(page.locator(".timeline-price-summary")).toHaveCount(0);
+    await expect(page.locator(".timeline-price-summary")).toHaveText("Current hour price: Unavailable.");
     await expect(page.locator(".timeline-actual, .timeline-forecast, .timeline-comfort-band, .timeline-target")).toHaveCount(0);
     await expect(page.getByText("No planned actions or recorded outcomes in this window.")).toBeVisible();
 });
@@ -388,8 +388,8 @@ test("a delayed response for an old legacy plan cannot replace newer Timeline ac
 });
 
 for (const variant of [
-    { name: "EUR with a 24-hour clock", currency: { code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EURc/kWh" }, hour12: false, label: "EURc/kWh", price: "EUR 42.0" },
-    { name: "SEK with a 12-hour clock", currency: { code: "SEK", prefix: "", suffix: " kr", multiplier: 1, price_label: "SEK/kWh" }, hour12: true, label: "SEK/kWh", price: "0.42 kr" },
+    { name: "EUR with a 24-hour clock", currency: { code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EURc/kWh" }, hour12: false, label: "EURc/kWh", price: "EUR 12.0" },
+    { name: "SEK with a 12-hour clock", currency: { code: "SEK", prefix: "", suffix: " kr", multiplier: 1, price_label: "SEK/kWh" }, hour12: true, label: "SEK/kWh", price: "0.12 kr" },
 ]) {
     test(`timeline uses ${variant.name} from server preferences`, async ({ page }) => {
         await timelineFixture(page);
@@ -397,8 +397,45 @@ for (const variant of [
         await page.route("**/api/time-format", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ hour12: variant.hour12 }) }));
         await page.goto("/?view=timeline");
         await expect(page.getByText(`Price (${variant.label})`)).toBeVisible();
-        await expect(page.getByText(new RegExp(`Current price series: ${variant.price.replace(".", "\\.")}`))).toBeVisible();
+        await expect(page.getByText(new RegExp(`Current hour price: ${variant.price.replace(".", "\\.")}`))).toBeVisible();
         const axis = page.locator(".timeline-axis");
         await expect(axis).toContainText(variant.hour12 ? /AM|PM/ : /\d{2}:\d{2}/);
     });
 }
+
+test("current-hour price rolls over exactly, retaining zero and negative prices without carry-forward", async ({ page }) => {
+    const fixedNow = new Date("2026-10-12T10:59:59.000Z");
+    await page.clock.install({ time: fixedNow });
+    await page.clock.pauseAt(fixedNow);
+    await timelineFixture(page);
+    await page.route("**/api/prices?hours=48", (route) => route.fulfill({
+        contentType: "application/json", body: JSON.stringify([
+            { ts: "2026-10-12T10:00:00Z", price_eur_per_kwh: 0 },
+            { ts: "2026-10-12T11:00:00Z", price_eur_per_kwh: -0.1 },
+            { ts: "2026-10-12T13:00:00Z", price_eur_per_kwh: 99 },
+        ]),
+    }));
+    await page.goto("/?view=timeline");
+    const summary = page.locator(".timeline-price-summary");
+    await expect(summary).toContainText("Current hour price: EUR 0.0");
+    await page.clock.fastForward(1_000);
+    await expect(summary).toContainText("Current hour price: EUR -10.0");
+    await page.clock.fastForward(3_600_000);
+    await expect(summary).toHaveText("Current hour price: Unavailable.");
+});
+
+test("current price at 10:37 is the 10:00 interval, not the final future price", async ({ page }) => {
+    const fixedNow = new Date("2026-10-12T10:37:00.000Z");
+    await page.clock.install({ time: fixedNow });
+    await page.clock.pauseAt(fixedNow);
+    await timelineFixture(page);
+    await page.route("**/api/prices?hours=48", (route) => route.fulfill({
+        contentType: "application/json", body: JSON.stringify([
+            { ts: "2026-10-12T10:00:00Z", price_eur_per_kwh: 0.12 },
+            { ts: "2026-10-12T11:00:00Z", price_eur_per_kwh: 0.42 },
+            { ts: "2026-10-12T23:00:00Z", price_eur_per_kwh: 99 },
+        ]),
+    }));
+    await page.goto("/?view=timeline");
+    await expect(page.locator(".timeline-price-summary")).toContainText("Current hour price: EUR 12.0");
+});

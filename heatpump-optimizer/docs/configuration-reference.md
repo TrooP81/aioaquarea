@@ -468,3 +468,56 @@ Register the key in `SETTINGS_SCHEMA` with `type`, `description`, and either
 `default` or `default_env` (the `Settings` attribute name). Add `options` or
 `min_value`/`max_value` to have the API validate input. Then add a row to this
 reference.
+
+
+### Reporting windows and source-qualified costs
+
+`GET /api/stats?period=day|week|month` measures the rolling 24-hour, 7-day or
+30-day window `[window_start, window_end)`. `price_area`, `price_source` and
+`price_currency` identify the active feed; unrelated sources, currencies and
+future/end-hour tariffs cannot contribute. `/api/prices` is unchanged.
+
+Stats, dashboard daily costs and measured plan outcomes use uniform-duration
+allocation within confirmed, per-device/per-channel counter intervals. Reads
+retain two hours before and after the window for interval inference and change
+confirmation; energy allocation alone is half-open. Daily resets use recorded
+source-day/timezone provenance, not sums of daily cumulative maxima. Allocation
+is estimated and is not command attribution. Reporting baseline prices are
+weighted by hourly tariff overlap duration, not by all supplied prices.
+
+`total_kwh` is confirmed overlapping energy (a partial quantity when telemetry is
+incomplete), or null without any confirmed evidence. `telemetry_status` and
+`complete` distinguish meter completeness from tariff coverage. `priced_kwh`,
+`unpriced_kwh`, `coverage_pct` and `partial_priced_amount` describe only confirmed
+energy, not unknown use. Coverage is null, never 100%, without confirmed energy.
+`total_cost_eur` is null unless telemetry and pricing are complete; zero and
+negative prices remain valid. Legacy `*_eur` monetary fields carry the explicit
+source currency, **not** automatically converted EUR.
+
+Completeness conservatively requires confirmed interval coverage of all three
+counters for each observed device throughout the window. Flat, missing, stale,
+unresolved-reset and unconfirmed-tail counters do not certify zero use. The
+existing affirmative-zero contract covers space heating only, not whole-device
+heat/cool/tank energy, so this reporting API cannot certify complete zero total
+use. It returns unavailable/incomplete rather than manufacturing zero evidence.
+Dashboard exposes `today_telemetry_status` and `today_cost_allocation_basis` with
+the same rules. Measured outcomes retain `actual_cost` as a **partial priced
+amount** for compatibility, with `total_cost` nullable and `complete` explicit.
+Energy/cost are rounded to 3 decimals and tariff averages to 5 decimals.
+
+These are reporting-only corrections. Feed persistence, frozen rules/MILP price
+inputs, confirmed-interval extraction and the rules observed-rate baseline are
+unchanged. Revert reporting API and web contracts together; no migration is
+needed. Tibber home identity/tariff changes remain a separately approved packet.
+
+
+Reporting `incomplete_reason` (dashboard: `today_cost_incomplete_reason`) is null
+for complete results, `telemetry_unavailable` without confirmed intervals,
+`telemetry_incomplete` when whole-window/channel coverage cannot be certified,
+or `tariff_incomplete` when telemetry is complete but confirmed energy lacks
+prices. Meter incompleteness takes precedence if both kinds are missing;
+`unpriced_kwh` still separately describes tariff gaps. Fully priced **confirmed**
+energy can have `unpriced_kwh=0` and `coverage_pct=100` while the whole-window cost
+is null: flat channels, missing leading observations or unconfirmed tails remain
+unknown energy, not invented unpriced kWh. The six-hour E2E fixture with heat
+counters 1.2 through 1.7, flat cooling 0 and tank 0.5 has exactly this status.
