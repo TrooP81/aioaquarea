@@ -6,11 +6,11 @@
 - **Current phase:** Phase 1 — Reliable measurement. Code complete except P1.6c; backup and heartbeat operational activation remain pending.
 - **Overall status:** 🔵 In progress. Overall roadmap risk: **HIGH**.
 - **Safety now:** The build is observe-only. Ordinary pump writes are prohibited in code.
-- **Models now:** All three ML models are unqualified after the 2026-10-16 13:04 data reset.
-- **Next step:** P1.6c design (reachable complete-cost reporting), then Phase 2 design. Phase 1 code is complete except P1.6c; backups and heartbeat remain disabled pending separate owner activation/acceptance.
-- **Waiting on you:** P1.2/P1.3: separate activation approval and the first live backup. P1.5: Healthchecks.io check (60 s period / 300 s grace), live alert test, isolated crash test, and unattended reboot. Code merge approval does not authorize deployment or activation.
+- **Models now:** Owner-supplied startup evidence (2026-10-17 21:32–21:33 Europe/Stockholm; not independently verified): comfort/demand/COP trained flags false; thermal uncalibrated. All remain unqualified; no later readiness evidence.
+- **Next step:** Phase 2 HIGH design `phase2-house-contract-v3` independently reviewed PASS, awaiting explicit owner implementation approval. P1.6c `p16c-reporting-v4` is PASS AS DESIGN ONLY; full capability blocked by B1–B7 evidence/decisions, separate safe core not approved.
+- **Waiting on you:** P1.2/P1.3: separate activation approval and the first verified live backup; observed prior-image container uptime does not establish activation or backup success (enabled state unknown). P1.5: Healthchecks.io check (60 s period / 300 s grace), live alert test, isolated crash test, and unattended reboot remain pending. No ordinary pump commands authorized.
 - **Pre-commit cleanup:** OP1 is user-confirmed complete (not agent-verified); OP2 is 🟢 Done. Approved Phase 1 changes are now merged through PRs #34–#39; historical activity entries retain their original pre-merge evidence.
-- **Last updated:** 2026-10-17 — Release operator (agent).
+- **Last updated:** 2026-10-17 21:33 Europe/Stockholm — Documentation implementer (owner-supplied evidence; not independently verified).
 
 ## Status legend
 
@@ -31,7 +31,7 @@ Effort estimates are approximate. Data collection takes calendar time.
 | Phase | Goal | Status | Est. effort |
 | --- | --- | --- | --- |
 | 1 — Reliable measurement | Trust the results, backups, and alerts. | 🟡 Code complete except P1.6c; backup/heartbeat activation pending | ~1 week |
-| 2 — Configurable house | Use one set of house and tariff settings everywhere. | ⬜ Not started | ~1 week |
+| 2 — Configurable house | Use one set of house and tariff settings everywhere. | 🟡 HIGH design review PASS; owner implementation approval pending | ~1 week |
 | 3 — Baseline | Measure native-pump costs and comfort for comparison. | ⬜ Not started | ~2 weeks of data; parallel with Phase 4 |
 | 4 — ML for planning | Prove that ML plans improve on native operation. | ⬜ Not started | ≥14 days of heating-season data |
 | 5 — Control-enable build | Add safe control only with your approval. | ⬜ Not started | Not yet estimated; HIGH risk |
@@ -42,17 +42,19 @@ Effort estimates are approximate. Data collection takes calendar time.
 | ID | Item (plain language) | Gap ref | Who | Status | Evidence/notes |
 | --- | --- | --- | --- | --- | --- |
 | P1.1 | Fix the crashing results summary and heat-curve advice. | G03 | Agents | 🟢 Done | Release Gate passed against PR CI run 38923249300 / head ae98367b8150b353daac7ac86900fb9ce09e4f61 (includes fix 804a210). Owned PostgreSQL E2E ordinary phase passed (231 passed); all five collected TestG03ReadOnlyRoutes nodes were included, no skips/deselections reported. Receipt reconciliation/final seal step completed; backend-e2e and backend-unit jobs succeeded. | .agent-runs/20261016-143346-tracking-and-phase1/release-gate-p11-11-sanitized-proof.log (same folder); CI run 38923249300 |
-| P1.2 | Schedule backups of the active database, verify a test restore, and show backup status in UI alerts. | G04 | Agents | 🟡 Code merged but disabled | PR #35; owner merge approval 2026-10-17 10:33. Waiting on owner activation and the first live backup; activation requires separate approval. Backup profile remains disabled; no live backup or deployment performed. |
-| P1.3 | Show the last successful backup separately from a fresh failed attempt. | G14 | Agents | 🟡 Code merged but disabled | PR #35; owner merge approval 2026-10-17 10:33. Waiting on owner activation and the first live backup; activation requires separate approval. Backup profile remains disabled; no live backup or deployment performed. |
+| P1.2 | Schedule backups of the active database, verify a test restore, and show backup status in UI alerts. | G04 | Agents | 🟡 Activation/verified backup pending | PR #35; owner merge approval 2026-10-17 10:33. Separate activation approval and first verified live backup remain pending. Owner-supplied 21:32–21:33 startup snapshot: prior-image backup container up for 5 h; enabled state unknown. Uptime is not activation or verified-backup evidence. |
+| P1.3 | Show the last successful backup separately from a fresh failed attempt. | G14 | Agents | 🟡 Activation/verified backup pending | PR #35; owner merge approval 2026-10-17 10:33. Same pending activation/verified-backup evidence as P1.2; prior-image container uptime proves neither. Enabled state unknown. |
 | P1.4 | Stop misleading “no fresh sensor” warnings when the cause is too few scored forecasts or the observe-only build. | G12 | Agents | 🟢 Done/merged | PR #34 merged 2026-10-17 after green CI. Reason-specific forecast/sensor messaging and separate observe-only write-prohibition copy; assessment states, optimizer decisions and write/rate-limit gates unchanged. Evidence: unit, API and Playwright coverage (`thermal-forecast-limitation.spec.ts`), Release Gate PASS; .agent-runs/20261016-221904-p1-split-and-repair/p14-*.log, p14verify-*.log and gate-p14-*.log. LOW follow-ups: backend `observe_only_build` summary is unreachable (the UI notice covers it); the sensor-reason list is duplicated in Python and TypeScript. |
-| P1.5 | Add automatic restarts for the database and Redis, plus an external heartbeat monitor. | G13 | Agents | 🟡 Code merged but disabled | PR #37; owner merge approval 2026-10-17 10:33. Waiting on owner operational acceptance: (1) Healthchecks.io check with 60 s period / 300 s grace; (2) live alert test; (3) isolated crash test; (4) unattended reboot. Heartbeat remains disabled by default; no deployment or live acceptance performed. |
+| P1.5 | Add automatic restarts for the database and Redis, plus an external heartbeat monitor. | G13 | Agents | 🟡 Operational acceptance pending | PR #37; owner merge approval 2026-10-17 10:33. Waiting on owner operational acceptance: (1) Healthchecks.io check with 60 s period / 300 s grace; (2) live alert test; (3) isolated crash test; (4) unattended reboot. Heartbeat is disabled by default; owner-supplied application startup snapshot is not heartbeat acceptance evidence. |
 | P1.6 | Reporting fixes and selected Tibber home binding, split into P1.6a/P1.6b; reachable complete-cost follow-up P1.6c. | G16 | Agents | See sub-items | Reporting and feed-persistence changes remain separate packets. |
 | P1.6a | Timeline current-hour prices, status labels, scoped stats, half-open windows and reporting-only accounting. | G16 | Agents | 🟢 Done/merged | Owner chose option A on 2026-10-17: partial-only cost reporting is accepted for now. E2E contract alignment and telemetry_incomplete reason included; PR #36 merged 2026-10-17 after green CI. Excludes feed persistence, planner price selection and rules baseline changes. |
 | P1.6b | Selected Tibber home binding/tariff migration (separate HIGH-risk packet). | G16 | Agents | 🟢 Done/merged | Owner release approval 2026-10-17 10:33; PR #39. Migration 037. Deploy note: a single home auto-binds; planning may wait for tomorrow's prices. |
-| P1.6c | Reachable complete-cost reporting | P1.6a follow-up | Agents | ⚪ Not started | Needs design (STANDARD). Affirmative zero evidence for legitimately flat channels (no cooling, idle DHW) via a Settings-declared 'channel not used' per installation (modular, multi-house) and/or fresh flat readings; live-edge window ending at the last confirmed reading, labelled 'as of HH:MM'. Why: make complete-cost reporting reachable without treating unknown energy or unconfirmed tails as zero. |
+| P1.6c | Reachable complete-cost reporting | P1.6a follow-up | Agents | 🔴 Full capability blocked; design only | `p16c-reporting-v4` review PASS AS DESIGN ONLY. Full capability blocked by B1–B7 evidence/decisions; separate safe core not approved. Not done; no implementation approval. Preserve affirmative-zero evidence and a last-confirmed-reading live edge without treating unknown energy or unconfirmed tails as zero. Design artifacts are gitignored session material, not public docs. |
 | P1.7 | Fix planner read-only ORM escapes | G03 follow-up | Agents | 🟢 Done/merged | Owner final release approval: 2026-10-17 09:11. rules_v8 / milp_v2; detached snapshots, rollback regressions, and owned-PG acceptance coverage. Approved for merge after green CI; observe-only policy unchanged (HIGH). |
 
 ## Phase 2 — Configurable house
+
+HIGH design `phase2-house-contract-v3`: independent review PASS; awaiting explicit owner implementation approval. Implementation rows below remain not started. Design artifacts are gitignored session material, not public docs.
 
 | ID | Item (plain language) | Gap ref | Who | Status | Evidence/notes |
 | --- | --- | --- | --- | --- | --- |
@@ -132,6 +134,10 @@ Requires at least 14 days of heating-season data.
 | 2026-10-16 | Hot water is mainly needed mornings, evenings, and weekends. Colder water is acceptable on work-from-home days. | Current schedule-derived ready-by times already match. Manual boosts must be respected. |
 
 ## Activity log
+
+- 2026-10-17 21:32–21:33 Europe/Stockholm — Owner-supplied terminal evidence, not independently verified: application images built at `d4da400`; Alembic 036→037 completed, migrate Exited(0); API healthy on 8500, web running on 4444, DB/Redis healthy, optimizer/poller running. Startup snapshot only, not sustained readiness. Poller logged `device_status_polled` and `prices_fetched` (48, SEK, tibber). Weekly timer read failed `TOKEN_EXPIRED` after token-refresh/full-login attempts while status polling succeeded: monitor/follow-up, not evidence of a persistent general auth outage or healthy timer. Initial comfort training paused `device_status_stale` before the fresh poll; models remain untrained/unqualified with no later readiness evidence. Backup/heartbeat gates remain pending (see P1.2/P1.3/P1.5); orphan reset-maintenance sleeping container remains, no cleanup authorized. Observe-only unchanged; no ordinary commands authorized.
+
+- 2026-10-17 — Design status reconciliation: Phase 2 `phase2-house-contract-v3` independent review PASS, owner implementation approval pending (HIGH); P1.6c `p16c-reporting-v4` PASS AS DESIGN ONLY, B1–B7 unresolved, separate safe core not approved. Neither design review authorizes implementation; session packets/logs remain gitignored, not published.
 
 - 2026-10-17 — Release operator reconciled main after the approved sequential merges: P1.6b PR #39 (`5a6f474`), P1.2/P1.3 PR #35 (`1ce15d8`), and P1.5 PR #37 (`c1896fa`). Each PR passed CI before merge; weekly-real-restore was intentionally skipped. P1.1, P1.4, P1.6a, P1.6b and P1.7 are done; backup and heartbeat code is merged but disabled. P1.6c is not started. Next: P1.6c design and Phase 2. No deployment, activation, live backup, or live device calls performed.
 
