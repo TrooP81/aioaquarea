@@ -89,7 +89,13 @@ async def get_settings():
             continue
         val = values.get(key, "")
         if schema.get("type") == "secret" and val:
-            display_val = val[:1] + "***" + val[-1:] if len(val) > 8 else "***"
+            display_val = (
+                "***"
+                if schema.get("redaction") == "full"
+                else val[:1] + "***" + val[-1:]
+                if len(val) > 8
+                else "***"
+            )
         else:
             display_val = val
         result[key] = {
