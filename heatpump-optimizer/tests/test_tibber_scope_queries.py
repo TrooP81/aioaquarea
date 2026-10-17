@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from packages.core import price_scope, settings_service
-from packages.core.models import ConsumptionRecord, DeviceStatusRecord, PriceRecord, PriceScopeRecord
+from packages.core.models import (
+    ConsumptionRecord,
+    DeviceStatusRecord,
+    PriceRecord,
+    PriceScopeRecord,
+)
 from packages.ml import forecast_quality
 
 NOW = dt.datetime(2026, 10, 16, 12, tzinfo=dt.timezone.utc)
@@ -169,9 +174,16 @@ async def test_reporting_costs_never_use_another_homes_prices(monkeypatch, route
             if route == "stats" or len(statement.selected_columns) == 2:
                 return Result([(ts, amount) for ts, amount, *_ in rows_for_scope])
             if len(statement.selected_columns) == 3:
-                current = [(amount, currency, source) for _, amount, currency, source, _ in rows_for_scope]
+                current = [
+                    (amount, currency, source) for _, amount, currency, source, _ in rows_for_scope
+                ]
                 return SimpleNamespace(one_or_none=lambda: current[-1] if current else None)
-            return Result([(ts, amount, currency, source) for ts, amount, currency, source, _ in rows_for_scope])
+            return Result(
+                [
+                    (ts, amount, currency, source)
+                    for ts, amount, currency, source, _ in rows_for_scope
+                ]
+            )
         if entity is ConsumptionRecord:
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: records))
         if entity is DeviceStatusRecord:
@@ -184,9 +196,7 @@ async def test_reporting_costs_never_use_another_homes_prices(monkeypatch, route
 
     session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
     monkeypatch.setattr(dashboard, "get_session", lambda: session_context(session))
-    result = await (
-        dashboard.get_stats("day") if route == "stats" else dashboard.get_dashboard()
-    )
+    result = await (dashboard.get_stats("day") if route == "stats" else dashboard.get_dashboard())
 
     price_queries = [
         statement

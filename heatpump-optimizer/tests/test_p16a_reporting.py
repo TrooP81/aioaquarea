@@ -279,7 +279,9 @@ async def test_P16a_A6_dashboard_uses_identical_confirmed_allocation(monkeypatch
     )
     monkeypatch.setattr(dashboard, "get_user_tz", AsyncMock(return_value="UTC"))
     monkeypatch.setattr(
-        dashboard, "get_active_price_context", AsyncMock(return_value=PriceContext("tibber", "SEK", "tibber"))
+        dashboard,
+        "get_active_price_context",
+        AsyncMock(return_value=PriceContext("tibber", "SEK", "tibber")),
     )
     monkeypatch.setattr(
         dashboard, "get_device_data_quality", AsyncMock(return_value={"threshold_seconds": 900})

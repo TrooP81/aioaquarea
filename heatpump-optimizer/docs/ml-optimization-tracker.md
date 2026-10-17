@@ -133,7 +133,7 @@ Requires at least 14 days of heating-season data.
 
 ## Activity log
 
-- 2026-10-17: P1.6b rebased onto P1.6a/main; combined interval-allocated reporting with registry-verified Tibber scope and suspended-binding unavailability across stats/dashboard. Local validation underway; PR #39 CI and final owner release approval pending (HIGH).
+- 2026-10-17: P1.6b rebased onto P1.6a/main; combined interval-allocated reporting with registry-verified Tibber scope and suspended-binding unavailability across stats/dashboard. Offline suite (4,020 passed, 74 skipped), Ruff, migration head 037 and 751-test E2E collection passed; PR #39 CI and final owner release approval pending (HIGH).
 
 - 2026-10-17: P1.6a merge reconciliation restored P1.7 friendly planner labels (`Optimized` / `Optimized + ML`) for legacy and current MILP versions plus the configuration fallback; reporting-only reason labels preserved. Audited P1.7 planner, mock, compatibility-test and tracker changes against main; no other P1.7 reversions found.
 
