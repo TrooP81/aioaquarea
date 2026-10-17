@@ -668,7 +668,7 @@ class TestIndoorForecast:
             horizon_start=now,
             horizon_end=now + dt.timedelta(hours=4),
             plan_json=json.dumps({"forecast_snapshot": snapshot}),
-            optimizer_version="milp_v1",
+            optimizer_version="milp_v2",
         )
         db_session.add(plan)
         await db_session.commit()
@@ -758,7 +758,7 @@ class TestIndoorForecast:
             horizon_start=now - dt.timedelta(hours=1),
             horizon_end=now + dt.timedelta(hours=23),
             plan_json=json.dumps({"forecast_snapshot": snapshot}),
-            optimizer_version="milp_v1",
+            optimizer_version="milp_v2",
         )
         db_session.add(plan)
         await db_session.commit()

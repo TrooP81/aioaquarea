@@ -1,3 +1,4 @@
+import { LAYER_LABELS, LAYER_TOOLTIPS } from "../lib/constants";
 import { controlState, defaultBody, demandDataQuality, expect, manualCOPObservation, manualCOPResponse, modelLifecycleStatus, readinessOptimizerStatus, retiredCopModel, test, type Page } from "./fixtures";
 
 test.describe("Localized readiness", () => {
@@ -500,9 +501,9 @@ test.describe("Manual controller ledger", () => {
 
 const statusWithFreshData = {
     configured_layer: "rules_only",
-    active_layer: "rules_v7",
-    fallback_layer: "rules_v7",
-    last_plan: { version: "rules_v7", engine: "rules", fell_back: false, created_at: null },
+    active_layer: "rules_v8",
+    fallback_layer: "rules_v8",
+    last_plan: { version: "rules_v8", engine: "rules", fell_back: false, created_at: null },
     data_freshness: {
         latest_device_status: "2026-09-30T10:00:00Z",
         age_seconds: 0,
@@ -1133,4 +1134,26 @@ test.describe("Models status split", () => {
         await expect(decisionHeading).toBeFocused();
         expect(statusCalls).toBeGreaterThan(1);
     });
+});
+
+test.describe("Planner version display compatibility", () => {
+    for (const [version, label] of [
+        ["rules_v3", "Rules"],
+        ["rules_v7", "Rules"],
+        ["rules_v8", "Rules"],
+        ["milp_v1", "Optimized"],
+        ["milp_v1+ml", "Optimized + ML"],
+        ["milp_v2", "Optimized"],
+        ["milp_v2+ml", "Optimized + ML"],
+    ]) {
+        test(`renders ${version} with a friendly label and tooltip`, async ({ page }) => {
+            expect(LAYER_LABELS[version]).toBe(label);
+            expect(LAYER_TOOLTIPS[version]).toBeTruthy();
+            expect(LAYER_TOOLTIPS[version]).not.toBe(version);
+            await mockOptimizerStatus(page, { ...statusWithFreshData, active_layer: version });
+            await page.goto("/?view=under-the-hood");
+            await expect(page.getByText(`The active engine is ${label}.`, { exact: false })).toBeVisible();
+            await expect(page.getByText(`The active engine is ${version}.`, { exact: false })).toHaveCount(0);
+        });
+    }
 });

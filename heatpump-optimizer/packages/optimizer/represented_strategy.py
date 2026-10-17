@@ -6,6 +6,8 @@ import datetime as dt
 import math
 from copy import deepcopy
 
+from packages.core.device_status_values import DeviceStatusValues
+
 from packages.optimizer import DataIncompleteError, InfeasibleError, SolverTimeoutError
 
 SCHEMA = "native_sh_trace_v1"
@@ -13,7 +15,7 @@ TOLERANCE = 1e-5
 NATIVE_ASSUMPTION = "unchanged_hourly_load_over_declared_max_electrical_power"
 
 
-async def observation_context(status, captured_at):
+async def observation_context(status: DeviceStatusValues | None, captured_at):
     """Bind cached tank evidence to one device and the caller's captured clock."""
     from packages.core.settings_service import get_setting
     from packages.core.device_data_quality import device_status_clock_issue
@@ -86,7 +88,7 @@ def build_represented_plan(
     reported_indoor_targets=None,
     serialized_actions=None,
     timeout_seconds=40,
-    version="milp_v1",
+    version="milp_v2",
 ):
     """Solver-independent trace construction and serialized-command reporting."""
     from packages.core.config import settings

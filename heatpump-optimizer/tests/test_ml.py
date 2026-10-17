@@ -3039,7 +3039,7 @@ class TestOrchestratorFallback:
         ):
             status = await optimizer_main.get_optimizer_status_snapshot("auto")
 
-        assert status["active_layer"] == "rules_v7"
+        assert status["active_layer"] == "rules_v8"
         assert status["configured_layer"] == "auto"
         assert status["effective_layer"] == "rules"
         assert status["selection_reason"] == "auto_milp_disabled_cop_retired"
@@ -3195,7 +3195,7 @@ class TestOrchestratorFallback:
         from packages.optimizer.main import run_optimization
         from tests.test_optimizer_api_contracts import _INACTIVE, _admissible_plan
 
-        plan = _admissible_plan(version="milp_v1")
+        plan = _admissible_plan(version="milp_v2")
         plan["planning_data_quality"] = {
             "control_allowed": False,
             "status": "unavailable",

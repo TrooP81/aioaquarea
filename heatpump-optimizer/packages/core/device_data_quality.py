@@ -9,6 +9,8 @@ from typing import Any
 
 from sqlalchemy import select
 
+from packages.core.device_status_values import DeviceStatusValues
+
 from packages.core.database import get_session
 from packages.core.models import DeviceStatusRecord
 from packages.core.settings_service import get_setting
@@ -70,7 +72,9 @@ def observation_clock_issue(
     return None
 
 
-def _device_status_clock_values(status: Any) -> dict[str, Any] | None:
+def _device_status_clock_values(
+    status: DeviceStatusValues | dt.datetime | None,
+) -> dict[str, Any] | None:
     timestamp = status if isinstance(status, dt.datetime) else getattr(status, "ts", None)
     provenance = getattr(status, "native_policy_provenance", None)
     if provenance is None:
@@ -89,7 +93,7 @@ def _device_status_clock_values(status: Any) -> dict[str, Any] | None:
 
 
 def device_status_clock_issue(
-    status: Any,
+    status: DeviceStatusValues | dt.datetime | None,
     *,
     as_of: dt.datetime,
     max_age_seconds: float | None = None,

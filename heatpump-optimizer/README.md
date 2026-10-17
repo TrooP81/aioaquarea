@@ -34,8 +34,8 @@ retirement is not physical OFF verification; it creates no pending carryover.
 - **Electricity price integration**: ENTSO-E day-ahead prices or Tibber subscription prices
 - **Weather-aware**: Open-Meteo forecast for assumed heating efficiency, demand forecasting and pre-heating
 - **SmartThings indoor temperature**: OAuth or PAT integration for real indoor sensor readings (multi-sensor averaging), with an in-app sensor selector to choose which discovered sensors to poll
-- **Rules-based optimizer (`rules_v7`)**: Diagnostic DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort and quiet-mode proposals; no ordinary dispatch
-- **MILP optimizer (`milp_v1`)**: Diagnostic 24h scheduling via linear programming, with schedule-aware off-peak tank floor
+- **Rules-based optimizer (`rules_v8`)**: Diagnostic DHW shifting, pre-heating, peak avoidance, schedule-driven eco/comfort and quiet-mode proposals; no ordinary dispatch
+- **MILP optimizer (`milp_v2`)**: Diagnostic 24h scheduling via linear programming, with schedule-aware off-peak tank floor
 - **Shower mode**: Retained settings; ordinary DHW boosts are disabled in this build
 - **Seasonal calibration**: Opt-in cold-weather observation, persisting until explicit human exit; maintenance can queue demand/thermal candidates for reporting
 - **Comfort schedule**: Weekday/weekend comfort hours with adaptive learning from actual usage
@@ -365,9 +365,11 @@ The `optimizer_layer` setting chooses the planner:
 | `milp_preferred` | Selects diagnostic MILP, optionally using reporting-qualified Demand. Existing input gates and solver fallback to rules are unchanged. Heating efficiency is assumed, never learned COP. |
 | `auto` | Always rules during COP retirement, with reason `auto_milp_disabled_cop_retired`. No legacy-history qualification query or automatic MILP promotion. |
 
-Planning retains the bounded assumption `max(1.5, min(6.0, 3.5 + 0.1 * outdoor_temperature_c))`. This is not measured pump performance. DHW thermal kWh are divided by this ratio exactly once; space-heating demand is already electrical kWh and is not divided again. Plans carry `cop_source=assumed` and `cop_measured=false`. The `+ml` version suffix means retained Demand only; `rules_v7` and `milp_v1` versions are unchanged.
+Planning retains the bounded assumption `max(1.5, min(6.0, 3.5 + 0.1 * outdoor_temperature_c))`. This is not measured pump performance. DHW thermal kWh are divided by this ratio exactly once; space-heating demand is already electrical kWh and is not divided again. Plans carry `cop_source=assumed` and `cop_measured=false`. The `+ml` version suffix means retained Demand only; `rules_v8` and `milp_v2` identify the planner ORM-lifetime repair.
 
-### Rules Engine (`rules_v7`)
+Planning captures device status (including isolated native-policy provenance), persisted gate evidence, and baseline consumption counters before read-only rollback expires their ORM rows. Missing or mismatched gate evidence remains UNKNOWN; consumption snapshots preserve source-day/timezone reset accounting and genuine unavailable/row-budget reasons. This changes diagnostic planning/accounting only: ordinary writes stay disabled and persisted diagnostics contain no executable actions.
+
+### Rules Engine (`rules_v8`)
 1. **DHW Shifting**: Uses the thermal model to find the cheapest slot before each deadline, with direction-aware heating time estimation
 2. **Pre-heating**: Boosts zone temperature during cheap hours before forecast cold spells
 3. **Peak avoidance**: Quiet mode level 1 for up to 1/6 of the horizon's hours, choosing the most expensive hours that are at least 1.3× the median price; skipped when outdoor temperature is below 0 °C
@@ -377,7 +379,7 @@ Planning retains the bounded assumption `max(1.5, min(6.0, 3.5 + 0.1 * outdoor_t
 7. **Holiday mode**: Suspends all optimization when device is in holiday mode
 8. **Action verification**: Polls device after each command to confirm it took effect
 
-### MILP Optimizer (`milp_v1`)
+### MILP Optimizer (`milp_v2`)
 Solves a 24h cost-minimization problem with:
 - Decision: when to run DHW, how much space heating per hour
 - Objective: minimize Σ(price × kWh_electrical)

@@ -7,7 +7,6 @@ import math
 import time
 from typing import Any
 
-from sqlalchemy import select
 
 try:
     import pulp
@@ -30,7 +29,6 @@ from packages.core.settings_service import (
     get_user_tz,
     is_comfort_hour,
 )
-from packages.core.models import SpaceHeatingGateRecord
 from packages.core.space_heating_gate import (
     SpaceHeatingGateState,
     project_gate_states,
@@ -43,6 +41,8 @@ from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
 from packages.optimizer.rules_engine import minimum_floor_protection_duties
 
 import structlog
+
+from .data_access import get_gate_snapshot
 
 logger = structlog.get_logger()
 
@@ -88,7 +88,7 @@ class MILPOptimizer:
     Requires `pulp` package.
     """
 
-    VERSION = "milp_v1"
+    VERSION = "milp_v2"
     SOLVER_TIMEOUT_SECONDS = 30
     FALLBACK_DESIGN_OUTDOOR_C = -15.0
 
@@ -129,16 +129,8 @@ class MILPOptimizer:
                 planning_batch_quality(batch) if isinstance(batch, PlanningInputBatch) else None
             )
             last_status = await self._get_last_status(session)
-            gate_row = (
-                (
-                    await session.execute(
-                        select(SpaceHeatingGateRecord).where(
-                            SpaceHeatingGateRecord.device_id == last_status.device_id
-                        )
-                    )
-                ).scalar_one_or_none()
-                if last_status is not None
-                else None
+            gate_row = await get_gate_snapshot(
+                session, last_status.device_id if last_status is not None else None
             )
 
         if not prices:

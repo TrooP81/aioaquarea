@@ -47,7 +47,7 @@ Effort estimates are approximate. Data collection takes calendar time.
 | P1.4 | Stop misleading “no fresh sensor” warnings when the cause is too few scored forecasts or the observe-only build. | G12 | Agents | 🟢 Done (pending CI on PR #34) | Reason-specific forecast/sensor messaging and separate observe-only write-prohibition copy; assessment states, optimizer decisions and write/rate-limit gates unchanged. Evidence: unit, API and Playwright coverage (`thermal-forecast-limitation.spec.ts`), Release Gate PASS; .agent-runs/20261016-221904-p1-split-and-repair/p14-*.log, p14verify-*.log and gate-p14-*.log. LOW follow-ups: backend `observe_only_build` summary is unreachable (the UI notice covers it); the sensor-reason list is duplicated in Python and TypeScript. |
 | P1.5 | Add automatic restarts for the database and Redis, plus an external heartbeat monitor. | G13 | Agents | ⬜ Not started | Detect when the system stops reporting. |
 | P1.6 | Fix Timeline current-hour prices, known status labels, zero/negative prices in /api/stats, price-window boundaries, and selected Tibber home binding. | G16 | Agents | ⬜ Not started | Use half-open price windows: include the start, exclude the end. |
-| P1.7 | Fix planner read-only ORM escapes | G03 follow-up | Agents | ⬜ Not started | rules_engine.generate_plan last_status/gate_row; milp.generate_plan status/gate; rules_engine._estimate_unshifted_baseline consumption masked as source_unavailable. Changes planner behaviour, needs its own design. |
+| P1.7 | Fix planner read-only ORM escapes | G03 follow-up | Agents | 🟢 Done/merged | Owner final release approval: 2026-10-17 09:11. rules_v8 / milp_v2; detached snapshots, rollback regressions, and owned-PG acceptance coverage. Approved for merge after green CI; observe-only policy unchanged (HIGH). |
 
 ## Phase 2 — Configurable house
 
@@ -129,6 +129,8 @@ Requires at least 14 days of heating-season data.
 | 2026-10-16 | Hot water is mainly needed mornings, evenings, and weekends. Colder water is acceptable on work-from-home days. | Current schedule-derived ready-by times already match. Manual boosts must be respected. |
 
 ## Activity log
+
+- 2026-10-17: P1.7 final owner release approval recorded (09:11); rebased onto main and approved for merge after green CI.
 
 Newest first. Evidence paths are relative to the repository root.
 

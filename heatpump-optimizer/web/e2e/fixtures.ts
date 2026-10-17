@@ -109,8 +109,8 @@ const optimizerStatus = {
     build_policy: "observe_only",
     ordinary_writes_allowed: false,
     control_ready: false,
-    active_layer: "rules_v7",
-    fallback_layer: "rules_v7",
+    active_layer: "rules_v8",
+    fallback_layer: "rules_v8",
     last_plan: null,
     model_lifecycle: {
         demand: modelLifecycleStatus(), comfort: modelLifecycleStatus(), thermal: modelLifecycleStatus(),

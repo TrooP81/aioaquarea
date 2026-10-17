@@ -384,7 +384,7 @@ class TestMILPSolver:
         plan = case.solve()
 
         hand = _assert_replayed(case, plan)
-        assert plan["version"] == "milp_v1"
+        assert plan["version"] == "milp_v2"
         assert plan["cost_estimate"] == pytest.approx(0.275)
         assert hand.pulses == {0: 30}
         assert hand.peaks[0] == pytest.approx(48.75)
@@ -1055,7 +1055,7 @@ class TestMILPSolver:
 
         _assert_replayed(case, plan)
         assert plan is not None
-        assert plan["version"] == "milp_v1"
+        assert plan["version"] == "milp_v2"
         assert plan["cop_source"] == "assumed"
         assert plan["cop_measured"] is False
         assert plan["heating_efficiency"] == {"source": "assumed", "measured": False}
@@ -1088,7 +1088,7 @@ class TestMILPSolver:
         plan = case.solve(milp, cop_fn=milp._build_cop_function(None))
 
         _assert_replayed(case, plan)
-        assert plan["version"] == ("milp_v1+ml" if trained else "milp_v1")
+        assert plan["version"] == ("milp_v2+ml" if trained else "milp_v2")
         demand.predict_hourly.assert_not_called()
 
     def test_dhw_thermal_divides_once_and_sh_stays_electrical(self):
@@ -1110,7 +1110,7 @@ class TestMILPSolver:
         assert dhw["payload"]["cop_measured"] is False
 
     def test_milp_version_without_ml(self):
-        """Version should be plain milp_v1 without ML models."""
+        """Version should be plain milp_v2 without ML models."""
         from packages.optimizer.milp import MILPOptimizer
 
         case = _day_case()
@@ -1118,7 +1118,7 @@ class TestMILPSolver:
 
         _assert_replayed(case, plan)
         assert plan is not None
-        assert plan["version"] == "milp_v1"
+        assert plan["version"] == "milp_v2"
 
     def test_milp_fast_heating_tank_feasible(self):
         """MILP should remain feasible with fast-heating tanks (20+ °C/h)."""
@@ -1271,7 +1271,7 @@ class TestMILPSolver:
         plan = case.solve()
 
         hand = _assert_replayed(case, plan)
-        assert plan["version"] == "milp_v1"
+        assert plan["version"] == "milp_v2"
         assert min(hand.tank_ends[:7]) < 45.0
         assert all(tank >= 45.0 - _TOLERANCE for tank in hand.tank_ends[7:22])
 
@@ -1295,7 +1295,7 @@ class TestMILPSolver:
 
         hand = _assert_replayed(case, plan)
         assert case.tank_floors == [float(settings.tank_min_temp)] * 24
-        assert plan["version"] == "milp_v1"
+        assert plan["version"] == "milp_v2"
         assert all(tank >= settings.tank_min_temp - _TOLERANCE for tank in hand.tank_ends)
 
     def test_milp_cold_house_below_comfort_stays_feasible(self):
