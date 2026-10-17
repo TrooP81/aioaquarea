@@ -582,6 +582,7 @@ class TestVerification:
         handler = MagicMock()
         handler.verification_supported = True
         handler.redispatch_expected = AsyncMock()
+        executor._sleep = AsyncMock()
         setattr(executor, method_name, AsyncMock(side_effect=RuntimeError("ledger unavailable")))
         executor._mark_executed_unverified = AsyncMock()
 
@@ -593,6 +594,7 @@ class TestVerification:
         executor._mark_executed_unverified.assert_awaited_once_with(
             action, "verification_ledger_unavailable"
         )
+        executor._sleep.assert_awaited_once_with(15)
 
     @pytest.mark.asyncio
     async def test_cancelled_verification_is_reraised_without_terminal_outcome(self, executor):
@@ -893,6 +895,7 @@ class TestVerification:
     @pytest.mark.asyncio
     async def test_quota_denial_does_not_refresh_or_redispatch(self, executor, mock_wrapper):
         action = _make_action(str(ActionType.FORCE_DHW_ON))
+        executor._sleep = AsyncMock()
         executor._reserve_verification_read = AsyncMock(return_value=False)
         executor._mark_executed_unverified = AsyncMock()
 
@@ -903,6 +906,7 @@ class TestVerification:
         executor._mark_executed_unverified.assert_awaited_once_with(
             action, "verification_quota_exhausted"
         )
+        executor._sleep.assert_awaited_once_with(15)
 
     @pytest.mark.asyncio
     async def test_unsupported_verification_consumes_no_read(self, executor):

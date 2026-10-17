@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import datetime as dt
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -29,6 +32,7 @@ PINNED_IMAGE = (
     "timescale/timescaledb@sha256:15e00162766bd6f0019afaad4e57b850dcf882de5909bd7633899eebd4c03d57"
 )
 GIB = 1024**3
+SOURCE_LABEL = "org.heatpump.synthetic-restore-source"
 
 
 class RestoreStack:
@@ -68,6 +72,17 @@ class RestoreStack:
         if check:
             assert result.returncode == 0, result.stdout + result.stderr
         return result
+
+    def docker(self, *arguments: str) -> str:
+        return subprocess.run(
+            ["docker", *arguments],
+            cwd=PROJECT_ROOT,
+            env=self.environment,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=120,
+        ).stdout.strip()
 
     def sql(self, database: str, statement: str) -> str:
         return self.compose(
@@ -149,6 +164,7 @@ def _isolated_stack(backup_dir: Path) -> Iterator[RestoreStack]:
         assert int(database_config["mem_limit"]) == stack.tmpfs_bytes + 2 * GIB
         assert str(stack.tmpfs_bytes) in database_config["tmpfs"][0]
         assert database_config.get("ports", []) == []
+        assert "pg_isready -h 127.0.0.1 " in database_config["healthcheck"]["test"][1]
         assert config["networks"]["default"]["internal"] is True
         assert all(volume["read_only"] for volume in config["services"]["restore-tool"]["volumes"])
         stack.compose("up", "-d", "--wait", "db")
@@ -260,12 +276,12 @@ def synthetic_archive(stack: RestoreStack) -> Path:
         "--format=custom",
         "--no-owner",
         "--no-privileges",
-        "--file=/tmp/synthetic.dump",
+        "--file=/synthetic.dump",
     )
     archive = stack.backup_dir / "heatpump-20261003T000000Z.dump"
     container = stack.compose("ps", "-q", "db").stdout.strip()
     subprocess.run(
-        ["docker", "cp", f"{container}:/tmp/synthetic.dump", str(archive)],
+        ["docker", "cp", f"{container}:/synthetic.dump", str(archive)],
         check=True,
         capture_output=True,
     )
@@ -310,6 +326,123 @@ def _assert_restored(stack: RestoreStack, database: str) -> None:
     assert (
         stack.sql("postgres", "SELECT NOT rolcanlogin FROM pg_roles WHERE rolname = 'heatpump'")
         == "t"
+    )
+
+
+def _inspect_backup_source(
+    stack: RestoreStack, worker: str, token: str, network: str, created_after: float
+) -> dict:
+    """Produce authority only from fresh platform inspection plus independent source SQL."""
+    rows = json.loads(stack.docker("container", "inspect", worker))
+    assert len(rows) == 1
+    source = rows[0]
+    image = json.loads(stack.docker("image", "inspect", PINNED_IMAGE))
+    assert len(image) == 1
+    assert source["Id"] == worker and re.fullmatch(r"[0-9a-f]{64}", worker)
+    assert source["Config"]["Labels"][SOURCE_LABEL] == token
+    assert source["Config"]["Image"] == PINNED_IMAGE and source["Image"] == image[0]["Id"]
+    assert source["State"]["Running"]
+    created = dt.datetime.fromisoformat(source["Created"].replace("Z", "+00:00"))
+    assert created.tzinfo is not None and created_after <= created.timestamp() <= time.time()
+    assert {n["NetworkID"] for n in source["NetworkSettings"]["Networks"].values()} == {network}
+    networks = json.loads(stack.docker("network", "inspect", network))
+    assert len(networks) == 1 and networks[0]["Id"] == network
+    assert networks[0]["Internal"] and worker in networks[0]["Containers"]
+    query = (
+        "SELECT md5(system_identifier::text || '/' || current_database()) FROM pg_control_system()"
+    )
+    source_id = stack.sql(stack.database, query)
+    assert re.fullmatch(r"[0-9a-f]{32}", source_id)
+    assert (
+        stack.docker("exec", worker, "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-c", query)
+        == source_id
+    )
+    prepared = time.time()
+    return {
+        "container_id": worker,
+        "image_id": source["Image"],
+        "created": source["Created"],
+        "network_id": network,
+        "prepared_at": prepared,
+        "expires_at": prepared + 5400,
+        "source_id": source_id,
+    }
+
+
+@contextmanager
+def _backup_source(stack: RestoreStack) -> Iterator[tuple[str, dict, str, float]]:
+    """Create one anonymous worker; never adopt or tear down by name/prefix."""
+    database = stack.compose("ps", "-q", "db").stdout.strip()
+    platform = json.loads(stack.docker("container", "inspect", database))[0]
+    assert platform["Id"] == database and platform["Config"]["Image"] == PINNED_IMAGE
+    assert platform["Config"]["Labels"]["com.docker.compose.project"] == stack.project
+    assert platform["Config"]["Labels"]["com.docker.compose.service"] == "db"
+    assert platform["State"]["Running"]
+    endpoints = list(platform["NetworkSettings"]["Networks"].values())
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    token = uuid.uuid4().hex
+    started = time.time()
+    worker = stack.docker(
+        "container",
+        "create",
+        "--label",
+        f"{SOURCE_LABEL}={token}",
+        "--network",
+        endpoint["NetworkID"],
+        "--memory",
+        str(512 * 1024**2),
+        "--cpus",
+        "1",
+        "--tmpfs",
+        "/backups:rw,size=268435456",
+        "--tmpfs",
+        "/var/lib/postgresql/data:rw,size=16777216",
+        "-e",
+        f"PGHOST={endpoint['IPAddress']}",
+        "-e",
+        "PGUSER=restore_test",
+        "-e",
+        "PGPASSWORD=restore_test",
+        "-e",
+        f"PGDATABASE={stack.database}",
+        "-e",
+        "BACKUP_REPLICA_ENABLED=false",
+        "-e",
+        "BACKUP_REPLICA_REQUIRED=false",
+        "--entrypoint",
+        "sh",
+        PINNED_IMAGE,
+        "-c",
+        "sleep 5400",
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", worker)
+    try:
+        item = json.loads(stack.docker("container", "inspect", worker))[0]
+        assert item["Id"] == worker and item["Config"]["Labels"][SOURCE_LABEL] == token
+        stack.docker("start", worker)
+        receipt = _inspect_backup_source(stack, worker, token, endpoint["NetworkID"], started)
+        stack.docker("exec", worker, "mkdir", "-p", "/scripts")
+        for name in ("backup_db.sh", "backup_status.sql", "stage_backup.sh"):
+            stack.docker("cp", str(PROJECT_ROOT / "scripts" / name), f"{worker}:/scripts/{name}")
+        yield worker, receipt, token, started
+    finally:
+        item = json.loads(stack.docker("container", "inspect", worker))[0]
+        assert item["Id"] == worker and item["Config"]["Labels"][SOURCE_LABEL] == token
+        stack.docker("container", "rm", "-f", worker)
+        assert worker not in stack.docker("container", "ls", "-aq", "--no-trunc").splitlines()
+
+
+def _seed_backup_source(stack: RestoreStack) -> None:
+    # A source job owner must be allowed to LOGIN when Timescale registers its
+    # scheduler via add_retention_policy. Restored roles remain independently NOLOGIN.
+    stack.sql("postgres", "CREATE ROLE heatpump LOGIN")
+    stack.sql(stack.database, "GRANT CREATE ON SCHEMA public TO heatpump")
+    _seed(stack, stack.database, "archive")
+    stack.sql(
+        stack.database,
+        "CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL); "
+        "CREATE TABLE service_heartbeats (service text PRIMARY KEY, updated_at timestamptz, details_json text)",
     )
 
 
@@ -438,22 +571,77 @@ def test_BK_7A_BK_7B_jobs_execute_after_rename_and_old_database_stays_suppressed
 
 
 def test_test_mode_restores_synthetic_archive_and_preserves_source(
-    stack: RestoreStack, synthetic_archive: Path
+    stack: RestoreStack,
 ) -> None:
-    stack.sql(
-        stack.database,
-        "CREATE TABLE restore_sentinel (value text); INSERT INTO restore_sentinel VALUES ('untouched')",
-    )
-    result = stack.entry(
-        "--test",
-        synthetic_archive,
-        RESTORE_TEST_PROJECT=stack.project,
-        RESTORE_TEST_DATABASE="restore_production_test_restored",
-        RESTORE_TEST_KEEP_STACK="true",
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _assert_restored(stack, "restore_production_test_restored")
-    assert stack.sql(stack.database, "SELECT value FROM restore_sentinel") == "untouched"
+    # --test now always tears its targets down. Retain the detailed content
+    # assertions via an independent restore of the exact worker-generated dump,
+    # then require the guarded entry's own content/cleanup receipt as well.
+    _seed_backup_source(stack)
+    with _backup_source(stack) as (worker, source, token, created_after):
+        stack.docker("exec", worker, "sh", "/scripts/backup_db.sh", "--once")
+        state = json.loads(
+            stack.sql(
+                stack.database, "SELECT details_json FROM service_heartbeats WHERE service='backup'"
+            )
+        )
+        assert state["last_attempt"]["status"] == "succeeded"
+        binding = state["last_success"]
+        assert binding["source_id"] == source["source_id"]
+        archive = stack.backup_dir / (binding["archive_id"] + ".dump")
+        # docker cp does not see the live tmpfs used by this worker.
+        with archive.open("xb") as output:
+            copied = subprocess.run(
+                ["docker", "exec", worker, "cat", f"/backups/{archive.name}"],
+                stdout=output,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+        assert copied.returncode == 0, copied.stderr.decode(errors="replace")
+        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        assert checksum == binding["sha256"]
+        # A fresh cluster, not the LOGIN source cluster: otherwise existing
+        # roles would hide whether the restore creates the required NOLOGIN role.
+        with _isolated_stack(stack.backup_dir) as restored:
+            restored.helper(
+                "restore", f"/backups/{archive.name}", "restore_production_test_assertions"
+            )
+            _assert_restored(restored, "restore_production_test_assertions")
+        stack.sql(stack.database, "UPDATE restore_sentinel SET value='untouched'")
+        leases = stack.backup_dir / "leases"
+        leases.mkdir(mode=0o700)
+        # Refresh inspection after the independent content drill; do not pass
+        # caller-supplied IDs or a stale receipt as the entry's authority.
+        source = _inspect_backup_source(stack, worker, token, source["network_id"], created_after)
+        receipt_path = stack.backup_dir / "source.json"
+        receipt_path.write_text(json.dumps(source), encoding="utf-8")
+        result = stack.entry(
+            "--test",
+            archive,
+            RESTORE_SOURCE_RECEIPT=str(receipt_path),
+            RESTORE_LEASE_ROOT=str(leases),
+            RESTORE_TEST_KEEP_STACK="false",
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        records = list(leases.glob("*/receipt.json"))
+        assert len(records) == 1
+        receipt = json.loads(records[0].read_text(encoding="utf-8"))
+        assert receipt["status"] == "verified"
+        assert receipt["content_verified"] is True and receipt["cleanup_verified"] is True
+        assert receipt["residual_resources"] == []
+        assert set(p.name for p in records[0].parent.iterdir()) == {"receipt.json"}
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == checksum
+        assert stack.sql(stack.database, "SELECT value FROM restore_sentinel") == "untouched"
+        assert stack.sql(stack.database, "SHOW timescaledb.restoring") == "off"
+        after = json.loads(
+            stack.sql(
+                stack.database, "SELECT details_json FROM service_heartbeats WHERE service='backup'"
+            )
+        )
+        assert after["last_success"] == binding
+        assert after["last_verification"]["status"] == "succeeded"
+        assert after["last_verified"]["sha256"] == checksum
+        assert json.loads(stack.docker("container", "inspect", worker))[0]["State"]["Running"]
 
 
 @pytest.mark.skipif(

@@ -11,6 +11,7 @@ import httpx
 import structlog
 from sqlalchemy import or_, select
 
+from packages.core.backup_health import load_backup_health, REASON_CODES
 from packages.core.database import get_session
 from packages.core.device_data_quality import get_device_data_quality
 from packages.core.models import (
@@ -134,8 +135,14 @@ async def get_operational_alerts(
     else:
         now = now.astimezone(dt.timezone.utc)
     enabled = await get_bool_setting("operational_alerts_enabled")
+    backup = await load_backup_health(now=now)
     if not enabled:
-        return {"enabled": False, "generated_at": now.isoformat(), "alerts": []}
+        return {
+            "enabled": False,
+            "generated_at": now.isoformat(),
+            "alerts": [],
+            "backup": backup,
+        }
 
     poll_interval, device_quality = await asyncio.gather(
         get_int_setting("poll_interval_seconds"),
@@ -213,6 +220,22 @@ async def get_operational_alerts(
         gate_rows = (await session.execute(select(SpaceHeatingGateRecord))).scalars().all()
 
     alerts: list[dict[str, object]] = []
+    if backup["reason_codes"]:
+        alerts.append(
+            _alert(
+                "backup_protection_degraded",
+                "warning",
+                "Database backup protection needs attention",
+                "Backup evidence is degraded or has a replica warning.",
+                action="Review backup and isolated restore evidence; do not restore the live database.",
+                details={
+                    "reason_codes": backup["reason_codes"],
+                    "last_success": backup["last_success"],
+                    "last_attempt_at": backup["last_attempt"]["started_at"],
+                    "last_verified": backup["last_verified"],
+                },
+            )
+        )
     by_service = {row.service: row for row in heartbeat_rows}
     watchdog = service_heartbeat_details(by_service.get("safety_watchdog"))
     if int(watchdog.get("consecutive_failures", 0) or 0) >= 3:
@@ -437,6 +460,7 @@ async def get_operational_alerts(
         "enabled": True,
         "generated_at": now.isoformat(),
         "alerts": alerts,
+        "backup": backup,
         "summary": {
             "critical": sum(alert["severity"] == "critical" for alert in alerts),
             "warning": sum(alert["severity"] == "warning" for alert in alerts),
@@ -459,7 +483,7 @@ async def deliver_operational_alert_webhook() -> dict[str, object]:
         logger.warning("operational_alert_webhook_rejected", reason="https_required")
         return {**result, "webhook": "https_required"}
 
-    payload = {"source": "heatpump-optimizer", **result}
+    payload = operational_webhook_payload(result)
     fingerprint = hashlib.sha256(
         json.dumps(payload["alerts"], sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -494,3 +518,61 @@ async def deliver_operational_alert_webhook() -> dict[str, object]:
     )
     logger.info("operational_alert_webhook_delivered", alerts=len(result["alerts"]))
     return {**result, "webhook": "delivered"}
+
+
+def operational_webhook_payload(result: dict) -> dict:
+    """Project delivery explicitly, including nested backup detail allowlists."""
+    alerts = []
+    fields = ("id", "severity", "title", "detail", "action", "plan_id", "action_id", "href")
+    for alert in result.get("alerts", []):
+        safe = {key: alert[key] for key in fields if key in alert}
+        details = alert.get("details")
+        if alert.get("id") == "backup_protection_degraded":
+            details = details if isinstance(details, dict) else {}
+            # Never forward arbitrary strings from an internal status object.
+            safe["details"] = {
+                "reason_codes": [
+                    reason for reason in details.get("reason_codes", []) if reason in REASON_CODES
+                ]
+            }
+            from packages.core.backup_health import timestamp
+
+            now = dt.datetime.now(dt.timezone.utc)
+            for key in ("last_success", "last_attempt_at", "last_verified"):
+                value = timestamp(details.get(key), now=now)
+                safe["details"][key] = value.isoformat() if value else None
+        elif isinstance(details, dict):
+            # Existing non-backup alert details are a closed contract.
+            safe["details"] = {
+                key: details[key]
+                for key in (
+                    "event_id",
+                    "plan_id",
+                    "action_id",
+                    "device_id",
+                    "zone_id",
+                    "scheduled_ts",
+                    "blocked_since",
+                    "cause_hint",
+                    "unresolved_revert_count",
+                    "safety_attempt_count",
+                    "age_seconds",
+                    "attempt_count",
+                    "last_reason",
+                    "blocked_trigger_count",
+                    "latest_blocked_trigger_at",
+                    "zone",
+                )
+                if key in details
+            }
+        else:
+            safe["details"] = None
+        alerts.append(safe)
+    summary = result.get("summary", {})
+    return {
+        "source": "heatpump-optimizer",
+        "enabled": result.get("enabled") is True,
+        "generated_at": result.get("generated_at"),
+        "summary": {key: summary.get(key, 0) for key in ("critical", "warning")},
+        "alerts": alerts,
+    }

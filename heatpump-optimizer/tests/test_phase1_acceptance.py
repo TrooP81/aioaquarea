@@ -1159,6 +1159,17 @@ class TestAC10FreshnessSafety:
         planning = {"control_allowed": True}
         with (
             patch(
+                "packages.core.backup_health.load_backup_health",
+                new=AsyncMock(
+                    return_value={
+                        "ready": True,
+                        "last_success": now.isoformat(),
+                        "stale_after_seconds": 2764800,
+                        "reason_codes": [],
+                    }
+                ),
+            ),
+            patch(
                 "packages.api.routers.models_router.get_session",
                 return_value=_context(MagicMock(execute=AsyncMock(return_value=session_result))),
             ),
