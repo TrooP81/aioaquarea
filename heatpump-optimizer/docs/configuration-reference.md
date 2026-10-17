@@ -509,3 +509,15 @@ These are reporting-only corrections. Feed persistence, frozen rules/MILP price
 inputs, confirmed-interval extraction and the rules observed-rate baseline are
 unchanged. Revert reporting API and web contracts together; no migration is
 needed. Tibber home identity/tariff changes remain a separately approved packet.
+
+
+Reporting `incomplete_reason` (dashboard: `today_cost_incomplete_reason`) is null
+for complete results, `telemetry_unavailable` without confirmed intervals,
+`telemetry_incomplete` when whole-window/channel coverage cannot be certified,
+or `tariff_incomplete` when telemetry is complete but confirmed energy lacks
+prices. Meter incompleteness takes precedence if both kinds are missing;
+`unpriced_kwh` still separately describes tariff gaps. Fully priced **confirmed**
+energy can have `unpriced_kwh=0` and `coverage_pct=100` while the whole-window cost
+is null: flat channels, missing leading observations or unconfirmed tails remain
+unknown energy, not invented unpriced kWh. The six-hour E2E fixture with heat
+counters 1.2 through 1.7, flat cooling 0 and tank 0.5 has exactly this status.

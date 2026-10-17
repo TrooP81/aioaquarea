@@ -255,6 +255,9 @@ class StatsResponse(BaseModel):
     avg_price_eur_kwh: Optional[float] = None
     savings_vs_baseline_eur: Optional[float] = None
     telemetry_status: Literal["complete", "incomplete", "unavailable"]
+    incomplete_reason: Optional[
+        Literal["telemetry_unavailable", "telemetry_incomplete", "tariff_incomplete"]
+    ] = None
     complete: bool
     priced_kwh: float
     unpriced_kwh: float
@@ -278,6 +281,9 @@ class DashboardResponse(BaseModel):
     today_cost_priced_kwh: float = 0
     today_cost_unpriced_kwh: float = 0
     today_telemetry_status: Literal["complete", "incomplete", "unavailable"] = "unavailable"
+    today_cost_incomplete_reason: Optional[
+        Literal["telemetry_unavailable", "telemetry_incomplete", "tariff_incomplete"]
+    ] = None
     today_cost_allocation_basis: str = "uniform_duration_within_confirmed_counter_intervals"
     today_cost_priced_amount: Optional[float] = None
     today_cost_coverage_pct: Optional[float] = None

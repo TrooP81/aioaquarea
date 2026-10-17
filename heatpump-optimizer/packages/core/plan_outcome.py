@@ -92,6 +92,15 @@ def duration_allocated_cost(records, prices, *, start, end, timezone_name="UTC")
                 right = max(right, interval.end_ts)
             telemetry_complete = telemetry_complete and right >= end
     complete = telemetry_complete and result["tariff_complete"]
+    incomplete_reason = (
+        "telemetry_unavailable"
+        if not slots
+        else "telemetry_incomplete"
+        if not telemetry_complete
+        else "tariff_incomplete"
+        if not result["tariff_complete"]
+        else None
+    )
     return {
         **result,
         "telemetry_status": "complete"
@@ -100,6 +109,7 @@ def duration_allocated_cost(records, prices, *, start, end, timezone_name="UTC")
         if slots
         else "unavailable",
         "complete": complete,
+        "incomplete_reason": incomplete_reason,
         "total_cost": result["actual_cost"] if complete else None,
         "partial_priced_amount": result["actual_cost"],
         "allocation_basis": "uniform_duration_within_confirmed_counter_intervals",

@@ -63,6 +63,7 @@ interface DashboardData {
   today_cost_coverage_pct: number | null;
   today_cost_complete: boolean;
   today_telemetry_status?: "complete" | "incomplete" | "unavailable";
+  today_cost_incomplete_reason?: "telemetry_unavailable" | "telemetry_incomplete" | "tariff_incomplete" | null;
   today_cost_allocation_basis?: string;
   active_plan: {
     id: number;

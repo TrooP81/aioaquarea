@@ -93,7 +93,12 @@ class TestDashboard:
         assert data["current_status_age_seconds"] is None
         assert data["current_price"] is None
         assert data["today_kwh"] == 0
-        assert data["today_cost_eur"] == 0
+        # P1.6a design lines 46-51: no evidence is unavailable, not complete zero.
+        assert data["today_cost_eur"] is None
+        assert data["today_telemetry_status"] == "unavailable"
+        assert data["today_cost_incomplete_reason"] == "telemetry_unavailable"
+        assert data["today_cost_complete"] is False
+        assert data["today_cost_coverage_pct"] is None
         assert data["active_plan"] is None
         assert data["has_override"] is False
 
@@ -127,12 +132,16 @@ class TestDashboard:
         resp = await client.get("/api/dashboard")
         data = resp.json()
         assert data["today_kwh"] > 0
-        # The first cumulative meter sample has no attributable market hour;
-        # cost must be marked partial instead of silently priced at a default.
+        # P1.6a design lines 46-49: flat channels and a partial day cannot
+        # certify total energy, even when every confirmed delta has a price.
         assert data["today_cost_eur"] is None
         assert data["today_cost_complete"] is False
-        assert data["today_cost_unpriced_kwh"] > 0
-        assert data["today_cost_priced_amount"] >= 0
+        assert data["today_telemetry_status"] == "incomplete"
+        assert data["today_cost_incomplete_reason"] == "telemetry_incomplete"
+        assert data["today_cost_unpriced_kwh"] == 0
+        assert data["today_cost_priced_kwh"] == data["today_kwh"]
+        assert data["today_cost_coverage_pct"] == 100
+        assert data["today_cost_priced_amount"] > 0
 
     async def test_dashboard_with_active_plan(
         self, client: AsyncClient, seed_device_status, seed_plan

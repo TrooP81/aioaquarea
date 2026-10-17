@@ -208,6 +208,7 @@ export interface StatsResponse {
     avg_price_eur_kwh: number | null;
     savings_vs_baseline_eur: number | null;
     telemetry_status: "complete" | "incomplete" | "unavailable";
+    incomplete_reason: "telemetry_unavailable" | "telemetry_incomplete" | "tariff_incomplete" | null;
     complete: boolean;
     priced_kwh: number;
     unpriced_kwh: number;
