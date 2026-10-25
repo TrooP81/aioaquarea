@@ -74,13 +74,22 @@ from tests.e2e.test_ml_lifecycle_postgresql import (
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 
+def _assert_exact_two_updates(statements):
+    """Require two typed UPDATEs, including ORM annotations, without filtering SQL."""
+    from sqlalchemy.sql.dml import Update
+
+    assert len(statements) == 2, "expected exactly two application UPDATE statements"
+    assert all(isinstance(clause, Update) for clause in statements), (
+        "expected only SQLAlchemy UPDATE statements"
+    )
+
+
 async def test_owned_periodic_logging_coexists_with_unfiltered_application_guards(
     lifecycle_database,
 ):
     """A normal periodic turn in each guard window, never a forced/early flush."""
     from packages.core import log_sink
     from sqlalchemy import update
-    from sqlalchemy.sql.dml import Delete, Insert, Update
 
     database = lifecycle_database
     async with database.sessions() as session:
@@ -138,8 +147,7 @@ async def test_owned_periodic_logging_coexists_with_unfiltered_application_guard
     dml = []
 
     def exact_dml(_connection, clause, *_args):
-        if isinstance(clause, (Insert, Update, Delete)):
-            dml.append(type(clause).__name__.upper())
+        dml.append(clause)
 
     event.listen(database.engine.sync_engine, "before_execute", exact_dml)
     try:
@@ -155,7 +163,7 @@ async def test_owned_periodic_logging_coexists_with_unfiltered_application_guard
                 .values(value="first")
             )
         await periodic_turn("exact-dml")
-        assert dml == ["UPDATE", "UPDATE"]
+        _assert_exact_two_updates(dml)
     finally:
         event.remove(database.engine.sync_engine, "before_execute", exact_dml)
 

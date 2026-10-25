@@ -1267,3 +1267,108 @@ async def test_LOG_CR01_independent_session_listener_isolation_and_cleanup(outco
         )
     finally:
         engine.dispose()
+
+
+@pytest.fixture
+def added_guard_statements():
+    """Capture real Core and ORM before_execute clauses, without PostgreSQL/socket."""
+    from sqlalchemy import create_engine, event, update
+    from sqlalchemy.orm import Session
+    from sqlalchemy.sql.dml import Update
+
+    from packages.core.models import SettingRecord
+
+    engine = create_engine("sqlite:///:memory:")
+    captured = []
+
+    def observe(_connection, clause, *_args):
+        captured.append(clause)
+
+    try:
+        with engine.begin() as connection:
+            SettingRecord.__table__.create(connection)
+            connection.execute(
+                SettingRecord.__table__.insert().values(key="guard-probe", value="initial")
+            )
+        event.listen(engine, "before_execute", observe)
+        try:
+            with Session(engine) as session:
+                for target, key in (
+                    (SettingRecord.__table__, SettingRecord.__table__.c.key),
+                    (SettingRecord, SettingRecord.key),
+                ):
+                    for value in ("first", "second"):
+                        session.execute(
+                            update(target).where(key == "guard-probe").values(value=value)
+                        )
+                session.commit()
+        finally:
+            event.remove(engine, "before_execute", observe)
+        kinds = [type(clause).__name__ for clause in captured]
+        print("REAL_SQLALCHEMY_BEFORE_EXECUTE_TYPES:", kinds)
+        assert kinds == ["Update", "Update", "AnnotatedUpdate", "AnnotatedUpdate"]
+        assert all(isinstance(clause, Update) for clause in captured)
+        yield SimpleNamespace(core=captured[:2], orm=captured[2:])
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ["core", "orm", "mixed"])
+def test_added_guard_real_sqlalchemy_update_types(added_guard_statements, kind):
+    from tests.e2e.test_ml_lifecycle_verification import _assert_exact_two_updates
+
+    cases = {
+        "core": added_guard_statements.core,
+        "orm": added_guard_statements.orm,
+        "mixed": [added_guard_statements.core[0], added_guard_statements.orm[0]],
+    }
+    _assert_exact_two_updates(cases[kind])
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "insert",
+        "delete",
+        "select",
+        "text",
+        "ddl",
+        "spoof-update",
+        "spoof-annotated-update",
+        "empty",
+        "one",
+        "three",
+        "extra-select",
+        "extra-insert",
+        "extra-delete",
+    ],
+)
+def test_added_guard_rejects_non_updates_and_wrong_counts(added_guard_statements, kind):
+    from sqlalchemy import DDL, delete, insert, select, text
+
+    from packages.core.models import SettingRecord
+    from tests.e2e.test_ml_lifecycle_verification import _assert_exact_two_updates
+
+    first, second = added_guard_statements.core
+    bad = {
+        "insert": insert(SettingRecord).values(key="unexpected", value="bad"),
+        "delete": delete(SettingRecord),
+        "select": select(SettingRecord),
+        "text": text("UPDATE settings SET value='not-a-typed-update'"),
+        "ddl": DDL("UPDATE settings SET value='not-a-typed-update'"),
+        "spoof-update": type("Update", (), {"is_update": True})(),
+        "spoof-annotated-update": type("AnnotatedUpdate", (), {"is_update": True})(),
+    }
+    if kind in bad:
+        statements = [first, bad[kind]]
+    else:
+        statements = {
+            "empty": [],
+            "one": [first],
+            "three": [first, second, added_guard_statements.orm[0]],
+            "extra-select": [first, second, bad["select"]],
+            "extra-insert": [first, second, bad["insert"]],
+            "extra-delete": [first, second, bad["delete"]],
+        }[kind]
+    with pytest.raises(AssertionError):
+        _assert_exact_two_updates(statements)
