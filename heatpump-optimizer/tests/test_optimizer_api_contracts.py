@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 from structlog.testing import capture_logs
 
 from packages.api.schemas import DashboardResponse
@@ -2742,39 +2743,36 @@ def select_one():
     return select(AppLogRecord.id).limit(1)
 
 
-@pytest.fixture
-def production_log_sink(monkeypatch):
-    """Run the real structlog â†’ DB sink, then restore all logging globals."""
+@pytest_asyncio.fixture(loop_scope="function")
+async def production_log_sink(monkeypatch):
+    """Own a fresh real sink; never reset a live singleton's ownership metadata."""
     import structlog
 
-    from packages.core import log_sink
+    from tests.test_logging_ownership_contracts import load_sink
 
-    saved_config = structlog.get_config()
-    saved = {
-        name: getattr(log_sink, name)
-        for name in (
-            "_CLOSING",
-            "_SERVICE_NAME",
-            "_FLUSH_TASK",
-            "_INFLIGHT_TASK",
-            "_INFLIGHT_BATCH",
-        )
-    }
-    saved_buffer = list(log_sink._LOG_BUFFER)
-    saved_drops = log_sink._DROP_COUNTS.copy()
-    log_sink._LOG_BUFFER.clear()
-    log_sink._DROP_COUNTS.clear()
-    monkeypatch.setattr(log_sink.settings, "log_level", "INFO")
-    yield log_sink
-    task = log_sink._FLUSH_TASK
-    if task is not None and not task.done():
-        task.cancel()
-    structlog.configure(**saved_config)
-    for name, value in saved.items():
-        setattr(log_sink, name, value)
-    log_sink._LOG_BUFFER[:] = saved_buffer
-    log_sink._DROP_COUNTS.clear()
-    log_sink._DROP_COUNTS.update(saved_drops)
+    sink, saved_config = load_sink(monkeypatch)
+    monkeypatch.setattr(sink.settings, "log_level", "INFO")
+    try:
+        yield sink
+    finally:
+        try:
+            if sink.log_sink_status()["state"] != "FAILED_UNSETTLED":
+                await sink.shutdown_log_sink()
+            tasks = {
+                task
+                for task in (sink._FLUSH_TASK, sink._INFLIGHT_TASK, sink._OWNER.controller)
+                if task is not None
+            }
+            if tasks:
+                done, pending = await asyncio.wait(tasks, timeout=5)
+                assert not pending, "synthetic sink tasks must settle before restoring structlog"
+                for task in done:
+                    if not task.cancelled():
+                        task.result()
+            if sink._OWNER.lease is not None and sink._OWNER.state == "SETTLED":
+                sink._OWNER.lease.release()
+        finally:
+            structlog.configure(**saved_config)
 
 
 async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=None):
@@ -2785,9 +2783,12 @@ async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=
     optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     if failure is not None:
         optimizer.generate_plan.side_effect = failure
-    sink.configure_structlog_with_db("optimizer")
+    lease = sink.bind_log_session_factory(sentinel.factory)
     with (
-        patch("packages.core.database.get_session", new=sentinel.factory),
+        patch(
+            "packages.core.database.get_session",
+            side_effect=AssertionError("explicit logging binding must not fall back"),
+        ),
         patch.object(optimizer_main, "get_session", new=sentinel.factory),
         patch.object(optimizer_main, "logger", structlog.get_logger("ciu2_admission")),
         patch.object(optimizer_main, "get_setting", new=AsyncMock(return_value="rules")),
@@ -2808,6 +2809,7 @@ async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=
         patch.object(optimizer_main, "_last_plan_generated_at", 0.0),
     ):
         try:
+            sink.configure_structlog_with_db("optimizer")
             result = await optimizer_main.run_optimization()
         finally:
             cooldown = optimizer_main._last_plan_generated_at
@@ -2815,6 +2817,8 @@ async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=
                 await sink.shutdown_log_sink()
             finally:
                 drained_buffer = list(sink._LOG_BUFFER)
+                if sink._OWNER.state == "SETTLED":
+                    lease.release()
     return result, cooldown, drained_buffer
 
 
@@ -2926,20 +2930,49 @@ async def test_CIU2_unsettled_log_writer_retains_ownership(production_log_sink, 
     plan = _admissible_plan()
     plan["planning_data_quality"]["status"] = "degraded"
 
-    with pytest.raises(RuntimeError, match="log writer unsettled"):
-        await _refused_run_with_production_logging(production_log_sink, sentinel, plan)
+    try:
+        with pytest.raises(RuntimeError, match="resource disposal forbidden"):
+            await _refused_run_with_production_logging(production_log_sink, sentinel, plan)
 
-    writer = production_log_sink._INFLIGHT_TASK
-    assert writer is not None and not writer.done()
-    retained = list(production_log_sink._INFLIGHT_BATCH)
-    assert retained and production_log_sink._LOG_BUFFER[: len(retained)] == retained
-    assert sentinel.cancellations >= 1
-    assert sentinel.committed_logs == []
-
-    release.set()
-    await asyncio.wait({writer}, timeout=5)
-    assert writer.done()
+        writer = production_log_sink._INFLIGHT_TASK
+        assert writer is not None and not writer.done()
+        retained = list(production_log_sink._INFLIGHT_BATCH)
+        assert retained and production_log_sink._LOG_BUFFER[: len(retained)] == retained
+        assert production_log_sink.log_sink_status()["state"] == "FAILED_UNSETTLED"
+        assert sentinel.cancellations >= 1
+        assert sentinel.committed_logs == []
+        controller = production_log_sink._OWNER.controller
+        with pytest.raises(RuntimeError):
+            production_log_sink.configure_structlog_with_db("optimizer")
+        with pytest.raises(RuntimeError):
+            production_log_sink._OWNER.lease.release()
+    finally:
+        release.set()
+        tasks = {
+            task
+            for task in (
+                production_log_sink._FLUSH_TASK,
+                production_log_sink._INFLIGHT_TASK,
+                production_log_sink._OWNER.controller,
+            )
+            if task is not None
+        }
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=5)
+            assert not pending
+            for task in done:
+                if not task.cancelled():
+                    task.result()
+        await asyncio.sleep(0)  # observe the writer's late-completion callback
     assert production_log_sink._INFLIGHT_TASK is None
+    assert production_log_sink.log_sink_status()["state"] == "FAILED_UNSETTLED"
+    assert production_log_sink._OWNER.controller is controller
+    with pytest.raises(RuntimeError):
+        production_log_sink.configure_structlog_with_db("optimizer")
+    with pytest.raises(RuntimeError, match="resource disposal forbidden"):
+        await production_log_sink.shutdown_log_sink()
+    with pytest.raises(RuntimeError):
+        production_log_sink._OWNER.lease.release()
     assert sentinel.forbidden == []
     assert "optimizer_no_plan" in [record.event for record in sentinel.committed_logs]
 

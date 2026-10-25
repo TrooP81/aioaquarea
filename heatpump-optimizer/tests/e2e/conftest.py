@@ -46,12 +46,19 @@ from packages.core.models import (  # noqa: E402
 )
 from packages.core.settings_service import get_user_tz  # noqa: E402
 from tests.e2e import consumption_seed  # noqa: E402
+from tests.e2e.ordinary_cleanup import (  # noqa: E402
+    PRESERVED_TABLES,
+    capture_ordinary_baseline,
+    reset_ordinary_profile,
+    restore_ordinary_baseline,
+)
+from packages.core.runtime_ownership import finish_owned_cleanup  # noqa: E402
 
 
 LEGACY_TABLES = tuple(
     table
     for table in Base.metadata.sorted_tables
-    if table.name not in {"manual_cop_observations", "price_scopes"}
+    if table.name not in {"manual_cop_observations", "price_scopes"} | PRESERVED_TABLES
 )
 for legacy_table in LEGACY_TABLES:
     assert all(
@@ -139,7 +146,13 @@ async def setup_database():
                 existing = await connection.run_sync(
                     lambda current: set(inspect(current).get_table_names(schema="public"))
                 )
-                migrated_names = [table.name for table in LEGACY_TABLES if table.name in existing]
+                assert PRESERVED_TABLES <= existing, (
+                    "ordinary cleanup requires migrated house/settings storage"
+                )
+                migrated_names = sorted(
+                    {table.name for table in LEGACY_TABLES if table.name in existing}
+                    | PRESERVED_TABLES
+                )
                 schema = await legacy_schema_state(connection, migrated_names)
                 for table in LEGACY_TABLES:
                     if table.name not in existing:
@@ -147,8 +160,17 @@ async def setup_database():
                             lambda current, target=table: target.create(current, checkfirst=True)
                         )
                         created.append(table)
-                await truncate_legacy_tables(connection)
-            yield
+                async with AsyncSession(
+                    bind=connection,
+                    expire_on_commit=False,
+                    join_transaction_mode="rollback_only",
+                ) as session:
+                    baseline = await capture_ordinary_baseline(session)
+                    boundary = await restore_ordinary_baseline(
+                        session, baseline, truncate_legacy_tables
+                    )
+            baseline.boundary = boundary  # only the outer transaction commits
+            yield baseline
         finally:
             try:
                 if retained is not None:
@@ -167,12 +189,19 @@ async def setup_database():
 
 @pytest_asyncio.fixture(autouse=True, loop_scope="session")
 async def clean_tables(setup_database):
-    """Clear legacy synthetic rows without cascading into retained storage."""
+    """Restore settings forward and clear only mutable synthetic storage."""
+    setup_database.require_usable()
     try:
         yield
     finally:
-        async with engine.begin() as connection:
-            await truncate_legacy_tables(connection)
+        await finish_owned_cleanup(
+            lambda: reset_ordinary_profile(
+                engine,
+                setup_database,
+                guard=manual_sql.guard_owned_database,
+                truncate=truncate_legacy_tables,
+            )
+        )
 
 
 @pytest_asyncio.fixture(loop_scope="session")
