@@ -26,6 +26,758 @@ def _investigation_events(observer):
     return [json.loads(value) for value in observer.events]
 
 
+def test_diagnostic_guarded_plugin_serializer_reporting(fixtures, tmp_path):
+    """Exercise the real coordinator hooks, including an ordinary failed call."""
+    (tmp_path / "conftest.py").write_text(
+        "from tests.test_ml_lifecycle_fixture_contracts import fixtures\n"
+    )
+    (tmp_path / "test_reporting.py").write_text(
+        "import asyncio, json, os\n"
+        "from types import SimpleNamespace\n"
+        "from tests import test_ml_lifecycle_fixture_contracts as contracts\n"
+        "def test_wrapper(fixtures, monkeypatch):\n"
+        "    asyncio.run(contracts."
+        "test_investigation_serialization_failure_cannot_change_real_result_or_error"
+        "(fixtures, monkeypatch))\n"
+        "def test_storage(fixtures, monkeypatch):\n"
+        "    contracts.test_investigation_storage_bounds_reserve_before_detail"
+        "(fixtures, monkeypatch, 'serialization')\n"
+        "def test_emission(fixtures, monkeypatch, capsys):\n"
+        "    contracts.test_investigation_emission_failure_has_fixed_bounded_marker"
+        "(fixtures, monkeypatch, capsys, 'serialize')\n"
+        "def test_application_failure(fixtures, monkeypatch):\n"
+        "    if os.environ['EXPECTED_FAILURE'] != '1': return\n"
+        "    observer = fixtures._Investigation()\n"
+        "    async def application(): raise RuntimeError('EXPECTED_APPLICATION_FAILURE')\n"
+        "    owner = SimpleNamespace(call=application)\n"
+        "    observer.wrap(owner, 'call', 'batch')\n"
+        "    def broken(*a, **k): raise ValueError('SERIALIZER_SENTINEL')\n"
+        "    try:\n"
+        "        with monkeypatch.context() as patch:\n"
+        "            patch.setattr(json, 'dumps', broken)\n"
+        "            asyncio.run(owner.call())\n"
+        "    finally: observer.restore()\n"
+    )
+    for fail in (False, True):
+        reports = tmp_path / f"reports-{fail}.jsonl"
+        nodes = tmp_path / f"nodes-{fail}.json"
+        environment = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join((str(SOURCE.parents[2]), str(SOURCE.parents[3]))),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "COP_MANUAL_TEST_PHASE": "diagnostic-offline",
+            "COP_MANUAL_TEST_REPORTS": str(reports),
+            "COP_MANUAL_TEST_NODES": str(nodes),
+            "EXPECTED_FAILURE": str(int(fail)),
+        }
+        run = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "tests.e2e.test_manual_cop_postgresql",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert run.returncode == int(fail), run.stdout + run.stderr
+        assert "INTERNALERROR" not in run.stdout + run.stderr
+        assert "SERIALIZER_SENTINEL" not in run.stderr
+        inventory = json.loads(nodes.read_text())
+        assert inventory["exit"] == int(fail)
+        assert len(inventory["selected"]) == len(inventory["collected"]) == 4
+        records = [json.loads(line) for line in reports.read_text().splitlines()]
+        assert len(records) == 12
+        assert {r["when"] for r in records} == {"setup", "call", "teardown"}
+        assert sum(r["outcome"] == "failed" for r in records) == int(fail)
+        assert all(r["outcome"] == "passed" for r in records if r["when"] == "teardown")
+
+
+def test_diagnostic_routine_flood_never_builds_detail(fixtures, monkeypatch):
+    observer = fixtures._Investigation()
+    monkeypatch.setattr(observer, "stack", lambda: pytest.fail("routine detail constructed"))
+    for _ in range(100000):
+        observer.sql("sql_attempted", None, statement="SELECT 1 /* routine */")
+    assert observer.events == []
+    assert observer.bytes == 0
+    assert observer.selection["routine_filtered"] == 100000
+    assert not any(observer.drops.values())
+    assert observer.relevance == {}
+
+
+@pytest.mark.parametrize(
+    "statement,relation,sequence",
+    [
+        ('/* comment */ INSERT INTO "public"."app_logs"(id) VALUES (1)', "app_logs", False),
+        ("WITH x AS (SELECT 1) DELETE FROM app_logs WHERE id=1", "app_logs", False),
+        ("SELECT * FROM app_logs", "app_logs", False),
+        ("SELECT nextval('public.app_logs_id_seq')", "UNKNOWN", True),
+        ("SELECT 'public.app_logs_id_seq'::regclass", "UNKNOWN", True),
+        ('ALTER SEQUENCE "public"."app_logs_id_seq" RESTART', "app_logs_id_seq", True),
+        ("SELECT 'INSERT INTO app_logs', 'app_logs_id_seq'", "UNKNOWN", False),
+        ("SELECT 1 /* INSERT INTO app_logs */", "UNKNOWN", False),
+    ],
+)
+def test_diagnostic_text_classification(fixtures, statement, relation, sequence):
+    result = fixtures._Investigation().target(None, statement)
+    assert result["declared_relation"] == relation
+    assert result["target_sequence"] is sequence
+    assert result["resolved_relation"] == result["sequence_consumer"] == "UNKNOWN"
+    assert statement not in json.dumps(result)
+
+
+def test_diagnostic_structural_positives_precede_text(fixtures):
+    from sqlalchemy import (
+        Column,
+        Integer,
+        MetaData,
+        Sequence,
+        Table,
+        delete,
+        insert,
+        select,
+        update,
+    )
+
+    table = Table("app_logs", MetaData(), Column("id", Integer), schema="public")
+    other = Table("other", MetaData(), Column("id", Integer))
+    clauses = [
+        insert(table),
+        delete(table),
+        update(table),
+        select(table),
+        select(select(table.c.id).scalar_subquery()),
+        select(other.c.id).where(other.c.id.in_(select(table.c.id))),
+    ]
+    observer = fixtures._Investigation()
+    for clause in clauses:
+        result = observer.target(
+            SimpleNamespace(compiled=SimpleNamespace(statement=clause)),
+            "SELECT 1 /* deliberately misleading root */",
+        )
+        assert result["declared_relation"] == "app_logs"
+        assert result["declared_schema"] == "public"
+    result = observer.target(
+        SimpleNamespace(
+            compiled=SimpleNamespace(
+                statement=select(Sequence("app_logs_id_seq", schema="public").next_value())
+            )
+        ),
+        None,
+    )
+    assert result["target_sequence"] is True
+    observer.target(None, "SELECT " + "x" * 3000)
+    assert observer.selection["classification_uncertain"] > 0
+
+
+@pytest.mark.parametrize("target", ["app_logs", "app_logs_id_seq"])
+@pytest.mark.parametrize("form", ["label", "column"])
+def test_diagnostic_expression_names_are_not_relations(fixtures, target, form):
+    from sqlalchemy import column, literal, select
+
+    expression = literal(1).label(target) if form == "label" else column(target)
+    context = SimpleNamespace(compiled=SimpleNamespace(statement=select(expression)))
+    observer = fixtures._Investigation()
+    result = observer.target(context, None)
+    assert result["declared_relation"] != "app_logs"
+    assert result["target_sequence"] is False
+
+
+@pytest.mark.parametrize("marker", ["--", "/*", "*/", "it's -- /*"])
+def test_diagnostic_literal_comment_markers_do_not_hide_real_target(fixtures, marker):
+    from sqlalchemy import text
+
+    statement = (
+        "WITH x AS (SELECT '"
+        + marker.replace("'", "''")
+        + "') INSERT INTO public.app_logs DEFAULT VALUES"
+    )
+    context = SimpleNamespace(compiled=text(statement).compile())
+    observer = fixtures._Investigation()
+    result = observer.target(context, statement)
+    assert result["declared_relation"] == "app_logs"
+    assert result["declared_schema"] == "public"
+    observer.node = 1
+    observer.sql("sql_attempted", None, context, statement)
+    assert len(observer.events) == 1
+    assert observer.selection["routine_filtered"] == 0
+
+
+@pytest.mark.parametrize(
+    "statement,relation,sequence",
+    [
+        ('WITH x AS (SELECT 1 AS "-- /*") INSERT INTO app_logs DEFAULT VALUES', "app_logs", False),
+        ("WITH x AS (SELECT E'\\'--') INSERT INTO app_logs DEFAULT VALUES", "app_logs", False),
+        (
+            "WITH x AS (SELECT $tag$-- /* ' $tag$) INSERT INTO app_logs DEFAULT VALUES",
+            "app_logs",
+            False,
+        ),
+        (
+            "/* outside /* nested */ comment */ INSERT INTO app_logs DEFAULT VALUES",
+            "app_logs",
+            False,
+        ),
+        ("SELECT 1 -- outside\r; INSERT INTO app_logs DEFAULT VALUES", "app_logs", False),
+        ('SELECT 1 AS "app_logs_id_seq"', "UNKNOWN", False),
+        ("SELECT 'from app_logs /*', '-- nextval(''app_logs_id_seq'')'", "UNKNOWN", False),
+        ("SELECT $$INSERT INTO app_logs$$", "UNKNOWN", False),
+        ("SELECT $1, $2", "UNKNOWN", False),
+        ("SELECT nextval(E'app_logs_id_seq')", "UNKNOWN", True),
+        ("SELECT $seq$app_logs_id_seq$seq$::regclass", "UNKNOWN", True),
+        ('SELECT "nextval"(\'"public"."app_logs_id_seq"\')', "UNKNOWN", True),
+        ('SELECT 1 FROM "other_schema"."app_logs"', "app_logs", False),
+    ],
+)
+def test_diagnostic_bounded_lexer_keeps_token_kinds(fixtures, statement, relation, sequence):
+    from sqlalchemy import text
+
+    observer = fixtures._Investigation()
+    result = observer.target(SimpleNamespace(compiled=text(statement).compile()), statement)
+    assert result["declared_relation"] == relation
+    assert result["target_sequence"] is sequence
+    assert result["resolved_relation"] == result["sequence_consumer"] == "UNKNOWN"
+    assert statement not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "SELECT 'unterminated -- INSERT INTO app_logs",
+        'SELECT "unterminated /* INSERT INTO app_logs',
+        "/* unterminated INSERT INTO app_logs",
+        "SELECT $tag$unterminated INSERT INTO app_logs",
+        "SELECT U&'\\0061pp_logs'::regclass",
+        "SELECT `INSERT INTO app_logs`",
+        "SELECT $unsupported INSERT INTO app_logs",
+        "SELECT " + " " * 2048 + "FROM app_logs",
+        " " * (2048 - len("INSERT INTO app_logs")) + "INSERT INTO app_logs_not_target",
+    ],
+)
+def test_diagnostic_unsupported_or_truncated_sql_discloses_uncertainty(fixtures, statement):
+    observer = fixtures._Investigation()
+    observer.sql("sql_attempted", None, statement=statement)
+    assert observer.selection["classification_uncertain"] > 0
+    assert observer.events == []
+    assert observer.selection["routine_filtered"] == 1
+    assert not any(observer.drops.values())
+
+
+def test_diagnostic_expression_name_flood_preserves_target_reservations(fixtures, monkeypatch):
+    from sqlalchemy import Integer, column, literal, select, table
+
+    observer = fixtures._Investigation()
+    observer.node = 1
+    clauses = [
+        select(literal(1).label("app_logs")),
+        select(literal(1).label("app_logs_id_seq")),
+        select(column("app_logs")),
+        select(table("ordinary", column("app_logs_id_seq", Integer)).c.app_logs_id_seq),
+    ]
+    contexts = [SimpleNamespace(compiled=clause.compile()) for clause in clauses]
+    with monkeypatch.context() as patch:
+        patch.setattr(observer, "stack", lambda: pytest.fail("routine detail constructed"))
+        for index in range(100000):
+            observer.sql("sql_attempted", None, contexts[index % len(contexts)])
+    assert observer.events == []
+    assert observer.bytes == 0
+    assert observer.selection["routine_filtered"] == 100000
+    assert all(lane == [0, 0, 0] for lane in observer.lanes[1])
+    assert not any(observer.drops.values())
+    relation = table("app_logs", column("id", Integer))
+    context = SimpleNamespace(compiled=select(relation.c.id).compile())
+    observer.sql("sql_attempted", None, context, "SELECT 1")
+    observer.sql("sql_attempted", None, statement="SELECT nextval('app_logs_id_seq')")
+    records = _investigation_events(observer)
+    assert len(records) == 2
+    assert records[0]["declared_relation"] == "app_logs"
+    assert records[1]["target_sequence"] is True
+    assert all(record["reservation_owner_node"] == 1 for record in records)
+    assert observer.lanes[1][tuple(observer.LANES).index("logging")][0] == 1
+    assert observer.lanes[1][tuple(observer.LANES).index("sequence")][0] == 1
+
+
+async def test_diagnostic_all_nodes_survive_alias_exhaustion_and_routine_flood(fixtures):
+    observer = fixtures._Investigation()
+    expected = fixtures.PublicationResult(False, reason="indoor_scope_unavailable")
+    code = (lambda: None).__code__
+    observer.codes[id(code)] = (code, "materialize", frozenset())
+    frame = SimpleNamespace(f_code=code, f_locals={"statuses": [], "readings": []})
+
+    async def publish(**kwargs):
+        observer.record("inputs_returned", lambda: observer.inputs(frame, None))
+        return expected
+
+    async def batch():
+        observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        observer.sql("cursor_completed", None, statement="DELETE FROM app_logs")
+        observer.sql("sql_attempted", None, statement="SELECT nextval('app_logs_id_seq')")
+
+    owner = SimpleNamespace(publish=publish, batch=batch)
+    observer.wrap(owner, "publish", "publish")
+    observer.wrap(owner, "batch", "batch")
+    try:
+        observer.node = 1
+        for _ in range(129):
+            await owner.batch()
+        for _ in range(100000):
+            observer.sql("cursor_completed", None, statement="SELECT 1")
+        for node in range(1, 52):
+            observer.node = node
+            observer.record("stage")
+            for role in ("candidate", "incumbent"):
+                assert await owner.publish(role=role) is expected
+            await owner.batch()
+        events = _investigation_events(observer)
+        for node in range(1, 52):
+            for role in ("candidate", "incumbent"):
+                inputs = [
+                    e
+                    for e in events
+                    if e["node"] == node
+                    and e["event"] == "inputs_returned"
+                    and e["publication_role"] == role
+                ]
+                assert len(inputs) == 1
+                assert inputs[0]["reservation_owner_node"] == node
+                assert inputs[0]["wrapper_kind"] == "publish"
+                assert inputs[0]["operation"] == 0
+                outcome = next(
+                    e
+                    for e in events
+                    if e["node"] == node
+                    and e["event"] == "publish_returned"
+                    and e["publication_role"] == role
+                )
+                assert outcome["committed"] is False
+                assert outcome["reason"] == "indoor_scope_unavailable"
+            if node > 1:
+                assert any(e["node"] == node and e["event"] == "batch_returned" for e in events)
+                assert any(
+                    e["node"] == node and e.get("declared_relation") == "app_logs" for e in events
+                )
+                assert any(e["node"] == node and e.get("target_sequence") for e in events)
+        assert observer.selection["routine_filtered"] == 100000
+        assert observer.next_alias["operation"] == 128
+        assert observer.scope.get() is None
+        assert len(events) <= 3688
+        assert observer.bytes <= observer.ARENA_BYTES
+        assert sum(v[0] for v in observer.LANES.values()) * 51 + 16 == 3688
+        assert sum(v[1] for v in observer.LANES.values()) * 51 + 16384 == 4 * 1024 * 1024
+    finally:
+        observer.restore()
+
+
+async def test_diagnostic_pending_old_owner_and_nested_expired_context(fixtures, monkeypatch):
+    from contextvars import copy_context
+    from packages.core import log_sink
+
+    observer = fixtures._Investigation()
+    entered, release = asyncio.Event(), asyncio.Event()
+    copied = []
+    failure = ValueError("original")
+    outcome = "return"
+
+    class Connection:
+        engine = None
+
+    connections = [Connection() for _ in range(257)]
+
+    async def nested():
+        copied.append(copy_context())
+        observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        if outcome == "error":
+            raise failure
+        if outcome == "cancel":
+            raise asyncio.CancelledError()
+
+    async def early():
+        entered.set()
+        await release.wait()
+        outer = observer.scope.get()
+        for connection in connections:
+            observer.sql("sql_attempted", connection, statement="DELETE FROM app_logs")
+        for mode in ("return", "error", "cancel"):
+            nonlocal outcome
+            outcome = mode
+            if mode == "return":
+                await owner.nested()
+            else:
+                with pytest.raises(ValueError if mode == "error" else asyncio.CancelledError):
+                    await owner.nested()
+            assert observer.scope.get() is outer
+        for _ in range(1000):
+            observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        for _ in range(1000):
+            observer.sql("sql_attempted", None, statement="SELECT nextval('app_logs_id_seq')")
+
+    async def noop():
+        return None
+
+    owner = SimpleNamespace(early=early, nested=nested, noop=noop)
+    for name in ("early", "nested", "noop"):
+        observer.wrap(owner, name, "batch")
+    observer.node = 1
+    for _ in range(129):
+        await owner.noop()
+    task = asyncio.create_task(owner.early())
+    try:
+        await entered.wait()
+        observer.node = 19
+        for name in ("shutdown_log_sink", "_flush_once"):
+            monkeypatch.setattr(log_sink, name, AsyncMock(side_effect=AssertionError("settled")))
+        observer.pending()
+        pending = json.loads(observer.pending_bytes)
+        assert pending["active_operations"] == 1
+        assert not task.done()
+        release.set()
+        await task
+        assert observer.scope.get() is None
+        assert observer.operation.get() == 0
+        assert observer.selection["relevance_overflow"] == 1
+        assert observer.relevance == {}
+        assert observer.lanes[1][tuple(observer.LANES).index("logging")][2] > 0
+        assert observer.lanes[1][tuple(observer.LANES).index("sequence")][2] > 0
+        assert all(lane == [0, 0, 0] for lane in observer.lanes[19][:-1])
+        for context in copied:
+            before = len(observer.events)
+            context.run(observer.sql, "sql_attempted", None, statement="SELECT 1")
+            assert len(observer.events) == before  # Inactive copied batch is not admission.
+            context.run(observer.sql, "sql_attempted", None, statement="DELETE FROM app_logs")
+            assert len(observer.events) == before  # Expired owner's exhausted lane, not node 19.
+        observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        observer.sql("sql_attempted", None, statement="SELECT nextval('app_logs_id_seq')")
+        observer.record("stage")
+        later = [e for e in _investigation_events(observer) if e["reservation_owner_node"] == 19]
+        assert {e["event"] for e in later} >= {"sql_attempted", "stage"}
+        assert any(e.get("target_sequence") for e in later)
+        old = [
+            e
+            for e in _investigation_events(observer)
+            if e["node"] == 19 and e["reservation_owner_node"] == 1
+        ]
+        assert old and all(e["operation_origin"] in (1, 19) for e in old)
+        assert all(e["operation"] == 0 for e in old)
+        assert json.loads(observer.pending_bytes) == pending
+        log_sink.shutdown_log_sink.assert_not_called()
+        log_sink._flush_once.assert_not_called()
+    finally:
+        release.set()
+        await task
+        observer.restore()
+
+
+async def test_diagnostic_combined_old_flood_preserves_later_publication_and_batch(fixtures):
+    """One observer must survive all adversaries before the later real targets."""
+    observer = fixtures._Investigation()
+    entered, release = asyncio.Event(), asyncio.Event()
+    expected = fixtures.PublicationResult(False, reason="indoor_scope_unavailable")
+    code = (lambda: None).__code__
+    observer.codes[id(code)] = (code, "materialize", frozenset())
+    frame = SimpleNamespace(f_code=code, f_locals={"statuses": [], "readings": []})
+
+    async def noop():
+        return None
+
+    async def batch(*, pending=False):
+        if pending:
+            entered.set()
+            await release.wait()
+            # A live batch makes routine SQL relevant, but it still owns node 1.
+            for statement in (
+                "SELECT 1",
+                "DELETE FROM app_logs",
+                "SELECT nextval('app_logs_id_seq')",
+            ):
+                for _ in range(1000):
+                    observer.sql("sql_attempted", None, statement=statement)
+        else:
+            observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+            observer.sql("cursor_completed", None, statement="DELETE FROM app_logs")
+            observer.sql("sql_attempted", None, statement="SELECT nextval('app_logs_id_seq')")
+
+    async def publish(**kwargs):
+        observer.record("inputs_returned", lambda: observer.inputs(frame, None))
+        return expected
+
+    owner = SimpleNamespace(noop=noop, batch=batch, publish=publish)
+    for name in ("noop", "batch", "publish"):
+        observer.wrap(owner, name, "publish" if name == "publish" else "batch")
+    task = None
+    try:
+        observer.node = 1
+        for _ in range(129):
+            await owner.noop()
+        task = asyncio.create_task(owner.batch(pending=True))
+        await entered.wait()
+        observer.node = 19
+        observer.stage = "call"
+        for _ in range(100000):
+            observer.sql("sql_attempted", None, statement="SELECT 1")
+        assert observer.selection["routine_filtered"] == 100000
+        release.set()
+        await task
+        assert observer.scope.get() is None
+        assert observer.operation.get() == 0
+        assert all(lane == [0, 0, 0] for lane in observer.lanes[19])
+        for category in ("logging", "sequence", "batch"):
+            assert observer.lanes[1][tuple(observer.LANES).index(category)][2] > 0
+        old = _investigation_events(observer)
+        resumed = [event for event in old if event["node"] == 19]
+        assert resumed
+        assert all(event["reservation_owner_node"] == 1 for event in resumed)
+        assert all(event["operation_origin"] == 1 for event in resumed)
+        assert all(event["operation"] == 0 for event in resumed)
+        for role in ("candidate", "incumbent"):
+            assert await owner.publish(role=role) is expected
+        await owner.batch()
+        observer.record("stage")
+        later = _investigation_events(observer)[len(old) :]
+        assert all(event["reservation_owner_node"] == 19 for event in later)
+        assert all(event["operation"] == 0 for event in later)
+        for role in ("candidate", "incumbent"):
+            publication = [event for event in later if event["publication_role"] == role]
+            assert [event["event"] for event in publication] == [
+                "publish_started",
+                "inputs_returned",
+                "publish_returned",
+            ]
+            assert all(event["wrapper_kind"] == "publish" for event in publication)
+            assert all(event["operation_origin"] == 19 for event in publication)
+            assert publication[-1]["committed"] is False
+            assert publication[-1]["reason"] == "indoor_scope_unavailable"
+        assert {event["event"] for event in later} >= {
+            "batch_started",
+            "batch_returned",
+            "cursor_completed",
+            "stage",
+        }
+        assert any(event.get("declared_relation") == "app_logs" for event in later)
+        assert any(event.get("target_sequence") for event in later)
+        assert all(lane[2] == 0 for lane in observer.lanes[19])
+        assert observer.active == 0
+    finally:
+        release.set()
+        if task is not None:
+            await task
+        observer.restore()
+
+
+async def test_diagnostic_weak_relevance_independent_capacity_and_retirement(fixtures):
+    import gc
+    import weakref
+
+    class Connection:
+        engine = None
+
+    observer = fixtures._Investigation()
+    observer.node = 1
+    connections = [Connection() for _ in range(257)]
+    for connection in connections:
+        observer.sql("sql_attempted", connection, statement="DELETE FROM app_logs")
+    assert len(observer.relevance) == 256
+    assert observer.selection["relevance_overflow"] == 1
+    assert observer.lanes[1][tuple(observer.LANES).index("logging")][2] > 0
+    observer.node = 19
+    observer.sql("commit_notified", connections[-1])
+    assert observer.selection["relevance_unassociated"] == 1
+    observer.sql("sql_attempted", connections[0], statement="DELETE FROM app_logs")
+    assert observer.relevance[id(connections[0])]["owner"] == 1
+    assert observer.selection["relevance_ambiguous"] == 1
+    observer.sql("commit_notified", connections[0])
+    assert id(connections[0]) not in observer.relevance  # Retire even after capacity loss.
+    reference = weakref.ref(connections[1])
+    del connections[1]
+    gc.collect()
+    assert reference() is None
+    observer.sql("sql_attempted", connections[-1], statement="DELETE FROM app_logs")
+    assert len(observer.relevance) == 255
+
+    async def batch(*, fail=False):
+        observer.sql("sql_attempted", connections[0], statement="DELETE FROM app_logs")
+        if fail:
+            raise asyncio.CancelledError()
+
+    owner = SimpleNamespace(call=batch)
+    observer.wrap(owner, "call", "batch")
+    try:
+        for fail in (False, True):
+            if fail:
+                with pytest.raises(asyncio.CancelledError):
+                    await owner.call(fail=True)
+            else:
+                await owner.call()
+            assert id(connections[0]) not in observer.relevance
+        assert observer.selection["retired_without_terminal"] == 2
+        assert observer.scope.get() is None
+        assert observer.operation.get() == 0
+    finally:
+        observer.restore()
+    assert observer.relevance == {}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        (True, True, 42, None),
+        (False, False, None, "indoor_scope_unavailable"),
+        (False, False, None, "SECRET_UNKNOWN_REASON"),
+    ],
+)
+async def test_diagnostic_actual_publication_result_redacted(fixtures, result):
+    expected = fixtures.PublicationResult(
+        committed=result[0], readback=result[1], revision=result[2], reason=result[3]
+    )
+    observer = fixtures._Investigation()
+
+    async def publish():
+        return expected
+
+    owner = SimpleNamespace(call=publish)
+    observer.wrap(owner, "call", "publish")
+    try:
+        assert await owner.call() is expected
+        event = _investigation_events(observer)[-1]
+        assert event["committed"] is result[0]
+        assert event["readback"] is result[1]
+        assert event["revision_present"] is (result[2] is not None)
+        assert b"SECRET" not in b"".join(observer.events)
+        assert "revision" not in event
+    finally:
+        observer.restore()
+
+
+def test_diagnostic_maximum_footer_metadata_fits(fixtures, capsys):
+    observer = fixtures._Investigation()
+    observer.source = {"commit": "a" * 40, "source_manifest_sha256": "b" * 64}
+    for lanes in observer.lanes[1:]:
+        for lane, limits in zip(lanes, observer.LANES.values()):
+            lane[:2] = limits
+    observer.lanes[0][0][:2] = [16, 16 * 1024]
+    for lanes in observer.lanes:
+        for lane in lanes:
+            lane[2] = 2**31 - 1
+    for key in observer.selection:
+        observer.selection[key] = 2**31 - 1
+    for key in observer.drops:
+        observer.drops[key] = 2**31 - 1
+    observer.selected("routine_filtered")
+    assert observer.selection["saturated"] == 1
+
+    class Capture:
+        _global_capturing = None
+        _capture_fixture = None
+
+        def global_and_fixture_disabled(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+    observer.pending()
+    observer.emit(Capture())
+    output = capsys.readouterr()
+    _, footer = _decode_investigation_output(output.err)
+    assert footer["selection"]["credits"] == 3688
+    assert len(output.err.encode()) < 16 * 1024
+    assert output.out == ""
+
+
+async def test_diagnostic_expired_scope_and_ambiguous_connection_never_join(fixtures):
+    from contextvars import copy_context
+
+    class Connection:
+        engine = None
+
+    connection = Connection()
+    observer = fixtures._Investigation()
+    contexts = []
+
+    async def batch():
+        contexts.append(copy_context())
+
+    owner = SimpleNamespace(call=batch)
+    observer.wrap(owner, "call", "batch")
+    try:
+        observer.node = 1
+        await owner.call()
+        observer.node = 19
+        contexts[0].run(observer.sql, "sql_attempted", connection, statement="DELETE FROM app_logs")
+        expired = _investigation_events(observer)[-1]
+        assert expired["reservation_owner_node"] == expired["operation_origin"] == 1
+        assert expired["scope_live"] is False
+        assert expired["operation"] == 0
+        assert expired["correlation"] == "UNKNOWN"
+        # A new scope can conflict with the connection's outstanding origin,
+        # without gaining ownership of its reserved lane.
+        observer.sql("sql_attempted", connection, statement="DELETE FROM app_logs")
+        ambiguous = _investigation_events(observer)[-1]
+        assert ambiguous["association"] == "ambiguous"
+        assert ambiguous["reservation_owner_node"] == 1
+        assert ambiguous["wrapper_kind"] == ambiguous["publication_role"] == "UNKNOWN"
+        assert ambiguous["operation_origin"] == 0
+        observer.sql("commit_notified", connection)
+        assert observer.relevance == {}
+        assert _investigation_events(observer)[-1]["event"] == "commit_notified"
+        assert "confirmed_commit" not in json.dumps(_investigation_events(observer))
+    finally:
+        observer.restore()
+
+
+async def test_diagnostic_publication_partitions_and_unknown_results(fixtures, monkeypatch):
+    observer = fixtures._Investigation()
+    observer.node = 1
+
+    class Hostile:
+        def __getattribute__(self, name):
+            raise AssertionError("unknown result inspected")
+
+    class Subclass(fixtures.PublicationResult):
+        @property
+        def reason(self):
+            raise AssertionError("subclass inspected")
+
+    hostile = Hostile()
+    # Bypass dataclass initialization: no fields should ever be inspected.
+    subclass = object.__new__(Subclass)
+    expected = hostile
+
+    async def publish(**kwargs):
+        return expected
+
+    owner = SimpleNamespace(call=publish)
+    observer.wrap(owner, "call", "publish")
+    try:
+        # Other/unscoped input traffic cannot steal either publication role's lane.
+        for _ in range(100):
+            observer.record("inputs_returned")
+        for _ in range(100):
+            assert await owner.call(role="candidate") is hostile
+        expected = subclass
+        assert await owner.call(role="incumbent") is subclass
+        result = _investigation_events(observer)[-1]
+        assert result["publication_role"] == "incumbent"
+        assert result["publication_result"] == "UNKNOWN"
+        assert result["reservation_owner_node"] == 1
+        assert observer.lanes[1][0][2] > 0
+        assert observer.lanes[1][2][2] > 0
+        assert observer.lanes[1][1][2] == 0
+        observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        for _ in range(30):
+            observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        monkeypatch.setattr(observer, "stack", lambda: pytest.fail("exhausted detail"))
+        before = observer.next_alias.copy()
+        observer.sql("sql_attempted", None, statement="DELETE FROM app_logs")
+        assert observer.next_alias == before
+    finally:
+        observer.restore()
+
+
 @pytest.mark.parametrize("outcome", ["identity", "none", "error", "cancel"])
 async def test_investigation_wrapper_is_transparent(fixtures, outcome):
     import inspect
@@ -569,7 +1321,8 @@ async def test_investigation_operation_cap_and_final_boundary_never_settle(fixtu
     for name in ("shutdown_log_sink", "_flush_once"):
         monkeypatch.setattr(log_sink, name, AsyncMock(side_effect=AssertionError("settled")))
     try:
-        for _ in range(129):
+        for index in range(129):
+            observer.node = 1 + index // 3
             await owner.call()
         observer.pending()
         assert len(observer.origins) == 128
@@ -600,14 +1353,16 @@ async def test_investigation_serialization_failure_cannot_change_real_result_or_
     def broken(*args, **kwargs):
         raise ValueError("SECRET_SERIALIZER")
 
-    monkeypatch.setattr(fixtures.json, "dumps", broken)
     try:
-        assert await owner.call() is expected
-        with pytest.raises(RuntimeError) as raised:
-            await owner.call(fail=True)
-        assert raised.value is failure
-        assert observer.events == []
-        assert observer.drops["serialization"] == 4
+        with monkeypatch.context() as patch:
+            patch.setattr(fixtures.json, "dumps", broken)
+            assert await owner.call() is expected
+            with pytest.raises(RuntimeError) as raised:
+                await owner.call(fail=True)
+            assert raised.value is failure
+            assert observer.events == []
+            assert observer.drops["serialization"] == 4
+        assert json.dumps({"restored": True}) == '{"restored": true}'
     finally:
         observer.restore()
 
@@ -658,7 +1413,7 @@ def test_investigation_partial_profile_install_and_wrapper_restore_failure_are_i
     assert observer.drops["restore"] == 1
 
 
-def test_investigation_events_cover_existing_and_new_engines_without_extra_sql(fixtures):
+async def test_investigation_events_cover_existing_and_new_engines_without_extra_sql(fixtures):
     from sqlalchemy import create_engine, event, text
     from sqlalchemy.exc import OperationalError
 
@@ -673,7 +1428,8 @@ def test_investigation_events_cover_existing_and_new_engines_without_extra_sql(f
     observer.install_events()
     newer = create_engine("sqlite://")
     event.listen(newer, "before_cursor_execute", count)
-    try:
+
+    async def exercise():
         for engine in (existing, newer):
             with engine.connect() as connection:
                 assert connection.execute(text("SELECT 1 /* SECRET_LITERAL */")).scalar_one() == 1
@@ -684,7 +1440,16 @@ def test_investigation_events_cover_existing_and_new_engines_without_extra_sql(f
                         {"secret": "SECRET_PARAMETER"},
                     )
                 connection.rollback()
-        events = _investigation_events(observer)
+
+    owner = SimpleNamespace(call=exercise)
+    observer.wrap(owner, "call", "batch")
+    try:
+        await owner.call()
+        events = [
+            item
+            for item in _investigation_events(observer)
+            if item["event"] not in ("batch_started", "batch_returned")
+        ]
         labels = [item["event"] for item in events]
         assert len(calls) == 4
         assert labels.count("sql_attempted") == 4
@@ -770,10 +1535,11 @@ def test_investigation_storage_bounds_reserve_before_detail(fixtures, monkeypatc
         observer.RESERVE_BYTES,
     ) == (4096, 2048, 4 * 1024 * 1024, 16 * 1024)
     if bound == "serialization":
-        monkeypatch.setattr(
-            fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
-        )
-        observer.record("test")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
+            )
+            observer.record("test")
     elif bound == "event_bytes":
         observer.record("test", lambda: {"padding": "x" * 2048})
     else:
@@ -1014,15 +1780,16 @@ def test_investigation_emission_failure_has_fixed_bounded_marker(
                 raise RuntimeError("SECRET")
 
     monkeypatch.setattr(fixtures.sys, "stderr", Stream())
-    if fault == "serialize":
-        monkeypatch.setattr(
-            fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
-        )
     if fault == "digest":
         monkeypatch.setattr(fixtures.hashlib, "sha256", lambda: (_ for _ in ()).throw(ValueError()))
     if fault == "reserve":
         monkeypatch.setattr(observer, "RESERVE_BYTES", 1)
-    observer.emit(Capture())
+    with monkeypatch.context() as patch:
+        if fault == "serialize":
+            patch.setattr(
+                fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
+            )
+        observer.emit(Capture())
     assert observer.drops["emission"] == 1
     output = capsys.readouterr().out
     assert output == "LIFECYCLE_DIAGNOSTIC_INCOMPLETE emission\n"

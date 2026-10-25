@@ -35,9 +35,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
-from sqlalchemy.schema import CreateSchema, DropSchema
+from sqlalchemy.schema import CreateSchema, DropSchema, Sequence
 from sqlalchemy.sql.dml import Delete, Insert, Update
-from sqlalchemy.sql.selectable import Select
+from sqlalchemy.sql.selectable import Select, TableClause
+from sqlalchemy.sql.elements import ClauseElement, quoted_name
 
 from packages.core.config import settings
 from packages.core.models import (
@@ -64,6 +65,7 @@ from packages.ml.lifecycle import (
     Lifecycle,
     LeaseLost,
     LifecycleUnavailable,
+    PublicationResult,
     invalidate_lifecycle,
 )
 from packages.ml.safe_persistence import publish_signed_artifact, verify_signed_artifact
@@ -89,6 +91,27 @@ class _Investigation:
     ARENA_BYTES = 4 * 1024 * 1024
     RESERVE_BYTES = 16 * 1024
     ALIAS_LIMITS = {"engine": 128, "connection": 256, "task": 256, "operation": 128}
+    # Non-borrowing lanes: 51 * (72 credits / 80 KiB) + session (16 / 16 KiB).
+    LANES = {
+        "candidate": (8, 12 * 1024),
+        "incumbent": (8, 12 * 1024),
+        "inputs": (4, 8 * 1024),
+        "logging": (12, 16 * 1024),
+        "sequence": (12, 16 * 1024),
+        "batch": (12, 8 * 1024),
+        "boundary": (16, 8 * 1024),
+    }
+    SELECTION_KEYS = (
+        "routine_filtered",
+        "classification_uncertain",
+        "correlation_unknown",
+        "relevance_overflow",
+        "relevance_ambiguous",
+        "relevance_unassociated",
+        "retired_without_terminal",
+        "owner_unknown",
+        "saturated",
+    )
     REASONS = (
         "events",
         "arena",
@@ -129,6 +152,7 @@ class _Investigation:
         self.node = 0
         self.stage = "session"
         self.operation = ContextVar("lifecycle-investigation-operation", default=0)
+        self.scope = ContextVar("lifecycle-investigation-scope", default=None)
         self.active = 0
         self.listeners = []
         self.wrappers = []
@@ -139,6 +163,40 @@ class _Investigation:
         self.source = {}
         self.origins = {}
         self.pending_bytes = b'{"state":"UNKNOWN"}'
+        # Each lane stores retained count, encoded bytes, and capacity losses.
+        self.lanes = [[[0, 0, 0] for _ in self.LANES] for _ in range(52)]
+        self.selection = dict.fromkeys(self.SELECTION_KEYS, 0)
+        self.relevance = {}
+
+    def selected(self, key):
+        if self.selection[key] == 2**31 - 1:
+            self.selection["saturated"] = 1
+        else:
+            self.selection[key] += 1
+
+    def context(self):
+        scope = self.scope.get()
+        return scope if scope is not None and scope["live"] else None
+
+    def lane(self, event, scope, category, owner):
+        owner = scope["owner"] if owner is None and scope is not None else owner
+        owner = self.node if owner is None else owner
+        if type(owner) is not int or not 1 <= owner <= 51:
+            if owner != 0:
+                self.selected("owner_unknown")
+            owner = 0
+        if category is None:
+            if event.startswith("publish_") or event == "inputs_returned":
+                category = scope["role"] if scope is not None else "inputs"
+                if category not in ("candidate", "incumbent"):
+                    category = "inputs"
+            elif event.startswith("batch_"):
+                category = "batch"
+            else:
+                category = "boundary"
+        index = tuple(self.LANES).index(category) if owner else 0
+        limits = self.LANES[category] if owner else (16, 16 * 1024)
+        return owner, self.lanes[owner][index], limits
 
     def gap(self, reason):
         # Fixed keys and saturating counters also bound fault paths.
@@ -199,18 +257,36 @@ class _Investigation:
             del frame
         return result
 
-    def record(self, event, detail=None):
+    def record(self, event, detail=None, *, category=None, owner=None, association=None):
         """Detail producers run only after capacity reservation; never retain payloads."""
         try:
             if not self.reserve():
                 return
+            scope = self.scope.get()
+            metadata = scope if scope is not None else association
+            if scope is None and association is not None and association["ambiguous"]:
+                # Preserve its budget owner, not an invented operation attribution.
+                metadata = None
+            owner, lane, limits = self.lane(event, metadata, category, owner)
+            if lane[0] >= limits[0] or lane[1] + self.EVENT_BYTES > limits[1]:
+                if lane[2] == 2**31 - 1:
+                    self.selection["saturated"] = 1
+                lane[2] = min(lane[2] + 1, 2**31 - 1)
+                self.gap("events" if lane[0] >= limits[0] else "arena")
+                return
+            operation = self.operation.get() if scope is None or scope["live"] else 0
             record = {
                 "event": event,
                 "node": self.node,
                 "stage": self.enum(self.stage, self.STAGES),
                 "task": self.task(),
-                "operation": self.operation.get(),
-                "operation_origin": self.origins.get(self.operation.get(), 0),
+                "operation": operation,
+                "operation_origin": metadata["entry"] if metadata is not None else 0,
+                "reservation_owner_node": owner,
+                "wrapper_kind": metadata["kind"] if metadata is not None else "UNKNOWN",
+                "publication_role": metadata["role"] if metadata is not None else "UNKNOWN",
+                "correlation": "known" if operation else "UNKNOWN",
+                "scope_live": scope is not None and scope["live"],
                 "operation_origin_kind": "wrapper_entry",
                 "batch_admission_origin": "UNKNOWN",
                 "task_origin": "UNKNOWN",
@@ -225,6 +301,8 @@ class _Investigation:
                 return
             self.events.append(encoded)
             self.bytes += len(encoded)
+            lane[0] += 1
+            lane[1] += len(encoded)
         except BaseException:
             self.gap("serialization")
 
@@ -380,9 +458,22 @@ class _Investigation:
         @wraps(original, updated=())
         async def observed(*args, **kwargs):
             token = None
+            parent = self.scope.get()
+            scope = {
+                "kind": self.enum(role, ("publish", "batch")),
+                "role": self.enum(kwargs.get("role", "candidate"), ("candidate", "incumbent"))
+                if role == "publish"
+                else "UNKNOWN",
+                "entry": self.node,
+                # Even an expired copied scope must never steal the current node's lane.
+                "owner": parent["owner"] if parent is not None else self.node,
+                "live": True,
+            }
+            scope_token = self.scope.set(scope)
             try:
                 if self.next_alias["operation"] >= self.ALIAS_LIMITS["operation"]:
                     self.gap("aliases")
+                    self.selected("correlation_unknown")
                     number = 0
                 else:
                     self.next_alias["operation"] += 1
@@ -420,9 +511,19 @@ class _Investigation:
                 self.record(role + "_failed", lambda error=exc: self.failure(error))
                 raise
             else:
-                self.record(role + "_returned")
+                self.record(
+                    role + "_returned",
+                    (lambda: self.publication(result)) if role == "publish" else None,
+                )
                 return result
             finally:
+                scope["live"] = False
+                try:
+                    self.retire_scope(scope)
+                except BaseException:
+                    self.gap("restore")
+                finally:
+                    self.scope.reset(scope_token)
                 try:
                     if token is not None:
                         self.active -= 1
@@ -432,6 +533,29 @@ class _Investigation:
 
         self.wrappers.append((owner, name, original, observed))
         setattr(owner, name, observed)
+
+    @staticmethod
+    def publication(result):
+        if type(result) is not PublicationResult:
+            return {"publication_result": "UNKNOWN"}
+        return {
+            "publication_result": "known",
+            "committed": result.committed if type(result.committed) is bool else "UNKNOWN",
+            "readback": result.readback if type(result.readback) is bool else "UNKNOWN",
+            "revision_present": result.revision is not None,
+            "reason": _Investigation.enum(
+                result.reason,
+                (
+                    "indoor_scope_unavailable",
+                    "indoor_dependency_scope_mismatch",
+                    "demand_scope_mismatch",
+                    "publication_conflict",
+                    "committed",
+                    "readback_failed",
+                    "lease_lost",
+                ),
+            ),
+        }
 
     @staticmethod
     def failure(error):
@@ -447,8 +571,7 @@ class _Investigation:
                 }.get(arguments[0], "UNKNOWN")
         return {"failure_class": reason}
 
-    @staticmethod
-    def target(context, statement):
+    def target(self, context, statement):
         compiled = context.compiled if context is not None else None
         clause = compiled.statement if compiled is not None else None
         operation = "UNKNOWN"
@@ -462,7 +585,7 @@ class _Investigation:
             table = clause.table
         elif isinstance(clause, Select):
             operation = "select"
-        if table is not None:
+        if isinstance(table, TableClause):
             name = "app_logs" if table.name == "app_logs" else "OTHER"
             schema = (
                 "public"
@@ -471,23 +594,222 @@ class _Investigation:
             )
         else:
             name, schema = "UNKNOWN", "UNKNOWN"
-            # Never stringify a statement. Recognition is bounded and no text is retained.
-            if type(statement) is str:
-                prefix = statement[:2048]
-                match = re.match(
-                    r"^\s*(INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+"
-                    r'(?:(public)\.)?("?app_logs"?)(?=[\s(]|$)',
-                    prefix,
-                    re.IGNORECASE,
-                )
-                if match:
-                    operation = {
-                        "INSERT INTO": "insert",
-                        "DELETE FROM": "delete",
-                        "UPDATE": "update",
-                    }.get(" ".join(match[1].upper().split()), "UNKNOWN")
-                    name = "app_logs"
-                    schema = "public" if match[2] else "UNQUALIFIED"
+        sequence = False
+        if clause is not None and not isinstance(clause, ClauseElement):
+            self.selected("classification_uncertain")
+        # Trusted SQLAlchemy nodes only; fixed width/depth, no compilation or SQL.
+        if isinstance(clause, ClauseElement):
+            todo = [clause]
+            seen = set()
+            for _ in range(64):
+                if not todo:
+                    break
+                current = todo.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                if type(current).__module__.startswith("sqlalchemy."):
+                    # Expression/alias names are not relation provenance. Follow
+                    # their children to real tables or Sequence/next_value nodes.
+                    current_name = (
+                        current.name if isinstance(current, (TableClause, Sequence)) else None
+                    )
+                    if type(current_name) in (str, quoted_name) and current_name in (
+                        "app_logs",
+                        "app_logs_id_seq",
+                    ):
+                        sequence |= current_name == "app_logs_id_seq"
+                        name = current_name
+                        current_schema = getattr(current, "schema", None)
+                        schema = (
+                            "public"
+                            if current_schema == "public"
+                            else ("UNQUALIFIED" if current_schema is None else "OTHER")
+                        )
+                    if type(current) is Sequence:
+                        continue
+                    children = iter(current.get_children())
+                    # SQLAlchemy next_value keeps its Sequence outside get_children().
+                    if (
+                        type(current).__module__ == "sqlalchemy.sql.functions"
+                        and type(current).__name__ == "next_value"
+                    ):
+                        todo.append(current.sequence)
+                    for _ in range(16):
+                        child = next(children, None)
+                        if child is None:
+                            break
+                        if len(todo) < 64:
+                            todo.append(child)
+                        else:
+                            self.selected("classification_uncertain")
+                    else:
+                        self.selected("classification_uncertain")
+                else:
+                    self.selected("classification_uncertain")
+            if todo:
+                self.selected("classification_uncertain")
+        # One bounded lexical pass: comment markers inside literals/identifiers
+        # must never hide subsequent SQL. Tokens are transient, never emitted.
+        if type(statement) is str:
+            if len(statement) > 2048:
+                self.selected("classification_uncertain")
+            prefix = statement[:2048]
+            tokens = []
+            index = 0
+            while index < len(prefix):
+                char = prefix[index]
+                if char.isspace():
+                    index += 1
+                elif prefix.startswith("--", index):
+                    index += 2
+                    while index < len(prefix) and prefix[index] not in "\r\n":
+                        index += 1
+                elif prefix.startswith("/*", index):
+                    depth = 1
+                    index += 2
+                    while index < len(prefix) and depth:
+                        if prefix.startswith("/*", index):
+                            depth += 1
+                            index += 2
+                        elif prefix.startswith("*/", index):
+                            depth -= 1
+                            index += 2
+                        else:
+                            index += 1
+                    if depth:
+                        self.selected("classification_uncertain")
+                elif char in ("'", '"'):
+                    quote = char
+                    # E strings have escapes; ordinary PostgreSQL strings do not.
+                    escaped = (
+                        quote == "'"
+                        and index > 0
+                        and prefix[index - 1] in "eE"
+                        and (
+                            index < 2
+                            or not (prefix[index - 2].isalnum() or prefix[index - 2] in "_$")
+                        )
+                    )
+                    if escaped and tokens and tokens[-1] == ("word", "e"):
+                        tokens.pop()
+                    value = []
+                    index += 1
+                    closed = False
+                    while index < len(prefix):
+                        char = prefix[index]
+                        index += 1
+                        if char == quote:
+                            if index < len(prefix) and prefix[index] == quote:
+                                value.append(quote)
+                                index += 1
+                            else:
+                                closed = True
+                                break
+                        elif escaped and char == "\\":
+                            # Correctly skip escaped delimiters without claiming
+                            # to decode PostgreSQL octal/Unicode/regclass values.
+                            self.selected("classification_uncertain")
+                            if index < len(prefix):
+                                index += 1
+                            value.append("?")
+                        else:
+                            value.append(char)
+                    if not closed:
+                        self.selected("classification_uncertain")
+                        break
+                    if len(tokens) >= 2 and tokens[-2:] == [("word", "u"), ("symbol", "&")]:
+                        self.selected("classification_uncertain")
+                        value = ["?"]
+                    tokens.append(("string" if quote == "'" else "identifier", "".join(value)))
+                elif char == "$":
+                    delimiter = re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$", prefix[index:])
+                    if delimiter is None:
+                        parameter = re.match(r"\$[0-9]+", prefix[index:])
+                        if parameter is None:
+                            self.selected("classification_uncertain")
+                            break
+                        tokens.append(("parameter", "?"))
+                        index += len(parameter[0])
+                    else:
+                        start = index + len(delimiter[0])
+                        end = prefix.find(delimiter[0], start)
+                        if end < 0:
+                            self.selected("classification_uncertain")
+                            break
+                        tokens.append(("string", prefix[start:end]))
+                        index = end + len(delimiter[0])
+                elif char.isascii() and (char.isalpha() or char == "_"):
+                    end = index + 1
+                    while (
+                        end < len(prefix)
+                        and prefix[end].isascii()
+                        and (prefix[end].isalnum() or prefix[end] in "_$")
+                    ):
+                        end += 1
+                    if end == len(prefix) and len(statement) > len(prefix):
+                        self.selected("classification_uncertain")
+                        break
+                    tokens.append(("word", prefix[index:end].lower()))
+                    index = end
+                else:
+                    if not char.isascii() or char in ("\\", "`", "[", "]"):
+                        self.selected("classification_uncertain")
+                        break
+                    tokens.append(("symbol", char))
+                    index += 1
+
+            for position, (kind, value) in enumerate(tokens):
+                if kind == "string":
+                    # Only explicit sequence-function arguments / regclass casts,
+                    # never arbitrary literals or result-column aliases.
+                    call = tokens[max(0, position - 2) : position]
+                    cast = tokens[position + 1 : position + 4]
+                    if (
+                        len(call) == 2
+                        and call[0][0] in ("word", "identifier")
+                        and call[0][1] in ("nextval", "currval", "setval")
+                        and call[1] == ("symbol", "(")
+                    ) or cast == [("symbol", ":"), ("symbol", ":"), ("word", "regclass")]:
+                        sequence |= bool(
+                            re.fullmatch(
+                                r'(?:(?:public|"public")\.)?(?:app_logs_id_seq|"app_logs_id_seq")',
+                                value,
+                            )
+                        )
+                if kind != "word":
+                    continue
+                offset = 1
+                if value == "insert" and tokens[position + 1 : position + 2] == [("word", "into")]:
+                    offset = 2
+                elif value not in ("from", "join", "update", "sequence"):
+                    continue
+                target = tokens[position + offset : position + offset + 3]
+                target_schema = "UNQUALIFIED"
+                if len(target) == 3 and target[1] == ("symbol", "."):
+                    target_schema = "public" if target[0][1] == "public" else "OTHER"
+                    target = target[2:]
+                if not target or target[0][0] not in ("word", "identifier"):
+                    continue
+                found = target[0][1]
+                if found not in ("app_logs", "app_logs_id_seq"):
+                    continue
+                sequence |= found == "app_logs_id_seq"
+                # Structural positives still take precedence over text.
+                if name not in ("app_logs", "app_logs_id_seq"):
+                    name, schema = found, target_schema
+                if operation == "UNKNOWN":
+                    operation = (
+                        value
+                        if value in ("insert", "update")
+                        else "delete"
+                        if tokens[max(0, position - 1) : position] == [("word", "delete")]
+                        else "select"
+                        if value in ("from", "join")
+                        else "alter"
+                        if tokens[max(0, position - 1) : position] == [("word", "alter")]
+                        else "UNKNOWN"
+                    )
         return {
             "sql_kind": operation,
             "declared_relation": name,
@@ -495,25 +817,114 @@ class _Investigation:
             # No connection-local dependency/search-path evidence is collected by SQL.
             "resolved_relation": "UNKNOWN",
             "sequence_consumer": "UNKNOWN",
+            "target_sequence": sequence,
         }
 
     def sql(self, label, connection, context=None, statement=None):
-        def detail():
-            result = self.target(context, statement)
-            result.update(
-                {
-                    "engine": self.alias("engine", connection.engine)
-                    if connection is not None
-                    else 0,
-                    "connection": self.alias("connection", connection),
-                    "backend": "UNKNOWN",
-                    "factory": "UNKNOWN",
-                    "stack": self.stack(),
-                }
-            )
-            return result
+        try:
+            if self.closed:
+                return
+            if threading.get_ident() != self.thread:
+                self.gap("thread")
+                return
+            scope = self.context()
+            origin = self.scope.get()
+            association = self.connection_relevance(connection)
+            terminal = label in ("commit_notified", "rollback_notified")
+            try:
+                if terminal:
+                    if scope is None and association is None:
+                        self.selected("relevance_unassociated")
+                        return
+                    result = self.target(None, None)
+                    category = association["category"] if association is not None else "logging"
+                else:
+                    result = self.target(context, statement)
+                    category = "sequence" if result["target_sequence"] else "logging"
+                    if not result["target_sequence"] and result["declared_relation"] != "app_logs":
+                        if scope is None or scope["kind"] != "batch":
+                            self.selected("routine_filtered")
+                            return
+                    # Admission is independent of event retention and alias availability.
+                    association = self.admit(connection, origin, category)
 
-        self.record(label, detail)
+                def detail():
+                    result.update(
+                        {
+                            "engine": self.alias("engine", connection.engine)
+                            if connection is not None
+                            else 0,
+                            "connection": self.alias("connection", connection),
+                            "backend": "UNKNOWN",
+                            "factory": "UNKNOWN",
+                            "stack": self.stack(),
+                            "association": "ambiguous"
+                            if association is not None and association["ambiguous"]
+                            else "UNKNOWN",
+                        }
+                    )
+                    return result
+
+                self.record(
+                    label,
+                    detail,
+                    category=category,
+                    owner=origin["owner"]
+                    if origin is not None
+                    else (association["owner"] if association is not None else self.node),
+                    association=association,
+                )
+            finally:
+                if terminal and connection is not None:
+                    self.relevance.pop(id(connection), None)
+        except BaseException:
+            self.gap("serialization")
+
+    def connection_relevance(self, connection):
+        entry = self.relevance.get(id(connection))
+        return entry if entry is not None and entry["ref"]() is connection else None
+
+    def admit(self, connection, scope, category):
+        if connection is None:
+            return None
+        entry = self.connection_relevance(connection)
+        owner = scope["owner"] if scope is not None else self.node
+        if entry is not None:
+            if entry["scope"] is not scope or entry["owner"] != owner:
+                if not entry["ambiguous"]:
+                    self.selected("relevance_ambiguous")
+                entry["ambiguous"] = True
+            return entry
+        # Bounded dead-reference sweep; never evict a live owner at a node boundary.
+        for key, value in tuple(self.relevance.items()):
+            if value["ref"]() is None:
+                self.relevance.pop(key, None)
+        if len(self.relevance) >= 256:
+            self.selected("relevance_overflow")
+            return None
+        try:
+            reference = weakref.ref(connection)
+        except TypeError:
+            self.selected("relevance_unassociated")
+            return None
+        entry = {
+            "ref": reference,
+            "owner": owner,
+            "entry": scope["entry"] if scope else 0,
+            "kind": scope["kind"] if scope else "UNKNOWN",
+            "role": scope["role"] if scope else "UNKNOWN",
+            "scope": scope,
+            "category": category,
+            "ambiguous": False,
+        }
+        self.relevance[id(connection)] = entry
+        return entry
+
+    def retire_scope(self, scope):
+        for key, entry in tuple(self.relevance.items()):
+            if entry["scope"] is scope:
+                self.selected("retired_without_terminal")
+                self.relevance.pop(key, None)
 
     def install_events(self):
         def before(connection, cursor, statement, parameters, context, executemany):
@@ -632,6 +1043,28 @@ class _Investigation:
                         ],
                         "pending_operations": self.active,
                         "pending": json.loads(self.pending_bytes),
+                        "selection": {
+                            "policy": "origin-lanes-v2",
+                            "limits": self.LANES,
+                            "session": [16, 16384],
+                            "credits": 3688,
+                            "arena": self.ARENA_BYTES,
+                            "counters": self.selection,
+                            "totals": [
+                                [
+                                    sum(lanes[index][0] for lanes in self.lanes[1:]),
+                                    sum(lanes[index][1] for lanes in self.lanes[1:]),
+                                ]
+                                for index in range(len(self.LANES))
+                            ],
+                            # Fixed-size sparse loss matrix; no operation histories.
+                            "losses": [
+                                [node, index, lane[2]]
+                                for node, lanes in enumerate(self.lanes)
+                                for index, lane in enumerate(lanes)
+                                if lane[2]
+                            ],
+                        },
                     }
                     header_text = json.dumps(header, sort_keys=True) + "\n"
                     footer_text = json.dumps(footer, sort_keys=True) + "\n"
@@ -675,6 +1108,7 @@ class _Investigation:
             fallback()
 
     def restore(self):
+        self.relevance.clear()
         # Each removal/restoration is independent, including partial installation.
         for name, callback in self.listeners:
             try:
