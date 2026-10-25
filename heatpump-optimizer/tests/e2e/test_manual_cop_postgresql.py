@@ -5296,20 +5296,27 @@ class TestManualCOPPostgreSQLMigration:
                 )
                 plan_id = (
                     await connection.execute(
-                        insert(PlanRecord)
-                        .values(
-                            created_at=stamp,
-                            horizon_start=stamp,
-                            horizon_end=stamp + dt.timedelta(days=1),
-                            plan_json='{"fixture":true}',
-                            optimizer_version="rules_v8",
-                            input_provenance_json='{"cop_source":"assumed_planning_curve"}',
-                            price_currency="SEK",
-                            price_source="manual",
-                            cost_estimate_eur=12.5,
-                            status="superseded",
-                        )
-                        .returning(PlanRecord.id)
+                        # This is revision 031, not the current ORM schema. Explicit
+                        # columns prevent later Python-side defaults leaking into it.
+                        text(
+                            "INSERT INTO plans (created_at,horizon_start,horizon_end,plan_json,"
+                            "optimizer_version,input_provenance_json,price_currency,price_source,"
+                            "cost_estimate_eur,status) VALUES (:created_at,:horizon_start,"
+                            ":horizon_end,:plan_json,:optimizer_version,:input_provenance_json,"
+                            ":price_currency,:price_source,:cost_estimate_eur,:status) RETURNING id"
+                        ),
+                        {
+                            "created_at": stamp,
+                            "horizon_start": stamp,
+                            "horizon_end": stamp + dt.timedelta(days=1),
+                            "plan_json": '{"fixture":true}',
+                            "optimizer_version": "rules_v8",
+                            "input_provenance_json": '{"cop_source":"assumed_planning_curve"}',
+                            "price_currency": "SEK",
+                            "price_source": "manual",
+                            "cost_estimate_eur": 12.5,
+                            "status": "superseded",
+                        },
                     )
                 ).scalar_one()
                 action_id = (
