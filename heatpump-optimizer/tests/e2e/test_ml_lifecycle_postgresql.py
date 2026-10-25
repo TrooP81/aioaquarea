@@ -16,6 +16,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -259,14 +260,91 @@ async def _assert_local_sequence(connection, schema, sequence, table, column, *,
     assert ownership_bound is owned, "incorrect sequence ownership"
 
 
-async def _public_fixture_state(connection):
+def _diagnostic_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _public_fixture_components(state, content, bindings):
+    """Allowlisted observations only. Never serialize the raw acceptance state."""
+    result = {}
+    for name, value in state.items():
+        qualified = "public." + name.removeprefix("sequence:")
+        if value is None:
+            continue
+        if name.startswith("sequence:"):
+            oid, configuration, position, dependencies = value
+            result[qualified] = {
+                "kind": "sequence",
+                "oid": oid,
+                "configuration": _diagnostic_hash(configuration),
+                "value_state": _diagnostic_hash(position),
+                "dependencies": dependencies,
+            }
+        else:
+            oid, identity, rows, catalog, constraints, defaults = value
+            result[qualified] = {
+                "kind": "relation",
+                "oid": oid,
+                "count": rows[0],
+                "identity": _diagnostic_hash(identity),
+                "content": content[name],
+                "versions": rows[1],
+                "catalog": catalog,
+                "constraints": constraints,
+                "defaults": defaults,
+                "bindings": bindings[name],
+            }
+    return result
+
+
+def _public_fixture_delta(before, after):
+    changes = []
+    for name in sorted(before.keys() | after.keys()):
+        old, new = before.get(name), after.get(name)
+        if old == new:
+            continue
+        changes.append(
+            {
+                "object": name,
+                "change": "added" if old is None else "removed" if new is None else "changed",
+                "before_hash": _diagnostic_hash(old),
+                "after_hash": _diagnostic_hash(new),
+                "components": {
+                    key: {"before": (old or {}).get(key), "after": (new or {}).get(key)}
+                    for key in sorted((old or {}).keys() | (new or {}).keys())
+                    if (old or {}).get(key) != (new or {}).get(key)
+                },
+            }
+        )
+    return changes
+
+
+def _emit_public_diagnostic(phase, source, before, after, unchanged):
+    print(
+        json.dumps(
+            {
+                "probe": "public-fixture-drift",
+                "phase": phase,
+                "source": source,
+                "unchanged": unchanged,
+                "writer": "UNKNOWN",
+                "deltas": _public_fixture_delta(before, after),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+async def _public_fixture_state(connection, *, diagnostics=None, schema="public"):
     """Only identities/digests leave PostgreSQL; never log settings or payloads."""
     state = {}
+    content, bindings = {}, {}
+    quoted_schema = connection.dialect.identifier_preparer.quote_identifier(schema)
     for model in FIXTURE_MODELS:
         name = model.__tablename__
         oid = (
             await connection.execute(
-                text("SELECT to_regclass(:name)::oid"), {"name": f"public.{name}"}
+                text("SELECT to_regclass(:name)::oid"), {"name": f"{schema}.{name}"}
             )
         ).scalar_one()
         if oid is None:
@@ -276,9 +354,11 @@ async def _public_fixture_state(connection):
         rows = (
             await connection.execute(
                 text(
-                    "SELECT count(*), md5(coalesce(string_agg(digest, '' ORDER BY digest),'')) "
+                    "SELECT count(*), md5(coalesce(string_agg(digest, '' ORDER BY digest),'')), "
+                    "md5(coalesce(string_agg(content, '' ORDER BY content),'')) "
                     f"FROM (SELECT md5(row_to_json(r)::text || r.xmin::text || r.ctid::text) "
-                    f'AS digest FROM public."{name}" r) versions'
+                    f"AS digest, md5(row_to_json(r)::text) AS content "
+                    f'FROM {quoted_schema}."{name}" r) versions'
                 )
             )
         ).one()
@@ -318,21 +398,55 @@ async def _public_fixture_state(connection):
                 {"oid": oid},
             )
         ).one()
-        state[name] = (oid, tuple(identity), tuple(rows), catalog, constraints, defaults)
+        state[name] = (oid, tuple(identity), tuple(rows[:2]), catalog, constraints, defaults)
+        content[name] = rows[2]
+        # Structural identities only: no expressions, row JSON or SQL parameters.
+        references = (
+            await connection.execute(
+                text(
+                    "SELECT DISTINCT n.nspname,c.relname,c.oid FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid IN ("
+                    "SELECT confrelid FROM pg_constraint WHERE conrelid=:oid AND contype='f' "
+                    "UNION SELECT d.refobjid FROM pg_depend d JOIN pg_attrdef a "
+                    "ON d.classid='pg_attrdef'::regclass AND d.objid=a.oid "
+                    "WHERE a.adrelid=:oid AND d.refclassid='pg_class'::regclass "
+                    "UNION SELECT d.objid FROM pg_depend d "
+                    "WHERE d.refclassid='pg_class'::regclass AND d.refobjid=:oid "
+                    "AND d.classid='pg_class'::regclass AND d.deptype IN ('a','i')) "
+                    "ORDER BY n.nspname,c.relname,c.oid"
+                ),
+                {"oid": oid},
+            )
+        ).all()
+        resolved = (
+            await connection.execute(text("SELECT to_regclass(:name)::oid"), {"name": name})
+        ).scalar_one()
+        bindings[name] = {
+            "qualified": f"{schema}.{name}",
+            "local_oid": oid,
+            "resolved_oid": resolved,
+            "references": [
+                {"qualified": f"{namespace}.{relation}", "oid": reference}
+                for namespace, relation, reference in references
+            ],
+        }
     sequences = (
         await connection.execute(
             text(
                 "SELECT c.oid, c.relname, row_to_json(s)::text FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_sequence s "
-                "ON s.seqrelid=c.oid WHERE n.nspname='public' ORDER BY c.relname"
-            )
+                "ON s.seqrelid=c.oid WHERE n.nspname=:schema ORDER BY c.relname"
+            ),
+            {"schema": schema},
         )
     ).all()
     for oid, name, configuration in sequences:
         # Identifier quoting from the dialect, not values from settings.
         quoted = connection.dialect.identifier_preparer.quote_identifier(name)
         value = (
-            await connection.execute(text(f"SELECT last_value,is_called FROM public.{quoted}"))
+            await connection.execute(
+                text(f"SELECT last_value,is_called FROM {quoted_schema}.{quoted}")
+            )
         ).one()
         dependencies = (
             await connection.execute(
@@ -347,6 +461,11 @@ async def _public_fixture_state(connection):
             )
         ).scalar_one()
         state["sequence:" + name] = (oid, configuration, tuple(value), dependencies)
+    if diagnostics is not None:
+        components = _public_fixture_components(state, content, bindings)
+        diagnostics.update(
+            {key.replace("public.", schema + ".", 1): value for key, value in components.items()}
+        )
     return state
 
 
@@ -366,6 +485,113 @@ def _source_receipt(receipt, environment=None):
         proof["digest"],
     ), "ownership/source mismatch"
     return {"commit": proof["commit"], "source_manifest_sha256": proof["digest"]}
+
+
+async def _cleanup_lifecycle_storage(
+    *,
+    engine,
+    control,
+    schema,
+    created,
+    retained,
+    public_baseline,
+    diagnostic_baseline,
+    source,
+    emit_receipt,
+):
+    """Every cleanup obligation is independent, including when diagnostics fail."""
+    state = {
+        "schema_removed": False,
+        "public_manual_storage_unchanged": False,
+        "public_fixture_storage_unchanged": False,
+    }
+    observations = {}
+
+    async def compare(phase):
+        diagnostics = {}
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            manual = await retained_storage_state(connection) == retained
+            unchanged = (
+                await _public_fixture_state(connection, diagnostics=diagnostics) == public_baseline
+            )
+        # Record acceptance before attempting potentially failing serialization.
+        observations[phase] = (manual, unchanged)
+        state["public_manual_storage_unchanged"] = (
+            all(value[0] for value in observations.values()) and len(observations) == 2
+        )
+        state["public_fixture_storage_unchanged"] = (
+            all(value[1] for value in observations.values()) and len(observations) == 2
+        )
+        _emit_public_diagnostic(phase, source, diagnostic_baseline, diagnostics, unchanged)
+
+    async def drop():
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            await connection.execute(DropSchema(schema, cascade=True))
+
+    async def verify_absence():
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            state["schema_removed"] = (
+                await connection.execute(
+                    text("SELECT to_regnamespace(:schema)"), {"schema": schema}
+                )
+            ).scalar_one() is None
+
+    async def receipt():
+        emit_receipt(state)
+
+    async def check():
+        if created:
+            public_unchanged = state["public_manual_storage_unchanged"]
+            fixture_public_unchanged = state["public_fixture_storage_unchanged"]
+            removed = state["schema_removed"]
+            assert public_unchanged, "public manual storage drift"
+            assert fixture_public_unchanged, "public fixture storage/sequence drift"
+            assert removed, "owned fixture schema remains"
+
+    stages = []
+    if created:
+        stages.extend(
+            [
+                ("pre-drop", lambda: compare("pre-drop")),
+                ("drop", drop),
+                ("absence", verify_absence),
+                ("post-drop", lambda: compare("post-drop")),
+            ]
+        )
+    stages.extend(
+        [
+            ("engine-dispose", engine.dispose),
+            ("control-dispose", control.dispose),
+            ("receipt", receipt),
+            ("acceptance", check),
+        ]
+    )
+    failures, failed_stages = [], []
+    for phase, action in stages:
+        try:
+            await action()
+        except BaseException as exc:
+            failures.append(exc)
+            failed_stages.append(phase)
+            try:
+                print(
+                    json.dumps(
+                        {
+                            "probe": "public-fixture-drift-error",
+                            "phase": phase,
+                            "source": source,
+                            "exception": type(exc).__name__,
+                            "writer": "UNKNOWN",
+                        }
+                    )
+                )
+            except BaseException as diagnostic_error:
+                failures.append(diagnostic_error)
+    if failures:
+        raise BaseExceptionGroup("fixture cleanup failed: " + ", ".join(failed_stages), failures)
 
 
 @pytest_asyncio.fixture
@@ -388,11 +614,10 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
     )
     started = dt.datetime.now(dt.timezone.utc)
     created = False
-    removed = False
-    public_unchanged = False
-    fixture_public_unchanged = False
     ownership_checked = False
     public_baseline = None
+    diagnostic_baseline = {}
+    retained = None
     with owned_test_network():
         try:
             async with control.begin() as connection:
@@ -403,7 +628,22 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     await connection.execute(text("SELECT version_num FROM public.alembic_version"))
                 ).scalar_one() == head
                 retained = await retained_storage_state(connection)
-                public_baseline = await _public_fixture_state(connection)
+                public_baseline = await _public_fixture_state(
+                    connection, diagnostics=diagnostic_baseline
+                )
+            async with control.begin() as connection:
+                await guard_owned_database(connection)
+                immediate = {}
+                stable = (
+                    await _public_fixture_state(connection, diagnostics=immediate)
+                    == public_baseline
+                )
+            _emit_public_diagnostic(
+                "baseline-repeat", source, diagnostic_baseline, immediate, stable
+            )
+            assert stable, "public fixture baseline unstable"
+            async with control.begin() as connection:
+                await guard_owned_database(connection)
                 await connection.execute(CreateSchema(schema))
             created = True
             async with engine.begin() as connection:
@@ -440,40 +680,8 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                 schema=schema,
             )
         finally:
-            try:
-                await engine.dispose()
-                if created:
-                    try:
-                        async with control.begin() as connection:
-                            await guard_owned_database(connection)
-                            public_unchanged = await retained_storage_state(connection) == retained
-                            fixture_public_unchanged = (
-                                await _public_fixture_state(connection) == public_baseline
-                            )
-                    finally:
-                        # A comparison/query failure cannot prevent owned-schema cleanup.
-                        async with control.begin() as connection:
-                            await guard_owned_database(connection)
-                            await connection.execute(DropSchema(schema, cascade=True))
-                        async with control.begin() as connection:
-                            removed = (
-                                await connection.execute(
-                                    text("SELECT to_regnamespace(:schema)"), {"schema": schema}
-                                )
-                            ).scalar_one() is None
-                            after = await _public_fixture_state(connection)
-                            fixture_public_unchanged = (
-                                fixture_public_unchanged and after == public_baseline
-                            )
-                            public_unchanged = (
-                                await retained_storage_state(connection) == retained
-                                and public_unchanged
-                            )
-                    assert public_unchanged, "public manual storage drift"
-                    assert fixture_public_unchanged, "public fixture storage/sequence drift"
-                    assert removed, "owned fixture schema remains"
-            finally:
-                await control.dispose()
+
+            def emit_receipt(state):
                 write_lifecycle_receipt(
                     root / "evidence",
                     {
@@ -484,12 +692,22 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         "started_at": started.isoformat(),
                         "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                         "schema_owned": created,
-                        "schema_removed": removed,
-                        "public_manual_storage_unchanged": public_unchanged,
                         "fixture_storage_ownership_checked": ownership_checked,
-                        "public_fixture_storage_unchanged": fixture_public_unchanged,
+                        **state,
                     },
                 )
+
+            await _cleanup_lifecycle_storage(
+                engine=engine,
+                control=control,
+                schema=schema,
+                created=created,
+                retained=retained,
+                public_baseline=public_baseline,
+                diagnostic_baseline=diagnostic_baseline,
+                source=source,
+                emit_receipt=emit_receipt,
+            )
 
 
 async def _readiness_source_fixture(database, monkeypatch):
@@ -1652,6 +1870,35 @@ async def test_R06_family_identity_survives_queue_transitions_and_claim(lifecycl
         ).scalar_one() == 0
 
 
+async def _initialize_thermal_installation(database):
+    """Opt-in prerequisite only; callers must already have proved local storage."""
+    installation_id, house_id = uuid.uuid4(), uuid.uuid4()
+    async with database.sessions() as session:
+        assert await session.get(HouseInstallationRecord, 1) is None
+        session.add(
+            HouseInstallationRecord(
+                singleton_id=1,
+                installation_id=installation_id,
+                house_id=house_id,
+                demand_dependency_generation=1,
+                indoor_dependency_generation=1,
+                current_revision_id=None,
+            )
+        )
+        await session.flush()
+        await session.refresh(await session.get(HouseInstallationRecord, 1))
+        row = await session.get(HouseInstallationRecord, 1)
+        assert row is not None
+        assert (row.installation_id, row.house_id) == (installation_id, house_id)
+        assert (row.demand_dependency_generation, row.indoor_dependency_generation) == (1, 1)
+        assert row.current_revision_id is None
+    async with database.sessions() as session:
+        row = await session.get(HouseInstallationRecord, 1)
+        assert row is not None and row.installation_id == installation_id
+        assert row.house_id == house_id and row.current_revision_id is None
+        assert (row.demand_dependency_generation, row.indoor_dependency_generation) == (1, 1)
+
+
 async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong_skill=False):
     from unittest.mock import AsyncMock
     from packages.core import settings_service
@@ -1665,10 +1912,17 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
     from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute
 
     async with database.engine.begin() as connection:
-        for model in (ConsumptionRecord, IndoorTempReading, PriceRecord, WeatherRecord):
+        for model in (
+            ConsumptionRecord,
+            IndoorTempReading,
+            PriceRecord,
+            WeatherRecord,
+            HouseInstallationRecord,
+        ):
             await connection.run_sync(
                 lambda current, table=model.__table__: _require_local_table(current, table)
             )
+    await _initialize_thermal_installation(database)
     async with database.sessions() as session:
         current = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     frozen_at = current - dt.timedelta(hours=360)
@@ -1817,9 +2071,11 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
             source_counts=source_counts,
         )
     except BaseException:
-        if owner is not None:
-            await owner.close()
-        await database.lifecycle.release(lease)
+        try:
+            if owner is not None:
+                await owner.close()
+        finally:
+            await database.lifecycle.release(lease)
         raise
 
 
@@ -1828,13 +2084,27 @@ def _thermal_native_snapshot(route, issued, capability):
 
     inputs = TestR06ThermalQualificationRoute.native_inputs(issued)
     frozen = route.fitted["inputs"]
+    assert capability in frozen["capabilities"] and capability.startswith("indoor_")
+    for key in (
+        "installation_id",
+        "indoor_dependency_generation",
+        "configured_sensor_ids",
+        "reference_sensor_id",
+        "sensor_basis",
+        "native_settings",
+        "schemas",
+        "capabilities",
+        "device_id",
+        "weather_provider",
+        "timezone",
+    ):
+        inputs[key] = deepcopy(frozen[key])
+    if "tzdata_version" in frozen:
+        inputs["tzdata_version"] = deepcopy(frozen["tzdata_version"])
     inputs.update(
         {
             "capability": capability,
-            "sensor_basis": frozen["sensor_basis"],
-            "native_settings": frozen["native_settings"],
-            "schemas": frozen["schemas"],
-            "timer": {**frozen["timer"], "fetched_at": issued.isoformat()},
+            "timer": {**deepcopy(frozen["timer"]), "fetched_at": issued.isoformat()},
         }
     )
     active = capability == "indoor_heating"

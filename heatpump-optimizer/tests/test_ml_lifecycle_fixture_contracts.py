@@ -4,7 +4,10 @@ from pathlib import Path
 import ast
 import asyncio
 from contextlib import asynccontextmanager
+from copy import deepcopy
+import datetime as dt
 import importlib
+import json
 import pickle
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -342,21 +345,376 @@ async def test_full_catalog_check_rejects_nonlocal_relations_and_fk_targets(fixt
 
 def test_public_comparison_failure_cannot_bypass_schema_drop():
     node = _function("lifecycle_database")
-    comparisons = [
-        part
-        for part in ast.walk(node)
-        if isinstance(part, ast.Try)
-        and any("fixture_public_unchanged =" in ast.unparse(line) for line in part.body)
-        and any("DropSchema" in ast.unparse(line) for line in part.finalbody)
-    ]
-    assert comparisons
-    cleanup = ast.unparse(comparisons[-1])
-    assert cleanup.index("_public_fixture_state") < cleanup.index("finally:")
-    assert cleanup.index("DropSchema") < cleanup.rindex("_public_fixture_state")
+    cleanup = ast.unparse(_function("_cleanup_lifecycle_storage"))
+    assert "_cleanup_lifecycle_storage" in ast.unparse(node)
+    assert "('pre-drop', lambda: compare(" in cleanup
+    assert "('post-drop', lambda: compare(" in cleanup
+    assert cleanup.index("('drop', drop)") < cleanup.index("('absence', verify_absence)")
     assert cleanup.count("async with control.begin()") == 3
     assert "retained_storage_state" in cleanup
-    assert "await control.dispose()" in ast.unparse(node)
+    assert "('control-dispose', control.dispose)" in cleanup
     assert "fixture_storage_ownership_checked" in ast.unparse(node)
+
+
+def test_thermal_prerequisite_is_opt_in_after_locality_before_materialization():
+    source = SOURCE.read_text()
+    route = ast.unparse(_function("_thermal_route_owner"))
+    assert route.index("_require_local_table") < route.index("_initialize_thermal_installation")
+    assert route.index("_initialize_thermal_installation") < route.index("hook.materialize")
+    assert "HouseInstallationRecord" in route
+    assert source.count("await _initialize_thermal_installation(") == 1
+    initializer = ast.unparse(_function("_initialize_thermal_installation"))
+    for forbidden in ("set_settings_bulk", "ensure_current_contract", "_readiness_source_fixture"):
+        assert forbidden not in initializer
+
+
+@pytest.mark.asyncio
+async def test_nonlocal_thermal_table_prevents_initialization(fixtures, monkeypatch):
+    initialize = AsyncMock()
+    monkeypatch.setattr(fixtures, "_initialize_thermal_installation", initialize)
+
+    class Connection:
+        async def run_sync(self, callback):
+            callback(
+                SimpleNamespace(
+                    execute=lambda *args, **kwargs: SimpleNamespace(
+                        scalar_one=lambda: "owned", one=lambda: (10, 99)
+                    )
+                )
+            )
+
+    @asynccontextmanager
+    async def begin():
+        yield Connection()
+
+    with pytest.raises(AssertionError, match="nonlocal fixture table"):
+        await fixtures._thermal_route_owner(
+            SimpleNamespace(engine=SimpleNamespace(begin=begin)), monkeypatch
+        )
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "present", "insert", "readback", "committed-readback"])
+async def test_thermal_singleton_prerequisite_and_failures(fixtures, fault):
+    events, added = [], []
+    state = {"row": None}
+
+    class Session:
+        async def get(self, model, key):
+            assert model is fixtures.HouseInstallationRecord and key == 1
+            events.append("get")
+            if fault == "present" and not added:
+                return object()
+            if fault == "committed-readback" and "commit" in events:
+                return None
+            return state["row"]
+
+        def add(self, row):
+            events.append("add")
+            added.append(row)
+            state["row"] = row
+
+        async def flush(self):
+            events.append("flush")
+            if fault == "insert":
+                raise ValueError("insert failed")
+
+        async def refresh(self, row):
+            events.append("refresh")
+            if fault == "readback":
+                row.indoor_dependency_generation = 9
+
+    @asynccontextmanager
+    async def sessions():
+        try:
+            yield Session()
+            events.append("commit")
+        except BaseException:
+            events.append("rollback")
+            if "commit" not in events:
+                state["row"] = None
+            raise
+
+    call = fixtures._initialize_thermal_installation(SimpleNamespace(sessions=sessions))
+    if fault:
+        with pytest.raises(ValueError if fault == "insert" else AssertionError):
+            await call
+        assert "rollback" in events
+        if fault != "committed-readback":
+            assert state["row"] is None and "commit" not in events
+        else:
+            assert events.count("commit") == 1  # post-commit read failure is not hidden
+    else:
+        await call
+        assert len(added) == 1 and events.count("commit") == 2
+        row = added[0]
+        assert row.singleton_id == 1 and row.installation_id != row.house_id
+        assert row.current_revision_id is None
+        assert (row.demand_dependency_generation, row.indoor_dependency_generation) == (1, 1)
+        assert events.index("flush") < events.index("refresh") < events.index("commit")
+
+
+def _thermal_frozen_inputs():
+    from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute as route
+
+    inputs = route.native_inputs(route.NOW)
+    inputs.update(
+        installation_id="synthetic-installation",
+        indoor_dependency_generation=1,
+        capabilities=["indoor_heating", "indoor_cooling"],
+    )
+    return inputs
+
+
+@pytest.mark.parametrize("head", ["indoor_heating", "indoor_cooling"])
+def test_thermal_snapshot_real_freezing_scope_and_nested_copy(fixtures, head):
+    from packages.ml.forecast_quality import freeze_native_pair, native_scope
+
+    frozen = _thermal_frozen_inputs()
+    original = deepcopy(frozen)
+    issued = dt.datetime.fromisoformat(frozen["issued_at"]) + dt.timedelta(hours=2)
+    snapshot = fixtures._thermal_native_snapshot(
+        SimpleNamespace(fitted={"inputs": frozen}), issued, head
+    )
+    assert "scope" not in snapshot
+    assert snapshot["capabilities"] == ["indoor_heating", "indoor_cooling"]
+    assert native_scope(snapshot) == native_scope(frozen)
+
+    def predictor(snapshot, horizons):
+        return dict.fromkeys(horizons, 21.0)
+
+    pair = freeze_native_pair(
+        snapshot,
+        epoch="offline",
+        component="thermal",
+        candidate_hash="candidate",
+        incumbent_hash=None,
+        horizons=(15, 30, 60),
+        candidate_predictor=predictor,
+        incumbent_predictor=predictor,
+        baseline_predictor=predictor,
+    )
+    assert pair is not None
+    assert json.loads(pair.snapshot_json)["scope"] == native_scope(frozen)
+    snapshot["sensor_basis"]["sensor_ids"].append("mutated")
+    snapshot["native_settings"]["mutated"] = []
+    snapshot["schemas"]["artifact"] = "mutated"
+    snapshot["configured_sensor_ids"].append("mutated")
+    snapshot["capabilities"].clear()
+    snapshot["timer"]["slots"].append({"mutated": True})
+    assert frozen == original
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("installation_id", "other"),
+        ("indoor_dependency_generation", 2),
+        ("configured_sensor_ids", ["other"]),
+        ("reference_sensor_id", "other"),
+        ("sensor_basis", {"kind": "other"}),
+        ("native_settings", {"other": True}),
+        ("schemas", {"artifact": "other"}),
+        ("timer", {"status": "unknown"}),
+        ("capabilities", []),
+        ("capabilities", ["tank_cooling"]),
+    ],
+)
+@pytest.mark.parametrize("remove", [False, True])
+def test_thermal_scope_dependency_negative_sensitivity(fixtures, key, value, remove):
+    from packages.ml.forecast_quality import native_scope
+
+    original = _thermal_frozen_inputs()
+    changed = deepcopy(original)
+    if remove:
+        changed.pop(key)
+    else:
+        changed[key] = value
+    try:
+        scope = native_scope(changed)
+    except KeyError:
+        pass  # required dependency rejected, never manufactured
+    else:
+        assert scope != native_scope(original)
+    if key == "capabilities":
+        with pytest.raises((AssertionError, KeyError)):
+            fixtures._thermal_native_snapshot(
+                SimpleNamespace(fitted={"inputs": changed}),
+                dt.datetime.fromisoformat(original["issued_at"]),
+                "indoor_heating",
+            )
+
+
+def _fingerprint_fixture(fixtures):
+    raw = {
+        "settings": (10, (1, "r", 2, 3), (1, "versions"), "catalog", "fk", "defaults"),
+        "sequence:settings_id_seq": (20, "SECRET_CONFIGURATION", (1, True), "dependencies"),
+    }
+    return raw, fixtures._public_fixture_components(
+        raw, {"settings": "content"}, {"settings": {"local_oid": 10, "resolved_oid": 10}}
+    )
+
+
+@pytest.mark.parametrize(
+    "object_name,component",
+    [
+        ("public.settings", "content"),
+        ("public.settings", "versions"),
+        ("public.settings", "catalog"),
+        ("public.settings", "constraints"),
+        ("public.settings", "defaults"),
+        ("public.settings", "identity"),
+        ("public.settings", "bindings"),
+        ("public.settings_id_seq", "configuration"),
+        ("public.settings_id_seq", "value_state"),
+        ("public.settings_id_seq", "dependencies"),
+    ],
+)
+def test_named_public_drift_component_sensitivity(fixtures, capsys, object_name, component):
+    _, baseline = _fingerprint_fixture(fixtures)
+    changed = deepcopy(baseline)
+    changed[object_name][component] = "changed"
+    for phase in ("pre-drop", "post-drop"):
+        fixtures._emit_public_diagnostic(phase, {"commit": "offline"}, baseline, changed, False)
+        receipt = json.loads(capsys.readouterr().out)
+        assert receipt["phase"] == phase and receipt["writer"] == "UNKNOWN"
+        assert receipt["unchanged"] is False
+        (delta,) = receipt["deltas"]
+        assert delta["object"] == object_name and delta["change"] == "changed"
+        assert delta["components"].keys() == {component}
+        assert delta["before_hash"] != delta["after_hash"]
+
+
+def test_public_diagnostic_add_remove_stability_and_redaction(fixtures, capsys):
+    raw, baseline = _fingerprint_fixture(fixtures)
+    assert fixtures._public_fixture_delta(baseline, deepcopy(baseline)) == []
+    for old, new, classification in (({}, baseline, "added"), (baseline, {}, "removed")):
+        fixtures._emit_public_diagnostic("pre-drop", {}, old, new, False)
+        output = capsys.readouterr().out
+        assert "SECRET_CONFIGURATION" not in output
+        assert "row_payload" not in output
+        assert {delta["change"] for delta in json.loads(output)["deltas"]} == {classification}
+    version_changed = deepcopy(raw)
+    relation = list(version_changed["settings"])
+    relation[2] = (1, "reverted-write-versions")
+    version_changed["settings"] = tuple(relation)
+    assert version_changed != raw  # advisory equal content cannot excuse reverted writes
+    sequence_changed = deepcopy(raw)
+    sequence_changed["sequence:settings_id_seq"] = (20, "SECRET_CONFIGURATION", (2, True), "d")
+    assert sequence_changed != raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "query",
+        "post-query",
+        "serialization",
+        "drop",
+        "absence",
+        "engine",
+        "control",
+        "receipt",
+        "drift",
+        "post-drift",
+    ],
+)
+async def test_cleanup_attempts_all_obligations_without_swallowing(
+    fixtures, monkeypatch, capsys, fault
+):
+    events, transactions = [], []
+    serial = 0
+    source = {"commit": "offline"}
+    raw, components = _fingerprint_fixture(fixtures)
+
+    class Control:
+        @asynccontextmanager
+        async def begin(self):
+            nonlocal serial
+            serial += 1
+            transactions.append(serial)
+            yield SimpleNamespace(execute=execute, transaction=serial)
+
+        async def dispose(self):
+            events.append("control")
+            if fault == "control":
+                raise ValueError("SECRET_ERROR")
+
+    async def execute(statement, parameters=None):
+        if "DROP SCHEMA" in str(statement):
+            events.append("drop")
+            if fault == "drop":
+                raise ValueError("SECRET_ERROR")
+        else:
+            events.append("absence")
+            if fault == "absence":
+                raise ValueError("SECRET_ERROR")
+        return SimpleNamespace(scalar_one=lambda: None)
+
+    async def fingerprint(connection, *, diagnostics):
+        events.append("fingerprint")
+        if fault == "query" or (fault == "post-query" and connection.transaction == 4):
+            raise ValueError("SECRET_ERROR")
+        diagnostics.update(deepcopy(components))
+        if (fault == "drift" and connection.transaction == 1) or (
+            fault == "post-drift" and connection.transaction == 4
+        ):
+            return {}
+        return raw
+
+    async def dispose():
+        events.append("engine")
+        if fault == "engine":
+            raise ValueError("SECRET_ERROR")
+
+    def emit(state):
+        events.append("receipt")
+        assert state["schema_removed"] == (fault != "absence")
+        if fault in {"drift", "query", "post-query", "post-drift"}:
+            assert state["public_fixture_storage_unchanged"] is False
+        if fault == "receipt":
+            raise ValueError("SECRET_ERROR")
+
+    monkeypatch.setattr(fixtures, "guard_owned_database", AsyncMock())
+    monkeypatch.setattr(fixtures, "retained_storage_state", AsyncMock(return_value="retained"))
+    monkeypatch.setattr(fixtures, "_public_fixture_state", fingerprint)
+    if fault == "serialization":
+
+        def fail_serialization(*args, **kwargs):
+            raise TypeError("SECRET_ERROR")
+
+        monkeypatch.setattr(fixtures, "json", SimpleNamespace(dumps=fail_serialization))
+    call = fixtures._cleanup_lifecycle_storage(
+        engine=SimpleNamespace(dispose=dispose),
+        control=Control(),
+        schema="owned",
+        created=True,
+        retained="retained",
+        public_baseline=raw,
+        diagnostic_baseline=components,
+        source=source,
+        emit_receipt=emit,
+    )
+    if fault:
+        with pytest.raises(BaseExceptionGroup) as failure:
+            await call
+        assert failure.value.exceptions
+    else:
+        await call
+    assert events == [
+        "fingerprint",
+        "drop",
+        "absence",
+        "fingerprint",
+        "engine",
+        "control",
+        "receipt",
+    ]
+    assert transactions == [1, 2, 3, 4]
+    assert "SECRET_ERROR" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -562,7 +920,9 @@ async def test_public_state_observes_fresh_row_and_sequence_drift_without_writes
         if "SELECT to_regclass" in sql:
             return SimpleNamespace(scalar_one=lambda: 10)
         if "SELECT count(*)" in sql:
-            return SimpleNamespace(one=lambda: (1, state["row_version"]))
+            return SimpleNamespace(one=lambda: (1, state["row_version"], "content"))
+        if "SELECT DISTINCT n.nspname" in sql:
+            return SimpleNamespace(all=lambda: [("owned", "related", 42)])
         if "SELECT relnamespace" in sql:
             return SimpleNamespace(one=lambda: (2200, "r", 1, 10))
         if "JOIN pg_sequence" in sql:

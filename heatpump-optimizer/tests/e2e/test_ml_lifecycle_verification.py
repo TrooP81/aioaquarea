@@ -64,6 +64,7 @@ from tests.e2e.test_manual_cop_postgresql import (
 from tests.e2e.test_ml_lifecycle_postgresql import (
     _artifact,
     _owner,
+    _public_fixture_state,
     _run_migration,
     _source_receipt,
     lifecycle_database as lifecycle_database,
@@ -78,6 +79,56 @@ TABLES = (
     "ml_forecast_issues",
     "ml_forecast_outcomes",
 )
+
+
+async def test_owned_fingerprint_read_stability_reverted_write_and_sequence_rollback(
+    lifecycle_database,
+):
+    """Exercise the diagnostic primitive without intentionally writing public storage."""
+    database = lifecycle_database
+    schema = database.schema
+    quoted = database.engine.dialect.identifier_preparer.quote_identifier(schema)
+
+    async def observe():
+        components = {}
+        async with database.engine.begin() as connection:
+            state = await _public_fixture_state(connection, schema=schema, diagnostics=components)
+        return state, components
+
+    async with database.engine.begin() as connection:
+        await connection.execute(
+            text(f"INSERT INTO {quoted}.settings (key,value) VALUES (:key,:value)"),
+            {"key": "fingerprint-diagnostic-only", "value": "synthetic-not-logged"},
+        )
+    before, baseline = await observe()
+    repeated, repeat_components = await observe()
+    assert repeated == before and repeat_components == baseline
+    async with database.engine.begin() as connection:
+        await connection.execute(
+            text(f"UPDATE {quoted}.settings SET value=value WHERE key=:key"),
+            {"key": "fingerprint-diagnostic-only"},
+        )
+    changed, after = await observe()
+    relation = f"{schema}.settings"
+    assert changed != before
+    assert after[relation]["content"] == baseline[relation]["content"]
+    assert after[relation]["versions"] != baseline[relation]["versions"]
+    assert after[relation]["catalog"] == baseline[relation]["catalog"]
+    async with database.engine.connect() as connection:
+        transaction = await connection.begin()
+        try:
+            await connection.execute(
+                text("SELECT nextval(CAST(:sequence AS regclass))"),
+                {"sequence": f"{schema}.ml_lifecycle_token_seq"},
+            )
+        finally:
+            await transaction.rollback()
+    advanced, sequence_after = await observe()
+    sequence = f"{schema}.ml_lifecycle_token_seq"
+    assert advanced != changed
+    assert sequence_after[sequence]["value_state"] != after[sequence]["value_state"]
+    assert sequence_after[sequence]["configuration"] == after[sequence]["configuration"]
+    assert sequence_after[sequence]["dependencies"] == after[sequence]["dependencies"]
 
 
 async def _marker(engine):
