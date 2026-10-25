@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import dis
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import sys
+import threading
 import uuid
+import weakref
+from contextvars import ContextVar
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,11 +30,14 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import pytest
 import pytest_asyncio
-from sqlalchemy import Column, MetaData, Table, func, select, text, update
+from sqlalchemy import Column, MetaData, Table, event, func, select, text, update
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.selectable import Select
 
 from packages.core.config import settings
 from packages.core.models import (
@@ -70,6 +79,706 @@ from tests.e2e.test_manual_cop_postgresql import (
 )
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+
+class _Investigation:
+    """Passive, session-owned evidence. Never owns application work or transactions."""
+
+    EVENT_LIMIT = 4096
+    EVENT_BYTES = 2048
+    ARENA_BYTES = 4 * 1024 * 1024
+    RESERVE_BYTES = 16 * 1024
+    ALIAS_LIMITS = {"engine": 128, "connection": 256, "task": 256, "operation": 128}
+    REASONS = (
+        "events",
+        "arena",
+        "event_bytes",
+        "serialization",
+        "aliases",
+        "sensors",
+        "thread",
+        "profile",
+        "install",
+        "restore",
+        "ownership",
+        "emission",
+    )
+    STAGES = (
+        "session",
+        "node",
+        "node_end",
+        "baseline",
+        "call",
+        "pre-drop",
+        "drop",
+        "absence",
+        "post-drop",
+        "engine-dispose",
+        "control-dispose",
+        "receipt",
+        "acceptance",
+    )
+
+    def __init__(self):
+        self.events = []
+        self.bytes = 0
+        self.drops = dict.fromkeys(self.REASONS, 0)
+        self.aliases = {kind: {} for kind in self.ALIAS_LIMITS}
+        self.next_alias = dict.fromkeys(self.ALIAS_LIMITS, 0)
+        self.thread = threading.get_ident()
+        self.node = 0
+        self.stage = "session"
+        self.operation = ContextVar("lifecycle-investigation-operation", default=0)
+        self.active = 0
+        self.listeners = []
+        self.wrappers = []
+        self.profile = None
+        self.codes = {}
+        self.stack_codes = {}
+        self.closed = False
+        self.source = {}
+        self.origins = {}
+        self.pending_bytes = b'{"state":"UNKNOWN"}'
+
+    def gap(self, reason):
+        # Fixed keys and saturating counters also bound fault paths.
+        self.drops[reason] = min(self.drops[reason] + 1, 2**31 - 1)
+
+    def reserve(self):
+        if self.closed:
+            return False
+        if threading.get_ident() != self.thread:
+            self.gap("thread")
+            return False
+        if len(self.events) >= self.EVENT_LIMIT:
+            self.gap("events")
+            return False
+        if self.bytes + self.EVENT_BYTES > self.ARENA_BYTES:
+            self.gap("arena")
+            return False
+        return True
+
+    def alias(self, kind, value):
+        if value is None:
+            return 0
+        mapping = self.aliases[kind]
+        key = id(value)
+        previous = mapping.get(key)
+        if previous is not None and previous[0]() is value:
+            return previous[1]
+        if self.next_alias[kind] >= self.ALIAS_LIMITS[kind]:
+            self.gap("aliases")
+            return 0
+        number = self.next_alias[kind] + 1
+        # Only weak ownership: a completed task/closed connection is not kept alive.
+        mapping[key] = (weakref.ref(value), number)
+        self.next_alias[kind] = number
+        return number
+
+    def task(self):
+        try:
+            return self.alias("task", asyncio.current_task())
+        except RuntimeError:
+            return 0
+
+    def stack(self):
+        result = []
+        frame = sys._getframe(1)
+        try:
+            for _ in range(24):
+                if frame is None:
+                    break
+                code = frame.f_code
+                entry = self.stack_codes.get(id(code))
+                if entry is not None and entry[0] is code:
+                    result.append([entry[1], frame.f_lineno])
+                    if len(result) == 6:
+                        break
+                frame = frame.f_back
+        finally:
+            del frame
+        return result
+
+    def record(self, event, detail=None):
+        """Detail producers run only after capacity reservation; never retain payloads."""
+        try:
+            if not self.reserve():
+                return
+            record = {
+                "event": event,
+                "node": self.node,
+                "stage": self.enum(self.stage, self.STAGES),
+                "task": self.task(),
+                "operation": self.operation.get(),
+                "operation_origin": self.origins.get(self.operation.get(), 0),
+                "operation_origin_kind": "wrapper_entry",
+                "batch_admission_origin": "UNKNOWN",
+                "task_origin": "UNKNOWN",
+            }
+            if detail is not None:
+                record.update(detail())
+            encoded = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode(
+                "ascii"
+            )
+            if len(encoded) > self.EVENT_BYTES:
+                self.gap("event_bytes")
+                return
+            self.events.append(encoded)
+            self.bytes += len(encoded)
+        except BaseException:
+            self.gap("serialization")
+
+    @staticmethod
+    def enum(value, allowed):
+        return value if type(value) is str and len(value) <= 64 and value in allowed else "UNKNOWN"
+
+    @staticmethod
+    def count(value, limit):
+        return (
+            len(value) if type(value) in (list, tuple, set) and len(value) <= limit else "UNKNOWN"
+        )
+
+    @staticmethod
+    def loaded(row, key):
+        # Bypass mapped descriptors, including expired/unloaded attributes.
+        comfort = sys.modules.get("packages.ml.comfort_model")
+        observation = vars(comfort).get("_IndoorObservation") if comfort is not None else None
+        if type(row) not in (
+            DeviceStatusRecord,
+            IndoorTempReading,
+            SimpleNamespace,
+            HouseInstallationRecord,
+            observation,
+        ):
+            return None
+        values = object.__getattribute__(row, "__dict__")
+        return values.get(key) if type(values) is dict else None
+
+    def inputs(self, frame, result):
+        local = frame.f_locals
+        now = local.get("now")
+        values = local.get("values")
+        values = values if type(values) is dict else {}
+        component = self.enum(local.get("component"), ("cop", "demand", "comfort", "thermal"))
+        detail = {
+            "observer": self.codes[id(frame.f_code)][1],
+            "result": "none" if result is None else "present",
+            "component": component,
+            "clock": now.timestamp() if type(now) is dt.datetime else "UNKNOWN",
+            "status_count": self.count(local.get("statuses"), 1001),
+            "selected_count": self.count(local.get("selected_ids"), 64),
+            "sensor_count": self.count(local.get("sensor_ids"), 64),
+            "fresh_count": self.count(local.get("fresh_ids"), 64),
+            "reading_count": self.count(local.get("readings"), 5001),
+            "filtered_count": self.count(local.get("raw_indoor"), 5001),
+            "sensor_freshness_seconds": 900,
+            "indoor_available": (
+                local["indoor_available"]
+                if type(local.get("indoor_available")) is bool
+                else "NOT_REACHED"
+            ),
+            "reference_blocked": (
+                local["reference_blocked"]
+                if type(local.get("reference_blocked")) is bool
+                else "NOT_REACHED"
+            ),
+            "provider": self.enum(values.get("weather_provider"), ("open-meteo", "smhi")),
+            "timezone": self.enum(
+                values.get("timezone"), ("Europe/Amsterdam", "Europe/Stockholm", "UTC")
+            ),
+            "reference": self.enum(local.get("reference_sensor"), ("selected-room", "second-room")),
+            "selected_ids": [],
+            "installation": "UNKNOWN",
+            "capabilities": [],
+        }
+        capabilities = local.get("capabilities")
+        if type(capabilities) in (tuple, list) and len(capabilities) <= 8:
+            detail["capabilities"] = [
+                self.enum(item, ("indoor_heating", "indoor_cooling", "dhw"))
+                for item in capabilities
+            ]
+        for name in ("selected_ids", "sensor_ids", "fresh_ids"):
+            value = local.get(name)
+            if type(value) in (list, set, tuple) and len(value) > 64:
+                self.gap("sensors")
+            elif type(value) in (list, set, tuple):
+                detail[name + "_aliases"] = sorted(
+                    self.enum(item, ("selected-room", "second-room")) for item in value
+                )
+        for name in ("readings", "raw_indoor"):
+            value = local.get(name)
+            if type(value) is list and len(value) > 5001:
+                self.gap("sensors")
+        statuses = local.get("statuses")
+        if type(statuses) is list and statuses:
+            stamp = self.loaded(statuses[-1], "ts")
+            detail["latest_status_age"] = (
+                (now - stamp).total_seconds()
+                if type(now) is dt.datetime and type(stamp) is dt.datetime
+                else "UNKNOWN"
+            )
+        readings = local.get("readings")
+        if type(readings) is list and 0 < len(readings) <= 5001:
+            stamp = self.loaded(readings[-1], "timestamp")
+            detail["latest_selected_age"] = (
+                (now - stamp).total_seconds()
+                if type(now) is dt.datetime and type(stamp) is dt.datetime
+                else "UNKNOWN"
+            )
+        installation = local.get("installation")
+        generation = self.loaded(installation, "indoor_dependency_generation")
+        detail["indoor_generation"] = (
+            generation if type(generation) is int and 0 <= generation < 2**63 else "UNKNOWN"
+        )
+        generation = self.loaded(installation, "demand_dependency_generation")
+        detail["demand_generation"] = (
+            generation if type(generation) is int and 0 <= generation < 2**63 else "UNKNOWN"
+        )
+        # Do not retain data, row collections, settings values, frames or return objects.
+        return detail
+
+    def install_profile(self, functions):
+        if sys.getprofile() is not None:
+            self.gap("profile")
+            return
+        if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 11), (3, 12)):
+            self.gap("profile")
+            return
+        for alias, function in functions:
+            code = function.__code__
+            returns = frozenset(
+                instruction.offset
+                for instruction in dis.get_instructions(code)
+                if instruction.opname in ("RETURN_VALUE", "RETURN_CONST")
+            )
+            self.codes[id(code)] = (code, alias, returns)
+            self.stack_codes[id(code)] = (code, alias)
+
+        def observe(frame, event, result):
+            try:
+                if event != "return":
+                    return
+                code = frame.f_code
+                entry = self.codes.get(id(code))
+                if entry is None or entry[0] is not code:
+                    return
+                if frame.f_lasti not in entry[2]:
+                    # Includes suspension, exceptional exit and cancellation.
+                    return
+                self.record("inputs_returned", lambda: self.inputs(frame, result))
+            except BaseException:
+                self.gap("profile")
+
+        self.profile = observe
+        sys.setprofile(observe)
+
+    def wrap(self, owner, name, role):
+        original = getattr(owner, name)
+        code = original.__code__
+        self.stack_codes[id(code)] = (code, role)
+
+        @wraps(original, updated=())
+        async def observed(*args, **kwargs):
+            token = None
+            try:
+                if self.next_alias["operation"] >= self.ALIAS_LIMITS["operation"]:
+                    self.gap("aliases")
+                    number = 0
+                else:
+                    self.next_alias["operation"] += 1
+                    number = self.next_alias["operation"]
+                    self.origins[number] = self.node
+                token = self.operation.set(number)
+                self.active += 1
+                self.record(
+                    role + "_started",
+                    lambda: {
+                        "origin_node": self.node,
+                        "publication_role": self.enum(
+                            kwargs.get("role", "candidate"), ("candidate", "incumbent")
+                        )
+                        if role == "publish"
+                        else "UNKNOWN",
+                        "qualification": (
+                            "SUPPLIED" if kwargs.get("qualification") is not None else "NONE"
+                        )
+                        if role == "publish"
+                        else "UNKNOWN",
+                        "batch_count": self.count(args[0], 1000)
+                        if role == "batch" and args
+                        else "UNKNOWN",
+                    },
+                )
+            except BaseException:
+                self.gap("serialization")
+            try:
+                result = await original(*args, **kwargs)
+            except asyncio.CancelledError:
+                self.record(role + "_cancelled")
+                raise
+            except BaseException as exc:
+                self.record(role + "_failed", lambda error=exc: self.failure(error))
+                raise
+            else:
+                self.record(role + "_returned")
+                return result
+            finally:
+                try:
+                    if token is not None:
+                        self.active -= 1
+                        self.operation.reset(token)
+                except BaseException:
+                    self.gap("restore")
+
+        self.wrappers.append((owner, name, original, observed))
+        setattr(owner, name, observed)
+
+    @staticmethod
+    def failure(error):
+        reason = "UNKNOWN"
+        if type(error) is CASConflict:
+            arguments = BaseException.args.__get__(error)
+            if len(arguments) == 1 and type(arguments[0]) is str and len(arguments[0]) <= 64:
+                reason = {
+                    "indoor_scope_unavailable": "inputs_unavailable",
+                    "indoor_dependency_scope_mismatch": "dependency_mismatch",
+                    "demand_scope_mismatch": "dependency_mismatch",
+                    "publication_conflict": "publication_fenced",
+                }.get(arguments[0], "UNKNOWN")
+        return {"failure_class": reason}
+
+    @staticmethod
+    def target(context, statement):
+        compiled = context.compiled if context is not None else None
+        clause = compiled.statement if compiled is not None else None
+        operation = "UNKNOWN"
+        table = None
+        if isinstance(clause, (Insert, Delete, Update)):
+            operation = (
+                "insert"
+                if isinstance(clause, Insert)
+                else ("delete" if isinstance(clause, Delete) else "update")
+            )
+            table = clause.table
+        elif isinstance(clause, Select):
+            operation = "select"
+        if table is not None:
+            name = "app_logs" if table.name == "app_logs" else "OTHER"
+            schema = (
+                "public"
+                if table.schema == "public"
+                else ("UNQUALIFIED" if table.schema is None else "OTHER")
+            )
+        else:
+            name, schema = "UNKNOWN", "UNKNOWN"
+            # Never stringify a statement. Recognition is bounded and no text is retained.
+            if type(statement) is str:
+                prefix = statement[:2048]
+                match = re.match(
+                    r"^\s*(INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+"
+                    r'(?:(public)\.)?("?app_logs"?)(?=[\s(]|$)',
+                    prefix,
+                    re.IGNORECASE,
+                )
+                if match:
+                    operation = {
+                        "INSERT INTO": "insert",
+                        "DELETE FROM": "delete",
+                        "UPDATE": "update",
+                    }.get(" ".join(match[1].upper().split()), "UNKNOWN")
+                    name = "app_logs"
+                    schema = "public" if match[2] else "UNQUALIFIED"
+        return {
+            "sql_kind": operation,
+            "declared_relation": name,
+            "declared_schema": schema,
+            # No connection-local dependency/search-path evidence is collected by SQL.
+            "resolved_relation": "UNKNOWN",
+            "sequence_consumer": "UNKNOWN",
+        }
+
+    def sql(self, label, connection, context=None, statement=None):
+        def detail():
+            result = self.target(context, statement)
+            result.update(
+                {
+                    "engine": self.alias("engine", connection.engine)
+                    if connection is not None
+                    else 0,
+                    "connection": self.alias("connection", connection),
+                    "backend": "UNKNOWN",
+                    "factory": "UNKNOWN",
+                    "stack": self.stack(),
+                }
+            )
+            return result
+
+        self.record(label, detail)
+
+    def install_events(self):
+        def before(connection, cursor, statement, parameters, context, executemany):
+            self.sql("sql_attempted", connection, context, statement)
+
+        def after(connection, cursor, statement, parameters, context, executemany):
+            self.sql("cursor_completed", connection, context, statement)
+
+        def failed(context):
+            try:
+                self.sql(
+                    "sql_failed", context.connection, context.execution_context, context.statement
+                )
+            except BaseException:
+                self.gap("serialization")
+
+        def commit(connection):
+            self.sql("commit_notified", connection)
+
+        def rollback(connection):
+            self.sql("rollback_notified", connection)
+
+        for name, callback in (
+            ("before_cursor_execute", before),
+            ("after_cursor_execute", after),
+            ("handle_error", failed),
+            ("commit", commit),
+            ("rollback", rollback),
+        ):
+            # Include attempted registrations in cleanup even if installation raises.
+            self.listeners.append((name, callback))
+            try:
+                event.listen(Engine, name, callback)
+            except BaseException:
+                self.gap("install")
+
+    def pending(self):
+        from packages.core import log_sink
+
+        # No locks, task settlement, clock reads or application status callbacks.
+        # Status uses the separate header/footer reserve: an exhausted event arena
+        # must not discard the final pending-work boundary.
+        self.pending_bytes = json.dumps(
+            {
+                "active_operations": self.active,
+                "buffered_rows": len(log_sink._LOG_BUFFER),
+                "inflight_rows": len(log_sink._INFLIGHT_BATCH),
+                "flusher_present": log_sink._FLUSH_TASK is not None,
+                "writer_present": log_sink._INFLIGHT_TASK is not None,
+                "thread_boundary": "UNKNOWN",
+                "process_boundary": "OPEN",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        self.record("observation_boundary", lambda: json.loads(self.pending_bytes))
+
+    def emit(self, capture):
+        """Synchronous capture-independent emission, with one bounded fallback."""
+        global_capture = fixture_capture = None
+        global_started = fixture_started = False
+        fallback_attempted = False
+
+        def fallback():
+            nonlocal fallback_attempted
+            if fallback_attempted:
+                return
+            fallback_attempted = True
+            try:
+                sys.stdout.write("LIFECYCLE_DIAGNOSTIC_INCOMPLETE emission\n")
+                sys.stdout.flush()
+            except BaseException:
+                pass
+
+        try:
+            # CaptureManager's own context resumes global before fixture capture;
+            # a failed global resume can otherwise prevent the fixture attempt.
+            global_capture = capture._global_capturing
+            fixture_capture = capture._capture_fixture
+            global_started = bool(global_capture and global_capture.is_started())
+            fixture_started = bool(fixture_capture and fixture_capture._is_started())
+            with capture.global_and_fixture_disabled():
+                try:
+                    digest = hashlib.sha256()
+                    for record in self.events:
+                        digest.update(record)
+                    stream = sys.stderr
+                    header = {
+                        "investigation": "lifecycle-v1",
+                        "kind": "header",
+                        "source": self.source,
+                        "interpreter": list(sys.version_info[:3]),
+                        "alias_zero": "UNKNOWN",
+                        "return_observer": "installed"
+                        if self.profile is not None
+                        else "UNAVAILABLE",
+                    }
+                    footer = {
+                        "investigation": "lifecycle-v1",
+                        "kind": "footer",
+                        "count": len(self.events),
+                        "bytes": self.bytes,
+                        "sha256": digest.hexdigest(),
+                        "drops": self.drops,
+                        "coverage_complete": False,
+                        "coverage": [
+                            "backend_UNKNOWN",
+                            "factory_UNKNOWN",
+                            "resolution_UNKNOWN",
+                            "sequence_UNKNOWN",
+                            "task_origin_UNKNOWN",
+                            "thread_UNOBSERVED",
+                            "process_OPEN",
+                            "preexisting_connections_UNKNOWN",
+                            "source_present" if len(self.source) == 2 else "source_UNKNOWN",
+                        ],
+                        "pending_operations": self.active,
+                        "pending": json.loads(self.pending_bytes),
+                    }
+                    header_text = json.dumps(header, sort_keys=True) + "\n"
+                    footer_text = json.dumps(footer, sort_keys=True) + "\n"
+                    if len((header_text + footer_text).encode("ascii")) > self.RESERVE_BYTES:
+                        raise ValueError("diagnostic reserve exceeded")
+                    stream.write(header_text)
+                    for record in self.events:
+                        stream.write(record.decode("ascii"))
+                    stream.write(footer_text)
+                    stream.flush()
+                except BaseException:
+                    self.gap("emission")
+                    # Still inside disabled global AND fixture capture.
+                    fallback()
+        except BaseException:
+            self.gap("emission")
+            for started, saved, attribute, check, resume in (
+                (
+                    global_started,
+                    global_capture,
+                    "_global_capturing",
+                    "is_started",
+                    "resume_global_capture",
+                ),
+                (
+                    fixture_started,
+                    fixture_capture,
+                    "_capture_fixture",
+                    "_is_started",
+                    "resume_fixture",
+                ),
+            ):
+                if started:
+                    try:
+                        if getattr(capture, attribute) is not saved:
+                            self.gap("ownership")
+                        elif not getattr(saved, check)():
+                            getattr(capture, resume)()
+                    except BaseException:
+                        self.gap("restore")
+            fallback()
+
+    def restore(self):
+        # Each removal/restoration is independent, including partial installation.
+        for name, callback in self.listeners:
+            try:
+                event.remove(Engine, name, callback)
+            except BaseException:
+                self.gap("restore")
+        for owner, name, original, observed in self.wrappers:
+            try:
+                if getattr(owner, name) is observed:
+                    setattr(owner, name, original)
+                else:
+                    self.gap("ownership")
+            except BaseException:
+                self.gap("restore")
+        if self.profile is not None:
+            try:
+                if sys.getprofile() is self.profile:
+                    sys.setprofile(None)
+                else:
+                    self.gap("ownership")
+            except BaseException:
+                self.gap("restore")
+
+
+_INVESTIGATION = None
+
+
+def _investigation_stage(stage, source=None):
+    observer = _INVESTIGATION
+    if observer is None:
+        return
+    try:
+        observer.stage = observer.enum(stage, observer.STAGES)
+        if type(source) is dict:
+            for name, size in (("commit", 40), ("source_manifest_sha256", 64)):
+                value = source.get(name)
+                if (
+                    type(value) is str
+                    and len(value) == size
+                    and all(character in "0123456789abcdef" for character in value)
+                ):
+                    observer.source[name] = value
+        observer.record("stage")
+    except BaseException:
+        observer.gap("serialization")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _lifecycle_investigation(request):
+    global _INVESTIGATION
+    observer = _Investigation()
+    _INVESTIGATION = observer
+
+    def finish():
+        global _INVESTIGATION
+        try:
+            observer.pending()
+        except BaseException:
+            observer.gap("serialization")
+        try:
+            observer.restore()
+        finally:
+            if _INVESTIGATION is observer:
+                _INVESTIGATION = None
+            else:
+                observer.gap("ownership")
+            observer.closed = True
+            observer.emit(request.config.pluginmanager.getplugin("capturemanager"))
+        if any(
+            observer.drops[reason]
+            for reason in ("install", "restore", "ownership", "serialization", "emission")
+        ):
+            raise RuntimeError("lifecycle investigation infrastructure incomplete")
+
+    # Installed before any observer mutation, including partial installation failures.
+    request.addfinalizer(finish)
+    from packages.core import log_sink
+    from packages.ml import forecast_quality
+
+    for install in (
+        observer.install_events,
+        lambda: observer.wrap(Lifecycle, "publish", "publish"),
+        lambda: observer.wrap(log_sink, "_write_batch", "batch"),
+        lambda: observer.install_profile(
+            (
+                ("materialize", forecast_quality.materialize_native_inputs),
+                ("prepare", forecast_quality._prepare_native_inputs),
+            )
+        ),
+    ):
+        try:
+            install()
+        except BaseException:
+            observer.gap("install")
+    return observer
+
+
+@pytest.fixture(autouse=True)
+def _lifecycle_investigation_node(_lifecycle_investigation):
+    observer = _lifecycle_investigation
+    observer.node += 1
+    _investigation_stage("node")
+    yield
+    _investigation_stage("node_end")
 
 
 def _migration():
@@ -571,6 +1280,7 @@ async def _cleanup_lifecycle_storage(
     )
     failures, failed_stages = [], []
     for phase, action in stages:
+        _investigation_stage(phase, source)
         try:
             await action()
         except BaseException as exc:
@@ -600,6 +1310,7 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
     assert os.name == "posix", "owned harness requires Linux Unix-socket/process semantics"
     receipt = owned_test_environment()
     source = _source_receipt(receipt)
+    _investigation_stage("baseline", source)
     root = Path(receipt["temp_root"])
     assert tmp_path.resolve().is_relative_to(root), "pytest basetemp must be coordinator-owned"
     model_dir = tmp_path / "artifact-fixtures"
@@ -671,6 +1382,7 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         await session.rollback()
                         raise
 
+            _investigation_stage("call", source)
             yield SimpleNamespace(
                 lifecycle=Lifecycle(sessions),
                 sessions=sessions,

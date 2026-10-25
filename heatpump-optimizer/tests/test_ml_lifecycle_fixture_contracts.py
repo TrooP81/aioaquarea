@@ -9,6 +9,10 @@ import datetime as dt
 import importlib
 import json
 import pickle
+import hashlib
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,6 +20,1065 @@ import pytest
 
 
 SOURCE = Path(__file__).parent / "e2e/test_ml_lifecycle_postgresql.py"
+
+
+def _investigation_events(observer):
+    return [json.loads(value) for value in observer.events]
+
+
+@pytest.mark.parametrize("outcome", ["identity", "none", "error", "cancel"])
+async def test_investigation_wrapper_is_transparent(fixtures, outcome):
+    import inspect
+
+    observer = fixtures._Investigation()
+    result = object() if outcome == "identity" else None
+    failure = asyncio.CancelledError("SECRET") if outcome == "cancel" else ValueError("SECRET")
+    calls = []
+
+    async def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        if outcome in ("error", "cancel"):
+            raise failure
+        return result
+
+    owner = SimpleNamespace(call=original)
+    observer.wrap(owner, "call", "batch")
+    assert inspect.signature(owner.call) == inspect.signature(original)
+    assert owner.call.__name__ == original.__name__
+    argument = object()
+    try:
+        if outcome in ("error", "cancel"):
+            with pytest.raises(type(failure)) as raised:
+                await owner.call(argument, keyword=argument)
+            assert raised.value is failure
+        else:
+            assert await owner.call(argument, keyword=argument) is result
+        assert calls == [((argument,), {"keyword": argument})]
+        assert observer.active == 0
+        assert observer.operation.get() == 0
+        assert b"SECRET" not in b"".join(observer.events)
+    finally:
+        observer.restore()
+    assert owner.call is original
+
+
+@pytest.mark.parametrize(
+    "reason,classification",
+    [
+        ("indoor_scope_unavailable", "inputs_unavailable"),
+        ("indoor_dependency_scope_mismatch", "dependency_mismatch"),
+        ("publication_conflict", "publication_fenced"),
+        ("SECRET_EXCEPTION_TEXT", "UNKNOWN"),
+    ],
+)
+async def test_investigation_publish_separates_fixed_failure_categories(
+    fixtures, reason, classification
+):
+    observer = fixtures._Investigation()
+    failure = fixtures.CASConflict(reason)
+
+    async def publish(**kwargs):
+        raise failure
+
+    owner = SimpleNamespace(publish=publish)
+    observer.wrap(owner, "publish", "publish")
+    try:
+        with pytest.raises(fixtures.CASConflict) as raised:
+            await owner.publish(role="incumbent", qualification=object())
+        assert raised.value is failure
+        events = _investigation_events(observer)
+        assert events[0]["publication_role"] == "incumbent"
+        assert events[0]["qualification"] == "SUPPLIED"
+        assert events[-1]["failure_class"] == classification
+        assert reason.encode() not in b"".join(observer.events)
+    finally:
+        observer.restore()
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+async def test_investigation_wraps_real_batch_once_without_control_or_tasks(
+    fixtures, monkeypatch, poisoned
+):
+    from packages.core import database, log_sink
+
+    failure = RuntimeError("SECRET_BATCH_ERROR")
+    calls = []
+    pending = [object()]
+
+    class Session:
+        def add(self, value):
+            calls.append("add")
+            pending.append(value)
+
+        async def execute(self, statement):
+            calls.append("execute")
+            if poisoned:
+                raise failure
+            return object()
+
+    @asynccontextmanager
+    async def sessions():
+        calls.append("enter")
+        try:
+            yield Session()
+        finally:
+            calls.append("exit")
+
+    monkeypatch.setattr(database, "get_session", sessions)
+    observer = fixtures._Investigation()
+    original = log_sink._write_batch
+    observer.wrap(log_sink, "_write_batch", "batch")
+    entry = SimpleNamespace(row={"event": "SECRET_ROW", "service": "offline", "level": "info"})
+    tasks = asyncio.all_tasks()
+    try:
+        if poisoned:
+            with pytest.raises(RuntimeError) as raised:
+                await log_sink._write_batch([entry])
+            assert raised.value is failure
+        else:
+            assert await log_sink._write_batch([entry]) is None
+        assert calls == ["enter", "add", "execute", "exit"]
+        assert len(pending) == 2
+        assert asyncio.all_tasks() == tasks
+        assert _investigation_events(observer)[0]["batch_count"] == 1
+        assert b"SECRET" not in b"".join(observer.events)
+    finally:
+        observer.restore()
+    assert log_sink._write_batch is original
+
+
+async def test_investigation_profile_distinguishes_suspend_return_exception_cancel(fixtures):
+    observer = fixtures._Investigation()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def materialize(*, outcome):
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise ValueError("SECRET")
+        return object()
+
+    prior = sys.getprofile()
+    observer.install_profile((("materialize", materialize),))
+    try:
+        if prior is not None:
+            assert sys.getprofile() is prior
+            assert observer.drops["profile"] == 1
+            return
+        for outcome in ("return", "error", "cancel"):
+            entered.clear()
+            release.clear()
+            before = len(observer.events)
+            task = asyncio.create_task(materialize(outcome=outcome))
+            await entered.wait()
+            assert len(observer.events) == before  # Suspension is not completion.
+            if outcome == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif outcome == "error":
+                release.set()
+                with pytest.raises(ValueError, match="SECRET"):
+                    await task
+            else:
+                release.set()
+                assert await task is not None
+            assert len(observer.events) == before + (outcome == "return")
+    finally:
+        observer.restore()
+    assert sys.getprofile() is prior
+
+
+async def test_investigation_requires_code_identity_not_structural_equality(fixtures):
+    from types import FunctionType
+
+    async def original():
+        return None
+
+    copy = original.__code__.replace()
+    assert copy == original.__code__ and copy is not original.__code__
+    duplicate = FunctionType(copy, original.__globals__)
+    observer = fixtures._Investigation()
+    prior = sys.getprofile()
+    observer.install_profile((("materialize", original),))
+    try:
+        assert await duplicate() is None
+        assert observer.events == []
+        assert await original() is None
+        assert len(observer.events) == (0 if prior is not None else 1)
+    finally:
+        observer.restore()
+    assert sys.getprofile() is prior
+
+
+def test_investigation_existing_and_unsupported_profiler_preserved(fixtures, monkeypatch):
+    observer = fixtures._Investigation()
+    prior = sys.getprofile()
+
+    def sentinel(*args):
+        return None
+
+    monkeypatch.setattr(sys, "getprofile", lambda: sentinel)
+    setter = AsyncMock()
+    monkeypatch.setattr(sys, "setprofile", setter)
+    observer.install_profile(())
+    observer.restore()
+    setter.assert_not_called()
+    assert observer.drops["profile"] == 1
+    monkeypatch.setattr(sys, "getprofile", lambda: None)
+    monkeypatch.setattr(sys, "version_info", (3, 99))
+    observer.install_profile(())
+    setter.assert_not_called()
+    assert observer.drops["profile"] == 2
+    assert prior is None or callable(prior)
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+async def test_investigation_real_materializer_adds_no_sql_or_session_control(
+    fixtures, monkeypatch, poisoned
+):
+    from packages.ml import forecast_quality
+    from packages.core import settings_service
+    from packages.poller import smartthings
+
+    values = {
+        "weather_provider": "smhi",
+        "timezone": "Europe/Stockholm",
+        "comfort_reference_sensor_id": "selected-room",
+        "SECRET_SETTINGS_ID": object(),
+    }
+    settings_reader = AsyncMock(return_value=values)
+    monkeypatch.setattr(settings_service, "get_all_settings", settings_reader)
+    selection = AsyncMock(return_value=["selected-room"])
+    monkeypatch.setattr(smartthings, "get_selected_device_ids", selection)
+    failure = RuntimeError("SECRET poisoned transaction")
+
+    class Session:
+        def __init__(self):
+            self.pending = [object()]
+            self.calls = []
+
+        async def execute(self, statement):
+            self.calls.append("execute")
+            if poisoned:
+                raise failure
+            # Only the application may consume this result.
+            session = self
+
+            class Result:
+                def scalars(self):
+                    session.calls.append("scalars")
+                    return self
+
+                def all(self):
+                    session.calls.append("all")
+                    return []
+
+            return Result()
+
+        def __getattr__(self, name):
+            raise AssertionError("unexpected session control/access: " + name)
+
+    session = Session()
+    pending = session.pending[0]
+    observer = fixtures._Investigation()
+    observer.install_profile((("materialize", forecast_quality.materialize_native_inputs),))
+    now = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
+    before_tasks = asyncio.all_tasks()
+    try:
+        if poisoned:
+            with pytest.raises(RuntimeError) as raised:
+                await forecast_quality.materialize_native_inputs(
+                    "thermal", now=now, session=session
+                )
+            assert raised.value is failure
+            assert session.calls == ["execute"]
+        else:
+            assert (
+                await forecast_quality.materialize_native_inputs(
+                    "thermal", now=now, session=session
+                )
+                is None
+            )
+            assert session.calls == ["execute", "scalars", "all"]
+            if observer.profile is not None:
+                event = _investigation_events(observer)[0]
+                assert event["status_count"] == 0
+                assert event["clock"] == now.timestamp()
+                assert event["provider"] == "smhi"
+                assert event["timezone"] == "Europe/Stockholm"
+                assert event["indoor_available"] == "NOT_REACHED"
+                assert event["reference"] == "selected-room"
+        assert asyncio.all_tasks() == before_tasks
+        assert session.pending == [pending]
+        settings_reader.assert_awaited_once_with(session=session)
+        selection.assert_awaited_once_with(values=values)
+    finally:
+        observer.restore()
+
+
+def test_investigation_hostile_locals_are_not_stringified_or_retained(fixtures, monkeypatch):
+    import gc
+    import weakref
+
+    class Hostile:
+        def __str__(self):
+            raise AssertionError("str called")
+
+        def __repr__(self):
+            raise AssertionError("repr called")
+
+        def __iter__(self):
+            raise AssertionError("iteration called")
+
+        def __hash__(self):
+            raise AssertionError("hash called")
+
+    observer = fixtures._Investigation()
+    hostile = Hostile()
+    code = (lambda: None).__code__
+    observer.codes[id(code)] = (code, "prepare", frozenset())
+    frame = SimpleNamespace(
+        f_code=code,
+        f_locals={
+            "values": {"weather_provider": hostile, "timezone": "SECRET", "id": hostile},
+            "component": hostile,
+            "selected_ids": [hostile],
+            "reference_sensor": "SECRET",
+            "capabilities": [hostile],
+            "statuses": [hostile],
+            "readings": [hostile],
+            "indoor_available": hostile,
+            "reference_blocked": hostile,
+        },
+    )
+    observer.record(
+        "inputs_returned", lambda frame=frame, hostile=hostile: observer.inputs(frame, hostile)
+    )
+    assert len(observer.events) == 1
+    encoded = b"".join(observer.events)
+    assert b"SECRET" not in encoded
+    assert b"Hostile" not in encoded
+    assert _investigation_events(observer)[0]["indoor_available"] == "NOT_REACHED"
+    assert observer.drops["serialization"] == 0
+    reference = weakref.ref(hostile)
+    frame.f_locals["values"]["self"] = frame.f_locals["values"]
+    observer.record(
+        "inputs_returned", lambda frame=frame, hostile=hostile: observer.inputs(frame, hostile)
+    )
+    del frame, hostile
+    gc.collect()
+    assert reference() is None
+    stamp = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
+    row = fixtures.DeviceStatusRecord(ts=stamp)
+
+    def unloaded_access(_row):
+        raise AssertionError("observer invoked an ORM descriptor")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fixtures.DeviceStatusRecord, "ts", property(unloaded_access))
+        assert observer.loaded(row, "ts") is stamp
+        del row.__dict__["ts"]
+        assert observer.loaded(row, "ts") is None
+
+
+@pytest.mark.parametrize(
+    "age,available", [(-1, False), (0, True), (899, True), (900, True), (901, False)]
+)
+def test_investigation_observes_real_prepare_sensor_freshness(fixtures, age, available):
+    from packages.ml import forecast_quality
+
+    observer = fixtures._Investigation()
+    now = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
+    status_values = dict.fromkeys(
+        column.name for column in fixtures.DeviceStatusRecord.__table__.columns
+    )
+    status_values.update(
+        device_id="fixture-device",
+        ts=now,
+        direction="HEAT",
+        device_action="HEATING",
+        native_policy_provenance={},
+        space_heating_active=True,
+        tank_temp=30,
+    )
+    status = SimpleNamespace(**status_values)
+    data = {
+        "component": "thermal",
+        "capabilities": ("indoor_heating",),
+        "now": now,
+        "values": {},
+        "device_id": "fixture-device",
+        "selected_ids": ["selected-room"],
+        "reference_sensor": "selected-room",
+        "reference_blocked": False,
+        "statuses": [status],
+        "weather": [],
+        "prices": [],
+        "counters": [],
+        "weather_provider": "open-meteo",
+        "timer": None,
+        "raw_indoor": [
+            SimpleNamespace(
+                device_id="selected-room",
+                timestamp=now - dt.timedelta(seconds=age),
+                temperature=20.0,
+                is_stale=False,
+            ),
+            SimpleNamespace(
+                device_id="selected-room",
+                timestamp=now,
+                temperature=float("nan"),
+                is_stale=False,
+            ),
+            SimpleNamespace(
+                device_id="selected-room",
+                timestamp=now,
+                temperature=20,
+                is_stale=True,
+            ),
+            SimpleNamespace(
+                device_id="SECRET_UNSELECTED_SENSOR",
+                timestamp=now,
+                temperature=20,
+                is_stale=False,
+            ),
+        ],
+    }
+    prior = sys.getprofile()
+    observer.install_profile((("prepare", forecast_quality._prepare_native_inputs),))
+    try:
+        result = forecast_quality._prepare_native_inputs(data)
+    finally:
+        observer.restore()
+    assert (result is not None) is available
+    if prior is not None:
+        assert observer.drops["profile"] == 1
+        assert sys.getprofile() is prior
+        return
+    observed = _investigation_events(observer)
+    assert len(observed) == 1
+    assert observed[0]["indoor_available"] is available
+    assert observed[0]["sensor_freshness_seconds"] == 900
+    if age < 0:
+        assert "latest_selected_age" not in observed[0]
+    else:
+        assert observed[0]["latest_selected_age"] == age
+    assert observed[0]["filtered_count"] == (0 if age < 0 else 1)
+    assert observed[0]["fresh_count"] == (1 if available else 0)
+    assert observed[0]["sensor_count"] == 1
+    assert b"SECRET" not in b"".join(observer.events)
+
+
+def test_investigation_pending_orm_and_poisoned_transaction_are_untouched(fixtures):
+    from sqlalchemy import Column, Integer, Table, MetaData, create_engine, event, text
+    from sqlalchemy.orm import Session, registry
+    from sqlalchemy.exc import IntegrityError, PendingRollbackError
+
+    mapper = registry()
+    table = Table("offline_observation", MetaData(), Column("id", Integer, primary_key=True))
+
+    class Row:
+        pass
+
+    mapper.map_imperatively(Row, table)
+    engine = create_engine("sqlite://")
+    table.create(engine)
+    flushes, sql = [], []
+    event.listen(engine, "before_cursor_execute", lambda *args: sql.append(1))
+    observer = fixtures._Investigation()
+    observer.install_events()
+    try:
+        with Session(engine) as session:
+            event.listen(session, "before_flush", lambda *args: flushes.append(1))
+            row = Row()
+            row.id = 1
+            session.add(row)
+            assert session.execute(text("SELECT 1")).scalar_one() == 1
+            assert row in session.new
+            assert flushes == []
+            assert len(sql) == 1
+            session.flush()  # Test-owned setup, not an observer operation.
+            session.expunge(row)
+            duplicate = Row()
+            duplicate.id = 1
+            session.add(duplicate)
+            with pytest.raises(IntegrityError):
+                session.flush()
+            before_sql, before_flush = len(sql), len(flushes)
+            before_events = len(observer.events)
+            with pytest.raises(PendingRollbackError):
+                session.execute(text("SELECT 1"))
+            assert not session.is_active
+            assert len(sql) == before_sql
+            assert len(flushes) == before_flush
+            assert len(observer.events) == before_events
+    finally:
+        observer.restore()
+        engine.dispose()
+        mapper.dispose()
+
+
+def test_investigation_sensor_and_thread_bounds_are_explicit(fixtures):
+    import threading
+
+    observer = fixtures._Investigation()
+    code = (lambda: None).__code__
+    observer.codes[id(code)] = (code, "prepare", frozenset())
+    hostile = object()
+    frame = SimpleNamespace(
+        f_code=code,
+        f_locals={
+            "selected_ids": [hostile] * 65,
+            "sensor_ids": [hostile] * 65,
+            "fresh_ids": [hostile] * 65,
+            "readings": [hostile] * 5001,
+            "values": {"timezone": "SECRET" * 100000},
+        },
+    )
+    observer.record("inputs_returned", lambda: observer.inputs(frame, None))
+    record = _investigation_events(observer)[0]
+    assert record["selected_count"] == "UNKNOWN"
+    assert record["sensor_count"] == "UNKNOWN"
+    assert record["fresh_count"] == "UNKNOWN"
+    assert record["reading_count"] == 5001
+    assert observer.drops["sensors"] == 3
+    thread = threading.Thread(target=lambda: observer.record("test"))
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(observer.events) == 1
+    assert observer.drops["thread"] == 1
+    frame.f_locals = {"readings": [hostile] * 5002}
+    observer.record("inputs_returned", lambda: observer.inputs(frame, None))
+    assert _investigation_events(observer)[-1]["reading_count"] == "UNKNOWN"
+    assert observer.drops["sensors"] == 4
+    assert b"SECRET" not in b"".join(observer.events)
+
+
+async def test_investigation_operation_cap_and_final_boundary_never_settle(fixtures, monkeypatch):
+    from packages.core import log_sink
+
+    observer = fixtures._Investigation()
+
+    async def original():
+        return None
+
+    owner = SimpleNamespace(call=original)
+    observer.wrap(owner, "call", "batch")
+    for name in ("shutdown_log_sink", "_flush_once"):
+        monkeypatch.setattr(log_sink, name, AsyncMock(side_effect=AssertionError("settled")))
+    try:
+        for _ in range(129):
+            await owner.call()
+        observer.pending()
+        assert len(observer.origins) == 128
+        assert observer.next_alias["operation"] == 128
+        assert observer.drops["aliases"] == 1
+        assert _investigation_events(observer)[-2]["operation"] == 0
+        log_sink.shutdown_log_sink.assert_not_called()
+        log_sink._flush_once.assert_not_called()
+    finally:
+        observer.restore()
+
+
+async def test_investigation_serialization_failure_cannot_change_real_result_or_error(
+    fixtures, monkeypatch
+):
+    observer = fixtures._Investigation()
+    expected = object()
+    failure = RuntimeError("SECRET")
+
+    async def original(*, fail=False):
+        if fail:
+            raise failure
+        return expected
+
+    owner = SimpleNamespace(call=original)
+    observer.wrap(owner, "call", "batch")
+
+    def broken(*args, **kwargs):
+        raise ValueError("SECRET_SERIALIZER")
+
+    monkeypatch.setattr(fixtures.json, "dumps", broken)
+    try:
+        assert await owner.call() is expected
+        with pytest.raises(RuntimeError) as raised:
+            await owner.call(fail=True)
+        assert raised.value is failure
+        assert observer.events == []
+        assert observer.drops["serialization"] == 4
+    finally:
+        observer.restore()
+
+
+def test_investigation_partial_profile_install_and_wrapper_restore_failure_are_independent(
+    fixtures, monkeypatch
+):
+    observer = fixtures._Investigation()
+    prior = sys.getprofile()
+    if prior is not None:
+        observer.install_profile(())
+        assert observer.drops["profile"] == 1
+        assert sys.getprofile() is prior
+        return
+    setter = sys.setprofile
+    changes = []
+
+    def partial(callback):
+        changes.append(callback)
+        setter(callback)
+        if len(changes) == 1:
+            raise RuntimeError("SECRET_PROFILE_INSTALL")
+
+    class Owner:
+        def __init__(self):
+            self.broken = False
+            self.call = original
+
+        def __setattr__(self, name, value):
+            if name == "call" and self.broken:
+                raise RuntimeError("SECRET_RESTORE")
+            object.__setattr__(self, name, value)
+
+    async def original():
+        return None
+
+    owner = Owner()
+    observer.wrap(owner, "call", "batch")
+    owner.broken = True
+    monkeypatch.setattr(fixtures.sys, "setprofile", partial)
+    try:
+        with pytest.raises(RuntimeError, match="SECRET_PROFILE_INSTALL"):
+            observer.install_profile(())
+    finally:
+        observer.restore()
+    assert changes == [observer.profile, None]
+    assert sys.getprofile() is prior
+    assert observer.drops["restore"] == 1
+
+
+def test_investigation_events_cover_existing_and_new_engines_without_extra_sql(fixtures):
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.exc import OperationalError
+
+    observer = fixtures._Investigation()
+    existing = create_engine("sqlite://")
+    calls = []
+
+    def count(*args):
+        calls.append(1)
+
+    event.listen(existing, "before_cursor_execute", count)
+    observer.install_events()
+    newer = create_engine("sqlite://")
+    event.listen(newer, "before_cursor_execute", count)
+    try:
+        for engine in (existing, newer):
+            with engine.connect() as connection:
+                assert connection.execute(text("SELECT 1 /* SECRET_LITERAL */")).scalar_one() == 1
+                connection.commit()
+                with pytest.raises(OperationalError):
+                    connection.execute(
+                        text("INSERT INTO app_logs(message) VALUES (:secret)"),
+                        {"secret": "SECRET_PARAMETER"},
+                    )
+                connection.rollback()
+        events = _investigation_events(observer)
+        labels = [item["event"] for item in events]
+        assert len(calls) == 4
+        assert labels.count("sql_attempted") == 4
+        assert labels.count("cursor_completed") == 2
+        assert labels.count("sql_failed") == 2
+        assert labels.count("commit_notified") == 2
+        assert labels.count("rollback_notified") == 2
+        assert len({item["engine"] for item in events}) == 2
+        assert all(item["resolved_relation"] == "UNKNOWN" for item in events)
+        assert all(item["sequence_consumer"] == "UNKNOWN" for item in events)
+        assert all(item["backend"] == "UNKNOWN" for item in events)
+        assert b"SECRET" not in b"".join(observer.events)
+        assert b"confirmed_commit" not in b"".join(observer.events)
+    finally:
+        observer.restore()
+        existing.dispose()
+        newer.dispose()
+
+
+@pytest.mark.parametrize(
+    "statement,schema",
+    [
+        ("INSERT INTO app_logs (message) VALUES ('SECRET')", "UNQUALIFIED"),
+        ("INSERT INTO public.app_logs (message) VALUES ('SECRET')", "public"),
+        ("SELECT setval('public.app_logs_id_seq', 123)", "UNKNOWN"),
+        ("SELECT * FROM pg_class", "UNKNOWN"),
+        (" " * 2048 + "INSERT INTO public.app_logs VALUES ('SECRET')", "UNKNOWN"),
+    ],
+)
+def test_investigation_declared_target_never_proves_execution_or_sequence(
+    fixtures, statement, schema
+):
+    observer = fixtures._Investigation()
+    result = observer.target(None, statement)
+    assert result["declared_schema"] == schema
+    assert result["resolved_relation"] == "UNKNOWN"
+    assert result["sequence_consumer"] == "UNKNOWN"
+    assert "SECRET" not in json.dumps(result)
+
+
+async def test_investigation_cross_node_pending_batch_is_not_settled(fixtures, monkeypatch):
+    observer = fixtures._Investigation()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def batch(argument):
+        calls.append(argument)
+        entered.set()
+        await release.wait()
+
+    owner = SimpleNamespace(call=batch)
+    observer.wrap(owner, "call", "batch")
+    observer.node = 1
+    task = asyncio.create_task(owner.call(object()), name="SECRET_TASK_NAME")
+    try:
+        await entered.wait()
+        observer.node = 2
+        observer.stage = "post-drop"
+        observer.pending()
+        assert not task.done()
+        assert observer.active == 1
+        assert len(calls) == 1
+        release.set()
+        await task
+        events = _investigation_events(observer)
+        assert events[0]["operation_origin"] == 1
+        assert events[-1]["node"] == 2
+        assert events[-1]["operation_origin"] == 1
+        assert b"SECRET_TASK_NAME" not in b"".join(observer.events)
+    finally:
+        release.set()
+        await task
+        observer.restore()
+
+
+@pytest.mark.parametrize("bound", ["events", "arena", "event_bytes", "serialization"])
+def test_investigation_storage_bounds_reserve_before_detail(fixtures, monkeypatch, bound):
+    observer = fixtures._Investigation()
+    assert (
+        observer.EVENT_LIMIT,
+        observer.EVENT_BYTES,
+        observer.ARENA_BYTES,
+        observer.RESERVE_BYTES,
+    ) == (4096, 2048, 4 * 1024 * 1024, 16 * 1024)
+    if bound == "serialization":
+        monkeypatch.setattr(
+            fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
+        )
+        observer.record("test")
+    elif bound == "event_bytes":
+        observer.record("test", lambda: {"padding": "x" * 2048})
+    else:
+        for _ in range(4097):
+            observer.record("test", (lambda: {"padding": "x" * 1700}) if bound == "arena" else None)
+        calls = []
+        observer.record("test", lambda: calls.append(1))
+        assert calls == []
+        observer.pending()
+        pending = json.loads(observer.pending_bytes)
+        assert pending["active_operations"] == 0
+        assert type(pending["buffered_rows"]) is int
+        assert type(pending["flusher_present"]) is bool
+        assert pending["process_boundary"] == "OPEN"
+    assert observer.drops[bound] > 0
+    assert len(observer.events) <= 4096
+    assert observer.bytes <= 4 * 1024 * 1024
+    assert all(len(item) <= 2048 for item in observer.events)
+    observer.drops[bound] = 2**31 - 1
+    observer.gap(bound)
+    assert observer.drops[bound] == 2**31 - 1
+
+
+@pytest.mark.parametrize("kind,cap", [("engine", 128), ("connection", 256), ("task", 256)])
+def test_investigation_alias_maps_are_bounded_and_weak(fixtures, kind, cap):
+    import gc
+    import weakref
+
+    class Item:
+        pass
+
+    observer = fixtures._Investigation()
+    values = [Item() for _ in range(cap + 1)]
+    assert [observer.alias(kind, item) for item in values[:cap]] == list(range(1, cap + 1))
+    assert observer.alias(kind, values[-1]) == 0
+    assert len(observer.aliases[kind]) == cap
+    reference = weakref.ref(values[0])
+    del values
+    gc.collect()
+    assert reference() is None
+    assert observer.drops["aliases"] == 1
+
+
+def test_investigation_stack_caps_no_source_or_hostile_paths(fixtures, monkeypatch):
+    observer = fixtures._Investigation()
+    code = (lambda: None).__code__
+    inspected = []
+
+    class Frame:
+        def __init__(self, line):
+            self.f_lineno = line
+            self.f_back = None
+
+        @property
+        def f_code(self):
+            inspected.append(self.f_lineno)
+            return code
+
+    frames = [Frame(index) for index in range(40)]
+    for left, right in zip(frames, frames[1:]):
+        left.f_back = right
+    monkeypatch.setattr(fixtures.sys, "_getframe", lambda *a: frames[0])
+    observer.stack_codes[id(code)] = (code, "known_code")
+    assert observer.stack() == [["known_code", index] for index in range(6)]
+    assert inspected == list(range(6))
+    observer.stack_codes.clear()
+    inspected.clear()
+    assert observer.stack() == []
+    assert inspected == list(range(24))
+
+
+@pytest.mark.parametrize("failure", ["registration", "removal", "ownership", "profile"])
+def test_investigation_cleanup_attempts_are_independent(fixtures, monkeypatch, failure):
+    from sqlalchemy import event
+
+    observer = fixtures._Investigation()
+    original = AsyncMock()
+    owner = SimpleNamespace(call=original)
+
+    # AsyncMock has no __code__; use a genuine saved coroutine.
+    async def call():
+        return None
+
+    owner.call = call
+    prior_profile = sys.getprofile()
+    observer.wrap(owner, "call", "batch")
+    if failure == "registration":
+        listen = event.listen
+        attempts = []
+
+        def partial(target, name, callback):
+            attempts.append(name)
+            if len(attempts) > 1:
+                raise ValueError("SECRET")
+            listen(target, name, callback)
+
+        monkeypatch.setattr(event, "listen", partial)
+        observer.install_events()
+        assert len(attempts) == 5
+    elif failure == "removal":
+        observer.listeners = [("commit", object()), ("rollback", object())]
+        attempts = []
+
+        def broken(*args):
+            attempts.append(args[1])
+            raise ValueError("SECRET")
+
+        monkeypatch.setattr(event, "remove", broken)
+    elif failure == "ownership":
+        owner.call = original
+    elif failure == "profile":
+        observer.profile = lambda *a: None
+        # A different currently installed owner must remain untouched.
+    observer.restore()
+    assert sys.getprofile() is prior_profile
+    if failure == "ownership":
+        assert owner.call is original
+        assert observer.drops["ownership"] == 1
+    else:
+        assert owner.call is call
+    if failure == "removal":
+        assert attempts == ["commit", "rollback"]
+        assert observer.drops["restore"] == 2
+    if failure == "profile":
+        assert observer.drops["ownership"] == 1
+
+
+def _decode_investigation_output(output):
+    assert "LIFECYCLE_DIAGNOSTIC_INCOMPLETE" not in output, "diagnostic emission failure"
+    records = []
+    active = False
+    for line in output.splitlines():
+        if not line.startswith("{"):
+            continue
+        record = json.loads(line)
+        if record.get("kind") == "header":
+            assert not active
+            active = True
+        elif record.get("kind") == "footer":
+            assert active
+            assert record["count"] == len(records)
+            encoded = [
+                json.dumps(item, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+                for item in records
+            ]
+            assert record["bytes"] == sum(map(len, encoded))
+            assert record["sha256"] == hashlib.sha256(b"".join(encoded)).hexdigest()
+            return records, record
+        elif active:
+            records.append(record)
+    raise AssertionError("missing diagnostic footer")
+
+
+@pytest.mark.parametrize("failure", ["passing", "setup", "call", "teardown"])
+def test_investigation_ordinary_pytest_capture_retains_multiple_nodes(fixtures, tmp_path, failure):
+    (tmp_path / "conftest.py").write_text(
+        "from tests.e2e.test_ml_lifecycle_postgresql import (\n"
+        "    _lifecycle_investigation, _lifecycle_investigation_node,\n"
+        ")\n"
+    )
+    (tmp_path / "test_capture.py").write_text(
+        "import pytest\n"
+        "from tests.e2e import test_ml_lifecycle_postgresql as subject\n"
+        "@pytest.fixture\n"
+        "def fault():\n"
+        f"    if {failure!r} == 'setup': raise RuntimeError('expected setup')\n"
+        "    yield\n"
+        f"    if {failure!r} == 'teardown': raise RuntimeError('expected teardown')\n"
+        "def test_first():\n"
+        "    print('ORDINARY_PASSING_PRINT')\n"
+        "    subject._investigation_stage('baseline')\n"
+        "def test_second(fault):\n"
+        "    subject._investigation_stage('call')\n"
+        f"    if {failure!r} == 'call': raise RuntimeError('expected call')\n"
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(SOURCE.parents[2]), str(SOURCE.parents[3]))),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+    }
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == (0 if failure == "passing" else 1), run.stdout + run.stderr
+    records, footer = _decode_investigation_output(run.stderr)
+    assert {item["node"] for item in records} >= {1, 2}
+    assert any(item["stage"] == "baseline" and item["node"] == 1 for item in records)
+    assert any(item["event"] == "observation_boundary" for item in records)
+    assert "ORDINARY_PASSING_PRINT" not in run.stdout + run.stderr
+    assert footer["coverage_complete"] is False
+    assert footer["pending"]["process_boundary"] == "OPEN"
+    assert type(footer["pending"]["inflight_rows"]) is int
+    with pytest.raises(AssertionError, match="missing diagnostic footer"):
+        _decode_investigation_output(run.stderr[: run.stderr.rfind('{"bytes"')])
+
+
+@pytest.mark.parametrize(
+    "fault", ["enter", "exit", "write", "flush", "serialize", "digest", "reserve"]
+)
+def test_investigation_emission_failure_has_fixed_bounded_marker(
+    fixtures, monkeypatch, capsys, fault
+):
+    observer = fixtures._Investigation()
+    observer.record("test")
+
+    class Capture:
+        _global_capturing = None
+        _capture_fixture = None
+
+        def global_and_fixture_disabled(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def disabled():
+                if fault == "enter":
+                    raise RuntimeError("SECRET")
+                try:
+                    yield
+                finally:
+                    if fault == "exit":
+                        raise RuntimeError("SECRET")
+
+            return disabled()
+
+    class Stream:
+        def write(self, value):
+            if fault == "write":
+                raise RuntimeError("SECRET")
+            return len(value)
+
+        def flush(self):
+            if fault == "flush":
+                raise RuntimeError("SECRET")
+
+    monkeypatch.setattr(fixtures.sys, "stderr", Stream())
+    if fault == "serialize":
+        monkeypatch.setattr(
+            fixtures.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError())
+        )
+    if fault == "digest":
+        monkeypatch.setattr(fixtures.hashlib, "sha256", lambda: (_ for _ in ()).throw(ValueError()))
+    if fault == "reserve":
+        monkeypatch.setattr(observer, "RESERVE_BYTES", 1)
+    observer.emit(Capture())
+    assert observer.drops["emission"] == 1
+    output = capsys.readouterr().out
+    assert output == "LIFECYCLE_DIAGNOSTIC_INCOMPLETE emission\n"
+    assert len(output.encode()) < 2048
+    with pytest.raises(AssertionError, match="diagnostic emission failure"):
+        _decode_investigation_output(output)
+
+
+@pytest.mark.parametrize("fault", ["partial_enter", "exit", "ownership"])
+def test_investigation_capture_restoration_attempts_are_independent(fixtures, capsys, fault):
+    from contextlib import contextmanager
+
+    observer = fixtures._Investigation()
+    attempts = []
+
+    class State:
+        started = True
+
+        def is_started(self):
+            return self.started
+
+        _is_started = is_started
+
+    class Capture:
+        def __init__(self):
+            self._global_capturing = State()
+            self._capture_fixture = State()
+
+        @contextmanager
+        def global_and_fixture_disabled(self):
+            self._global_capturing.started = False
+            self._capture_fixture.started = False
+            if fault == "partial_enter":
+                raise RuntimeError("SECRET_PARTIAL_ENTER")
+            yield
+            if fault == "ownership":
+                self._capture_fixture = State()
+                self._capture_fixture.started = False
+            raise RuntimeError("SECRET_EXIT")
+
+        def resume_global_capture(self):
+            attempts.append("global")
+            raise RuntimeError("SECRET_GLOBAL_RESTORE")
+
+        def resume_fixture(self):
+            attempts.append("fixture")
+            self._capture_fixture.started = True
+
+    capture = Capture()
+    observer.emit(capture)
+    assert attempts == (["global"] if fault == "ownership" else ["global", "fixture"])
+    assert observer.drops["emission"] == 1
+    assert observer.drops["restore"] == 1
+    assert observer.drops["ownership"] == (1 if fault == "ownership" else 0)
+    assert capture._capture_fixture.started is (fault != "ownership")
+    assert "SECRET" not in capsys.readouterr().out
 
 
 def _function(name, source=None):
