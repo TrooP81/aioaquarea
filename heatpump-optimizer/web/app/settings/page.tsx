@@ -30,6 +30,30 @@ interface SettingMeta {
 
 type SettingsMap = Record<string, SettingMeta>;
 
+function settingsRevision(response: Response): string | null {
+  const header = response.headers.get("X-Contract-Revision");
+  const rawEtag = response.headers.get("ETag");
+  if (rawEtag !== null && !/^"[1-9]\d*"$/.test(rawEtag)) return null;
+  const etag = rawEtag?.slice(1, -1) ?? null;
+  const revision = header ?? etag;
+  if (!revision || !/^[1-9]\d*$/.test(revision) || (header !== null && etag !== null && header !== etag)) {
+    return null;
+  }
+  return revision;
+}
+
+function preserveSettingsDraft(latest: SettingsMap, draft: Record<string, string>, baseline: SettingsMap): Record<string, string> {
+  return Object.fromEntries(Object.entries(latest).map(([key, meta]) => [
+    key, draft[key] !== undefined && draft[key] !== (baseline[key]?.value ?? "") ? draft[key] : meta.value,
+  ]));
+}
+
+function baselineFromDraft(settings: SettingsMap, draft: Record<string, string>): SettingsMap {
+  return Object.fromEntries(Object.entries(settings).map(([key, meta]) => [
+    key, { ...meta, value: draft[key] ?? meta.value },
+  ]));
+}
+
 interface FieldRule {
   label?: string;
   unit?: string;
@@ -262,7 +286,11 @@ export default function SettingsPage() {
   const [editValues, setEditValues] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [refreshingSettings, setRefreshingSettings] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [contractRevision, setContractRevision] = useState<string | null>(null);
+  const [scheduleContractChange, setScheduleContractChange] = useState(0);
+  const [settingsConflict, setSettingsConflict] = useState<{ latest: SettingsMap; revision: string } | null>(null);
   const [apiVersion, setApiVersion] = useState<string | null>(null);
   const [apiContract, setApiContract] = useState<string | null>(null);
   const [apiVersionUnavailable, setApiVersionUnavailable] = useState(false);
@@ -395,26 +423,58 @@ export default function SettingsPage() {
     }
   };
 
-  const fetchSettings = async () => {
+  const fetchSettings = async (
+    preserveDraft = false,
+    baseline: SettingsMap = {},
+    showComparison = preserveDraft,
+  ) => {
+    setRefreshingSettings(true);
     try {
       const res = await fetch("/api/settings");
       if (!res.ok) throw new Error("Failed to load settings");
       const data: SettingsMap = await res.json();
+      const revision = settingsRevision(res);
       setSettings(data);
+      setContractRevision(revision);
+      setSettingsConflict(preserveDraft && showComparison && revision ? { latest: data, revision } : null);
       // Initialize edit values with current values
       const vals: Record<string, string> = {};
       for (const [key, meta] of Object.entries(data)) {
         vals[key] = meta.value;
       }
-      setEditValues(vals);
+      setEditValues((previous) => preserveDraft
+        ? preserveSettingsDraft(data, previous, baseline)
+        : vals);
+      if (preserveDraft && showComparison) {
+        setScheduleContractChange((change) => change + 1);
+        setMessage({
+          text: revision
+            ? "Planning settings reloaded. Your edits are preserved; compare before choosing how to continue."
+            : "Settings revision is unavailable. Your edits are preserved; saving remains blocked.",
+          type: "error",
+        });
+      }
     } catch {
+      setContractRevision(null);
+      setSettingsConflict(null);
       setMessage({ text: "Failed to load settings", type: "error" });
     } finally {
       setLoading(false);
+      setRefreshingSettings(false);
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = async (revisionOverride?: string) => {
+    if (saving || refreshingSettings) return;
+    const expectedRevision = revisionOverride ?? contractRevision;
+    if (!expectedRevision || !/^[1-9]\d*$/.test(expectedRevision) || expectedRevision !== contractRevision) {
+      setMessage({ text: "Settings revision is unavailable. Reload planning settings before saving; your edits are preserved.", type: "error" });
+      return;
+    }
+    if (settingsConflict && revisionOverride !== settingsConflict.revision) {
+      setMessage({ text: "Compare the latest saved settings before choosing how to continue.", type: "error" });
+      return;
+    }
     const firstInvalidKey = SETTINGS_TABS.flatMap((tab) => SETTING_GROUPS
       .filter((group) => tab.groups.includes(group.title as never))
       .flatMap((group) => group.keys))
@@ -446,11 +506,32 @@ export default function SettingsPage() {
     }
 
     try {
+      const submittedDraft = { ...editValues };
       const res = await fetch("/api/settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": expectedRevision,
+        },
         body: JSON.stringify({ settings: updates }),
       });
+      if (res.status === 409) {
+        setContractRevision(null);
+        setSettingsConflict(null);
+        const latestResponse = await fetch("/api/settings");
+        if (latestResponse.ok) {
+          const latest: SettingsMap = await latestResponse.json();
+          const latestRevision = settingsRevision(latestResponse);
+          if (latestRevision) {
+            setSettings(latest);
+            setEditValues((draft) => preserveSettingsDraft(latest, draft, settings));
+            setContractRevision(latestRevision);
+            setSettingsConflict({ latest, revision: latestRevision });
+          }
+        }
+        setMessage({ text: "Settings changed elsewhere. Your edits are preserved; compare before choosing how to continue.", type: "error" });
+        return;
+      }
       if (!res.ok) {
         const errorResponse: unknown = await res.json().catch(() => null);
         const detail = errorResponse !== null && typeof errorResponse === "object" && "detail" in errorResponse
@@ -467,8 +548,13 @@ export default function SettingsPage() {
         }
         throw new Error(failureMessage || "Save failed");
       }
+      setContractRevision(settingsRevision(res));
+      // An accepted write may advance the planning contract even if the following
+      // settings refresh fails. Keep the mounted schedule draft, not its old context.
+      setScheduleContractChange((change) => change + 1);
+      setSettingsConflict(null);
       setMessage({ text: `Saved ${Object.keys(updates).length} setting(s)`, type: "success" });
-      await fetchSettings();
+      await fetchSettings(true, baselineFromDraft(settings, submittedDraft), false);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Save failed", type: "error" });
     } finally {
@@ -557,6 +643,37 @@ export default function SettingsPage() {
         </div>
       )}
 
+      {settingsConflict && (
+        <div className="override-banner" role="alert" style={{ display: "block", overflowWrap: "anywhere" }}>
+          <p>Current saved planning settings differ from your draft:</p>
+          <ul>
+            {Object.keys(settingsConflict.latest)
+              .filter((key) => settingsConflict.latest[key]?.value !== editValues[key])
+              .map((key) => (
+                <li key={key}>
+                  {key}: saved “{settingsConflict.latest[key].type === "secret" ? "(hidden)" : settingsConflict.latest[key]?.value ?? ""}”; your draft “{settingsConflict.latest[key].type === "secret" ? "(hidden)" : editValues[key] ?? ""}”
+                </li>
+              ))}
+          </ul>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+            <button
+              className="btn"
+              disabled={saving || refreshingSettings}
+              onClick={() => {
+                setEditValues(Object.fromEntries(Object.entries(settingsConflict.latest).map(([key, meta]) => [key, meta.value])));
+                setSettingsConflict(null);
+                setMessage({ text: "Loaded the latest saved settings", type: "success" });
+              }}
+            >
+              Load saved settings
+            </button>
+            <button className="btn" disabled={saving || refreshingSettings} onClick={() => void handleSave(settingsConflict.revision)}>
+              Save my draft over this revision
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="settings-action-bar settings-action-bar--sticky">
         <div className="settings-save-summary" aria-live="polite">
           <strong>{dirtyKeys.length === 0 ? "No unsaved changes" : `${dirtyKeys.length} unsaved change${dirtyKeys.length === 1 ? "" : "s"}`}</strong>
@@ -567,12 +684,20 @@ export default function SettingsPage() {
           )}
           {Object.keys(validationErrors).length > 0 && <span className="text-danger">{Object.keys(validationErrors).length} field(s) need attention</span>}
         </div>
-        <button className="btn btn-primary" onClick={handleSave} disabled={saving || dirtyKeys.length === 0}>
+        <button className="btn btn-primary" onClick={() => void handleSave()} disabled={saving || refreshingSettings || !contractRevision || settingsConflict !== null || dirtyKeys.length === 0}>
           {saving ? "Saving..." : `Save ${dirtyKeys.length || ""} change${dirtyKeys.length === 1 ? "" : "s"}`}
         </button>
-        <button className="btn" onClick={discardChanges} disabled={dirtyKeys.length === 0}>
+        <button className="btn" onClick={discardChanges} disabled={saving || refreshingSettings || dirtyKeys.length === 0}>
           Discard draft
         </button>
+        {!contractRevision && (
+          <div role="alert">
+            <p>Settings revision is unavailable. Saving is blocked; reload planning settings without discarding your edits.</p>
+            <button className="btn" disabled={saving || refreshingSettings} onClick={() => void fetchSettings(true, settings)}>
+              {refreshingSettings ? "Reloading planning settings..." : "Reload planning settings"}
+            </button>
+          </div>
+        )}
       </div>
 
       {SETTINGS_TABS.filter((tab) => tab.id !== activeTab).map((tab) => (
@@ -802,7 +927,7 @@ export default function SettingsPage() {
         </section>
 
         <div id="comfort-schedule" className="settings-tab-panel" hidden={activeTab !== "optimizer"}>
-          <ComfortSchedule />
+          <ComfortSchedule contractChange={scheduleContractChange} />
         </div>
 
         <div id="test-connection" className="settings-tab-panel" hidden={activeTab !== "system"}>

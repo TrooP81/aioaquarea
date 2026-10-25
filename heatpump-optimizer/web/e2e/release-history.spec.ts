@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "./fixtures";
+import { expect, mockPlanningSettings, planningInstallationId, test, type Page } from "./fixtures";
 import packageInfo from "../package.json";
 
 async function mockSettingsPage(page: Page) {
@@ -12,6 +12,7 @@ async function mockSettingsPage(page: Page) {
     route.fulfill({
       status: 200,
       contentType: "application/json",
+      headers: { "X-Installation-ID": planningInstallationId },
       body: JSON.stringify({
         outcome_experiments_enabled: {
           value: "false",
@@ -44,6 +45,7 @@ async function mockSettingsPage(page: Page) {
   await page.route("**/api/smartthings/devices", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ devices: [] }) })
   );
+  await mockPlanningSettings(page);
 }
 
 test("shows the live release and its change history on Settings", async ({ page }) => {

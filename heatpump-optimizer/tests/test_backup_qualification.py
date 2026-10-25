@@ -68,12 +68,30 @@ def test_backup_nodes_are_never_owned_by_ordinary_phase():
 
 def test_unit_gate_executes_conftest_free_seal_regressions(tmp_path):
     """Keep the normal unit gate from missing coordinator-only synthetic fixtures."""
+    root = Path(__file__).resolve().parents[1]
     environment = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith("COP_MANUAL_TEST_") and key != "PYTEST_PLUGINS"
     }
+    for key in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_PREFIX",
+    ):
+        environment.pop(key, None)
     environment["HPO_TEST_OFFLINE"] = "1"
+    python_path = [
+        str(root),
+        str(root.parent),
+        environment.get("PYTHONPATH", ""),
+    ]
+    environment["PYTHONPATH"] = os.pathsep.join(path for path in python_path if path)
     result = subprocess.run(
         [
             sys.executable,

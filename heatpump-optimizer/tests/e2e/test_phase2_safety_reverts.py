@@ -41,7 +41,7 @@ from packages.optimizer.shower_mode import ShowerDetector, reconcile_shower_expi
 
 ROOT = Path(__file__).parents[2]
 MIGRATION_UNDER_TEST = "034"
-CURRENT_HEAD = "037"
+CURRENT_HEAD = "039"
 HISTORICAL_HEAD = "035"
 
 
@@ -69,12 +69,14 @@ def _historical_ancestry() -> str:
     assert scripts.get_heads() == [CURRENT_HEAD], "migration fixture requires the reviewed head"
     assert {
         revision: scripts.get_revision(revision).down_revision
-        for revision in (MIGRATION_UNDER_TEST, HISTORICAL_HEAD, "036", CURRENT_HEAD)
+        for revision in (MIGRATION_UNDER_TEST, HISTORICAL_HEAD, "036", "037", "038", CURRENT_HEAD)
     } == {
         MIGRATION_UNDER_TEST: "033",
         HISTORICAL_HEAD: MIGRATION_UNDER_TEST,
         "036": "035",
-        CURRENT_HEAD: "036",
+        "037": "036",
+        "038": "037",
+        CURRENT_HEAD: "038",
     }
     return HISTORICAL_HEAD
 

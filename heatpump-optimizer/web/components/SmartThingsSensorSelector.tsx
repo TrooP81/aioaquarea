@@ -11,6 +11,7 @@ interface Sensor {
 interface Props {
   value: string;
   onChange: (next: string) => void;
+  disabled?: boolean;
   single?: boolean;
   title?: string;
   emptyMessage?: string;
@@ -26,6 +27,7 @@ function parseIds(value: string): string[] {
 export function SmartThingsSensorSelector({
   value,
   onChange,
+  disabled = false,
   single = false,
   title = "Sensors to poll",
   emptyMessage,
@@ -72,6 +74,7 @@ export function SmartThingsSensorSelector({
   };
 
   const toggle = (id: string) => {
+    if (disabled) return;
     if (single) {
       onChange(selected.includes(id) ? "" : id);
       return;
@@ -86,10 +89,14 @@ export function SmartThingsSensorSelector({
   };
 
   const selectAll = () => {
+    if (disabled) return;
     onChange((sensors || []).map((s) => s.device_id).join(","));
   };
 
-  const clearAll = () => onChange("");
+  const clearAll = () => {
+    if (disabled) return;
+    onChange("");
+  };
 
   // Selected ids that are no longer reported by discovery (e.g. removed sensor).
   const unavailable = selected.filter(
@@ -119,7 +126,7 @@ export function SmartThingsSensorSelector({
           type="button"
           className="btn"
           onClick={discover}
-          disabled={loading}
+          disabled={loading || disabled}
           style={{ fontSize: "0.8rem", padding: "0.25rem 0.75rem", marginLeft: "auto" }}
         >
           {loading ? "Scanning..." : "Rescan"}
@@ -164,6 +171,7 @@ export function SmartThingsSensorSelector({
                     type={single ? "radio" : "checkbox"}
                     name={single ? "smartthings-reference-sensor" : undefined}
                     checked={checked}
+                    disabled={disabled}
                     onChange={() => toggle(s.device_id)}
                   />
                   <span style={{ fontWeight: 500 }}>{s.label || "(unnamed sensor)"}</span>
@@ -181,6 +189,7 @@ export function SmartThingsSensorSelector({
               type="button"
               className="btn"
               onClick={selectAll}
+              disabled={disabled}
               style={{ fontSize: "0.8rem", padding: "0.2rem 0.7rem" }}
             >
               Select all
@@ -190,6 +199,7 @@ export function SmartThingsSensorSelector({
               type="button"
               className="btn"
               onClick={clearAll}
+              disabled={disabled}
               style={{ fontSize: "0.8rem", padding: "0.2rem 0.7rem" }}
             >
               Clear
@@ -214,7 +224,7 @@ export function SmartThingsSensorSelector({
                 cursor: "pointer",
               }}
             >
-              <input type={single ? "radio" : "checkbox"} checked onChange={() => toggle(id)} />
+              <input type={single ? "radio" : "checkbox"} checked disabled={disabled} onChange={() => toggle(id)} />
               <span style={{ color: "var(--text-muted)" }}>{id}</span>
             </label>
           ))}

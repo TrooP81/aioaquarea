@@ -169,6 +169,7 @@ async def test_bulk_validation_under_existing_lock_before_upsert():
     session = AsyncMock()
     session.execute.side_effect = [
         None,
+        None,
         SimpleNamespace(
             scalars=lambda: [
                 SimpleNamespace(key="backup_retention_days", value="33"),
@@ -179,8 +180,13 @@ async def test_bulk_validation_under_existing_lock_before_upsert():
         await settings_service.set_settings_bulk(
             {"backup_max_age_seconds": str(34 * 86400)}, session=session
         )
-    assert session.execute.await_count == 2
-    assert "pg_advisory_xact_lock" in str(session.execute.call_args_list[0].args[0])
+    assert session.execute.await_count == 3
+    from packages.core.house_contract import CONTRACT_LOCK_KEY
+
+    for call in session.execute.call_args_list[:2]:
+        assert "pg_advisory_xact_lock" in str(call.args[0])
+    assert session.execute.call_args_list[0].args[1]["key"] == CONTRACT_LOCK_KEY
+    assert session.execute.call_args_list[1].args[1]["key"] != CONTRACT_LOCK_KEY
     session.commit.assert_not_awaited()
 
 
@@ -199,18 +205,22 @@ async def test_concurrent_merged_changes_cannot_persist_invalid_combination(monk
 
     from packages.core import settings_service
 
-    lock = asyncio.Lock()
+    locks = {}
     stored = {}
 
     class Transaction:
         def __init__(self):
             self.owns_lock = False
+            self.held_keys = []
             self.pending = {}
 
         async def execute(self, statement, params=None):
             sql = str(statement)
             if "pg_advisory_xact_lock" in sql:
-                await lock.acquire()
+                key = params["key"]
+                if key not in self.held_keys:
+                    await locks.setdefault(key, asyncio.Lock()).acquire()
+                    self.held_keys.append(key)
                 self.owns_lock = True
                 await asyncio.sleep(0)
                 return None
@@ -232,8 +242,8 @@ async def test_concurrent_merged_changes_cannot_persist_invalid_combination(monk
             yield transaction
             stored.update(transaction.pending)
         finally:
-            if transaction.owns_lock:
-                lock.release()
+            for key in reversed(transaction.held_keys):
+                locks[key].release()
 
     monkeypatch.setattr(settings_service, "get_session", session)
     results = await asyncio.gather(

@@ -3,25 +3,31 @@
   "version": "0.15.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "postinstall": "node scripts/patch-next-zod.mjs apply",
+    "patch:next-zod": "node scripts/patch-next-zod.mjs apply",
+    "verify:next-zod": "node scripts/patch-next-zod.mjs verify",
+    "test:next-zod": "node --test tests/next-zod*.test.mjs",
+    "dev": "node scripts/run-next.mjs dev",
+    "build": "node scripts/run-next.mjs build",
     "lint": "eslint . --max-warnings=0",
-    "start": "next start",
+    "start": "node scripts/run-next.mjs start",
     "typecheck": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:headed": "playwright test --headed",
-    "test:e2e:live": "playwright test --config=playwright.live.config.ts"
+    "test:e2e:live": "playwright test --config=playwright.live.config.ts",
+    "test:proxy": "node --test tests/proxy-route.test.mjs"
   },
   "dependencies": {
     "lucide-react": "1.31.0",
-    "next": "16.3.8",
+    "next": "16.4.2",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "recharts": "^2.12.0"
   },
   "overrides": {
-    "postcss": "8.5.23"
+    "postcss": "8.5.23",
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@playwright/test": "^1.44.0",
@@ -29,7 +35,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "eslint": "^9.0.0",
-    "eslint-config-next": "16.3.8",
+    "eslint-config-next": "16.4.2",
     "typescript": "^5.4.0"
   }
 }

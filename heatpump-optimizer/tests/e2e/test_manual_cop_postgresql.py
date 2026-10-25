@@ -155,7 +155,7 @@ def migration_targets():
 
 LEGACY_MANUAL_REVISIONS = ("032", "033", "034", "035")
 LOCAL_PERIOD_REVISION = "036"
-CURRENT_HEAD_REVISION = "037"
+CURRENT_HEAD_REVISION = "039"
 HISTORICAL_HEAD = LEGACY_MANUAL_REVISIONS[-1]
 LEGACY_BOUNDARY_COLUMNS = ("period_start", "period_end")
 LEGACY_CALENDAR_CONSTRAINTS = ("ck_manual_cop_calendar", "ck_manual_cop_period_order")
@@ -3043,7 +3043,8 @@ class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
         )
         environment = dict(os.environ)
         root = Path(__file__).resolve().parents[3]
-        environment["PYTHONPATH"] = os.pathsep.join((str(root), str(root.parent)))
+        python_paths = (str(root), str(root.parent), environment.get("PYTHONPATH", ""))
+        environment["PYTHONPATH"] = os.pathsep.join(path for path in python_paths if path)
         child = subprocess.Popen(
             [sys.executable, "-c", script, str(evidence)],
             stdin=subprocess.PIPE,
@@ -3057,7 +3058,13 @@ class TestLifecycleReceiptSeal(SyntheticVerificationEvidence):
             reader = threading.Thread(target=lambda: ready.append(child.stdout.readline().strip()))
             reader.start()
             reader.join(10)
-            assert ready == ["LOCKED"], "receipt lock child did not become ready"
+            if ready != ["LOCKED"] and child.poll() is not None:
+                _, child_stderr = child.communicate(timeout=10)
+                pytest.fail(
+                    "receipt lock child did not become ready "
+                    f"(exit {child.returncode}): {child_stderr}"
+                )
+            assert ready == ["LOCKED"], "receipt lock child did not become ready within 10s"
             with pytest.raises(AssertionError, match="lock unavailable"):
                 write_lifecycle_receipt(evidence, {"test": "contender"})
         finally:
@@ -5515,7 +5522,7 @@ class TestManualCOPPostgreSQLMigration:
             async with engine.connect() as connection:
                 retained = await retained_storage_state(connection)
             # Historical qualification stops at genuine 035: 036 is forward-only, and the
-            # workflow's upgrade-head phase then upgrades this populated database to 037.
+            # workflow's upgrade-head phase then upgrades this populated database to 039.
             assert head == CURRENT_HEAD_REVISION
             assert (
                 ScriptDirectory.from_config(config)
@@ -5570,7 +5577,7 @@ class TestManualCOPPostgreSQLMigration:
                     if target == HISTORICAL_HEAD:
                         for table, columns in additions.items():
                             next_positions[table] += len(columns)
-            # No historical `alembic check`: 035 differs from the current 037 metadata by
+            # No historical `alembic check`: 035 differs from the current 039 metadata by
             # design. The explicit catalog, row and sequence comparisons above replace it.
         finally:
             await engine.dispose()

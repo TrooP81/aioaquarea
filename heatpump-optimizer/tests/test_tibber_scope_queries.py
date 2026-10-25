@@ -49,7 +49,22 @@ def values(reason=None):
 async def test_native_materialization_filters_captured_scope_before_limit_and_honors_latch(
     monkeypatch, reason
 ):
+    from packages.core import house_contract
+
     captured = values(reason)
+    contract_revision = SimpleNamespace(
+        id=7,
+        contract_hash="a" * 64,
+        contract_json={
+            "installation_id": "00000000-0000-0000-0000-000000000001",
+            "timezone": "Europe/Amsterdam",
+        },
+    )
+    monkeypatch.setattr(
+        house_contract,
+        "ensure_current_contract",
+        AsyncMock(return_value=contract_revision),
+    )
     status = DeviceStatusRecord(ts=NOW, device_id="heatpump", tank_temp=50)
     prices = [
         PriceRecord(
@@ -86,7 +101,15 @@ async def test_native_materialization_filters_captured_scope_before_limit_and_ho
             rows = [status] if model is DeviceStatusRecord else []
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
-    session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=execute),
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                installation_id="00000000-0000-0000-0000-000000000001",
+                demand_dependency_generation=1,
+            )
+        ),
+    )
     monkeypatch.setattr(
         forecast_quality,
         "get_session",

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import datetime as dt
 import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 from structlog.testing import capture_logs
@@ -28,6 +30,101 @@ from packages.api.routers.optimizer import (
 from packages.ml.model_status import clear_artifact_status_cache
 from packages.ml.safe_persistence import safe_dump
 from packages.ml.thermal import ThermalModel
+
+
+@pytest.fixture
+def current_house_revision(monkeypatch):
+    from packages.core.house_contract import (
+        HousePlanningContract,
+        _contract_hash,
+    )
+
+    contract = HousePlanningContract.from_settings(
+        {
+            "comfort_schedule": '{"weekday":[],"weekend":[]}',
+            "comfort_temp_min": "19.0",
+            "comfort_temp_target": "19.0",
+            "comfort_temp_max": "25.0",
+            "timezone": "UTC",
+        },
+        installation_id=UUID("00000000-0000-0000-0000-000000000001"),
+        house_id=UUID("00000000-0000-0000-0000-000000000002"),
+    )
+    projection = contract.to_projection()
+    revision = SimpleNamespace(
+        id=1,
+        contract_hash=_contract_hash(projection),
+        contract_json=projection,
+    )
+
+    async def ensure_current_contract(_session, _settings=None, **_options):
+        return revision
+
+    monkeypatch.setattr(
+        "packages.core.house_contract.ensure_current_contract", ensure_current_contract
+    )
+    return revision
+
+
+@pytest.fixture
+def current_house_contract(monkeypatch, current_house_revision):
+    from packages.core.comfort_schedule import resolve_hourly_targets
+    from packages.core.house_contract import (
+        RESOLVER_SCHEMA,
+        policy_dependency_fingerprint,
+    )
+
+    revision = current_house_revision
+
+    async def snapshot_from_revision(_session, revision_id, start, end):
+        projection = revision.contract_json
+        intervals = resolve_hourly_targets(
+            projection["comfort_schedule"],
+            projection["timezone"],
+            start,
+            end,
+            scheduled_target_c=projection["comfort_temp_target"],
+            unscheduled_target_c=projection["comfort_temp_min"],
+            outer_max_c=projection["comfort_temp_max"],
+        )
+        for interval in intervals:
+            interval.update(
+                contract_revision_id=revision_id,
+                contract_hash=revision.contract_hash,
+                preferred_band=None,
+                room_policy="not_configured",
+                dhw_preference="inherit_comfort",
+            )
+        return {
+            **projection,
+            "revision_id": revision_id,
+            "contract_hash": revision.contract_hash,
+            "effective_at": "2026-01-01T00:00:00+00:00",
+            "source": "test_fixture",
+            "field_sources": {},
+            "policy_dependency_fingerprint": policy_dependency_fingerprint(projection),
+            "resolver_schema": RESOLVER_SCHEMA,
+            "schedule_projection": intervals,
+            "ordinary_writes_allowed": False,
+            "scope": {
+                "protected_rooms": "not_configured_in_p2_1",
+                "dhw_custom_schedule": "not_configured_in_p2_1",
+                "tariff_contract": "unchanged_existing_price_scope",
+                "controller_curve_attestation": "not_configured_in_p2_1",
+            },
+            "p2_defaults": {
+                "protected_rooms": [],
+                "dhw_schedule_mode": "inherit_comfort",
+                "dhw_custom_schedule": None,
+                "tariff_settings": None,
+                "curve_attestation": "unknown_not_recorded_by_p2_1",
+            },
+        }
+
+    monkeypatch.setattr(
+        "packages.core.house_contract.snapshot_from_revision", snapshot_from_revision
+    )
+    return revision
 
 
 @pytest.mark.parametrize(
@@ -1442,6 +1539,7 @@ def _admissible_plan(*, version: str = "rules_v8", **quality_options) -> dict:
 @pytest.mark.parametrize("planner", ["rules", "milp", "fallback"])
 @pytest.mark.parametrize("force_replace", [False, True])
 @pytest.mark.parametrize("learning_state", ["active", "inactive"])
+@pytest.mark.usefixtures("current_house_contract")
 async def test_diagnostic_has_zero_actions_and_is_never_active(
     planner, force_replace, learning_state
 ):
@@ -1533,18 +1631,95 @@ def _refused_plan_session():
 
 
 async def _run_admission(
-    plan, *, layer="rules", failure=None, fallback_plan=None, isolate_frozen_quality=True
+    plan,
+    *,
+    layer="rules",
+    failure=None,
+    fallback_plan=None,
+    isolate_frozen_quality=True,
+    demand_context=None,
 ):
+    from contextlib import ExitStack, asynccontextmanager
+
     from packages.optimizer import main as optimizer_main
     from packages.optimizer.represented_strategy import validate_represented_plan
+
+    lifecycle_lock_held = False
+    demand_patches = ExitStack()
+    if demand_context is not None:
+        plan["demand_planning_context"] = demand_context
+
+        async def scalar(statement):
+            nonlocal lifecycle_lock_held
+            if "ml_lifecycle_state" in str(statement).lower():
+                assert statement._for_update_arg is not None
+                lifecycle_lock_held = True
+                return SimpleNamespace(id=1)
+            return None
+
+        session_scalar = AsyncMock(side_effect=scalar)
+
+        @asynccontextmanager
+        async def locked_demand_scope(_device_id, *, session):
+            assert lifecycle_lock_held
+            yield demand_context["scope"], session
+
+        demand_patches.enter_context(
+            patch("packages.ml.forecast_quality.locked_demand_scope", new=locked_demand_scope)
+        )
+        demand_patches.enter_context(
+            patch.object(
+                optimizer_main,
+                "_native_model_contexts_are_current",
+                new=AsyncMock(return_value=True),
+            )
+        )
+
+        reference = SimpleNamespace(
+            artifact_hash=demand_context["artifact_hash"],
+            manifest={"device_id": demand_context["device_id"]},
+        )
+        lifecycle = SimpleNamespace(
+            read=AsyncMock(
+                return_value=SimpleNamespace(
+                    reference=lambda component: reference if component == "demand" else None
+                )
+            )
+        )
+        demand_patches.enter_context(
+            patch.object(
+                optimizer_main, "_capture_native_model_contexts", new=AsyncMock(return_value=())
+            )
+        )
+        demand_patches.enter_context(
+            patch("packages.ml.lifecycle.Lifecycle", return_value=lifecycle)
+        )
+        demand_patches.enter_context(
+            patch(
+                "packages.ml.lifecycle.reference_is_qualified",
+                side_effect=lambda reference, **_kwargs: reference is not None,
+            )
+        )
+    else:
+        session_scalar = None
 
     optimizer = SimpleNamespace(generate_plan=AsyncMock(return_value=plan))
     if failure is not None:
         optimizer.generate_plan.side_effect = failure
     fallback = SimpleNamespace(generate_plan=AsyncMock(return_value=fallback_plan))
     session, records = _refused_plan_session()
+    if session_scalar is not None:
+        session.scalar = session_scalar
+    from tests.planning_contract_support import local_contract_revision
+
+    revision = local_contract_revision()
+    session.get = AsyncMock(return_value=revision)
     session_factory = MagicMock(side_effect=lambda *args, **kwargs: _session_context(session))
     with (
+        patch(
+            "packages.core.house_contract.ensure_current_contract",
+            new=AsyncMock(return_value=revision),
+        ),
         # These unit oracles target the frozen-input owner, not the earlier S4
         # serializer/replay gate. Integrated S4 and diagnostic-publication controls
         # keep the real gate; repair-one also explicitly tests that earlier refusal.
@@ -1555,6 +1730,7 @@ async def _run_admission(
             else validate_represented_plan,
         ),
         patch.object(optimizer_main, "get_session", new=session_factory),
+        demand_patches,
         patch.object(optimizer_main, "get_setting", new=AsyncMock(return_value=layer)),
         patch.object(
             optimizer_main, "_select_optimizer", new=AsyncMock(return_value=(layer, optimizer))
@@ -1602,7 +1778,7 @@ async def _run_admission(
 def _assert_refused(outcome, refusal):
     assert outcome.result is None
     assert outcome.records == []
-    outcome.session_factory.assert_not_called()
+    outcome.session_factory.assert_called_once()
     assert outcome.cooldown == 0.0
     refusals = [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
     assert refusals == [
@@ -1613,6 +1789,38 @@ def _assert_refused(outcome, refusal):
             "refusal": refusal,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_P2_AC20_frozen_solve_is_not_persisted_after_contract_revision_changes():
+    with patch(
+        "packages.core.house_contract.current_revision_matches",
+        new=AsyncMock(return_value=False),
+    ):
+        outcome = await _run_admission(_admissible_plan())
+
+    assert outcome.result is None
+    assert outcome.records == []
+    assert outcome.cooldown == 0.0
+    assert outcome.session_factory.call_count == 2
+    assert any(
+        event.get("event") == "plan_admission_contract_refused"
+        and event.get("reason") == "refused_contract_changed"
+        for event in outcome.logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_P2_demand_only_admission_locks_lifecycle_before_rechecking_demand():
+    demand_context = {
+        "device_id": "device-a",
+        "artifact_hash": "d" * 64,
+        "scope": {"component_dependency_generation": 5},
+    }
+    outcome = await _run_admission(_admissible_plan(), demand_context=demand_context)
+
+    assert outcome.result == 321
+    assert len(outcome.records) == 1
 
 
 def _quality(plan):
@@ -1702,7 +1910,7 @@ async def test_CIU2_frozen_quality_clocks_require_producer_iso_strings(section, 
 
     assert outcome.result is None, "Non-string frozen clock must refuse publication"
     assert outcome.records == []
-    outcome.session_factory.assert_not_called()
+    outcome.session_factory.assert_called_once()
     assert outcome.cooldown == 0.0
     assert any(
         log.get("event") == "optimizer_no_plan"
@@ -1755,7 +1963,7 @@ async def test_CIU2_producer_iso_clocks_and_datetime_plan_horizon_are_admitted(o
     outcome = await _run_admission(plan)
 
     assert outcome.result == 321
-    outcome.session_factory.assert_called_once()
+    assert outcome.session_factory.call_count == 2
     assert outcome.cooldown > 0.0
     (record,) = outcome.records
     assert json.loads(record.input_provenance_json)["input_quality"] == expected_quality
@@ -2081,7 +2289,7 @@ async def test_CIU2_valid_full_and_shortened_horizons_are_admitted(options, muta
     outcome = await _run_admission(plan)
 
     assert outcome.result == 321
-    outcome.session_factory.assert_called_once()
+    assert outcome.session_factory.call_count == 2
     assert outcome.cooldown > 0.0
     (record,) = outcome.records
     assert record.status == "diagnostic"
@@ -2264,6 +2472,17 @@ class _DmlSentinel:
                 self._autoflush()
                 sentinel.statement(statement)
                 return MagicMock()
+
+            async def get(self, model, identity):
+                from sqlalchemy import select
+                from packages.core.models import HouseInstallationRecord
+
+                assert model is HouseInstallationRecord and identity == 1
+                await self.execute(select(model).where(model.singleton_id == identity))
+                return SimpleNamespace(
+                    demand_dependency_generation=0,
+                    indoor_dependency_generation=1,
+                )
 
             def _autoflush(self):
                 from packages.core.models import AppLogRecord
@@ -2599,6 +2818,7 @@ async def _refused_run_with_production_logging(sink, sentinel, plan, *, failure=
     return result, cooldown, drained_buffer
 
 
+@pytest.mark.usefixtures("current_house_contract")
 async def test_CIU2_refusal_admits_and_drains_only_application_logs(production_log_sink):
     sentinel = _DmlSentinel()
     plan = _admissible_plan()
@@ -2630,6 +2850,7 @@ async def test_CIU2_refusal_admits_and_drains_only_application_logs(production_l
 
 
 @pytest.mark.parametrize(("section", "clock_key"), _FROZEN_CLOCKS)
+@pytest.mark.usefixtures("current_house_contract")
 async def test_CIU2_frozen_clock_refusal_drains_only_application_logs(
     production_log_sink, section, clock_key
 ):
@@ -2657,6 +2878,7 @@ async def test_CIU2_frozen_clock_refusal_drains_only_application_logs(
     }
 
 
+@pytest.mark.usefixtures("current_house_contract")
 async def test_CIU2_log_commit_failure_never_admits_planning(production_log_sink):
     sentinel = _DmlSentinel(fail_commits=10)
     plan = _admissible_plan()
@@ -2675,6 +2897,7 @@ async def test_CIU2_log_commit_failure_never_admits_planning(production_log_sink
     assert production_log_sink.log_sink_status()["drops"]
 
 
+@pytest.mark.usefixtures("current_house_contract")
 async def test_CIU2_cancellation_preserves_log_drain(production_log_sink):
     sentinel = _DmlSentinel()
 
@@ -2689,10 +2912,17 @@ async def test_CIU2_cancellation_preserves_log_drain(production_log_sink):
 
 
 async def test_CIU2_unsettled_log_writer_retains_ownership(production_log_sink, monkeypatch):
+    from packages.optimizer import main as optimizer_main
+
     release = asyncio.Event()
     sentinel = _DmlSentinel(block=release)
     monkeypatch.setattr(production_log_sink, "_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
     monkeypatch.setattr(production_log_sink, "_ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        optimizer_main,
+        "_freeze_contract_revision",
+        AsyncMock(return_value=(7, "a" * 64)),
+    )
     plan = _admissible_plan()
     plan["planning_data_quality"]["status"] = "degraded"
 
@@ -2825,6 +3055,7 @@ async def test_restart_and_rollback_preserve_restore_and_embargo(learning_state)
         assert dhw_embargoed([restore], "device-a") is True
 
 
+@pytest.mark.usefixtures("current_house_revision")
 async def test_default_history_excludes_diagnostics_and_explicit_detail_has_no_outcome():
     from fastapi import HTTPException
     from packages.api.routers.optimizer import get_plan_activity
@@ -2882,6 +3113,14 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
 ):
     from packages.optimizer.executor_core import LearningModeState
 
+    contract = SimpleNamespace(
+        id=17,
+        contract_hash="a" * 64,
+        contract_json={
+            "comfort_schedule": {"weekday": [8], "weekend": [9]},
+            "timezone": "UTC",
+        },
+    )
     status = SimpleNamespace(tank_temp=48.0, tank_target_temp=52, outdoor_temp=7.0, zone1_temp=20.0)
     active_plan = SimpleNamespace(id=42)
     action = SimpleNamespace(
@@ -2898,6 +3137,8 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
     thermal_model = SimpleNamespace(
         load_latest=MagicMock(),
         arefresh_if_changed=AsyncMock(return_value=False),
+        capture_dependency_context=MagicMock(return_value=None),
+        dependency_context_is_current=AsyncMock(return_value=True),
         predict_temperature_curve=MagicMock(return_value=[]),
         predict_planned_tank_curve=MagicMock(return_value=[]),
         predict_managed_tank_curve=MagicMock(return_value=[]),
@@ -2907,10 +3148,17 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
             "packages.api.routers.models_router.get_session", return_value=_session_context(session)
         ),
         patch(
-            "packages.core.settings_service.get_comfort_schedule", new=AsyncMock(return_value={})
+            "packages.core.house_contract.ensure_current_contract",
+            new=AsyncMock(return_value=contract),
         ),
-        patch("packages.core.settings_service.get_user_tz", new=AsyncMock(return_value="UTC")),
-        patch("packages.core.settings_service.get_setting", new=AsyncMock(return_value=None)),
+        patch(
+            "packages.core.house_contract.current_revision_matches",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "packages.core.settings_service.get_all_settings",
+            new=AsyncMock(return_value={"tank_min_temp": "45", "tank_min_temp_offpeak": "41"}),
+        ),
         patch(
             "packages.optimizer.executor_core.resolve_learning_mode_state",
             new=AsyncMock(return_value=LearningModeState(learning_state)),
@@ -2931,6 +3179,11 @@ async def test_thermal_curve_projects_tri_state_learning_contract(
         "learning_mode_state": learning_state,
         "learning_mode_reliable": expected_reliable,
         "plan_id": 42,
+    }
+    assert response["planning_contract"] == {
+        "revision_id": 17,
+        "contract_hash": "a" * 64,
+        "ordinary_writes_allowed": False,
     }
 
 
@@ -2958,6 +3211,7 @@ async def test_api_thermal_process_refreshes_committed_rates(monkeypatch):
 
     refresh_reader = AsyncMock(side_effect=refresh)
     model.arefresh_if_changed = refresh_reader
+    model.dependency_context_is_current = AsyncMock(return_value=True)
     monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
     monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
     monkeypatch.setattr(
@@ -3046,27 +3300,130 @@ async def test_optimizer_status_preserves_captured_thermal_even_if_seasonal_repo
 async def test_every_api_thermal_reader_refreshes_before_reading_inputs(monkeypatch, reader):
     from packages.api.routers import models_router
 
+    events = []
+    authority_session = SimpleNamespace(
+        execute=AsyncMock(side_effect=AssertionError("input SQL before refresh"))
+    )
+    revision, generation = object(), object()
+
+    async def refresh():
+        if reader == "get_indoor_forecast":
+            assert events == [
+                "authority-session",
+                "capture-authority",
+                "capture-generation",
+                "capture-provider",
+                "authority-session-released",
+            ]
+        events.append("thermal-refresh")
+        return False
+
     model = ThermalModel()
-    refresh_reader = AsyncMock(return_value=False)
+    refresh_reader = AsyncMock(side_effect=refresh)
     model.arefresh_if_changed = refresh_reader
     monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
-    monkeypatch.setattr(models_router, "_read_live_forecast_quality", AsyncMock(return_value={}))
-    monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
+
+    def input_after_refresh(name, result):
+        refresh_reader.assert_awaited_once()
+        events.append(name)
+        return result
+
+    if reader == "get_indoor_forecast":
+
+        def capture(name, result):
+            refresh_reader.assert_not_awaited()
+            events.append(name)
+            return result
+
+        ensure_authority = AsyncMock(
+            side_effect=lambda session: capture("capture-authority", revision)
+        )
+        capture_generation = AsyncMock(
+            side_effect=lambda session, authority: capture("capture-generation", generation)
+        )
+        capture_provider = AsyncMock(
+            side_effect=lambda *args, **kwargs: capture("capture-provider", "open-meteo")
+        )
+        monkeypatch.setattr(
+            "packages.core.house_contract.ensure_current_contract", ensure_authority
+        )
+        monkeypatch.setattr(models_router, "_forecast_dependency_context", capture_generation)
+        monkeypatch.setattr("packages.core.settings_service.get_setting", capture_provider)
+        monkeypatch.setattr(
+            model,
+            "capture_dependency_context",
+            MagicMock(side_effect=lambda: input_after_refresh("model-dependency-context", {})),
+        )
+
+    monkeypatch.setattr(
+        models_router,
+        "_read_live_forecast_quality",
+        AsyncMock(side_effect=lambda: input_after_refresh("forecast-quality", {})),
+    )
+    monkeypatch.setattr(
+        models_router,
+        "get_price_area",
+        AsyncMock(side_effect=lambda: input_after_refresh("price-area", "SE3")),
+    )
     monkeypatch.setattr(
         "packages.ml.model_status.get_model_status",
         AsyncMock(return_value={"status": "unqualified"}),
     )
 
+    @asynccontextmanager
+    async def capture_authority_session():
+        refresh_reader.assert_not_awaited()
+        events.append("authority-session")
+        try:
+            yield authority_session
+        finally:
+            refresh_reader.assert_not_awaited()
+            events.append("authority-session-released")
+
     def stop_after_refresh():
-        refresh_reader.assert_awaited_once()
+        # Only the first forecast session captures authority; all input sessions
+        # and settings-dependent model reads must still follow exactly one refresh.
+        if reader == "get_indoor_forecast" and not events:
+            return capture_authority_session()
+        input_after_refresh("forecast-input-session", None)
         raise RuntimeError("stop before fixture input reads")
 
     monkeypatch.setattr(models_router, "get_session", stop_after_refresh)
     with pytest.raises(RuntimeError, match="stop before fixture input reads"):
         await getattr(models_router, reader)()
 
+    if reader == "get_indoor_forecast":
+        assert events == [
+            "authority-session",
+            "capture-authority",
+            "capture-generation",
+            "capture-provider",
+            "authority-session-released",
+            "thermal-refresh",
+            "model-dependency-context",
+            "forecast-quality",
+            "price-area",
+            "forecast-input-session",
+        ]
+        ensure_authority.assert_awaited_once_with(authority_session)
+        capture_generation.assert_awaited_once_with(authority_session, revision)
+        capture_provider.assert_awaited_once_with("weather_provider", session=authority_session)
+        authority_session.execute.assert_not_awaited()
 
-async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
+
+async def test_thermal_curve_lookup_failure_returns_unknown_metadata(monkeypatch):
+    from packages.core import house_contract
+
+    revision = SimpleNamespace(
+        id=7,
+        contract_hash="a" * 64,
+        contract_json={"comfort_schedule": {"weekday": [], "weekend": []}, "timezone": "UTC"},
+    )
+    monkeypatch.setattr(house_contract, "ensure_current_contract", AsyncMock(return_value=revision))
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_all_settings",
+        AsyncMock(return_value={"tank_min_temp": "45", "tank_min_temp_offpeak": "40"}),
+    )
     status = SimpleNamespace(
         id=1,
         tank_temp=48.0,
@@ -3079,6 +3436,8 @@ async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
     thermal_model = SimpleNamespace(
         load_latest=MagicMock(),
         arefresh_if_changed=AsyncMock(return_value=False),
+        capture_dependency_context=MagicMock(return_value=None),
+        dependency_context_is_current=AsyncMock(return_value=True),
         predict_temperature_curve=MagicMock(return_value=[]),
         predict_managed_tank_curve=MagicMock(return_value=[]),
     )
@@ -3102,6 +3461,290 @@ async def test_thermal_curve_lookup_failure_returns_unknown_metadata():
     assert response["current"]["learning_mode_state"] == "unknown"
     assert response["current"]["learning_mode"] is False
     assert response["current"]["learning_mode_reliable"] is False
+
+
+async def test_saved_plan_rejects_learned_forecast_after_model_resets_to_default(monkeypatch):
+    from packages.api.routers import models_router
+    from tests.test_optimizer_api_contracts import _session_context
+
+    installation = SimpleNamespace(indoor_dependency_generation=7)
+
+    async def lock_lifecycle_row(statement):
+        assert statement._for_update_arg is not None
+        return SimpleNamespace(id=1)
+
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=installation),
+        scalar=AsyncMock(side_effect=lock_lifecycle_row),
+    )
+    state = SimpleNamespace(reference=lambda _component: None)
+
+    async def read_locked_state(*, session):
+        assert session.scalar.await_count >= 1
+        return state
+
+    lifecycle = SimpleNamespace(read=AsyncMock(side_effect=read_locked_state))
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    monkeypatch.setattr(models_router, "Lifecycle", lambda: lifecycle)
+    monkeypatch.setattr("packages.core.house_contract._lock_contract", AsyncMock())
+    plan = SimpleNamespace(
+        id=42,
+        input_provenance_json=json.dumps(
+            {
+                "indoor_dependency_generation": 7,
+                "models": {
+                    "native_dependencies": [
+                        {"component": "comfort", "artifact_digest": None, "scope": None},
+                        {"component": "thermal", "artifact_digest": None, "scope": None},
+                    ]
+                },
+            }
+        ),
+    )
+
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+
+    installation.indoor_dependency_generation = 8
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    installation.indoor_dependency_generation = 7
+
+    plan.input_provenance_json = json.dumps(
+        {
+            "indoor_dependency_generation": 7,
+            "models": {
+                "native_dependencies": [
+                    {"component": "comfort", "artifact_digest": None, "scope": None},
+                    {"component": "thermal", "artifact_digest": "a" * 64, "scope": {}},
+                ]
+            },
+        }
+    )
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+
+
+async def test_saved_plan_dependencies_use_lifecycle_before_api_model_is_loaded(monkeypatch):
+    from packages.api.routers import models_router
+    from packages.ml import forecast_quality, lifecycle as lifecycle_module
+    from tests.test_optimizer_api_contracts import _session_context
+
+    scopes = {
+        "comfort": {"sensor_generation": 7, "component": "comfort"},
+        "thermal": {"sensor_generation": 7, "component": "thermal"},
+    }
+    references = {
+        component: SimpleNamespace(
+            artifact_hash=digest,
+            manifest={
+                "device_id": "device-a",
+                "capabilities": [component],
+                "scope": scopes[component],
+            },
+        )
+        for component, digest in (("comfort", "a" * 64), ("thermal", "b" * 64))
+    }
+    state = SimpleNamespace(reference=references.__getitem__)
+    lifecycle = SimpleNamespace()
+    lifecycle_row_locked = False
+
+    async def lock_lifecycle_row(statement):
+        nonlocal lifecycle_row_locked
+        assert statement._for_update_arg is not None
+        lifecycle_row_locked = True
+        return SimpleNamespace(id=1)
+
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(indoor_dependency_generation=7)),
+        scalar=AsyncMock(side_effect=lock_lifecycle_row),
+    )
+
+    async def read_locked_state(*, session):
+        assert lifecycle_row_locked
+        return state
+
+    lifecycle.read = AsyncMock(side_effect=read_locked_state)
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    monkeypatch.setattr(models_router, "Lifecycle", lambda: lifecycle)
+    monkeypatch.setattr("packages.core.house_contract._lock_contract", AsyncMock())
+    monkeypatch.setattr(lifecycle_module, "reference_is_qualified", lambda *_args, **_kwargs: True)
+
+    @asynccontextmanager
+    async def current_scope(component, **_kwargs):
+        assert lifecycle_row_locked
+        if component == "thermal":
+            assert references["comfort"].artifact_hash == "a" * 64
+        yield scopes[component], None
+
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", current_scope)
+    plan = SimpleNamespace(
+        id=43,
+        input_provenance_json=json.dumps(
+            {
+                "indoor_dependency_generation": 7,
+                "models": {
+                    "native_dependencies": [
+                        {
+                            "component": "comfort",
+                            "artifact_digest": "a" * 64,
+                            "scope": scopes["comfort"],
+                        },
+                        {
+                            "component": "thermal",
+                            "artifact_digest": "b" * 64,
+                            "scope": scopes["thermal"],
+                        },
+                    ]
+                },
+            }
+        ),
+    )
+
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+
+
+async def test_saved_default_plan_allows_expired_registry_incumbents(monkeypatch):
+    from packages.api.routers import models_router
+    from packages.ml import forecast_quality, lifecycle as lifecycle_module
+    from tests.test_optimizer_api_contracts import _session_context
+
+    scope = {"component": "thermal", "generation": 4}
+    expired_reference = SimpleNamespace(
+        artifact_hash="c" * 64,
+        manifest={"device_id": "device-a", "capabilities": ["thermal"], "scope": scope},
+    )
+    state = SimpleNamespace(
+        reference=lambda component: expired_reference if component == "thermal" else None
+    )
+    lifecycle = SimpleNamespace(read=AsyncMock(return_value=state))
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(indoor_dependency_generation=7)),
+        scalar=AsyncMock(return_value=SimpleNamespace(id=1)),
+    )
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    monkeypatch.setattr(models_router, "Lifecycle", lambda: lifecycle)
+    monkeypatch.setattr("packages.core.house_contract._lock_contract", AsyncMock())
+    monkeypatch.setattr(lifecycle_module, "reference_is_qualified", lambda *_args, **_kwargs: False)
+
+    scope_available = False
+
+    @asynccontextmanager
+    async def current_scope(component, **_kwargs):
+        assert component == "thermal"
+        if not scope_available:
+            raise ValueError("current_thermal_scope_unavailable")
+        yield scope, None
+
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", current_scope)
+    plan = SimpleNamespace(
+        id=44,
+        input_provenance_json=json.dumps(
+            {
+                "indoor_dependency_generation": 7,
+                "models": {
+                    "native_dependencies": [
+                        {"component": "comfort", "artifact_digest": None, "scope": None},
+                        {"component": "thermal", "artifact_digest": None, "scope": None},
+                    ]
+                },
+            }
+        ),
+    )
+
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+
+    monkeypatch.setattr(lifecycle_module, "reference_is_qualified", lambda *_args, **_kwargs: True)
+    scope_available = True
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+
+
+async def test_saved_plan_revalidates_demand_dependency_and_generation(monkeypatch):
+    from packages.api.routers import models_router
+    from packages.ml import forecast_quality, lifecycle as lifecycle_module
+    from tests.test_optimizer_api_contracts import _session_context
+
+    demand_scope = {
+        "component_dependency_schema": "demand-schema-v1",
+        "component_dependency_fingerprint": "f" * 64,
+        "component_dependency_generation": 5,
+    }
+    demand_reference = SimpleNamespace(
+        artifact_hash="d" * 64,
+        manifest={"device_id": "device-a", "capabilities": ["demand"]},
+    )
+    demand_is_qualified = True
+    current_demand_reference = demand_reference
+    state = SimpleNamespace(
+        reference=lambda component: current_demand_reference if component == "demand" else None
+    )
+    lifecycle = SimpleNamespace(read=AsyncMock(return_value=state))
+    installation = SimpleNamespace(indoor_dependency_generation=7, demand_dependency_generation=9)
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=installation),
+        scalar=AsyncMock(return_value=SimpleNamespace(id=1)),
+    )
+    monkeypatch.setattr(models_router, "get_session", lambda: _session_context(session))
+    monkeypatch.setattr(models_router, "Lifecycle", lambda: lifecycle)
+    monkeypatch.setattr("packages.core.house_contract._lock_contract", AsyncMock())
+    monkeypatch.setattr(
+        lifecycle_module,
+        "reference_is_qualified",
+        lambda reference, **_kwargs: demand_is_qualified and reference is demand_reference,
+    )
+
+    @asynccontextmanager
+    async def current_demand_scope(device_id, *, session):
+        assert device_id == "device-a"
+        yield demand_scope, session
+
+    monkeypatch.setattr(forecast_quality, "locked_demand_scope", current_demand_scope)
+    plan = SimpleNamespace(
+        id=45,
+        input_provenance_json=json.dumps(
+            {
+                "indoor_dependency_generation": 7,
+                "planning_dependency_generation": 9,
+                "models": {
+                    "native_dependencies": [
+                        {"component": "comfort", "artifact_digest": None, "scope": None},
+                        {"component": "thermal", "artifact_digest": None, "scope": None},
+                    ],
+                    "demand_serving_dependency": {
+                        "artifact_digest": "d" * 64,
+                        "dependency_schema": demand_scope["component_dependency_schema"],
+                        "dependency_fingerprint": demand_scope["component_dependency_fingerprint"],
+                        "dependency_generation": demand_scope["component_dependency_generation"],
+                        "used_for_plan": True,
+                    },
+                },
+            }
+        ),
+    )
+
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+    provenance = json.loads(plan.input_provenance_json)
+    demand_provenance = provenance["models"]["demand_serving_dependency"]
+    malformed_dependencies = [
+        {},
+        {key: value for key, value in demand_provenance.items() if key != "used_for_plan"},
+        {**demand_provenance, "used_for_plan": None},
+        {**demand_provenance, "used_for_plan": "true"},
+    ]
+    for malformed in malformed_dependencies:
+        provenance["models"]["demand_serving_dependency"] = malformed
+        plan.input_provenance_json = json.dumps(provenance)
+        assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    provenance["models"]["demand_serving_dependency"] = demand_provenance
+    plan.input_provenance_json = json.dumps(provenance)
+    demand_is_qualified = False
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    demand_is_qualified = True
+    current_demand_reference = None
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    current_demand_reference = demand_reference
+    installation.demand_dependency_generation = 10
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    installation.demand_dependency_generation = 9
+    demand_scope["component_dependency_fingerprint"] = "e" * 64
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
 
 
 def test_dashboard_response_serializes_space_heating_gate_evidence() -> None:
@@ -5285,9 +5928,11 @@ async def test_hash_hmac_schema_tampering_refuses_load(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("current_house_revision")
 async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
     plan = SimpleNamespace(
         id=7,
+        plan_json="{}",
         created_at=dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc),
         horizon_start=dt.datetime(2026, 9, 14, 1, tzinfo=dt.timezone.utc),
         horizon_end=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
@@ -5299,6 +5944,12 @@ async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
         status_reason="replaced_by_manual_replan",
         superseded_at=dt.datetime(2026, 9, 14, 2, tzinfo=dt.timezone.utc),
         superseded_by_plan_id=8,
+        contract_revision_id=None,
+        contract_hash=None,
+        contract_state="legacy_unknown",
+        contract_invalidated_at=None,
+        invalidated_by_revision_id=None,
+        contract_invalidation_reason=None,
     )
     session = SimpleNamespace()
     result = MagicMock()
@@ -5324,10 +5975,21 @@ async def test_plan_list_preserves_lifecycle_and_price_context() -> None:
         "status_reason": "replaced_by_manual_replan",
         "superseded_at": plan.superseded_at,
         "superseded_by_plan_id": 8,
+        "contract_revision_id": None,
+        "contract_hash": None,
+        "contract_state": "legacy_unknown",
+        "contract_snapshot_state": "unknown",
+        "contract_invalidated_at": None,
+        "invalidated_by_revision_id": None,
+        "contract_invalidation_reason": None,
+        "is_current": False,
+        "eligible_for_current_presentation": False,
+        "ordinary_writes_allowed": False,
     }
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("current_house_revision")
 async def test_plan_detail_preserves_provenance_and_change_summary() -> None:
     plan = SimpleNamespace(
         id=7,
@@ -5342,6 +6004,12 @@ async def test_plan_detail_preserves_provenance_and_change_summary() -> None:
         status_reason=None,
         superseded_at=None,
         superseded_by_plan_id=None,
+        contract_revision_id=None,
+        contract_hash=None,
+        contract_state="legacy_unknown",
+        contract_invalidated_at=None,
+        invalidated_by_revision_id=None,
+        contract_invalidation_reason=None,
         plan_json=json.dumps({"change_summary": json.dumps({"reason": "price_shift"})}),
         input_provenance_json=json.dumps({"input_quality": {"price": {"fresh": True}}}),
     )
@@ -5358,32 +6026,229 @@ async def test_plan_detail_preserves_provenance_and_change_summary() -> None:
     plan_result = SimpleNamespace(scalar_one_or_none=lambda: plan)
     actions_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [action]))
     session.execute = AsyncMock(side_effect=[plan_result, actions_result])
+    measurement = AsyncMock(return_value={})
 
     with (
         patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
-        patch(
-            "packages.api.routers.optimizer.plan_measurement",
-            new_callable=AsyncMock,
-            return_value={},
-        ),
+        patch("packages.api.routers.optimizer.plan_measurement", new=measurement),
         patch("packages.api._helpers.get_price_area", new_callable=AsyncMock, return_value="NL"),
-        patch(
-            "packages.core.settings_service.get_float_setting",
-            new_callable=AsyncMock,
-            return_value=18.0,
-        ),
-        patch(
-            "packages.core.settings_service.get_user_tz", new_callable=AsyncMock, return_value="UTC"
-        ),
     ):
         response = await get_plan_detail(7)
 
     assert response.change_summary == {"reason": "price_shift"}
     assert response.provenance == {"input_quality": {"price": {"fresh": True}}}
     assert response.price_source == "entsoe"
+    assert response.contract_state == "legacy_unknown"
+    assert response.house_contract_snapshot == {}
+    assert response.outcome["state"] == "unknown"
+    assert response.outcome["reason"] == "historical_contract_unavailable"
+    measurement.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("current_house_revision")
+async def test_historical_plan_measurement_uses_its_captured_contract_snapshot() -> None:
+    from uuid import UUID
+
+    from packages.core.house_contract import (
+        HousePlanningContract,
+        _contract_hash,
+        snapshot_from_revision,
+    )
+
+    plan = SimpleNamespace(
+        id=71,
+        created_at=dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc),
+        horizon_start=dt.datetime(2026, 9, 14, 1, tzinfo=dt.timezone.utc),
+        horizon_end=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
+        optimizer_version="rules_v8",
+        cost_estimate_eur=2.5,
+        price_currency="EUR",
+        price_source="entsoe",
+        status="active",
+        status_reason=None,
+        superseded_at=None,
+        superseded_by_plan_id=None,
+        contract_revision_id=4,
+        contract_hash="",
+        contract_state="stale",
+        contract_invalidated_at=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
+        invalidated_by_revision_id=5,
+        contract_invalidation_reason="comfort_target_changed",
+        plan_json="{}",
+        input_provenance_json="{}",
+    )
+    contract = HousePlanningContract.from_settings(
+        {
+            "comfort_schedule": '{"weekday":[7,8],"weekend":[9]}',
+            "comfort_temp_min": "17.5",
+            "comfort_temp_target": "19.0",
+            "comfort_temp_max": "24.0",
+            "timezone": "Europe/Stockholm",
+        },
+        installation_id=UUID("00000000-0000-0000-0000-000000000001"),
+        house_id=UUID("00000000-0000-0000-0000-000000000002"),
+    )
+    projection = contract.to_projection()
+    revision = SimpleNamespace(
+        id=plan.contract_revision_id,
+        contract_hash=_contract_hash(projection),
+        contract_json=projection,
+        effective_at=plan.created_at,
+        source="test",
+    )
+    plan.contract_hash = revision.contract_hash
+
+    class RevisionSession:
+        async def get(self, _model, _revision_id):
+            return revision
+
+    snapshot = await snapshot_from_revision(
+        RevisionSession(), plan.contract_revision_id, plan.horizon_start, plan.horizon_end
+    )
+    plan.plan_json = json.dumps({"house_contract_snapshot": snapshot})
+    from packages.core.house_contract import validate_plan_contract_snapshot
+
+    assert validate_plan_contract_snapshot(
+        plan, json.loads(plan.plan_json)["house_contract_snapshot"]
+    )
+    action = SimpleNamespace(
+        id=72,
+        scheduled_ts=plan.horizon_start,
+        action_type="quiet_mode_on",
+        payload_json="{}",
+        status="pending",
+        executed_at=None,
+        result_json=None,
+    )
+    session = SimpleNamespace()
+    plan_result = SimpleNamespace(scalar_one_or_none=lambda: plan)
+    actions_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [action]))
+    session.execute = AsyncMock(side_effect=[plan_result, actions_result])
+    measurement = AsyncMock(return_value={"comfort": {"status": "partial"}})
+
+    with (
+        patch("packages.api.routers.optimizer.get_session", return_value=_session_context(session)),
+        patch("packages.api.routers.optimizer.plan_measurement", new=measurement),
+        patch("packages.api._helpers.get_price_area", new_callable=AsyncMock, return_value="NL"),
+        patch(
+            "packages.core.settings_service.get_float_setting",
+            new_callable=AsyncMock,
+            side_effect=lambda key: {"comfort_temp_min": 18.0, "comfort_temp_max": 25.0}[key],
+        ),
+        patch(
+            "packages.core.settings_service.get_user_tz", new_callable=AsyncMock, return_value="UTC"
+        ),
+    ):
+        response = await get_plan_detail(71)
+
+    assert response.house_contract_snapshot == snapshot
+    assert response.outcome["contract_snapshot_state"] == "valid"
+    measurement.assert_awaited_once()
+    assert measurement.await_args.kwargs["comfort_min_c"] == snapshot["comfort_temp_min"]
+    assert measurement.await_args.kwargs["comfort_max_c"] == snapshot["comfort_temp_max"]
+    assert measurement.await_args.kwargs["timezone_name"] == snapshot["timezone"]
+
+    for field, value in (
+        ("revision_id", snapshot["revision_id"] + 1),
+        ("contract_hash", "f" * 64),
+    ):
+        invalid_snapshot = json.loads(json.dumps(snapshot))
+        invalid_snapshot[field] = value
+        plan.plan_json = json.dumps({"house_contract_snapshot": invalid_snapshot})
+        session.execute = AsyncMock(side_effect=[plan_result, actions_result])
+        measurement.reset_mock()
+        live_settings = AsyncMock(side_effect=[22.0, 28.0])
+        live_timezone = AsyncMock(return_value="UTC")
+        with (
+            patch(
+                "packages.api.routers.optimizer.get_session",
+                return_value=_session_context(session),
+            ),
+            patch("packages.api.routers.optimizer.plan_measurement", new=measurement),
+            patch(
+                "packages.api._helpers.get_price_area", new_callable=AsyncMock, return_value="NL"
+            ),
+            patch("packages.core.settings_service.get_float_setting", new=live_settings),
+            patch("packages.core.settings_service.get_user_tz", new=live_timezone),
+        ):
+            invalid_response = await get_plan_detail(71)
+
+        assert invalid_response.outcome["state"] == "unknown"
+        assert invalid_response.outcome["contract_snapshot_state"] == "corrupt"
+        assert invalid_response.outcome["reason"] == "historical_contract_corrupt"
+        measurement.assert_not_awaited()
+        live_settings.assert_not_awaited()
+        live_timezone.assert_not_awaited()
+
+    snapshot["schedule_projection"][0]["target_c"] += 1
+    plan.plan_json = json.dumps({"house_contract_snapshot": snapshot})
+    session.execute = AsyncMock(side_effect=[plan_result, actions_result])
+    measurement.reset_mock()
+    with patch(
+        "packages.api.routers.optimizer.get_session", return_value=_session_context(session)
+    ):
+        corrupted_response = await get_plan_detail(71)
+
+    assert corrupted_response.outcome["contract_snapshot_state"] == "corrupt"
+    assert corrupted_response.outcome["state"] == "unknown"
+    assert corrupted_response.outcome["reason"] == "historical_contract_corrupt"
+    measurement.assert_not_awaited()
+
+    plan.plan_json = json.dumps({"house_contract_snapshot": None})
+    session.execute = AsyncMock(side_effect=[plan_result, actions_result])
+    with patch(
+        "packages.api.routers.optimizer.get_session", return_value=_session_context(session)
+    ):
+        null_snapshot_response = await get_plan_detail(71)
+
+    assert null_snapshot_response.outcome["contract_snapshot_state"] == "corrupt"
+    assert null_snapshot_response.outcome["state"] == "unknown"
+    assert null_snapshot_response.outcome["reason"] == "historical_contract_corrupt"
+    measurement.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("snapshot_revision_id", "snapshot_hash"),
+    [(5, "c" * 64), (4, "d" * 64)],
+    ids=["revision-mismatch", "hash-mismatch"],
+)
+def test_historical_measurement_rejects_snapshot_identity_mismatch(
+    snapshot_revision_id: int, snapshot_hash: str
+) -> None:
+    from packages.api.routers.optimizer import _captured_plan_measurement_scope
+
+    plan = SimpleNamespace(
+        contract_state="stale",
+        contract_revision_id=4,
+        contract_hash="c" * 64,
+    )
+    snapshot = {
+        "revision_id": snapshot_revision_id,
+        "contract_hash": snapshot_hash,
+        "comfort_temp_min": 17.5,
+        "comfort_temp_target": 19.0,
+        "comfort_temp_max": 24.0,
+        "timezone": "Europe/Stockholm",
+    }
+
+    assert _captured_plan_measurement_scope(plan, snapshot) is None
+
+
+@pytest.mark.asyncio
+async def test_current_revision_guard_rejects_mismatched_plan_identity(monkeypatch) -> None:
+    from packages.core import house_contract
+
+    current = SimpleNamespace(id=8, contract_hash="d" * 64)
+    monkeypatch.setattr(house_contract, "ensure_current_contract", AsyncMock(return_value=current))
+
+    assert not await house_contract.current_revision_matches(
+        SimpleNamespace(), revision_id=4, contract_hash="c" * 64
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("current_house_revision")
 async def test_optimize_now_enqueues_and_status_reports_durable_record() -> None:
     session = SimpleNamespace()
     session.add = MagicMock()
@@ -5425,6 +6290,47 @@ async def test_optimize_now_enqueues_and_status_reports_durable_record() -> None
     assert status["status"] == "completed"
     assert status["plan_id"] == 9
     assert status["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_P2_AC20_stale_queued_revision_is_refused_without_running_solver():
+    from packages.optimizer.main import process_pending_optimization_requests
+
+    request = SimpleNamespace(
+        id=42,
+        status="pending",
+        requested_at=dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc),
+        contract_revision_id=7,
+        contract_hash="a" * 64,
+        started_at=None,
+        completed_at=None,
+        error=None,
+    )
+    result = SimpleNamespace(scalar_one_or_none=MagicMock(return_value=request))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    current = SimpleNamespace(id=8, contract_hash="b" * 64)
+    with (
+        patch(
+            "packages.optimizer.main.get_session",
+            return_value=_session_context(session),
+        ),
+        patch(
+            "packages.optimizer.main._fail_abandoned_optimization_requests",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "packages.core.house_contract.ensure_current_contract",
+            new=AsyncMock(return_value=current),
+        ),
+        patch("packages.optimizer.main.run_optimization", new=AsyncMock()) as run,
+    ):
+        await process_pending_optimization_requests()
+
+    run.assert_not_awaited()
+    assert request.status == "failed"
+    assert request.error == "refused_contract_changed"
+    assert request.completed_at is not None
+    session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio

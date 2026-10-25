@@ -1,4 +1,4 @@
-import { expect, test } from "./fixtures";
+import { expect, mockPlanningSettings, planningInstallationId, test } from "./fixtures";
 
 const curveSettings = {
   heat_curve_outdoor_cold_c: { value: "5", type: "float", description: "Cold outdoor point" },
@@ -19,7 +19,12 @@ test("copies a bounded heat-curve recommendation into the Settings draft", async
       saved = JSON.parse(route.request().postData() || "{}").settings;
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "updated", count: 6 }) });
     }
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(curveSettings) });
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "X-Installation-ID": planningInstallationId, "X-Contract-Revision": "7" },
+      body: JSON.stringify(curveSettings),
+    });
   });
   await page.route("**/api/logs*", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
@@ -49,6 +54,7 @@ test("copies a bounded heat-curve recommendation into the Settings draft", async
   await page.route("**/api/currency", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh" }) })
   );
+  await mockPlanningSettings(page);
 
   await page.goto("/settings");
 
@@ -69,7 +75,12 @@ test("keeps new curve recommendations locked while verification is pending", asy
     route.fulfill({ status: 200, contentType: "application/json", body: "{}" })
   );
   await page.route("**/api/settings", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(curveSettings) })
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "X-Installation-ID": planningInstallationId, "X-Contract-Revision": "7" },
+      body: JSON.stringify(curveSettings),
+    })
   );
   await page.route("**/api/logs*", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
@@ -110,6 +121,7 @@ test("keeps new curve recommendations locked while verification is pending", asy
   await page.route("**/api/currency", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh" }) })
   );
+  await mockPlanningSettings(page);
 
   await page.goto("/settings");
 

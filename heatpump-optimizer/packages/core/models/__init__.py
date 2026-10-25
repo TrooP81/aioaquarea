@@ -233,6 +233,18 @@ class PlanRecord(Base):
     status_reason: Mapped[str | None] = mapped_column(String(256))
     superseded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     superseded_by_plan_id: Mapped[int | None] = mapped_column(Integer)
+    contract_revision_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("house_contract_revisions.id")
+    )
+    contract_hash: Mapped[str | None] = mapped_column(String(64))
+    contract_state: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="legacy_unknown", server_default="legacy_unknown"
+    )
+    contract_invalidated_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidated_by_revision_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("house_contract_revisions.id")
+    )
+    contract_invalidation_reason: Mapped[str | None] = mapped_column(String(64))
 
 
 class PlanActionRecord(Base):
@@ -334,6 +346,10 @@ class OptimizationRequestRecord(Base):
     )
     plan_id: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
+    contract_revision_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("house_contract_revisions.id")
+    )
+    contract_hash: Mapped[str | None] = mapped_column(String(64))
 
 
 class ServiceHeartbeatRecord(Base):
@@ -385,6 +401,57 @@ class SettingRecord(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class HouseInstallationRecord(Base):
+    """The single supported house identity for this deployment."""
+
+    __tablename__ = "house_installations"
+    __table_args__ = (
+        CheckConstraint("singleton_id = 1", name="ck_house_installations_singleton"),
+        CheckConstraint(
+            "demand_dependency_generation >= 1",
+            name="ck_house_installations_demand_generation",
+        ),
+        CheckConstraint(
+            "indoor_dependency_generation >= 1",
+            name="ck_house_installations_indoor_generation",
+        ),
+    )
+
+    singleton_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    installation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, unique=True
+    )
+    house_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, unique=True)
+    demand_dependency_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    indoor_dependency_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    current_revision_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("house_contract_revisions.id")
+    )
+
+
+class HouseContractRevisionRecord(Base):
+    """Append-only, canonical revision of the P2.1 planning contract."""
+
+    __tablename__ = "house_contract_revisions"
+    __table_args__ = (Index("ix_house_contract_revision_installation", "installation_id", "id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    installation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("house_installations.installation_id"),
+        nullable=False,
+    )
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    contract_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    contract_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    effective_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
 class FaultRecord(Base):

@@ -451,7 +451,7 @@ async def test_S4_earlier_represented_gate_remains_real_and_nonpublishing(fault)
     outcome = await _run_admission(plan, isolate_frozen_quality=False)
     assert outcome.result is None
     assert outcome.records == []
-    outcome.session_factory.assert_not_called()
+    outcome.session_factory.assert_called_once()
     assert outcome.cooldown == 0.0
     refusal = [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
     assert refusal == [

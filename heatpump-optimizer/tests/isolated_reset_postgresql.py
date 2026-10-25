@@ -109,7 +109,7 @@ async def test_RESET2_RESET3_RESET4_REPAIR2_real_timescale_commit_and_rollback(
             assert await session.scalar(text("SELECT current_database()")) == url.database
             assert (
                 await session.scalars(text("SELECT version_num FROM alembic_version"))
-            ).all() == ["037"]
+            ).all() == ["039"]
             assert (
                 await session.scalar(
                     text(
@@ -446,7 +446,7 @@ async def test_RESET2_RESET3_RESET4_REPAIR2_real_timescale_commit_and_rollback(
             )
             assert (
                 await session.scalars(text("SELECT version_num FROM alembic_version"))
-            ).all() == ["037"]
+            ).all() == ["039"]
             assert not (await session.scalars(select(PlanActionRecord))).all()
     finally:
         await engine.dispose()

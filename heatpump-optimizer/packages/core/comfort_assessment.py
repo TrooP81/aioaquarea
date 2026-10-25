@@ -7,6 +7,7 @@ why, and what *manual* prerequisite would make a later trial possible.
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any, Mapping, Sequence
 
 from packages.core.heat_curve import HeatCurveConfig
@@ -113,7 +114,33 @@ def build_comfort_assessment(
         }
 
     misses: list[dict[str, Any]] = []
-    for index, (point, target_row) in enumerate(zip(forecast, targets)):
+    exact_policy = bool(targets) and all("interval_start_utc" in row for row in targets)
+    for index, point in enumerate(forecast):
+        if exact_policy:
+            from packages.core.comfort_schedule import sample_control_target
+
+            try:
+                start = point.get("interval_start_utc")
+                slot_start = (
+                    dt.datetime.fromisoformat(start)
+                    if start is not None
+                    else dt.datetime.fromisoformat(point["ts"]) - dt.timedelta(hours=1)
+                )
+                target_row = sample_control_target(list(targets), slot_start)
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "state": "unavailable",
+                    "reason_code": "target_policy_unavailable",
+                    "misses": [],
+                    "recommendations": [],
+                }
+        else:
+            target_row = next(
+                (row for row in targets if point.get("ts") and row.get("ts") == point["ts"]),
+                targets[index]
+                if index < len(targets) and not any(row.get("ts") for row in targets)
+                else {},
+            )
         predicted = point.get("predicted_indoor_temp")
         target = target_row.get("target")
         if predicted is None or target is None:

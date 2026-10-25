@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "./fixtures";
+import { mockPlanningSettings, planningInstallationId, test, expect, type Page } from "./fixtures";
 
 function settingsPayload() {
   return {
@@ -15,7 +15,12 @@ async function mockSettings(page: Page) {
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
   await page.route("**/api/settings", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(settingsPayload()) })
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "X-Installation-ID": planningInstallationId },
+      body: JSON.stringify(settingsPayload()),
+    })
   );
   await page.route("**/api/currency", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh" }) })
@@ -32,6 +37,7 @@ async function mockSettings(page: Page) {
   await page.route("**/api/smartthings/devices", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ devices: [] }) })
   );
+  await mockPlanningSettings(page);
 }
 
 test.describe("Reset data card", () => {

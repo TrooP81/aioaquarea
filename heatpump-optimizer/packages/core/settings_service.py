@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import logging
 import math
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from packages.core.config import settings as env_settings
 from packages.core.backup_health import BACKUP_BOUNDS, BACKUP_DEFAULTS, BackupPolicy
 from packages.core.database import get_session
+from packages.core.comfort_schedule import (
+    normalize_schedule,
+    normalize_timezone,
+    resolve_hourly_targets,
+)
 from packages.core.heat_curve import HEAT_CURVE_SETTING_KEYS, HeatCurveConfig
 from packages.core.space_heating_gate import HeatingGateConfig
 from packages.core.models import SettingRecord
@@ -672,9 +676,11 @@ def validate_setting_value(key: str, value: str) -> None:
 
     if spec.value_type == "json":
         try:
-            json.loads(value)
+            parsed = json.loads(value)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError(f"{key} must be valid JSON ({exc})") from exc
+        if key == "comfort_schedule":
+            normalize_schedule(parsed)
         return
 
     # Empty string clears a value (falls back to env/default); allowed for the
@@ -687,6 +693,43 @@ def validate_setting_value(key: str, value: str) -> None:
             spec.parse(value)
         except ValueError as exc:
             raise ValueError(f"{key} must be a valid {spec.value_type} ({exc})") from exc
+
+
+def normalize_contract_settings_updates(updates: dict[str, Any]) -> dict[str, str]:
+    """Normalize the P2.1 contract fields before any settings writer persists them."""
+    contract_keys = {
+        "comfort_schedule",
+        "comfort_temp_min",
+        "comfort_temp_target",
+        "comfort_temp_max",
+        "timezone",
+    }
+    normalized: dict[str, str] = {}
+    for key in contract_keys.intersection(updates):
+        value = updates[key]
+        if value is None or isinstance(value, bool):
+            raise ValueError(f"{key} must not be null or boolean")
+        if key == "comfort_schedule":
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"{key} must be valid JSON") from exc
+            value = normalize_schedule(value)
+            normalized[key] = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        elif key == "timezone":
+            if not isinstance(value, str):
+                raise ValueError("timezone must be an IANA timezone string")
+            normalized[key] = normalize_timezone(value)
+        else:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{key} must be a finite numeric value") from exc
+            if not math.isfinite(numeric) or not 10 <= numeric <= 30:
+                raise ValueError(f"{key} must be finite and between 10 and 30 °C")
+            normalized[key] = str(numeric)
+    return normalized
 
 
 def _default_setting_value(spec: SettingSpec) -> str:
@@ -827,6 +870,17 @@ async def set_setting(key: str, value: str) -> None:
         key == "seasonal_calibration_enabled"
         or key in BACKUP_DEFAULTS
         or key.startswith("external_heartbeat_")
+        or key
+        in {
+            "comfort_schedule",
+            "comfort_temp_min",
+            "comfort_temp_target",
+            "comfort_temp_max",
+            "timezone",
+            "weather_provider",
+            "smartthings_device_ids",
+            "comfort_reference_sensor_id",
+        }
     ):
         await set_settings_bulk({key: value})
         return
@@ -855,7 +909,13 @@ async def set_setting(key: str, value: str) -> None:
             await update_maintenance_gate(session, _parse_bool(value))
 
 
-async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
+async def set_settings_bulk(
+    updates: dict[str, str],
+    *,
+    session=None,
+    expected_revision_id: int | None = None,
+    source: str = "legacy_unversioned_write",
+) -> int | None:
     """Atomically validate and upsert multiple settings.
 
     Heat-curve and gate settings are one configuration: no concurrent bulk
@@ -865,12 +925,15 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
     from contextlib import nullcontext
 
     updates = dict(updates)
+    updates.update(normalize_contract_settings_updates(updates))
     for key, value in updates.items():
         if (
             key == "tibber_home_id"
             or SETTINGS_SCHEMA.get(key, {}).get("read_only")
             or SETTINGS_SCHEMA.get(key, {}).get("type") in {"int", "float"}
             or key == "external_heartbeat_url"
+            or key == "comfort_schedule"
+            or key == "weather_provider"
         ):
             validate_setting_value(key, value)
     if "seasonal_calibration_enabled" in updates and not _parse_bool(
@@ -881,18 +944,50 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with get_session() if session is None else nullcontext(session) as session:
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"),
-            {
-                "key": int.from_bytes(
-                    hashlib.sha256(b"settings:heat-gate").digest()[:8], "big", signed=True
-                )
-            },
+        from packages.core.house_contract import (
+            ContractRevisionConflict,
+            _lock_contract,
+            ensure_current_contract,
         )
+
+        await _lock_contract(session)
+        if expected_revision_id is not None:
+            current = await ensure_current_contract(
+                session, lock=False, verify_current_settings=False
+            )
+            if current.id != expected_revision_id:
+                raise ContractRevisionConflict(current.id)
         values = {key: _default_setting_value(spec) for key, spec in SETTING_SPECS.items()}
         rows = await session.execute(select(SettingRecord))
         values.update({row.key: row.value for row in rows.scalars() if row.key in values})
+        previous_weather_provider = values["weather_provider"]
+        previous_indoor_dependencies = {
+            key: values.get(key, "")
+            for key in ("smartthings_device_ids", "comfort_reference_sensor_id")
+        }
         values.update(updates)
+        weather_changed = (
+            "weather_provider" in updates
+            and updates["weather_provider"] != previous_weather_provider
+        )
+        indoor_changed = any(
+            key in updates and updates[key] != previous_indoor_dependencies[key]
+            for key in previous_indoor_dependencies
+        )
+        if weather_changed or previous_indoor_dependencies.keys() & updates.keys():
+            from packages.core.models import HouseInstallationRecord
+
+            # Even a no-op first sensor write initializes before persisting the
+            # setting. Initialization and generations share this transaction.
+            await ensure_current_contract(session, lock=False)
+            installation = await session.get(HouseInstallationRecord, 1)
+            if weather_changed:
+                installation.demand_dependency_generation += 1
+            # Indoor thermal and comfort consume weather; tank-only artifacts
+            # do not. Monotonic generations also fence provider A→B→A cycles.
+            if weather_changed or indoor_changed:
+                installation.indoor_dependency_generation += 1
+            await session.flush()
         if BACKUP_DEFAULTS.keys() & updates.keys():
             BackupPolicy.from_settings(
                 values,
@@ -942,6 +1037,25 @@ async def set_settings_bulk(updates: dict[str, str], *, session=None) -> None:
                 from packages.ml.lifecycle import update_maintenance_gate
 
                 await update_maintenance_gate(session, _parse_bool(value))
+        contract_keys = {
+            "comfort_schedule",
+            "comfort_temp_min",
+            "comfort_temp_target",
+            "comfort_temp_max",
+            "timezone",
+        }
+        if contract_keys.intersection(updates):
+            from packages.core.house_contract import revise_contract
+
+            revision = await revise_contract(
+                session,
+                values,
+                source=source,
+                changed_keys=sorted(contract_keys.intersection(updates)),
+                expected_revision_id=expected_revision_id,
+            )
+            return revision.id
+    return None
 
 
 async def get_comfort_schedule() -> dict[str, list[int]]:
@@ -949,18 +1063,9 @@ async def get_comfort_schedule() -> dict[str, list[int]]:
     raw = await get_setting("comfort_schedule")
     try:
         schedule = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        schedule = json.loads(SETTINGS_SCHEMA["comfort_schedule"]["default"])
-
-    # Validate structure
-    if not isinstance(schedule, dict):
-        schedule = json.loads(SETTINGS_SCHEMA["comfort_schedule"]["default"])
-    for key in ("weekday", "weekend"):
-        if key not in schedule or not isinstance(schedule[key], list):
-            schedule[key] = []
-        schedule[key] = [h for h in schedule[key] if isinstance(h, int) and 0 <= h <= 23]
-
-    return schedule
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"comfort_schedule must be valid JSON: {exc}") from exc
+    return normalize_schedule(schedule)
 
 
 def _to_local(ts: dt.datetime, tz_name: str | None = None) -> dt.datetime:
@@ -994,10 +1099,24 @@ async def get_user_tz() -> str:
 def is_comfort_hour(
     schedule: dict[str, list[int]], ts: dt.datetime, tz_name: str | None = None
 ) -> bool:
-    """Check if a given timestamp falls within a comfort hour (in local time)."""
-    local = _to_local(ts, tz_name)
-    day_type = "weekday" if local.weekday() < 5 else "weekend"
-    return local.hour in schedule.get(day_type, [])
+    """Resolve one instant through the canonical half-open UTC schedule resolver."""
+    instant = ts if ts.tzinfo is not None else ts.replace(tzinfo=dt.timezone.utc)
+    normalized = normalize_schedule(
+        {
+            "weekday": schedule.get("weekday", []),
+            "weekend": schedule.get("weekend", []),
+        }
+    )
+    slot = resolve_hourly_targets(
+        normalized,
+        tz_name or "Europe/Amsterdam",
+        instant,
+        instant + dt.timedelta(microseconds=1),
+        scheduled_target_c=0,
+        unscheduled_target_c=0,
+        outer_max_c=0,
+    )[0]
+    return bool(slot["scheduled"])
 
 
 def dhw_deadlines_from_schedule(

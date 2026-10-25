@@ -19,6 +19,31 @@ export const retiredCopModel = {
     reason: "unverified_thermal_output",
 };
 
+export const planningInstallationId = "00000000-0000-0000-0000-000000000017";
+
+export async function mockPlanningSettings(
+    page: Page,
+    comfortSchedule: { weekday: number[]; weekend: number[] } = { weekday: [], weekend: [] },
+) {
+    await page.route(
+        `**/api/installations/${planningInstallationId}/planning-settings`,
+        (route) => route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            headers: { ETag: '"7"', "X-Contract-Revision": "7" },
+            body: JSON.stringify({
+                installation_id: planningInstallationId,
+                comfort_schedule: comfortSchedule,
+                comfort_temp_min: 18,
+                comfort_temp_target: 20.5,
+                comfort_temp_max: 25,
+                timezone: "Europe/Stockholm",
+                revision_id: 7,
+            }),
+        }),
+    );
+}
+
 export function modelLifecycleStatus(state: ModelReportingState = "unqualified"): ModelLifecycleStatus {
     const available = state !== "unavailable";
     const hasFit = available && state !== "unqualified";

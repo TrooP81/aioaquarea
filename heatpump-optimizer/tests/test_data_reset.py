@@ -518,7 +518,7 @@ class GuardSession:
             return Rows(
                 [*reset.WIPE_TABLES, *reset.RETAIN_TABLES] + (["surprise"] if self.unknown else [])
             )
-        return Rows(["037"])
+        return Rows(["039"])
 
     async def execute(self, sql, params=None):
         self.sql.append(str(sql))

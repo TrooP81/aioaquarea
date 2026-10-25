@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
+import math
 import json
 import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import func, select, update
@@ -35,6 +39,11 @@ from packages.optimizer.executor_core import LearningModeState
 from packages.ml.models import DemandModel
 from packages.ml.comfort_model import comfort_model
 from packages.ml.thermal import thermal_model
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from packages.ml.lifecycle import ArtifactReference
 
 logger = structlog.get_logger()
 
@@ -146,6 +155,213 @@ _ADMISSIBLE_DIAGNOSTIC_STATUS = "conditional_feasible"
 
 class _PlanAdmissionRefused(ValueError):
     """Stable refusal reason; never carries the rejected payload."""
+
+
+def _canonical_contract_target_schedule(snapshot: dict) -> list[dict]:
+    """Build the saved hourly schedule from the frozen contract projection."""
+    from packages.core.house_contract import canonical_target_schedule
+
+    return canonical_target_schedule(snapshot)
+
+
+def _target_schedule_matches_contract(plan: dict, canonical: list[dict]) -> bool:
+    candidate = plan.get("target_schedule")
+    if candidate is None and isinstance(plan.get("forecast_snapshot"), dict):
+        candidate = plan["forecast_snapshot"].get("target_schedule")
+    if not isinstance(candidate, list):
+        return True
+    if not candidate:
+        return True
+    if not canonical:
+        return False
+    try:
+        previous_end = None
+        for interval in canonical:
+            interval_start = _aware_instant(interval["interval_start_utc"])
+            interval_end = _aware_instant(interval["interval_end_utc"])
+            if (
+                interval_end <= interval_start
+                or (previous_end is not None and interval_start != previous_end)
+                or not math.isfinite(float(interval["target"]))
+                or type(interval["comfort_hour"]) is not bool
+            ):
+                return False
+            _aware_instant(interval["ts"])
+            previous_end = interval_end
+    except (KeyError, TypeError, ValueError, _PlanAdmissionRefused):
+        return False
+    # Solvers emit hourly control slots, sampling the exact policy at slot
+    # start. Canonical policy may split that slot at local-hour/DST boundaries.
+    start = _aware_instant(canonical[0]["interval_start_utc"])
+    end = _aware_instant(canonical[-1]["interval_end_utc"])
+    slots = []
+    cursor = start
+    while cursor < end:
+        slot_end = min(cursor + dt.timedelta(hours=1), end)
+        expected = next(
+            interval
+            for interval in canonical
+            if _aware_instant(interval["interval_start_utc"])
+            <= cursor
+            < _aware_instant(interval["interval_end_utc"])
+        )
+        slots.append({**expected, "ts": slot_end.isoformat()})
+        cursor = slot_end
+    # Fully materialized projections are also accepted, with the same strict
+    # target/membership comparison; never silently replace a mismatched target.
+    expected_targets = canonical if len(candidate) == len(canonical) else slots
+    if len(candidate) != len(expected_targets):
+        return False
+    for planned, expected in zip(candidate, expected_targets, strict=True):
+        if not isinstance(planned, dict):
+            return False
+        if "ts" in planned:
+            try:
+                if _aware_instant(planned["ts"]) != _aware_instant(expected["ts"]):
+                    return False
+            except _PlanAdmissionRefused:
+                return False
+        try:
+            if (
+                not math.isfinite(float(planned["target"]))
+                or abs(float(planned["target"]) - float(expected["target"])) > 1e-6
+            ):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        if "comfort_hour" in planned and planned["comfort_hour"] is not expected["comfort_hour"]:
+            return False
+    return True
+
+
+def _apply_authoritative_contract_snapshot(plan: dict, snapshot: dict) -> list[dict] | None:
+    """Replace planner projections with the revision-bound house contract."""
+    canonical = _canonical_contract_target_schedule(snapshot)
+    if not _target_schedule_matches_contract(plan, canonical):
+        return None
+    plan["target_schedule"] = canonical
+    plan["house_contract_snapshot"] = snapshot
+    forecast_snapshot = plan.get("forecast_snapshot")
+    if isinstance(forecast_snapshot, dict):
+        forecast_snapshot["target_schedule"] = canonical
+        forecast_snapshot["house_contract_snapshot"] = snapshot
+    return canonical
+
+
+@dataclass(frozen=True)
+class _FrozenPlanningRevision:
+    revision_id: int
+    contract_hash: str
+    dependency_generation: int
+    indoor_dependency_generation: int
+
+    def __iter__(self):
+        return iter((self.revision_id, self.contract_hash))
+
+
+@dataclass(frozen=True)
+class _FrozenNativeModelContext:
+    component: str
+    reference: ArtifactReference | None
+    serving_generation: int
+    scope: dict[str, Any] | None
+
+
+async def _capture_native_model_contexts() -> tuple[_FrozenNativeModelContext, ...] | None:
+    from packages.ml.forecast_quality import locked_native_scope
+    from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
+    models = (("comfort", comfort_model), ("thermal", thermal_model))
+    contexts = []
+    for component, model in models:
+        reference = copy.deepcopy(getattr(model, "_qualified_reference", None))
+        serving_generation = getattr(model, "_serving_generation", 0)
+        if reference is None:
+            contexts.append(_FrozenNativeModelContext(component, None, serving_generation, None))
+            continue
+        if not reference_is_qualified(reference):
+            return None
+        capabilities = tuple(reference.manifest.get("capabilities", ()))
+        async with get_session() as session:
+            async with locked_native_scope(
+                component,
+                device_id=reference.manifest["device_id"],
+                capabilities=capabilities,
+                session=session,
+            ) as (scope, _):
+                state = await Lifecycle().read(session=session)
+                if (
+                    state.reference(component) != reference
+                    or scope != reference.manifest.get("scope")
+                    or not reference_is_qualified(reference, scope=scope)
+                ):
+                    return None
+        contexts.append(
+            _FrozenNativeModelContext(
+                component, reference, serving_generation, copy.deepcopy(scope)
+            )
+        )
+    return tuple(contexts)
+
+
+async def _native_model_contexts_are_current(
+    contexts: tuple[_FrozenNativeModelContext, ...],
+    *,
+    session: AsyncSession,
+) -> bool:
+    from packages.core.house_contract import _lock_contract
+    from packages.core.models import MLLifecycleStateRecord
+    from packages.ml.forecast_quality import locked_native_scope
+    from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
+    lifecycle_state = None
+    artifact_contexts = [context for context in contexts if context.reference is not None]
+    if artifact_contexts:
+        await _lock_contract(session)
+        state_row = await session.scalar(
+            select(MLLifecycleStateRecord).where(MLLifecycleStateRecord.id == 1).with_for_update()
+        )
+        if state_row is None:
+            return False
+        lifecycle = Lifecycle()
+        lifecycle_state = await lifecycle.read(session=session)
+    for context in contexts:
+        model = comfort_model if context.component == "comfort" else thermal_model
+        if (
+            getattr(model, "_qualified_reference", None) != context.reference
+            or getattr(model, "_serving_generation", 0) != context.serving_generation
+        ):
+            return False
+        if context.reference is None:
+            continue
+        current_reference = lifecycle_state.reference(context.component)
+        if current_reference != context.reference:
+            return False
+        capabilities = tuple(context.reference.manifest.get("capabilities", ()))
+        async with locked_native_scope(
+            context.component,
+            device_id=context.reference.manifest["device_id"],
+            capabilities=capabilities,
+            session=session,
+        ) as (scope, _):
+            if scope != context.scope or not reference_is_qualified(context.reference, scope=scope):
+                return False
+    return True
+
+
+async def _freeze_contract_revision() -> _FrozenPlanningRevision:
+    """Read the current contract revision before any planner solve."""
+    from packages.core.house_contract import ensure_current_contract
+    from packages.core.models import HouseInstallationRecord
+
+    async with get_session() as session:
+        revision = await ensure_current_contract(session)
+        installation = await session.get(HouseInstallationRecord, 1)
+        generation = installation.demand_dependency_generation
+        indoor_generation = installation.indoor_dependency_generation
+    return _FrozenPlanningRevision(
+        revision.id, revision.contract_hash, generation, indoor_generation
+    )
 
 
 def _strict_int(value: object) -> int:
@@ -403,7 +619,13 @@ async def _select_optimizer(
     return "rules", _new_rules_optimizer()
 
 
-async def run_optimization(*, scheduled: bool = False, force_replace: bool = False) -> int | None:
+async def run_optimization(
+    *,
+    scheduled: bool = False,
+    force_replace: bool = False,
+    expected_contract_revision_id: int | None = None,
+    expected_contract_hash: str | None = None,
+) -> int | None:
     """Store a non-executable diagnostic with layer selection and fallback.
 
     Args:
@@ -452,10 +674,31 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
             # Comfort-model refresh is deferred along with planning during UNKNOWN.
             return None
         try:
+            frozen_contract = await _freeze_contract_revision()
+            frozen_contract_revision_id, frozen_contract_hash = frozen_contract
+            if expected_contract_revision_id is not None and (
+                frozen_contract_revision_id != expected_contract_revision_id
+                or frozen_contract_hash != expected_contract_hash
+            ):
+                logger.info(
+                    "queued_request_contract_refused",
+                    reason="refused_contract_changed",
+                    requested_revision=expected_contract_revision_id,
+                    current_revision=frozen_contract_revision_id,
+                )
+                return None
             layer = await get_setting("optimizer_layer") or "rules_only"
             await _demand_model.arefresh_committed()
             layer_name, optimizer = await _select_optimizer(layer, reload_models=True)
             await comfort_model.arefresh_if_changed()
+            await thermal_model.arefresh_if_changed()
+            native_model_contexts = await _capture_native_model_contexts()
+            if native_model_contexts is None:
+                logger.info(
+                    "optimizer_no_plan",
+                    reason="native_model_dependency_context_unavailable",
+                )
+                return None
             try:
                 device_quality = await get_device_data_quality()
             except Exception as exc:  # noqa: BLE001 - readiness failures must block control
@@ -533,6 +776,8 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 source=price_input["source"],
                 currency=price_input["currency"],
             )
+            demand_context = plan.get("demand_planning_context")
+            demand_scope = demand_context["scope"] if demand_context else {}
             provenance = {
                 "schema_version": 1,
                 "generated_at": generated_at.isoformat(),
@@ -551,7 +796,24 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 "input_quality": input_quality,
                 "models": {
                     "cop_trained": False,
-                    "demand_trained": _demand_model.is_trained,
+                    "demand_trained": demand_context is not None,
+                    "demand_serving_dependency": (
+                        {
+                            "artifact_digest": demand_context["artifact_hash"],
+                            "dependency_schema": demand_scope.get("component_dependency_schema"),
+                            "dependency_fingerprint": demand_scope.get(
+                                "component_dependency_fingerprint"
+                            ),
+                            "dependency_generation": demand_scope.get(
+                                "component_dependency_generation"
+                            ),
+                            "used_for_plan": bool(
+                                layer_name == "milp" and not plan.get("fallback_diagnostics")
+                            ),
+                        }
+                        if demand_context
+                        else None
+                    ),
                     "comfort": {
                         "trained": comfort_model.is_trained,
                         "control_readiness": {"ready": False, "reason": "observe_only_build"},
@@ -565,6 +827,31 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                         ),
                         "indoor_heating_confidence": thermal_model.confidence_for("indoor_heating"),
                     },
+                    "native_dependencies": [
+                        {
+                            "component": context.component,
+                            "artifact_digest": (
+                                context.reference.artifact_hash if context.reference else None
+                            ),
+                            "scope": context.scope,
+                            "dependency_schema": (
+                                context.scope.get("component_dependency_schema")
+                                if context.scope
+                                else None
+                            ),
+                            "dependency_fingerprint": (
+                                context.scope.get("component_dependency_fingerprint")
+                                if context.scope
+                                else None
+                            ),
+                            "dependency_generation": (
+                                context.scope.get("component_dependency_generation")
+                                if context.scope
+                                else None
+                            ),
+                        }
+                        for context in native_model_contexts
+                    ],
                 },
             }
             plan["cop_source"] = "assumed"
@@ -599,6 +886,113 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                 accounting["price_currency"] = price_context.currency
             provenance["execution_policy"] = "observe_only_build"
             async with get_session() as session:
+                from packages.core.house_contract import (
+                    current_revision_matches,
+                    snapshot_from_revision,
+                )
+
+                if not await current_revision_matches(
+                    session, frozen_contract_revision_id, frozen_contract_hash
+                ):
+                    logger.info(
+                        "plan_admission_contract_refused",
+                        reason="refused_contract_changed",
+                        frozen_revision=frozen_contract_revision_id,
+                    )
+                    return None
+                if demand_context or any(
+                    context.reference is not None for context in native_model_contexts
+                ):
+                    from packages.core.models import MLLifecycleStateRecord
+
+                    lifecycle_row = await session.scalar(
+                        select(MLLifecycleStateRecord)
+                        .where(MLLifecycleStateRecord.id == 1)
+                        .with_for_update()
+                    )
+                    if lifecycle_row is None:
+                        logger.info(
+                            "plan_admission_model_refused",
+                            reason="lifecycle_authority_unavailable",
+                        )
+                        return None
+                frozen_generation = getattr(frozen_contract, "dependency_generation", None)
+                if frozen_generation is not None:
+                    from packages.core.models import HouseInstallationRecord
+
+                    installation = await session.get(HouseInstallationRecord, 1)
+                    if installation.demand_dependency_generation != frozen_generation:
+                        logger.info(
+                            "plan_admission_demand_refused",
+                            reason="planning_dependency_generation_changed",
+                        )
+                        return None
+                    provenance["planning_dependency_generation"] = frozen_generation
+                frozen_indoor_generation = getattr(
+                    frozen_contract, "indoor_dependency_generation", None
+                )
+                if frozen_indoor_generation is not None:
+                    from packages.core.models import HouseInstallationRecord
+
+                    installation = await session.get(HouseInstallationRecord, 1)
+                    if installation.indoor_dependency_generation != frozen_indoor_generation:
+                        logger.info(
+                            "plan_admission_indoor_model_refused",
+                            reason="indoor_dependency_generation_changed",
+                        )
+                        return None
+                    provenance["indoor_dependency_generation"] = frozen_indoor_generation
+                if demand_context:
+                    from packages.ml.forecast_quality import locked_demand_scope
+                    from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
+                    async with locked_demand_scope(
+                        demand_context["device_id"], session=session
+                    ) as (current_demand_scope, _):
+                        reference = (await Lifecycle().read(session=session)).reference("demand")
+                        if (
+                            current_demand_scope != demand_scope
+                            or not reference_is_qualified(reference, scope=demand_scope)
+                            or reference.artifact_hash != demand_context["artifact_hash"]
+                        ):
+                            logger.info(
+                                "plan_admission_demand_refused",
+                                reason="demand_dependency_context_changed",
+                            )
+                            return None
+                if not await _native_model_contexts_are_current(
+                    native_model_contexts, session=session
+                ):
+                    logger.info(
+                        "plan_admission_native_model_refused",
+                        reason="native_model_dependency_context_changed",
+                    )
+                    return None
+                house_contract_snapshot = await snapshot_from_revision(
+                    session,
+                    frozen_contract_revision_id,
+                    _aware_instant(plan["horizon_start"]),
+                    _aware_instant(plan["horizon_end"]),
+                )
+                canonical_target_schedule = _apply_authoritative_contract_snapshot(
+                    plan, house_contract_snapshot
+                )
+                if canonical_target_schedule is None:
+                    logger.info(
+                        "optimizer_no_plan",
+                        reason="contract_target_projection_mismatch",
+                        contract_revision=frozen_contract_revision_id,
+                    )
+                    return None
+                provenance["house_contract"] = {
+                    "revision_id": frozen_contract_revision_id,
+                    "contract_hash": frozen_contract_hash,
+                    "policy_dependency_fingerprint": house_contract_snapshot[
+                        "policy_dependency_fingerprint"
+                    ],
+                    "resolver_schema": house_contract_snapshot["resolver_schema"],
+                }
+                plan["input_provenance"] = provenance
                 plan_record = PlanRecord(
                     horizon_start=plan["horizon_start"],
                     horizon_end=plan["horizon_end"],
@@ -614,6 +1008,9 @@ async def run_optimization(*, scheduled: bool = False, force_replace: bool = Fal
                     input_provenance_json=json.dumps(provenance, default=str),
                     status=DIAGNOSTIC_PLAN_STATUS,
                     status_reason="observe_only_build",
+                    contract_revision_id=frozen_contract_revision_id,
+                    contract_hash=frozen_contract_hash,
+                    contract_state="current",
                 )
                 session.add(plan_record)
                 await session.flush()
@@ -684,11 +1081,35 @@ async def process_pending_optimization_requests() -> None:
         request = result.scalar_one_or_none()
         if request is None:
             return
+        from packages.core.house_contract import ensure_current_contract
+
+        current_contract = await ensure_current_contract(session)
+        if (
+            request.contract_revision_id is None
+            or request.contract_hash is None
+            or request.contract_revision_id != current_contract.id
+            or request.contract_hash != current_contract.contract_hash
+        ):
+            request.status = "failed"
+            request.completed_at = now
+            request.error = "refused_contract_changed"
+            logger.info(
+                "queued_request_contract_refused",
+                reason="refused_contract_changed",
+                request_id=request.id,
+            )
+            return
         request.status = "running"
         request.started_at = now
         request_id = request.id
+        expected_revision_id = request.contract_revision_id
+        expected_contract_hash = request.contract_hash
 
-    plan_id = await run_optimization(force_replace=True)
+    plan_id = await run_optimization(
+        force_replace=True,
+        expected_contract_revision_id=expected_revision_id,
+        expected_contract_hash=expected_contract_hash,
+    )
     completed_at = dt.datetime.now(dt.timezone.utc)
     async with get_session() as session:
         request = await session.get(OptimizationRequestRecord, request_id)
@@ -699,6 +1120,14 @@ async def process_pending_optimization_requests() -> None:
         if plan_id is None:
             request.status = "failed"
             request.error = "No diagnostic plan could be generated; check data availability."
+            from packages.core.house_contract import ensure_current_contract
+
+            current_contract = await ensure_current_contract(session)
+            if (
+                current_contract.id != expected_revision_id
+                or current_contract.contract_hash != expected_contract_hash
+            ):
+                request.error = "refused_contract_changed"
         else:
             request.status = "completed"
             request.error = None
