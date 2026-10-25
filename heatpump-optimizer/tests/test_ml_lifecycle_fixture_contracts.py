@@ -2297,6 +2297,244 @@ def _thermal_frozen_inputs():
     return inputs
 
 
+def test_current_publication_maintenance_placement_and_boundaries():
+    source = ast.unparse(
+        _function("test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse")
+    )
+    assert (
+        source.index("finish_decision(")
+        < source.index("_seed_current_thermal_publication_inputs(")
+        < source.index("before = await database.lifecycle.read()")
+        < source.index("database.lifecycle.publish(")
+    )
+    helper = ast.unparse(_function("_seed_current_thermal_publication_inputs"))
+    assert helper.index("_require_local_table(") < helper.index("session.add_all(")
+    assert helper.count("session.add_all(") == 1
+    for forbidden in (
+        "record_native_issues",
+        "commit_evidence_page",
+        "finish_decision",
+        "publish(",
+        "fit(",
+        "WeatherRecord(",
+        "PriceRecord(",
+        "AppLogRecord",
+        "configure_logging",
+    ):
+        assert forbidden not in helper
+    assert "quality.materialize_native_inputs(" in helper
+    assert "quality.native_scope(current) == route.reference.manifest['scope']" in helper
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "nonlocal",
+        "insert",
+        "missing_status",
+        "missing_sensor",
+        "stale",
+        "old_sensor",
+        "foreign_sensor",
+        "foreign_device",
+        "generation",
+        "installation",
+        "provider",
+        "timezone",
+        "selection",
+        "nonfinite",
+    ],
+)
+async def test_current_publication_inputs_real_materializer(fixtures, monkeypatch, fault):
+    """Real reader/preparer over disposable row fakes; no database or socket access."""
+    from sqlalchemy.sql import operators
+    from packages.core import settings_service
+    from packages.ml import forecast_quality as quality
+    from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute
+
+    frozen = _thermal_frozen_inputs()
+    # Build the frozen scope with the real materializer too, not a hand-authored basis.
+    source = fixtures.DeviceStatusRecord(
+        **{
+            key: value
+            for key, value in frozen["status_history"][-1].items()
+            if key in fixtures.DeviceStatusRecord.__table__.columns and key not in {"id", "ts"}
+        }
+    )
+    source.ts = TestR06ThermalQualificationRoute.NOW
+    source.native_policy_provenance = {"timer": deepcopy(frozen["timer"])}
+    historical_reading = fixtures.IndoorTempReading(
+        timestamp=source.ts, device_id="selected-room", temperature=21.0, is_stale=False
+    )
+    current = TestR06ThermalQualificationRoute.NOW + dt.timedelta(hours=360)
+    expected_scope = quality.native_scope(frozen)
+    route = SimpleNamespace(
+        fitted={"inputs": frozen},
+        current=current,
+        clock=[current],
+        frozen_at=TestR06ThermalQualificationRoute.NOW,
+        reference=SimpleNamespace(
+            manifest={
+                "data_cutoff": TestR06ThermalQualificationRoute.NOW.isoformat(),
+                "scope": expected_scope,
+            }
+        ),
+    )
+    values = {
+        "comfort_reference_sensor_id": "selected-room",
+        "smartthings_device_ids": "selected-room",
+        "weather_provider": "open-meteo",
+        "price_provider": "manual",
+        "timezone": "UTC",
+    }
+    installation = SimpleNamespace(
+        installation_id=frozen["installation_id"], indoor_dependency_generation=1
+    )
+    rows, events = [source, historical_reading], []
+
+    class Session:
+        async def get(self, model, key):
+            assert model is fixtures.HouseInstallationRecord and key == 1
+            return installation
+
+        def add_all(self, additions):
+            assert len(additions) == 2
+            events.append("insert")
+            if fault == "insert":
+                raise ValueError("synthetic insert failure")
+            status, reading = additions
+            assert status.ts == reading.timestamp == current
+            assert status.device_id == frozen["device_id"]
+            assert reading.device_id == frozen["reference_sensor_id"]
+            assert reading.temperature == original["sensor_history"][-1]["temperature"]
+            if fault == "stale":
+                reading.is_stale = True
+            if fault == "old_sensor":
+                reading.timestamp -= dt.timedelta(minutes=16)
+            if fault == "foreign_sensor":
+                reading.device_id = "unselected"
+            if fault == "foreign_device":
+                status.device_id = "foreign"
+            if fault == "generation":
+                installation.indoor_dependency_generation += 1
+            if fault == "installation":
+                installation.installation_id = "other"
+            if fault in {"provider", "timezone", "selection"}:
+                values[
+                    {
+                        "provider": "weather_provider",
+                        "timezone": "timezone",
+                        "selection": "smartthings_device_ids",
+                    }[fault]
+                ] = "other"
+            rows.extend(
+                row
+                for row in additions
+                if not (
+                    fault == "missing_status"
+                    and row is status
+                    or fault == "missing_sensor"
+                    and row is reading
+                )
+            )
+
+        async def execute(self, query):
+            model = query.column_descriptions[0]["entity"]
+            selected = [row for row in rows if isinstance(row, model)]
+            for clause in query._where_criteria:
+                value = getattr(clause.right, "value", False)
+
+                def matches(row):
+                    actual = getattr(row, clause.left.key)
+                    if clause.operator is operators.in_op:
+                        return actual in value
+                    if clause.operator is operators.is_:
+                        return actual is value
+                    assert clause.operator in {operators.eq, operators.ge, operators.le}
+                    return clause.operator(actual, value)
+
+                selected = [row for row in selected if matches(row)]
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: selected))
+
+    @asynccontextmanager
+    async def sessions():
+        yield Session()
+
+    class Connection:
+        async def run_sync(self, callback):
+            callback(self)
+
+    @asynccontextmanager
+    async def begin():
+        yield Connection()
+
+    def require_local(connection, table):
+        events.append(table.name)
+        if fault == "nonlocal":
+            raise AssertionError("nonlocal fixture table")
+
+    monkeypatch.setattr(fixtures, "_require_local_table", require_local)
+    monkeypatch.setattr(quality, "get_session", sessions)
+    monkeypatch.setattr(settings_service, "get_all_settings", AsyncMock(return_value=values))
+    database = SimpleNamespace(engine=SimpleNamespace(begin=begin), sessions=sessions)
+    frozen = await quality.materialize_native_inputs(
+        "thermal", now=source.ts, capabilities=tuple(frozen["capabilities"])
+    )
+    assert frozen is not None
+    route.fitted["inputs"] = frozen
+    expected_scope = quality.native_scope(frozen)
+    route.reference.manifest["scope"] = expected_scope
+    original = deepcopy(frozen)
+    history = [quality._plain_record(row, type(row)) for row in rows]
+    assert (
+        await quality.materialize_native_inputs(
+            "thermal", now=current, capabilities=tuple(frozen["capabilities"])
+        )
+        is None
+    )  # The unmaintained current window really is unavailable.
+    if fault == "nonfinite":
+        frozen["sensor_history"][-1]["temperature"] = float("nan")
+    if fault:
+        message = {
+            "nonlocal": "nonlocal fixture table",
+            "insert": "synthetic insert failure",
+            "generation": "indoor_dependency_generation",
+            "installation": "installation_id",
+            "provider": "weather_provider",
+            "timezone": "timezone",
+        }.get(fault)
+        with pytest.raises(ValueError if fault == "insert" else AssertionError, match=message):
+            await fixtures._seed_current_thermal_publication_inputs(database, route)
+        if fault in {"nonlocal", "nonfinite"}:
+            assert "insert" not in events and len(rows) == 2
+        if fault not in {"nonlocal", "insert", "nonfinite"}:
+            rejected = await quality.materialize_native_inputs(
+                "thermal",
+                now=current,
+                device_id=frozen["device_id"],
+                capabilities=tuple(frozen["capabilities"]),
+            )
+            if fault == "timezone":
+                # Timezone is retained by fixture identity, not an indoor dependency gate.
+                assert rejected is not None and rejected["timezone"] != frozen["timezone"]
+            else:
+                assert rejected is None or quality.native_scope(rejected) != expected_scope
+    else:
+        await fixtures._seed_current_thermal_publication_inputs(database, route)
+        assert len(rows) == 4 and events[-1] == "insert"
+        actual = await quality.materialize_native_inputs(
+            "thermal", now=current, capabilities=tuple(frozen["capabilities"])
+        )
+        assert actual is not None and quality.native_scope(actual) == expected_scope
+        assert actual["weather"] == [] and actual["pricing"]["points"] == []
+    if fault != "nonfinite":
+        assert frozen == original
+    assert [quality._plain_record(row, type(row)) for row in rows[:2]] == history
+    assert route.clock == [current] and route.frozen_at == TestR06ThermalQualificationRoute.NOW
+
+
 @pytest.mark.parametrize("head", ["indoor_heating", "indoor_cooling"])
 def test_thermal_snapshot_real_freezing_scope_and_nested_copy(fixtures, head):
     from packages.ml.forecast_quality import freeze_native_pair, native_scope

@@ -3225,6 +3225,69 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
         raise
 
 
+async def _seed_current_thermal_publication_inputs(database, route):
+    """Synthetic availability only: never training or prospective evidence."""
+    from packages.ml import forecast_quality as quality
+
+    frozen = route.fitted["inputs"]
+    assert route.clock[0] == route.current == route.frozen_at + dt.timedelta(hours=360)
+    assert route.current > dt.datetime.fromisoformat(route.reference.manifest["data_cutoff"])
+    assert frozen["sensor_basis"]["sensor_ids"] == [frozen["reference_sensor_id"]]
+    temperature = frozen["sensor_history"][-1]["temperature"]
+    assert quality._finite_number(temperature) and 5 <= temperature <= 35
+    async with database.engine.begin() as connection:
+        for model in (DeviceStatusRecord, IndoorTempReading):
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
+
+    # Copy source values into NEW rows; neither ORM history nor the frozen fit is retimestamped.
+    source = frozen["status_history"][-1]
+    status = DeviceStatusRecord(
+        **{
+            column.name: deepcopy(source.get(column.name))
+            for column in DeviceStatusRecord.__table__.columns
+            if column.name not in {"id", "ts"}
+        }
+    )
+    assert status.device_id == frozen["device_id"]
+    status.ts = route.current
+    status.native_policy_provenance = {
+        **(status.native_policy_provenance or {}),
+        "timer": {**deepcopy(frozen["timer"]), "fetched_at": route.current.isoformat()},
+    }
+    reading = IndoorTempReading(
+        timestamp=route.current,
+        temperature=temperature,
+        device_id=frozen["reference_sensor_id"],
+        is_stale=False,
+    )
+    async with database.sessions() as session:
+        session.add_all([status, reading])
+
+    # Exercise the production reader/preparer, not a replacement publication gate.
+    current = await quality.materialize_native_inputs(
+        "thermal",
+        now=route.current,
+        device_id=frozen["device_id"],
+        capabilities=tuple(frozen["capabilities"]),
+    )
+    assert current is not None
+    for key in (
+        "device_id",
+        "installation_id",
+        "indoor_dependency_generation",
+        "configured_sensor_ids",
+        "reference_sensor_id",
+        "sensor_basis",
+        "native_settings",
+        "weather_provider",
+        "timezone",
+    ):
+        assert current[key] == frozen[key], key
+    assert quality.native_scope(current) == route.reference.manifest["scope"]
+
+
 def _thermal_native_snapshot(route, issued, capability):
     from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute
 
@@ -3583,6 +3646,62 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         assert result["control_ready"] is False and result["ordinary_writes_allowed"] is False
         assert await database.lifecycle.claim_decision(route.lease, route.reference, 0)
         await database.lifecycle.finish_decision(route.lease, route.reference, 0, result)
+        from packages.core.models import IndoorTempReading
+
+        # Availability maintenance is strictly after all prospective targets and the decision.
+        assert route.current > max(
+            dt.datetime.fromisoformat(pair["target_at"])
+            + shift
+            + dt.timedelta(hours=2 if real_outcomes else 0)
+            for pair in pairs
+        )
+        preserved = await database.lifecycle.read()
+        frozen_inputs = deepcopy(route.fitted["inputs"])
+        original_artifact, original_payload = module.verify_reference(route.reference)
+        original_bytes = original_artifact.path.read_bytes()
+        historical = []
+        async with database.sessions() as session:
+            for model, timestamp in (
+                (DeviceStatusRecord, DeviceStatusRecord.ts),
+                (IndoorTempReading, IndoorTempReading.timestamp),
+            ):
+                historical.append(
+                    (
+                        await session.execute(
+                            select(model.__table__)
+                            .where(timestamp < route.current)
+                            .order_by(*model.__table__.primary_key.columns)
+                        )
+                    ).all()
+                )
+        await _seed_current_thermal_publication_inputs(database, route)
+        assert await database.lifecycle.read() == preserved
+        assert route.fitted["inputs"] == frozen_inputs
+        assert module.verify_reference(route.reference) == (original_artifact, original_payload)
+        assert original_artifact.path.read_bytes() == original_bytes
+        assert await database.lifecycle.decision_evidence(
+            route.lease, route.reference, window_end=route.frozen_at + dt.timedelta(hours=336)
+        ) == (materialized, complete)
+        async with database.sessions() as session:
+            for (model, timestamp), previous in zip(
+                (
+                    (DeviceStatusRecord, DeviceStatusRecord.ts),
+                    (IndoorTempReading, IndoorTempReading.timestamp),
+                ),
+                historical,
+            ):
+                assert (
+                    await session.execute(
+                        select(model.__table__)
+                        .where(timestamp < route.current)
+                        .order_by(*model.__table__.primary_key.columns)
+                    )
+                ).all() == previous
+                assert (
+                    await session.execute(
+                        select(func.count()).select_from(model).where(timestamp == route.current)
+                    )
+                ).scalar_one() == 1
         before = await database.lifecycle.read()
         artifact, _payload = module.verify_reference(route.reference)
         publication = await database.lifecycle.publish(
