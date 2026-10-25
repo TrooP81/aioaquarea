@@ -186,7 +186,7 @@ class TestOBS5RealMigration:
 
 async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch):
     database = lifecycle_database
-    lease = await _owner(database)
+    lease = await _owner(database, demand=True)
     events = []
     real_fsync = os.fsync
 
@@ -203,7 +203,7 @@ async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch
     monkeypatch.setattr(os, "fsync", fsync)
     event.listen(database.engine.sync_engine, "before_cursor_execute", before_execute)
     try:
-        artifact = _artifact(database, "real-linux-order")
+        artifact = await _artifact(database, "real-linux-order")
         publication_end = len(events)
         assert any(kind == "file" for kind, _ in events)
         assert ("directory", str(artifact.path.parent)) in events
@@ -226,8 +226,11 @@ async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch
 
 async def test_real_cas_loser_never_installs(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifacts = [_artifact(database, "install-first"), _artifact(database, "install-second")]
+    lease = await _owner(database, demand=True)
+    artifacts = [
+        await _artifact(database, "install-first"),
+        await _artifact(database, "install-second"),
+    ]
     installed = []
     results = await asyncio.gather(
         *(
@@ -295,8 +298,8 @@ async def test_maintenance_off_admin_reset_only_revokes_existing_state(
     queued = None
     before = None
     if initialized:
-        lease = await _owner(database)
-        artifact = _artifact(database, "maintenance-off-reset")
+        lease = await _owner(database, demand=True)
+        artifact = await _artifact(database, "maintenance-off-reset")
         published = await database.lifecycle.publish(
             lease, artifact, expected_revision=lease.revision, expected_incumbent=None
         )

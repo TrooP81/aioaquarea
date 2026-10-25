@@ -15,7 +15,7 @@ import json
 import os
 import re
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,12 +31,23 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from packages.core.config import settings
 from packages.core.models import (
+    AuditLogRecord,
+    ConsumptionRecord,
     DeviceStatusRecord,
+    HouseContractRevisionRecord,
+    HouseInstallationRecord,
+    IndoorTempReading,
     MLArtifactRecord,
     MLForecastIssueRecord,
     MLForecastOutcomeRecord,
     MLLifecycleStateRecord,
     MLMaintenanceRequestRecord,
+    OverrideRecord,
+    PlanActionRecord,
+    PlanRecord,
+    PriceRecord,
+    SettingRecord,
+    WeatherRecord,
 )
 from packages.ml.lifecycle import (
     CASConflict,
@@ -74,10 +85,41 @@ def _run_migration(connection, direction):
         getattr(_migration(), direction)()
 
 
-def _pre_lifecycle_device_table():
+SUPPORTING_MODELS = (
+    ConsumptionRecord,
+    IndoorTempReading,
+    PriceRecord,
+    WeatherRecord,
+    SettingRecord,
+    HouseInstallationRecord,
+    HouseContractRevisionRecord,
+    PlanRecord,
+    PlanActionRecord,
+    AuditLogRecord,
+    OverrideRecord,
+)
+LIFECYCLE_MODELS = (
+    MLLifecycleStateRecord,
+    MLArtifactRecord,
+    MLMaintenanceRequestRecord,
+    MLForecastIssueRecord,
+    MLForecastOutcomeRecord,
+)
+FIXTURE_MODELS = (DeviceStatusRecord, *SUPPORTING_MODELS, *LIFECYCLE_MODELS)
+
+
+def _fixture_metadata(schema):
+    """Private metadata: circular house/plan FKs must never bind to public."""
+    metadata = MetaData(schema=schema)
+    for model in SUPPORTING_MODELS:
+        model.__table__.to_metadata(metadata, schema=schema)
+    return metadata
+
+
+def _pre_lifecycle_device_table(schema):
     return Table(
         "device_status",
-        MetaData(),
+        MetaData(schema=schema),
         *(
             Column(
                 column.name,
@@ -92,6 +134,220 @@ def _pre_lifecycle_device_table():
             if column.name != "native_policy_provenance"
         ),
     )
+
+
+def _require_local_table(connection, table):
+    """Later fixture helpers may require storage, never create via public search_path."""
+    schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+    local, resolved = connection.execute(
+        text("SELECT to_regclass(:local)::oid, to_regclass(:name)::oid"),
+        {"local": f"{schema}.{table.name}", "name": table.name},
+    ).one()
+    assert local is not None and local == resolved, f"nonlocal fixture table: {table.name}"
+
+
+async def _assert_fixture_storage(connection, schema):
+    """Prove OIDs, columns, every FK, serial ownership and token defaults before writes."""
+    oids = {}
+    for model in FIXTURE_MODELS:
+        name = model.__tablename__
+        local, resolved, kind = (
+            await connection.execute(
+                text(
+                    "SELECT c.oid, to_regclass(:name)::oid, c.relkind::text "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=:schema AND c.relname=:name"
+                ),
+                {"schema": schema, "name": name},
+            )
+        ).one()
+        assert local == resolved and kind == "r", f"nonlocal fixture relation: {name}"
+        oids[name] = local
+        columns = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT attname FROM pg_attribute "
+                        "WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped"
+                    ),
+                    {"oid": local},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert set(columns) == set(model.__table__.columns.keys()), name
+    for model in FIXTURE_MODELS:
+        expected = sorted(
+            (
+                tuple(element.parent.name for element in fk.elements),
+                oids[fk.referred_table.name],
+                tuple(element.column.name for element in fk.elements),
+            )
+            for fk in model.__table__.foreign_key_constraints
+        )
+        actual = (
+            await connection.execute(
+                text(
+                    "SELECT ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY "
+                    "k(num,ord) JOIN pg_attribute a ON a.attrelid=c.conrelid "
+                    "AND a.attnum=k.num ORDER BY k.ord), c.confrelid, "
+                    "ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY "
+                    "k(num,ord) JOIN pg_attribute a ON a.attrelid=c.confrelid "
+                    "AND a.attnum=k.num ORDER BY k.ord) "
+                    "FROM pg_constraint c WHERE c.contype='f' AND c.conrelid=:oid"
+                ),
+                {"oid": oids[model.__tablename__]},
+            )
+        ).all()
+        assert sorted((tuple(a), b, tuple(c)) for a, b, c in actual) == expected, (
+            f"nonlocal/missing fixture FK: {model.__tablename__}"
+        )
+        for column in model.__table__.columns:
+            # PostgreSQL SERIAL is generated for these autoincrement PKs.
+            if (
+                column is not model.__table__.autoincrement_column
+                or column.server_default is not None
+            ):
+                continue
+            sequence = (
+                await connection.execute(
+                    text("SELECT pg_get_serial_sequence(:table, :column)::regclass::oid"),
+                    {"table": f"{schema}.{model.__tablename__}", "column": column.name},
+                )
+            ).scalar_one()
+            assert sequence is not None, f"missing owned sequence: {model.__tablename__}"
+            await _assert_local_sequence(
+                connection, schema, sequence, oids[model.__tablename__], column.name
+            )
+    token = (
+        await connection.execute(
+            text("SELECT to_regclass(:name)::oid"),
+            {"name": f"{schema}.ml_lifecycle_token_seq"},
+        )
+    ).scalar_one()
+    assert token is not None
+    for column in ("revision", "fence"):
+        await _assert_local_sequence(
+            connection, schema, token, oids["ml_lifecycle_state"], column, owned=False
+        )
+
+
+async def _assert_local_sequence(connection, schema, sequence, table, column, *, owned=True):
+    namespace, kind, resolved, default_bound, ownership_bound = (
+        await connection.execute(
+            text(
+                "SELECT n.nspname, c.relkind::text, to_regclass(c.relname)::oid, "
+                "EXISTS(SELECT 1 FROM pg_attrdef ad "
+                "JOIN pg_attribute a ON a.attrelid=ad.adrelid AND a.attnum=ad.adnum "
+                "JOIN pg_depend d ON d.classid='pg_attrdef'::regclass AND d.objid=ad.oid "
+                "WHERE ad.adrelid=:table AND a.attname=:column "
+                "AND d.refclassid='pg_class'::regclass AND d.refobjid=c.oid), "
+                "EXISTS(SELECT 1 FROM pg_depend d JOIN pg_attribute a "
+                "ON a.attrelid=d.refobjid AND a.attnum=d.refobjsubid "
+                "WHERE d.classid='pg_class'::regclass AND d.objid=c.oid "
+                "AND d.refclassid='pg_class'::regclass AND d.refobjid=:table "
+                "AND a.attname=:column AND d.deptype IN ('a','i')) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:seq"
+            ),
+            {"seq": sequence, "table": table, "column": column},
+        )
+    ).one()
+    assert namespace == schema and kind == "S" and resolved == sequence and default_bound, (
+        "nonlocal sequence default"
+    )
+    assert ownership_bound is owned, "incorrect sequence ownership"
+
+
+async def _public_fixture_state(connection):
+    """Only identities/digests leave PostgreSQL; never log settings or payloads."""
+    state = {}
+    for model in FIXTURE_MODELS:
+        name = model.__tablename__
+        oid = (
+            await connection.execute(
+                text("SELECT to_regclass(:name)::oid"), {"name": f"public.{name}"}
+            )
+        ).scalar_one()
+        if oid is None:
+            state[name] = None
+            continue
+        # Include row versions as well as content: even a reverted write is drift.
+        rows = (
+            await connection.execute(
+                text(
+                    "SELECT count(*), md5(coalesce(string_agg(digest, '' ORDER BY digest),'')) "
+                    f"FROM (SELECT md5(row_to_json(r)::text || r.xmin::text || r.ctid::text) "
+                    f'AS digest FROM public."{name}" r) versions'
+                )
+            )
+        ).one()
+        catalog = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(a)::text, '' "
+                    "ORDER BY a.attnum),'')) FROM pg_attribute a WHERE a.attrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        constraints = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(c)::text, '' "
+                    "ORDER BY c.oid),'')) FROM pg_constraint c WHERE c.conrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        defaults = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(d)::text, '' "
+                    "ORDER BY d.adnum),'')) FROM pg_attrdef d WHERE d.adrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        identity = (
+            await connection.execute(
+                text(
+                    "SELECT relnamespace,relkind::text,relowner,relfilenode "
+                    "FROM pg_class WHERE oid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).one()
+        state[name] = (oid, tuple(identity), tuple(rows), catalog, constraints, defaults)
+    sequences = (
+        await connection.execute(
+            text(
+                "SELECT c.oid, c.relname, row_to_json(s)::text FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_sequence s "
+                "ON s.seqrelid=c.oid WHERE n.nspname='public' ORDER BY c.relname"
+            )
+        )
+    ).all()
+    for oid, name, configuration in sequences:
+        # Identifier quoting from the dialect, not values from settings.
+        quoted = connection.dialect.identifier_preparer.quote_identifier(name)
+        value = (
+            await connection.execute(text(f"SELECT last_value,is_called FROM public.{quoted}"))
+        ).one()
+        dependencies = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(d)::text, '' "
+                    "ORDER BY d.classid,d.objid,d.objsubid,d.refclassid,d.refobjid,"
+                    "d.refobjsubid,d.deptype),'')) FROM pg_depend d "
+                    "WHERE (d.refclassid='pg_class'::regclass AND d.refobjid=:oid) "
+                    "OR (d.classid='pg_class'::regclass AND d.objid=:oid)"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        state["sequence:" + name] = (oid, configuration, tuple(value), dependencies)
+    return state
 
 
 def _source_receipt(receipt, environment=None):
@@ -134,6 +390,9 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
     created = False
     removed = False
     public_unchanged = False
+    fixture_public_unchanged = False
+    ownership_checked = False
+    public_baseline = None
     with owned_test_network():
         try:
             async with control.begin() as connection:
@@ -144,14 +403,23 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     await connection.execute(text("SELECT version_num FROM public.alembic_version"))
                 ).scalar_one() == head
                 retained = await retained_storage_state(connection)
+                public_baseline = await _public_fixture_state(connection)
                 await connection.execute(CreateSchema(schema))
             created = True
             async with engine.begin() as connection:
                 await connection.run_sync(
-                    lambda current: _pre_lifecycle_device_table().create(current)
+                    lambda current: _pre_lifecycle_device_table(schema).create(current)
                 )
                 await connection.run_sync(lambda current: _run_migration(current, "upgrade"))
+                await connection.run_sync(
+                    lambda current: _fixture_metadata(schema).create_all(current, checkfirst=False)
+                )
+                await _assert_fixture_storage(connection, schema)
+                ownership_checked = True
             maker = async_sessionmaker(engine, expire_on_commit=False)
+            from packages.core import database as database_module
+
+            monkeypatch.setattr(database_module, "async_session_factory", maker)
 
             @asynccontextmanager
             async def sessions():
@@ -169,17 +437,41 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                 maker=maker,
                 engine=engine,
                 model_dir=model_dir,
+                schema=schema,
             )
         finally:
             try:
                 await engine.dispose()
                 if created:
-                    async with control.begin() as connection:
-                        await guard_owned_database(connection)
-                        public_unchanged = await retained_storage_state(connection) == retained
-                        await connection.execute(DropSchema(schema, cascade=True))
-                    removed = True
+                    try:
+                        async with control.begin() as connection:
+                            await guard_owned_database(connection)
+                            public_unchanged = await retained_storage_state(connection) == retained
+                            fixture_public_unchanged = (
+                                await _public_fixture_state(connection) == public_baseline
+                            )
+                    finally:
+                        # A comparison/query failure cannot prevent owned-schema cleanup.
+                        async with control.begin() as connection:
+                            await guard_owned_database(connection)
+                            await connection.execute(DropSchema(schema, cascade=True))
+                        async with control.begin() as connection:
+                            removed = (
+                                await connection.execute(
+                                    text("SELECT to_regnamespace(:schema)"), {"schema": schema}
+                                )
+                            ).scalar_one() is None
+                            after = await _public_fixture_state(connection)
+                            fixture_public_unchanged = (
+                                fixture_public_unchanged and after == public_baseline
+                            )
+                            public_unchanged = (
+                                await retained_storage_state(connection) == retained
+                                and public_unchanged
+                            )
                     assert public_unchanged, "public manual storage drift"
+                    assert fixture_public_unchanged, "public fixture storage/sequence drift"
+                    assert removed, "owned fixture schema remains"
             finally:
                 await control.dispose()
                 write_lifecycle_receipt(
@@ -194,6 +486,8 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         "schema_owned": created,
                         "schema_removed": removed,
                         "public_manual_storage_unchanged": public_unchanged,
+                        "fixture_storage_ownership_checked": ownership_checked,
+                        "public_fixture_storage_unchanged": fixture_public_unchanged,
                     },
                 )
 
@@ -222,7 +516,7 @@ async def _readiness_source_fixture(database, monkeypatch):
             WeatherRecord,
         ):
             await connection.run_sync(
-                lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                lambda current, table=model.__table__: _require_local_table(current, table)
             )
     monkeypatch.setattr(database_module, "async_session_factory", database.maker)
     values = {
@@ -233,6 +527,9 @@ async def _readiness_source_fixture(database, monkeypatch):
     values.update(
         {
             "timezone": "UTC",
+            "comfort_temp_min": "18",
+            "comfort_temp_target": "20.5",
+            "comfort_temp_max": "25",
             "comfort_reference_sensor_id": "selected-room",
             "smartthings_device_ids": "selected-room",
             "weather_provider": "open-meteo",
@@ -300,10 +597,10 @@ async def _readiness_source_fixture(database, monkeypatch):
 
 
 async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeypatch):
+    from packages.core import settings_service
     from packages.core.models import (
         ConsumptionRecord,
         IndoorTempReading,
-        SettingRecord,
         WeatherRecord,
     )
     from packages.ml import model_status, thermal
@@ -311,7 +608,7 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
     database = lifecycle_database
     source = await _readiness_source_fixture(database, monkeypatch)
     lease = await _owner(database)
-    old_artifact = _artifact(database, "ur2-old-reference")
+    old_artifact = await _artifact(database, "ur2-old-reference", device_id="audit-device")
     before = await database.lifecycle.read()
     assert (
         await database.lifecycle.publish(
@@ -322,7 +619,6 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
             expected_incumbent=None,
         )
     ).committed
-    new_artifact = _artifact(database, "ur2-new-reference")
     reached, changed = asyncio.Event(), asyncio.Event()
     original = thermal.materialize_thermal_inputs
     calls = 0
@@ -341,31 +637,20 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
             route="ur2-real-pg", as_of=source.now, components=("demand", "thermal")
         )
     )
-    await asyncio.wait_for(reached.wait(), 3)
     try:
+        await asyncio.wait_for(reached.wait(), 3)
         async with database.sessions() as session:
             latest_before = (
                 await session.execute(select(func.max(IndoorTempReading.timestamp)))
             ).scalar_one()
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "comfort_reference_sensor_id")
-                .values(value="second-room")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "smartthings_device_ids")
-                .values(value="second-room")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "weather_provider")
-                .values(value="smhi")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "timezone")
-                .values(value="Europe/Stockholm")
+            await settings_service.set_settings_bulk(
+                {
+                    "comfort_reference_sensor_id": "second-room",
+                    "smartthings_device_ids": "second-room",
+                    "weather_provider": "smhi",
+                    "timezone": "Europe/Stockholm",
+                },
+                session=session,
             )
             await session.execute(
                 update(IndoorTempReading)
@@ -393,6 +678,7 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
                 .where(ConsumptionRecord.ts == source.start + dt.timedelta(hours=1))
                 .values(heat_kwh=2.0)
             )
+        new_artifact = await _artifact(database, "ur2-new-reference", device_id="audit-device")
         current = await database.lifecycle.read()
         assert (
             await database.lifecycle.publish(
@@ -726,7 +1012,7 @@ async def test_UR3_SR2_native_dto_to_qualification_no_incumbent_R06(
     async with lifecycle_database.engine.begin() as connection:
         for model in (PlanRecord, PlanActionRecord):
             await connection.run_sync(
-                lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                lambda current, table=model.__table__: _require_local_table(current, table)
             )
     monkeypatch.setattr(database_module, "async_session_factory", lifecycle_database.maker)
     await test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
@@ -747,7 +1033,7 @@ async def test_UR3_UR4_SR2_SR3_real_enabled_cycle_and_owner_without_incumbent(
     source = await _readiness_source_fixture(database, monkeypatch)
     async with database.engine.begin() as connection:
         await connection.run_sync(
-            lambda current: OverrideRecord.__table__.create(current, checkfirst=True)
+            lambda current: _require_local_table(current, OverrideRecord.__table__)
         )
     timer = {
         "status": "known",
@@ -938,13 +1224,20 @@ async def test_UR3_SR2_real_owner_off_and_rejection_counts(lifecycle_database, m
         await owner.close()
 
 
-def _artifact(database, fit_id, *, checkpoint=None):
+async def _artifact(database, fit_id, *, device_id="fixture-device", checkpoint=None):
+    from packages.ml.forecast_quality import locked_demand_scope
+
+    async with database.sessions() as session:
+        async with locked_demand_scope(device_id, session=session) as (scope, _session):
+            manifest_scope = scope
     return publish_signed_artifact(
         {"fit_id": fit_id, "weights": [1.25, 3.5]},
         component="demand",
         schema_version="demand_lifecycle_v1",
         manifest={
             "fit_id": fit_id,
+            "device_id": device_id,
+            "scope": manifest_scope,
             "data_cutoff": dt.datetime.now(dt.timezone.utc).isoformat(),
             "input_schema": "native_inputs_v1",
             "output_schema": "demand_v1",
@@ -960,7 +1253,29 @@ def _exact_fit(restored, fit_id):
     assert restored == {"fit_id": fit_id, "weights": [1.25, 3.5]}
 
 
-async def _owner(database):
+async def _prepare_demand_fixture(database):
+    """Opt-in current inputs, never added to readiness/thermal or empty-authority cohorts."""
+    from packages.core import settings_service
+    from packages.core.house_contract import ensure_current_contract
+
+    async with database.sessions() as session:
+        await settings_service.set_settings_bulk(
+            {
+                "timezone": "UTC",
+                "comfort_temp_min": "18",
+                "comfort_temp_target": "20.5",
+                "comfort_temp_max": "25",
+            },
+            session=session,
+        )
+        await ensure_current_contract(session)
+        now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+        session.add(DeviceStatusRecord(ts=now, device_id="fixture-device"))
+
+
+async def _owner(database, *, demand=False):
+    if demand:
+        await _prepare_demand_fixture(database)
     await database.lifecycle.initialize()
     await database.lifecycle.set_maintenance_enabled(True)
     lease = await database.lifecycle.acquire("worker-" + uuid.uuid4().hex)
@@ -969,9 +1284,9 @@ async def _owner(database):
 
 
 async def _native_fixture(database, count, *, incumbent_fit=None):
-    lease = await _owner(database)
+    lease = await _owner(database, demand=True)
     if incumbent_fit is not None:
-        incumbent = _artifact(database, incumbent_fit)
+        incumbent = await _artifact(database, incumbent_fit)
         state = await database.lifecycle.read()
         assert (
             await database.lifecycle.publish(
@@ -982,7 +1297,7 @@ async def _native_fixture(database, count, *, incumbent_fit=None):
                 expected_incumbent=None,
             )
         ).committed
-    artifact = _artifact(database, "native-fixture")
+    artifact = await _artifact(database, "native-fixture")
     state = await database.lifecycle.read()
     assert (
         await database.lifecycle.publish(
@@ -1020,6 +1335,149 @@ async def _native_fixture(database, count, *, incumbent_fit=None):
         for index in range(count)
     ]
     return lease, reference, rows
+
+
+@contextmanager
+def _trace_thermal_materializers(monkeypatch, observations, *, source="actual-hook"):
+    """Observe the real hook; return objects and exceptions are never replaced."""
+    from packages.ml import forecast_quality as quality, thermal
+
+    native = quality.materialize_native_inputs
+    history = thermal.materialize_thermal_inputs
+
+    async def observed_native(*args, **kwargs):
+        entry = {
+            "call": "native",
+            "capabilities": list(kwargs.get("capabilities", ())),
+        }
+        observations.append(entry)
+        try:
+            result = await native(*args, **kwargs)
+        except BaseException as exc:
+            entry["exception"] = type(exc).__name__
+            raise
+        entry["result"] = "None" if result is None else "present"
+        if result is not None:
+            entry["sensor_kind"] = result["sensor_basis"]["kind"]
+            entry["capability"] = result["capability"]
+        return result
+
+    async def observed_history(*args, **kwargs):
+        entry = {"call": "thermal_history"}
+        observations.append(entry)
+        try:
+            result = await history(*args, **kwargs)
+        except BaseException as exc:
+            entry["exception"] = type(exc).__name__
+            raise
+        entry["result"] = "None" if result is None else "present"
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(quality, "materialize_native_inputs", observed_native)
+        patch.setattr(thermal, "materialize_thermal_inputs", observed_history)
+        try:
+            yield
+        finally:
+            print(
+                json.dumps({"probe": "G3-materializers", "source": source, "calls": observations})
+            )
+
+
+async def _thermal_prerequisite_probe(database, monkeypatch, now):
+    """Prerequisite-only differential. Every probe rolls back; no hook fit/commit."""
+    from packages.ml import forecast_quality as quality, thermal
+
+    async with database.sessions() as session:
+        installation = await session.get(HouseInstallationRecord, 1)
+        local, resolved = (
+            await session.execute(
+                text("SELECT to_regclass(:local)::oid,to_regclass('house_installations')::oid"),
+                {"local": database.schema + ".house_installations"},
+            )
+        ).one()
+    print(
+        json.dumps(
+            {
+                "probe": "G3-prerequisite",
+                "local_oid": local,
+                "resolved_oid": resolved,
+                "singleton_present": installation is not None,
+            }
+        )
+    )
+    assert local is not None and local == resolved
+    if installation is not None:
+        print(json.dumps({"probe": "G3-boundary", "reason": "installation_already_present"}))
+        return
+    for present in (False, True):
+        observations = []
+        rolled_back = False
+        try:
+            async with database.engine.connect() as connection:
+                transaction = await connection.begin()
+                try:
+                    maker = async_sessionmaker(
+                        connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+                    )
+
+                    @asynccontextmanager
+                    async def diagnostic_sessions():
+                        async with maker() as session:
+                            yield session
+                            await session.commit()
+
+                    with monkeypatch.context() as patch:
+                        patch.setattr(quality, "get_session", diagnostic_sessions)
+                        patch.setattr(thermal, "get_session", diagnostic_sessions)
+                        if present:
+                            async with diagnostic_sessions() as session:
+                                session.add(
+                                    HouseInstallationRecord(
+                                        singleton_id=1,
+                                        installation_id=uuid.UUID(int=1),
+                                        house_id=uuid.UUID(int=2),
+                                        demand_dependency_generation=1,
+                                        indoor_dependency_generation=1,
+                                    )
+                                )
+                        with _trace_thermal_materializers(
+                            patch,
+                            observations,
+                            source="prerequisite-present" if present else "prerequisite-absent",
+                        ):
+                            # Same family selection as the hook, but never fit/publish/qualify.
+                            inputs = await quality.materialize_native_inputs("thermal", now=now)
+                            indoor = await quality.materialize_native_inputs(
+                                "thermal",
+                                now=now,
+                                device_id=inputs["device_id"] if inputs else None,
+                                capabilities=("indoor_heating", "indoor_cooling"),
+                            )
+                            if indoor is not None:
+                                await thermal.materialize_thermal_inputs(
+                                    indoor["device_id"],
+                                    indoor["reference_sensor_id"],
+                                    indoor["weather_provider"],
+                                    now,
+                                    selected_ids=indoor["configured_sensor_ids"],
+                                )
+                finally:
+                    await transaction.rollback()
+                    rolled_back = True
+        except Exception as exc:
+            # Diagnostic failure is evidence, never a replacement for the actual hook result.
+            observations.append({"probe_exception": type(exc).__name__})
+        print(
+            json.dumps(
+                {
+                    "probe": "G3-installation-differential",
+                    "installation_present": present,
+                    "rolled_back": rolled_back,
+                    "calls": observations,
+                }
+            )
+        )
 
 
 async def test_issue_outcome_uniqueness_and_immutable_snapshot_under_concurrency(
@@ -1107,7 +1565,9 @@ async def test_R03_saved_plan_JSON_readers_preserve_integer_identity(
     database = lifecycle_database
     async with database.engine.begin() as connection:
         for model in (PlanRecord, PlanActionRecord, IndoorTempReading):
-            await connection.run_sync(lambda current, table=model.__table__: table.create(current))
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
     async with database.sessions() as session:
 
         def saved_history(plans, readings, _unresolved):
@@ -1206,7 +1666,9 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
 
     async with database.engine.begin() as connection:
         for model in (ConsumptionRecord, IndoorTempReading, PriceRecord, WeatherRecord):
-            await connection.run_sync(lambda current, table=model.__table__: table.create(current))
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
     async with database.sessions() as session:
         current = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     frozen_at = current - dt.timedelta(hours=360)
@@ -1276,29 +1738,53 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
     )
     monkeypatch.setattr(module, "_now", lambda: clock[0])
     lease = await _owner(database)
-    owner = module.MaintenanceRunner(
-        database.lifecycle, enabled_reader=AsyncMock(return_value=True)
-    )
+    owner = None
     try:
-        hook = owner.hooks["thermal"]
-        heating, cooling = thermal._extract_indoor_rate_samples(readings, records, weather)
-        source_counts = {
-            name: thermal._rate_sample_counts(samples)
-            for name, samples in (("indoor_heating", heating), ("indoor_cooling", cooling))
-        }
-        assert all(
-            counts["train"] >= 20 and counts["holdout"] >= 3 for counts in source_counts.values()
+        observations = []
+        with _trace_thermal_materializers(monkeypatch, observations):
+            owner = module.MaintenanceRunner(
+                database.lifecycle, enabled_reader=AsyncMock(return_value=True)
+            )
+            hook = owner.hooks["thermal"]
+            heating, cooling = thermal._extract_indoor_rate_samples(readings, records, weather)
+            source_counts = {
+                name: thermal._rate_sample_counts(samples)
+                for name, samples in (("indoor_heating", heating), ("indoor_cooling", cooling))
+            }
+            assert all(
+                counts["train"] >= 20 and counts["holdout"] >= 3
+                for counts in source_counts.values()
+            )
+            assert (await database.lifecycle.read()).reference("thermal") is None
+            queued = await database.lifecycle.enqueue(
+                "thermal", "scheduled", family="indoor_", dedup_key="r06-indoor-fit", lease=lease
+            )
+            assert isinstance(queued, module.MaintenanceRequest)
+            assert queued.details == {"family": "indoor_"}
+            claimed = await database.lifecycle.claim_request(lease, "thermal")
+            assert isinstance(claimed, module.MaintenanceRequest)
+            assert claimed.id == queued.id and claimed.details == {"family": "indoor_"}
+            try:
+                materialized = await hook.materialize(claimed)
+            except BaseException as exc:
+                print(json.dumps({"probe": "G3-actual-hook", "exception": type(exc).__name__}))
+                raise
+        print(
+            json.dumps(
+                {
+                    "probe": "G3-actual-hook",
+                    "result": "None" if materialized is None else "present",
+                    "requested_family": claimed.details.get("family"),
+                }
+            )
         )
-        assert (await database.lifecycle.read()).reference("thermal") is None
-        queued = await database.lifecycle.enqueue(
-            "thermal", "scheduled", family="indoor_", dedup_key="r06-indoor-fit", lease=lease
-        )
-        assert isinstance(queued, module.MaintenanceRequest)
-        assert queued.details == {"family": "indoor_"}
-        claimed = await database.lifecycle.claim_request(lease, "thermal")
-        assert isinstance(claimed, module.MaintenanceRequest)
-        assert claimed.id == queued.id and claimed.details == {"family": "indoor_"}
-        materialized = await hook.materialize(claimed)
+        if materialized is None:
+            try:
+                await _thermal_prerequisite_probe(database, monkeypatch, clock[0])
+            except Exception as exc:
+                print(
+                    json.dumps({"probe": "G3-diagnostic-failure", "exception": type(exc).__name__})
+                )
         assert materialized is not None
         assert materialized["requested_family"] == "indoor_"
         fitted = hook.fit(materialized)
@@ -1331,7 +1817,8 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
             source_counts=source_counts,
         )
     except BaseException:
-        await owner.close()
+        if owner is not None:
+            await owner.close()
         await database.lifecycle.release(lease)
         raise
 
@@ -1386,7 +1873,7 @@ async def test_R06_R07_R34_automatic_indoor_fit_has_positive_prospective_sql_rou
         async with database.engine.begin() as connection:
             for model in (PlanRecord, PlanActionRecord, OverrideRecord):
                 await connection.run_sync(
-                    lambda current, table=model.__table__: table.create(current)
+                    lambda current, table=model.__table__: _require_local_table(current, table)
                 )
         for issued, capability, rate in (
             (first, "indoor_heating", 0.6),
@@ -1512,7 +1999,7 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
 
             async with database.engine.begin() as connection:
                 await connection.run_sync(
-                    lambda current: OverrideRecord.__table__.create(current, checkfirst=True)
+                    lambda current: _require_local_table(current, OverrideRecord.__table__)
                 )
         for index in range(0, len(pairs), 3):
             group = pairs[index : index + 3]
@@ -1712,6 +2199,9 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         }
         captured_values.update(
             {
+                "comfort_temp_min": "18",
+                "comfort_temp_target": "20.5",
+                "comfort_temp_max": "25",
                 "comfort_reference_sensor_id": "selected-room",
                 "smartthings_device_ids": "selected-room",
                 "weather_provider": "open-meteo",
@@ -1727,7 +2217,7 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         async with database.engine.begin() as connection:
             for model in (PlanRecord, PlanActionRecord):
                 await connection.run_sync(
-                    lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                    lambda current, table=model.__table__: _require_local_table(current, table)
                 )
         monkeypatch.setattr(database_module, "async_session_factory", database.maker)
         dto = await model_status.get_readiness_snapshot(
@@ -1987,7 +2477,7 @@ async def test_R13_damaged_candidate_invalidation_is_durable_and_fences_publicat
         repaired_state.checkpoints["invalidated:" + reference.artifact_hash]["reason"]
         == "artifact_integrity_failure"
     )
-    replacement = _artifact(database, "repair-after-invalidation")
+    replacement = await _artifact(database, "repair-after-invalidation")
     stale = await database.lifecycle.publish(
         lease, replacement, expected_revision=before.revision, expected_incumbent=incumbent_hash
     )
@@ -2410,7 +2900,7 @@ async def test_cycle_retention_is_bounded_and_preserves_protected_evidence(
         created_at=old,
     )
     await database.lifecycle.record_native_issues(lease, reference, [protected], slot=0)
-    unreferenced = _artifact(database, "expired-unreferenced-fit")
+    unreferenced = await _artifact(database, "expired-unreferenced-fit")
     async with database.sessions() as session:
         session.add(
             MLArtifactRecord(
@@ -2622,8 +3112,8 @@ async def test_two_maintenance_owners_contend_for_one_lease(lifecycle_database):
 
 async def test_concurrent_publication_has_one_CAS_winner(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifacts = [_artifact(database, "fit-1"), _artifact(database, "fit-2")]
+    lease = await _owner(database, demand=True)
+    artifacts = [await _artifact(database, "fit-1"), await _artifact(database, "fit-2")]
     results = await asyncio.gather(
         *(
             database.lifecycle.publish(
@@ -2649,7 +3139,7 @@ async def test_concurrent_publication_has_one_CAS_winner(lifecycle_database):
 
 async def test_lease_loss_fences_late_worker(lifecycle_database):
     database = lifecycle_database
-    old = await _owner(database)
+    old = await _owner(database, demand=True)
     async with database.sessions() as session:
         await session.execute(
             update(MLLifecycleStateRecord).values(
@@ -2660,7 +3150,7 @@ async def test_lease_loss_fences_late_worker(lifecycle_database):
     assert current is not None and current.fence > old.fence and current.revision > old.revision
     stale = await database.lifecycle.publish(
         old,
-        _artifact(database, "late-fit"),
+        await _artifact(database, "late-fit"),
         expected_revision=old.revision,
         expected_incumbent=None,
     )
@@ -2671,7 +3161,7 @@ async def test_lease_loss_fences_late_worker(lifecycle_database):
     assert renewed.fence == current.fence
     result = await database.lifecycle.publish(
         renewed,
-        _artifact(database, "current-fit"),
+        await _artifact(database, "current-fit"),
         expected_revision=current.revision,
         expected_incumbent=None,
     )
@@ -2694,7 +3184,7 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
     lifecycle_database, stage
 ):
     database = lifecycle_database
-    lease = await _owner(database)
+    lease = await _owner(database, demand=stage != "before_file")
     installed = []
     if stage == "before_file":
         with pytest.raises(LifecycleUnavailable):
@@ -2708,12 +3198,12 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
                 raise OSError("injected publication interruption")
 
         with pytest.raises(OSError, match="injected publication interruption"):
-            _artifact(database, "interrupted-fit", checkpoint=crash)
+            await _artifact(database, "interrupted-fit", checkpoint=crash)
         with pytest.raises(LifecycleUnavailable):
             await database.lifecycle.load_committed("demand", role="candidate")
         assert len(list(database.model_dir.rglob("*.pkl"))) == int(stage != "file_synced")
         return
-    artifact = _artifact(database, "commit-fit")
+    artifact = await _artifact(database, "commit-fit")
     fired = False
 
     @asynccontextmanager
@@ -2772,8 +3262,8 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
 
 async def test_pruning_races_and_reset_never_recreate_epoch(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifact = _artifact(database, "racing-fit")
+    lease = await _owner(database, demand=True)
+    artifact = await _artifact(database, "racing-fit")
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)).timestamp()
     os.utime(artifact.path, (old, old))
     enumerated = asyncio.Event()
@@ -2857,8 +3347,12 @@ async def test_restart_and_rollback_preserve_restore_and_embargo(lifecycle_datab
     now = dt.datetime.now(dt.timezone.utc)
     before = await database.lifecycle.initialize()
     async with database.engine.begin() as connection:
-        await connection.run_sync(lambda current: PlanRecord.__table__.create(current))
-        await connection.run_sync(lambda current: PlanActionRecord.__table__.create(current))
+        await connection.run_sync(
+            lambda current: _require_local_table(current, PlanRecord.__table__)
+        )
+        await connection.run_sync(
+            lambda current: _require_local_table(current, PlanActionRecord.__table__)
+        )
     async with database.sessions() as session:
         session.add(
             PlanRecord(
