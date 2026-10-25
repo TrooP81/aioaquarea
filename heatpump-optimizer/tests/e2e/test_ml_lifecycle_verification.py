@@ -34,7 +34,7 @@ from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from packages.core.models import MLLifecycleStateRecord
+from packages.core.models import AppLogRecord, MLLifecycleStateRecord, SettingRecord
 from packages.ml.lifecycle import Lifecycle, LifecycleUnavailable, invalidate_lifecycle
 from packages.ml.model_status import get_model_status
 from tests.e2e.test_manual_cop_postgresql import (
@@ -63,6 +63,7 @@ from tests.e2e.test_manual_cop_postgresql import (
 )
 from tests.e2e.test_ml_lifecycle_postgresql import (
     _artifact,
+    _logging_phase as _logging_phase,
     _owner,
     _public_fixture_state,
     _run_migration,
@@ -71,6 +72,93 @@ from tests.e2e.test_ml_lifecycle_postgresql import (
 )
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+
+async def test_owned_periodic_logging_coexists_with_unfiltered_application_guards(
+    lifecycle_database,
+):
+    """A normal periodic turn in each guard window, never a forced/early flush."""
+    from packages.core import log_sink
+    from sqlalchemy import update
+    from sqlalchemy.sql.dml import Delete, Insert, Update
+
+    database = lifecycle_database
+    async with database.sessions() as session:
+        session.add(SettingRecord(key="logging-guard-probe", value="first"))
+
+    async def periodic_turn(label):
+        while not database.logging_commits.empty():
+            database.logging_commits.get_nowait()
+        marker = "periodic-guard-" + label
+        log_sink._db_log_processor(None, "info", {"event": marker})
+        # This waits for real transaction completion on the ordinary two-second
+        # flusher, while the application listener remains installed.
+        async with asyncio.timeout(10):
+            while True:
+                await database.logging_commits.get()
+                async with database.logging_sessions() as session:
+                    found = (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(AppLogRecord)
+                            .where(AppLogRecord.event == marker)
+                        )
+                    ).scalar_one()
+                if found:
+                    assert found == 1
+                    return
+
+    statements = []
+
+    def readonly(_connection, _cursor, statement, _parameters, _context, _many):
+        import re
+
+        statements.append(statement)
+        assert not re.search(
+            r"\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE)\b", statement, re.I
+        ), statement
+
+    event.listen(database.engine.sync_engine, "before_cursor_execute", readonly)
+    try:
+        async with database.sessions() as session:
+            await session.execute(select(SettingRecord.value))
+        await periodic_turn("read-only")
+        assert statements
+        statements.clear()
+        await periodic_turn("no-sql")
+        assert statements == []
+        # Application-originated log writes still use the guarded engine.
+        with pytest.raises(AssertionError, match="INSERT"):
+            async with database.sessions() as session:
+                session.add(AppLogRecord(event="must-be-caught", level="INFO", service="test"))
+        assert any("INSERT" in statement for statement in statements)
+    finally:
+        event.remove(database.engine.sync_engine, "before_cursor_execute", readonly)
+
+    dml = []
+
+    def exact_dml(_connection, clause, *_args):
+        if isinstance(clause, (Insert, Update, Delete)):
+            dml.append(type(clause).__name__.upper())
+
+    event.listen(database.engine.sync_engine, "before_execute", exact_dml)
+    try:
+        async with database.sessions() as session:
+            await session.execute(
+                update(SettingRecord)
+                .where(SettingRecord.key == "logging-guard-probe")
+                .values(value="second")
+            )
+            await session.execute(
+                update(SettingRecord)
+                .where(SettingRecord.key == "logging-guard-probe")
+                .values(value="first")
+            )
+        await periodic_turn("exact-dml")
+        assert dml == ["UPDATE", "UPDATE"]
+    finally:
+        event.remove(database.engine.sync_engine, "before_execute", exact_dml)
+
 
 TABLES = (
     "ml_lifecycle_state",

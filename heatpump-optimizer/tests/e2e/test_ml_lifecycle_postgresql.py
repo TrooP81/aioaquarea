@@ -30,6 +30,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import pytest
 import pytest_asyncio
+import structlog
 from sqlalchemy import Column, MetaData, Table, event, func, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -43,6 +44,7 @@ from sqlalchemy.sql.elements import ClauseElement, quoted_name
 from packages.core.config import settings
 from packages.core.models import (
     AuditLogRecord,
+    AppLogRecord,
     ConsumptionRecord,
     DeviceStatusRecord,
     HouseContractRevisionRecord,
@@ -1230,6 +1232,7 @@ def _run_migration(connection, direction):
 
 
 SUPPORTING_MODELS = (
+    AppLogRecord,
     ConsumptionRecord,
     IndoorTempReading,
     PriceRecord,
@@ -1641,6 +1644,7 @@ async def _cleanup_lifecycle_storage(
     diagnostic_baseline,
     source,
     emit_receipt,
+    logging_engine=None,
 ):
     """Every cleanup obligation is independent, including when diagnostics fail."""
     state = {
@@ -1696,6 +1700,8 @@ async def _cleanup_lifecycle_storage(
 
     stages = []
     if created:
+        if logging_engine is not None:
+            stages.append(("engine-dispose", logging_engine.dispose))
         stages.extend(
             [
                 ("pre-drop", lambda: compare("pre-drop")),
@@ -1738,12 +1744,150 @@ async def _cleanup_lifecycle_storage(
         raise BaseExceptionGroup("fixture cleanup failed: " + ", ".join(failed_stages), failures)
 
 
+def _logging_child_identity(receipt, source):
+    """Only the canonical isolated phase child may use non-unwinding containment."""
+    phase = os.environ["COP_MANUAL_TEST_PHASE"]
+    assert re.fullmatch(r"[a-z0-9-]+", phase), "invalid logging child phase"
+    root = Path(receipt["temp_root"]) / "evidence"
+    assert Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) == root
+    process = json.loads((root / phase / "process.json").read_text(encoding="utf-8"))
+    assert process["pid"] == process["pgid"] == os.getpid() == os.getpgrp() == os.getsid(0)
+    assert process["parent_pid"] == os.getppid()
+    assert process["commit"] == source["commit"]
+    assert process["source_manifest_sha256"] == source["source_manifest_sha256"]
+    assert process["revision"] == receipt["revision"]
+    assert "--noconftest" in process["command"] and "pytest" in process["command"]
+    assert "exit" not in process and "finished_at" not in process
+    return (os.getpid(), os.getppid(), os.getpgrp())
+
+
+def _exit_unsettled_logging(identity):
+    """Test child ONLY. No finally/pytest unwinding; failed profile is not reusable."""
+    assert (identity[0], identity[2]) == (os.getpid(), os.getpgrp())
+    assert os.getpid() == os.getsid(0) == os.getpgrp()
+    os._exit(86)
+
+
+def _assert_logging_accounting(status, *, complete):
+    """Cumulative phase totals, never a per-fixture baseline that hides prior loss."""
+    counts = status["counts"]
+    assert not any(status["drops"].values()), "logging phase rejected or lost rows"
+    for name in (
+        "batch_failures",
+        "writer_cancellations",
+        "attempt_timeouts",
+        "retried_rows",
+        "admitted_loss",
+        "unsettled_shutdowns",
+        "shutdown_expirations",
+        "task_creation_failures",
+        "writer_cancel_requests",
+        "caller_cancellations",
+        "flusher_failures",
+    ):
+        assert counts.get(name, 0) == 0, f"logging phase failure: {name}"
+    assert counts.get("admitted", 0) == (
+        counts.get("acknowledged", 0) + status["owned_rows"] - status["encoding_rows"]
+    ), "logging conservation failure"
+    if complete:
+        assert status["owned_rows"] == status["inflight_rows"] == 0
+        assert status["state"] == "SETTLED"
+
+
+async def _finish_logging_fixture(
+    *, lease, child_identity, verify_logging, cleanup_storage, saved_logging
+):
+    """Called inside finish_owned_cleanup; includes every independent finalizer."""
+    from packages.core import log_sink
+
+    failures = []
+    if lease is not None:
+        try:
+            await log_sink.shutdown_log_sink()
+        except BaseException as exc:
+            if log_sink.log_sink_status()["state"] != "SETTLED":
+                _exit_unsettled_logging(child_identity)
+            failures.append(exc)
+        try:
+            _assert_logging_accounting(log_sink.log_sink_status(), complete=True)
+            await verify_logging()
+        except BaseException as exc:
+            failures.append(exc)
+    try:
+        await cleanup_storage()
+    except BaseException as exc:
+        failures.append(exc)
+    finally:
+        if lease is not None:
+            try:
+                lease.release()
+            except BaseException as exc:
+                failures.append(exc)
+        # Restoring processors is deliberately NOT sink configuration/restart.
+        structlog.configure(**saved_logging)
+    if failures:
+        raise BaseExceptionGroup("owned logging/fixture cleanup failed", failures)
+
+
+@pytest.fixture(scope="session")
+def _logging_phase():
+    from packages.core import log_sink
+
+    _assert_logging_accounting(log_sink.log_sink_status(), complete=False)
+    yield
+    _assert_logging_accounting(log_sink.log_sink_status(), complete=True)
+
+
+def _logging_session_factory(maker, commits):
+    """Supply the logging transaction context and its committed-write notifications."""
+
+    @asynccontextmanager
+    async def sessions():
+        async with maker() as session:
+            wrote = False
+
+            def before_flush(current, _context, _instances):
+                nonlocal wrote
+                # Capture pending ORM writes BEFORE autoflush empties these sets,
+                # including seed rows whose first flush happens inside commit.
+                wrote |= bool(current.new or current.dirty or current.deleted)
+
+            def orm_execute(state):
+                nonlocal wrote
+                # Bulk ORM DML need not populate new/dirty/deleted at all.
+                wrote |= state.is_insert or state.is_update or state.is_delete
+
+            target = session.sync_session
+            event.listen(target, "before_flush", before_flush)
+            event.listen(target, "do_orm_execute", orm_execute)
+            try:
+                yield session
+                await session.commit()
+                if wrote:
+                    commits.put_nowait(True)
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                event.remove(target, "do_orm_execute", orm_execute)
+                event.remove(target, "before_flush", before_flush)
+
+    return sessions
+
+
 @pytest_asyncio.fixture
-async def lifecycle_database(request, tmp_path, monkeypatch):
+async def lifecycle_database(request, tmp_path, monkeypatch, _logging_phase):
     assert request.config.option.noconftest, "coordinator-owned suite requires --noconftest"
     assert os.name == "posix", "owned harness requires Linux Unix-socket/process semantics"
     receipt = owned_test_environment()
     source = _source_receipt(receipt)
+    child_identity = _logging_child_identity(receipt, source)
+    from packages.core import log_sink
+    from packages.core.runtime_ownership import finish_owned_cleanup
+
+    initial = log_sink.log_sink_status()
+    assert initial["state"] in ("IDLE", "SETTLED") and not initial["explicit_binding"]
+    assert initial["owned_rows"] == 0, "startup before binding cannot be adopted"
     _investigation_stage("baseline", source)
     root = Path(receipt["temp_root"])
     assert tmp_path.resolve().is_relative_to(root), "pytest basetemp must be coordinator-owned"
@@ -1757,6 +1901,16 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
         poolclass=NullPool,
         connect_args={"server_settings": {"search_path": schema + ", public"}},
     )
+    # Deliberately separate from application-engine listeners, NOT a model-wide bind.
+    logging_engine = create_async_engine(
+        os.environ["DATABASE_URL"],
+        poolclass=NullPool,
+        connect_args={"server_settings": {"search_path": schema + ", public"}},
+    )
+    saved_logging = structlog.get_config().copy()
+    logging_lease = None
+    logging_marker = "owned-logging-" + uuid.uuid4().hex
+    logging_commits = asyncio.Queue()
     started = dt.datetime.now(dt.timezone.utc)
     created = False
     ownership_checked = False
@@ -1800,6 +1954,9 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     lambda current: _fixture_metadata(schema).create_all(current, checkfirst=False)
                 )
                 await _assert_fixture_storage(connection, schema)
+                # Verify logging's own connection resolves relation/default/sequence locally.
+            async with logging_engine.begin() as connection:
+                await _assert_fixture_storage(connection, schema)
                 ownership_checked = True
             maker = async_sessionmaker(engine, expire_on_commit=False)
             from packages.core import database as database_module
@@ -1816,6 +1973,25 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         await session.rollback()
                         raise
 
+            logging_maker = async_sessionmaker(logging_engine, expire_on_commit=False)
+            logging_sessions = _logging_session_factory(logging_maker, logging_commits)
+
+            _assert_logging_accounting(log_sink.log_sink_status(), complete=False)
+            logging_lease = log_sink.bind_log_session_factory(logging_sessions)
+            # Matches the real API's import + lifespan configuration; no disabling,
+            # interval changes, forced flush or application-listener filtering.
+            log_sink.configure_structlog_with_db("api")
+            async with logging_sessions() as session:
+                session.add(
+                    AppLogRecord(
+                        event=logging_marker + "-expired",
+                        level="INFO",
+                        service="owned-test",
+                        ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25),
+                    )
+                )
+            log_sink._db_log_processor(None, "info", {"event": logging_marker})
+
             _investigation_stage("call", source)
             yield SimpleNamespace(
                 lifecycle=Lifecycle(sessions),
@@ -1824,6 +2000,9 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                 engine=engine,
                 model_dir=model_dir,
                 schema=schema,
+                logging_engine=logging_engine,
+                logging_sessions=logging_sessions,
+                logging_commits=logging_commits,
             )
         finally:
 
@@ -1843,17 +2022,48 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     },
                 )
 
-            await _cleanup_lifecycle_storage(
-                engine=engine,
-                control=control,
-                schema=schema,
-                created=created,
-                retained=retained,
-                public_baseline=public_baseline,
-                diagnostic_baseline=diagnostic_baseline,
-                source=source,
-                emit_receipt=emit_receipt,
-            )
+            async def verify_logging():
+                async with logging_maker() as session:
+                    rows = (
+                        (
+                            await session.execute(
+                                select(AppLogRecord.event).where(
+                                    AppLogRecord.event.in_(
+                                        [logging_marker, logging_marker + "-expired"]
+                                    )
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                assert rows == [logging_marker], "logging INSERT/retention not committed"
+
+            async def cleanup_storage():
+                await _cleanup_lifecycle_storage(
+                    engine=engine,
+                    control=control,
+                    logging_engine=logging_engine,
+                    schema=schema,
+                    created=created,
+                    retained=retained,
+                    public_baseline=public_baseline,
+                    diagnostic_baseline=diagnostic_baseline,
+                    source=source,
+                    emit_receipt=emit_receipt,
+                )
+
+            async def cleanup():
+                await _finish_logging_fixture(
+                    lease=logging_lease,
+                    child_identity=child_identity,
+                    verify_logging=verify_logging,
+                    cleanup_storage=cleanup_storage,
+                    saved_logging=saved_logging,
+                )
+
+            # Includes disposal, receipts, lease and processor restoration, not just drain.
+            await finish_owned_cleanup(cleanup)
 
 
 async def _readiness_source_fixture(database, monkeypatch):

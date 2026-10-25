@@ -12,6 +12,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_service_logging_configuration(monkeypatch):
+    # Service ownership tests already replace shutdown; do not start a real sink
+    # (or change the global structlog configuration) behind that fake cleanup.
+    monkeypatch.setattr("packages.core.logging.configure_structlog_with_db", lambda name: None)
+
+
 @pytest.mark.parametrize("service", ["api", "poller"])
 @pytest.mark.parametrize("failure", ["error", "cancel"])
 async def test_R23_startup_failure_disposes_engine_after_owned_drain(monkeypatch, service, failure):
@@ -312,7 +319,10 @@ async def test_R30_unsuccessful_publication_never_consumes_cooldown(monkeypatch,
 
 @pytest.fixture
 def isolated_sink(monkeypatch):
-    from packages.core import log_sink
+    from tests.test_logging_ownership_contracts import load_sink
+
+    log_sink, _saved = load_sink(monkeypatch)
+    log_sink._OWNER = log_sink._Owner(state="RUNNING")
 
     monkeypatch.setattr(log_sink, "_LOG_BUFFER", [])
     monkeypatch.setattr(log_sink, "_DROP_COUNTS", Counter())
