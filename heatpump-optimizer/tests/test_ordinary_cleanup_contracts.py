@@ -15,6 +15,28 @@ from sqlalchemy.sql.dml import Delete, Insert
 from tests.e2e import ordinary_cleanup as cleanup
 
 
+@pytest.mark.parametrize("layer", ["rules_only", "milp_preferred"])
+@pytest.mark.parametrize("gate", ["valid", "absent", "mismatch"])
+def test_planning_rows_are_valid_recognized_settings(layer, gate):
+    from packages.core.models import SettingRecord
+    from packages.core.settings_service import SETTINGS_SCHEMA
+    from tests.planner_orm_support import planning_rows
+
+    rows = planning_rows(layer=layer, gate=gate)
+    assert isinstance(rows, list)  # SQLite/P17 consumers retain the synchronous interface.
+    values = {row.key: row.value for row in rows if isinstance(row, SettingRecord)}
+    minimum, target, maximum = (
+        float(values[key])
+        for key in ("comfort_temp_min", "comfort_temp_target", "comfort_temp_max")
+    )
+    assert 10 <= minimum <= target <= maximum <= 30
+    assert set(values) <= set(SETTINGS_SCHEMA)
+    assert values["learning_mode_enabled"] == "false"
+    status = next(row for row in rows if type(row).__name__ == "DeviceStatusRecord")
+    assert status.zone1_temp == status.zone1_target_temp == 35
+    assert status.tank_target_temp == 60
+
+
 def _fixture_producer(filename, name, namespace):
     """Execute the real producer body without importing the owned E2E conftest."""
     module = ast.parse(Path(cleanup.__file__).with_name(filename).read_text(encoding="utf-8"))
@@ -33,6 +55,492 @@ def _fixture_producer(filename, name, namespace):
     )
     exec(compile(ast.fix_missing_locations(isolated), filename, "exec"), namespace)
     return namespace[name]
+
+
+async def _producer_session(*, planning=False):
+    """SQL-boundary fake, not PostgreSQL proof. Real services/validators run above it."""
+    import datetime as dt
+    from uuid import UUID
+
+    from packages.core.models import (
+        HouseContractRevisionRecord,
+        HouseInstallationRecord,
+        MLLifecycleStateRecord,
+        PlanRecord,
+        SettingRecord,
+    )
+    from sqlalchemy.sql.elements import TextClause
+    from tests.planner_orm_support import planning_rows
+
+    rows = {row.key: row for row in planning_rows() if planning and isinstance(row, SettingRecord)}
+    rows.pop("smartthings_device_ids", None)
+    events, added = [], []
+    installation = HouseInstallationRecord(
+        singleton_id=1,
+        installation_id=UUID(int=1),
+        house_id=UUID(int=2),
+        current_revision_id=17,
+        indoor_dependency_generation=4,
+        demand_dependency_generation=3,
+    )
+    state = MLLifecycleStateRecord(
+        id=1,
+        epoch="offline-epoch",
+        revision=1,
+        fence=1,
+        maintenance_enabled=False,
+        checkpoints={},
+    )
+    session = SimpleNamespace()
+
+    class Scalars:
+        def all(self):
+            return list(rows.values())
+
+        def __iter__(self):
+            return iter(rows.values())
+
+    async def execute(statement, *args):
+        if isinstance(statement, TextClause):
+            assert "pg_advisory_xact_lock" in str(statement)
+            events.append("contract_lock")
+            return SimpleNamespace()
+        if isinstance(statement, Insert):
+            if statement.table.name == "settings":
+                values = statement.compile().params
+                rows[values["key"]] = SettingRecord(key=values["key"], value=values["value"])
+                events.append("setting")
+            else:
+                assert statement.table.name == "ml_lifecycle_state"
+                assert "contract_lock" in events
+                events.append("lifecycle")
+            return SimpleNamespace()
+        sql = str(statement)
+        if "ml_lifecycle_state" in sql:
+            return SimpleNamespace(all=lambda: [(state, None)])
+        assert "settings" in sql, sql
+        return SimpleNamespace(scalars=Scalars)
+
+    session.execute = execute
+    effective = await cleanup.settings_service.get_all_settings(session=session)
+    projection = cleanup.house_contract._settings_projection(
+        effective, installation.installation_id, installation.house_id
+    )
+    revision = HouseContractRevisionRecord(
+        id=17,
+        installation_id=installation.installation_id,
+        schema_version=cleanup.house_contract.SCHEMA_VERSION,
+        contract_json=projection,
+        contract_hash=cleanup.house_contract._contract_hash(projection),
+        effective_at=dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc),
+        source="offline_fixture",
+    )
+
+    async def get(model, identifier):
+        assert identifier in (1, 17)
+        return {HouseInstallationRecord: installation, HouseContractRevisionRecord: revision}[model]
+
+    def add(row):
+        if isinstance(row, PlanRecord):
+            assert events.index("contract_lock") < events.index("lifecycle")
+            row.id = 123
+        added.append(row)
+        events.append("add")
+
+    async def commit():
+        events.append("commit")
+
+    async def scalar(statement):
+        assert "ml_lifecycle_state" in str(statement)
+        return state
+
+    session.get = get
+    session.scalar = scalar
+    session.add = add
+    session.add_all = lambda evidence: [add(row) for row in evidence]
+    session.flush = AsyncMock()
+    session.commit = AsyncMock(side_effect=commit)
+    return session, installation, revision, state, events, added
+
+
+@pytest.mark.parametrize("saved_hours,plan_hours", [(4, 4), (14, 24)])
+async def test_saved_forecast_producer_real_authority_lifecycle_and_coverage(
+    monkeypatch, saved_hours, plan_hours
+):
+    import datetime as dt
+    import json
+    from contextlib import asynccontextmanager
+
+    from packages.api.routers import models_router
+    from packages.core.models import IndoorTempReading, PlanRecord
+
+    session, installation, revision, state, events, added = await _producer_session()
+    now = dt.datetime(2026, 10, 26, 10, 59, 59, tzinfo=dt.timezone.utc)
+    producer = _fixture_producer(
+        "test_api_indoor_forecast.py",
+        "_seed_saved_forecast",
+        {
+            "dt": dt,
+            "json": json,
+            "asynccontextmanager": asynccontextmanager,
+            "IndoorTempReading": IndoorTempReading,
+            "PlanRecord": PlanRecord,
+        },
+    )
+    plan = await producer(
+        session,
+        now,
+        saved_hours=saved_hours,
+        plan_hours=plan_hours,
+        reference_sensor=saved_hours == 14,
+    )
+    assert events[-1] == "commit"
+    session.commit.assert_awaited_once()
+    assert [row for row in added if isinstance(row, PlanRecord)] == [plan]
+    assert plan.horizon_start == dt.datetime(2026, 10, 26, 11, tzinfo=dt.timezone.utc)
+    assert plan.horizon_end == plan.horizon_start + dt.timedelta(hours=plan_hours)
+    payload = json.loads(plan.plan_json)
+    authority, snapshot = payload["house_contract_snapshot"], payload["forecast_snapshot"]
+    assert cleanup.house_contract.validate_plan_contract_snapshot(plan, authority)
+    assert authority == await cleanup.house_contract.snapshot_from_revision(
+        session, revision.id, plan.horizon_start, plan.horizon_end
+    )
+    assert (
+        snapshot["target_schedule"]
+        == cleanup.house_contract.canonical_target_schedule(authority)[:saved_hours]
+    )
+    provenance = json.loads(plan.input_provenance_json)
+    assert provenance["indoor_dependency_generation"] == installation.indoor_dependency_generation
+    assert installation.indoor_dependency_generation == (5 if saved_hours == 14 else 4)
+    assert not state.maintenance_enabled
+
+    @asynccontextmanager
+    async def committed_session():
+        assert "commit" in events  # Real cross-session checker runs only after owner commits.
+        yield session
+
+    monkeypatch.setattr(models_router, "get_session", committed_session)
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+    assert models_router._qualified_forecast_indexes(
+        plan, payload, snapshot, plan.horizon_start, saved_hours
+    ) == list(range(saved_hours))
+    window = models_router._plan_forecast_window(plan, plan.horizon_start, saved_hours)
+    assert window is not None
+    assert window["forecast_with_plan"][0]["predicted_indoor_temp"] == 22.0
+    assert window["forecast_no_heating"][0]["predicted_indoor_temp"] == 19.5
+    assert window["price_forecast"][0]["price_eur_per_kwh"] == 0.12
+    assert (
+        window["forecast_with_plan"][0]["ts"]
+        == (plan.horizon_start + dt.timedelta(hours=1)).isoformat()
+    )
+    qualifier = _fixture_producer(
+        "test_api_indoor_forecast.py", "_assert_saved_forecast_qualified", {"json": json}
+    )
+    serialized = await qualifier(plan, plan.horizon_start, saved_hours)
+    assert serialized["forecast_with_plan"][0]["ts"] == (
+        plan.horizon_start + dt.timedelta(hours=1)
+    ).isoformat().replace("+00:00", "Z")
+    assert serialized["target_schedule"][0]["contract_hash"] == plan.contract_hash
+    if saved_hours == 14:
+        assert models_router._plan_forecast_window(plan, plan.horizon_start, 24) is None
+    # The genuine dependency guard must reject both generation drift and a saved lie.
+    installation.indoor_dependency_generation += 1
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+    provenance["indoor_dependency_generation"] = installation.indoor_dependency_generation
+    provenance["models"]["demand_trained"] = True
+    plan.input_provenance_json = json.dumps(provenance)
+    assert not await models_router._saved_plan_model_dependencies_are_current(plan)
+
+
+def test_saved_forecast_clock_is_router_local_and_stable_at_hour_rollover(monkeypatch):
+    import datetime as dt
+
+    from packages.api.routers import models_router
+
+    instant = dt.datetime(2026, 10, 26, 10, 59, 59, tzinfo=dt.timezone.utc)
+    original_datetime = dt.datetime
+    source = ast.parse(
+        Path(cleanup.__file__).with_name("test_api_indoor_forecast.py").read_text(encoding="utf-8")
+    )
+    function = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_freeze_forecast_clock"
+    )
+    namespace = {"dt": dt, "SimpleNamespace": SimpleNamespace}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "forecast_clock", "exec"), namespace)
+    namespace["_freeze_forecast_clock"](monkeypatch, instant)
+    assert dt.datetime is original_datetime
+    assert models_router.dt.datetime.now(dt.timezone.utc) == instant
+    assert models_router.dt.datetime.now(dt.timezone.utc) == instant
+
+
+@pytest.mark.parametrize("changed", [False, True])
+async def test_saved_forecast_storage_check_detects_provenance_changes(changed):
+    plan = SimpleNamespace(
+        plan_json="saved",
+        input_provenance_json="provenance",
+        contract_revision_id=17,
+        contract_hash="a" * 64,
+        contract_state="current",
+    )
+    before = (
+        plan.plan_json,
+        plan.input_provenance_json,
+        plan.contract_revision_id,
+        plan.contract_hash,
+        plan.contract_state,
+    )
+
+    async def refresh(actual):
+        assert actual is plan
+        if changed:
+            actual.input_provenance_json = "mutated"
+
+    session = SimpleNamespace(refresh=refresh)
+    checker = _fixture_producer(
+        "test_api_indoor_forecast.py", "_assert_saved_forecast_unchanged", {}
+    )
+    if changed:
+        with pytest.raises(AssertionError):
+            await checker(session, plan, before)
+    else:
+        await checker(session, plan, before)
+
+
+@pytest.mark.parametrize("failure", ["ensure", "bulk", "freeze", "lifecycle", "commit"])
+async def test_saved_forecast_producer_failure_aborts_before_serving(monkeypatch, failure):
+    import datetime as dt
+    import json
+    from contextlib import asynccontextmanager
+
+    from packages.core.models import IndoorTempReading, PlanRecord
+    from packages.ml.lifecycle import Lifecycle
+
+    session, _, _, _, events, added = await _producer_session()
+    rejected = AsyncMock(side_effect=ValueError(f"{failure} rejected"))
+    if failure == "ensure":
+        monkeypatch.setattr(cleanup.house_contract, "ensure_current_contract", rejected)
+    elif failure == "bulk":
+        monkeypatch.setattr(cleanup.settings_service, "set_settings_bulk", rejected)
+    elif failure == "freeze":
+        monkeypatch.setattr(cleanup.house_contract, "freeze_contract_snapshot", rejected)
+    elif failure == "lifecycle":
+        monkeypatch.setattr(Lifecycle, "initialize", rejected)
+    else:
+        session.commit = rejected
+    producer = _fixture_producer(
+        "test_api_indoor_forecast.py",
+        "_seed_saved_forecast",
+        {
+            "dt": dt,
+            "json": json,
+            "asynccontextmanager": asynccontextmanager,
+            "IndoorTempReading": IndoorTempReading,
+            "PlanRecord": PlanRecord,
+        },
+    )
+    serve = AsyncMock()
+    with pytest.raises(ValueError, match=f"{failure} rejected"):
+        await producer(
+            session,
+            dt.datetime.now(dt.timezone.utc),
+            saved_hours=14,
+            plan_hours=24,
+            reference_sensor=True,
+        )
+        await serve()
+    serve.assert_not_awaited()
+    assert "commit" not in events
+    if failure != "commit":
+        assert not any(isinstance(row, PlanRecord) for row in added)
+        session.commit.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [None, "ensure", "bulk", "commit", "consistency"])
+async def test_p17_producer_routes_settings_atomically_before_consistency(monkeypatch, failure):
+    from packages.core.models import SettingRecord
+    from tests.planner_orm_support import planning_rows
+
+    session, installation, _, _, events, added = await _producer_session(planning=True)
+    boundary = AsyncMock()
+
+    async def consistent():
+        assert events[-1] == "commit"
+        await cleanup.assert_ordinary_contract_consistent(
+            session, await cleanup.settings_service.get_all_settings(session=session)
+        )
+        if failure == "consistency":
+            raise ValueError("consistency rejected")
+        return "materialized boundary"
+
+    boundary.side_effect = consistent
+    rejected = AsyncMock(side_effect=ValueError(f"{failure} rejected"))
+    if failure == "ensure":
+        monkeypatch.setattr(cleanup.house_contract, "ensure_current_contract", rejected)
+    elif failure == "bulk":
+        monkeypatch.setattr(cleanup.settings_service, "set_settings_bulk", rejected)
+    elif failure == "commit":
+        session.commit = rejected
+    producer = _fixture_producer(
+        "test_planner_orm_postgresql.py",
+        "_seed_planning_rows",
+        {
+            "planning_rows": planning_rows,
+            "SettingRecord": SettingRecord,
+            "_planning_boundary": boundary,
+        },
+    )
+    plan = AsyncMock()
+    if failure:
+        with pytest.raises(ValueError, match=f"{failure} rejected"):
+            await producer(session)
+            await plan()
+        plan.assert_not_awaited()
+        if failure != "consistency":
+            boundary.assert_not_awaited()
+    else:
+        assert await producer(session) == "materialized boundary"
+        assert added and not any(isinstance(row, SettingRecord) for row in added)
+        assert installation.indoor_dependency_generation == 5
+        session.commit.assert_awaited_once()
+        boundary.assert_awaited_once()
+
+
+@pytest.mark.parametrize("component", [None, "comfort", "thermal", "demand"])
+async def test_saved_forecast_producer_rejects_nonempty_or_maintained_lifecycle(component):
+    import datetime as dt
+    import json
+    from contextlib import asynccontextmanager
+
+    from packages.core.models import IndoorTempReading, MLArtifactRecord, PlanRecord
+    from packages.ml.lifecycle import LIFECYCLE_SCHEMAS, PROTECTED_ROLES
+
+    session, _, _, state, events, added = await _producer_session()
+    if component is None:
+        state.maintenance_enabled = True
+    else:
+        assert "incumbent" in PROTECTED_ROLES
+        artifact = MLArtifactRecord(
+            artifact_hash="a" * 64,
+            epoch=state.epoch,
+            component=component,
+            schema_version=LIFECYCLE_SCHEMAS[component],
+            fit_id="offline-existing-fit",
+            manifest={},
+            role="incumbent",
+            committed_revision=1,
+            qualification_scope={},
+        )
+        execute = session.execute
+
+        async def with_existing_artifact(statement, *args):
+            if not isinstance(statement, Insert) and "ml_lifecycle_state" in str(statement):
+                return SimpleNamespace(all=lambda: [(state, artifact)])
+            return await execute(statement, *args)
+
+        session.execute = with_existing_artifact
+    producer = _fixture_producer(
+        "test_api_indoor_forecast.py",
+        "_seed_saved_forecast",
+        {
+            "dt": dt,
+            "json": json,
+            "asynccontextmanager": asynccontextmanager,
+            "IndoorTempReading": IndoorTempReading,
+            "PlanRecord": PlanRecord,
+        },
+    )
+    with pytest.raises(AssertionError):
+        await producer(
+            session,
+            dt.datetime(2026, 10, 26, 10, 59, 59, tzinfo=dt.timezone.utc),
+            saved_hours=4,
+            plan_hours=4,
+        )
+    session.commit.assert_not_awaited()
+    assert not any(isinstance(row, PlanRecord) for row in added)
+    assert "commit" not in events
+
+
+@pytest.mark.parametrize("producer_kind", ["forecast", "planning"])
+async def test_ordinary_producer_cancellation_propagates_without_taking_session_ownership(
+    monkeypatch, producer_kind
+):
+    import datetime as dt
+    import json
+    from contextlib import asynccontextmanager
+
+    from packages.core.models import IndoorTempReading, PlanRecord, SettingRecord
+    from packages.ml.lifecycle import Lifecycle
+    from tests.planner_orm_support import planning_rows
+
+    session, _, _, _, events, added = await _producer_session(planning=producer_kind == "planning")
+    session.rollback = AsyncMock()
+    session.close = AsyncMock()
+    boundary = AsyncMock()
+    if producer_kind == "forecast":
+        factories = []
+        original_init = Lifecycle.__init__
+
+        def capture_factory(self, session_factory):
+            factories.append(session_factory)
+            original_init(self, session_factory=session_factory)
+
+        async def cancelled_read(self, actual_session):
+            assert actual_session is session
+            assert events[-1] == "lifecycle"
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(Lifecycle, "__init__", capture_factory)
+        monkeypatch.setattr(Lifecycle, "_read", cancelled_read)
+        producer = _fixture_producer(
+            "test_api_indoor_forecast.py",
+            "_seed_saved_forecast",
+            {
+                "dt": dt,
+                "json": json,
+                "asynccontextmanager": asynccontextmanager,
+                "IndoorTempReading": IndoorTempReading,
+                "PlanRecord": PlanRecord,
+            },
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await producer(
+                session,
+                dt.datetime(2026, 10, 26, 10, 59, 59, tzinfo=dt.timezone.utc),
+                saved_hours=4,
+                plan_hours=4,
+            )
+        assert len(factories) == 1
+        # The injected context still exposes the caller's session after unwinding.
+        async with factories[0]() as same_session:
+            assert same_session is session
+    else:
+        monkeypatch.setattr(
+            cleanup.settings_service,
+            "set_settings_bulk",
+            AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        producer = _fixture_producer(
+            "test_planner_orm_postgresql.py",
+            "_seed_planning_rows",
+            {
+                "planning_rows": planning_rows,
+                "SettingRecord": SettingRecord,
+                "_planning_boundary": boundary,
+            },
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await producer(session)
+        boundary.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
+    session.close.assert_not_awaited()
+    assert not added
+    # Existing outer owner, rather than either producer, remains responsible for rollback.
+    await session.rollback()
+    session.rollback.assert_awaited_once()
 
 
 @pytest.mark.parametrize("authority", ["valid", "settings_mismatch", "missing_revision"])

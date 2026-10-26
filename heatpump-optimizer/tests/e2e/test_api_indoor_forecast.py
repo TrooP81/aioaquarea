@@ -2,12 +2,177 @@
 
 import datetime as dt
 import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
 
-from packages.core.models import IndoorTempReading, PlanActionRecord, PlanRecord, SettingRecord
+from packages.core.models import IndoorTempReading, PlanActionRecord, PlanRecord
 from packages.core.plan_lifecycle import activate_plan
+
+
+def _freeze_forecast_clock(monkeypatch, now):
+    from packages.api.routers import models_router
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(
+        models_router,
+        "dt",
+        SimpleNamespace(datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta),
+    )
+
+
+async def _seed_saved_forecast(db_session, now, *, saved_hours, plan_hours, reference_sensor=False):
+    """Create new, genuinely qualified evidence; never rebind a historical plan."""
+    from packages.core.house_contract import (
+        canonical_target_schedule,
+        ensure_current_contract,
+        freeze_contract_snapshot,
+        snapshot_from_revision,
+        validate_plan_contract_snapshot,
+    )
+    from packages.core.models import HouseInstallationRecord
+    from packages.core.settings_service import set_settings_bulk
+    from packages.ml.lifecycle import Lifecycle
+
+    current = await ensure_current_contract(db_session)
+    if reference_sensor:
+        await set_settings_bulk(
+            {
+                "smartthings_device_ids": "forecast-reference",
+                "comfort_reference_sensor_id": "forecast-reference",
+            },
+            session=db_session,
+            expected_revision_id=current.id,
+            source="saved_forecast_fixture",
+        )
+        db_session.add(
+            IndoorTempReading(
+                timestamp=now - dt.timedelta(minutes=5),
+                device_id="forecast-reference",
+                temperature=21.2,
+                is_stale=False,
+            )
+        )
+    start = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    end = start + dt.timedelta(hours=plan_hours)
+    authority = await freeze_contract_snapshot(db_session, start, end)
+
+    @asynccontextmanager
+    async def same_session():
+        # The owner commits once. Contract -> lifecycle; no second connection.
+        yield db_session
+
+    state = await Lifecycle(session_factory=same_session).initialize()
+    assert not state.maintenance_enabled
+    assert not state.references
+    assert all(state.reference(component) is None for component in ("comfort", "thermal", "demand"))
+    installation = await db_session.get(HouseInstallationRecord, 1)
+    provenance = {
+        "indoor_dependency_generation": installation.indoor_dependency_generation,
+        "models": {
+            "native_dependencies": [
+                {"component": component, "artifact_digest": None}
+                for component in ("comfort", "thermal")
+            ],
+            "demand_trained": False,
+            "demand_serving_dependency": None,
+        },
+    }
+    snapshot = {
+        "version": "indoor_forecast_v1",
+        "current_indoor": 21.2,
+        "forecast": [],
+        "forecast_with_plan": [],
+        "forecast_no_heating": [],
+        "target_schedule": canonical_target_schedule(authority)[:saved_hours],
+        "weather_forecast": [],
+        "price_forecast": [],
+    }
+    for hour in range(1, saved_hours + 1):
+        slot_start = start + dt.timedelta(hours=hour - 1)
+        state_ts = slot_start + dt.timedelta(hours=1)
+        snapshot["forecast"].append(
+            {"hour": hour, "ts": state_ts.isoformat(), "predicted_indoor_temp": 21.0 + hour}
+        )
+        snapshot["forecast_with_plan"].append(
+            {
+                "hour": hour,
+                "ts": state_ts.isoformat(),
+                "predicted_indoor_temp": 21.0 + hour,
+                "source": "milp_solution",
+                "space_heating_fraction": 0.5,
+            }
+        )
+        snapshot["forecast_no_heating"].append(
+            {
+                "hour": hour,
+                "ts": state_ts.isoformat(),
+                "predicted_indoor_temp": 20.5 - hour,
+                "source": "milp_counterfactual",
+            }
+        )
+        snapshot["weather_forecast"].append(
+            {
+                "ts": slot_start.isoformat(),
+                "hour": slot_start.hour,
+                "outdoor_temp": 4.0,
+                "wind_speed": 3.0,
+                "irradiance": 0.0,
+                "precipitation": 1.2,
+            }
+        )
+        snapshot["price_forecast"].append({"ts": slot_start.isoformat(), "price_eur_per_kwh": 0.12})
+    plan = PlanRecord(
+        created_at=now,
+        horizon_start=start,
+        horizon_end=end,
+        plan_json=json.dumps({"house_contract_snapshot": authority, "forecast_snapshot": snapshot}),
+        input_provenance_json=json.dumps(provenance),
+        contract_revision_id=authority["revision_id"],
+        contract_hash=authority["contract_hash"],
+        contract_state="current",
+        optimizer_version="milp_v2",
+    )
+    assert validate_plan_contract_snapshot(plan, authority)
+    assert authority == await snapshot_from_revision(
+        db_session, plan.contract_revision_id, plan.horizon_start, plan.horizon_end
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    return plan
+
+
+async def _assert_saved_forecast_qualified(plan, start, hours):
+    from packages.api.routers import models_router
+    from packages.api.schemas import IndoorForecastResponse
+
+    assert await models_router._saved_plan_model_dependencies_are_current(plan)
+    payload = json.loads(plan.plan_json)
+    assert models_router._qualified_forecast_indexes(
+        plan, payload, payload["forecast_snapshot"], start, hours
+    ) == list(range(hours))
+    window = models_router._plan_forecast_window(plan, start, hours)
+    assert window is not None
+    return IndoorForecastResponse.model_validate(
+        {**window, "planned_actions": [], "forecast_source": "active_plan"}
+    ).model_dump(mode="json")
+
+
+async def _assert_saved_forecast_unchanged(db_session, plan, before):
+    await db_session.refresh(plan)
+    assert (
+        plan.plan_json,
+        plan.input_provenance_json,
+        plan.contract_revision_id,
+        plan.contract_hash,
+        plan.contract_state,
+    ) == before
 
 
 def _scorecard_snapshot(issue_at: dt.datetime, *, shadow: bool) -> dict:
@@ -612,66 +777,19 @@ class TestIndoorForecast:
         client: AsyncClient,
         db_session,
         seed_device_status,
+        monkeypatch,
     ):
-        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-        snapshot = {
-            "version": "indoor_forecast_v1",
-            "current_indoor": 21.2,
-            "forecast": [],
-            "forecast_with_plan": [],
-            "forecast_no_heating": [],
-            "target_schedule": [],
-            "weather_forecast": [],
-            "price_forecast": [],
-        }
-        for hour in range(1, 5):
-            slot_start = now + dt.timedelta(hours=hour - 1)
-            state_ts = slot_start + dt.timedelta(hours=1)
-            snapshot["forecast"].append(
-                {"hour": hour, "ts": state_ts.isoformat(), "predicted_indoor_temp": 21.0 + hour}
-            )
-            snapshot["forecast_with_plan"].append(
-                {
-                    "hour": hour,
-                    "ts": state_ts.isoformat(),
-                    "predicted_indoor_temp": 21.0 + hour,
-                    "source": "milp_solution",
-                    "space_heating_fraction": 0.5,
-                }
-            )
-            snapshot["forecast_no_heating"].append(
-                {
-                    "hour": hour,
-                    "ts": state_ts.isoformat(),
-                    "predicted_indoor_temp": 20.5 - hour,
-                    "source": "milp_counterfactual",
-                }
-            )
-            snapshot["target_schedule"].append(
-                {"hour": hour, "ts": state_ts.isoformat(), "target": 20.5}
-            )
-            snapshot["weather_forecast"].append(
-                {
-                    "ts": slot_start.isoformat(),
-                    "hour": slot_start.hour,
-                    "outdoor_temp": 4.0,
-                    "wind_speed": 3.0,
-                    "irradiance": 0.0,
-                    "precipitation": 1.2,
-                }
-            )
-            snapshot["price_forecast"].append(
-                {"ts": slot_start.isoformat(), "price_eur_per_kwh": 0.12}
-            )
-
-        plan = PlanRecord(
-            horizon_start=now,
-            horizon_end=now + dt.timedelta(hours=4),
-            plan_json=json.dumps({"forecast_snapshot": snapshot}),
-            optimizer_version="milp_v2",
+        now = dt.datetime.now(dt.timezone.utc)
+        _freeze_forecast_clock(monkeypatch, now)
+        plan = await _seed_saved_forecast(db_session, now, saved_hours=4, plan_hours=4)
+        window = await _assert_saved_forecast_qualified(plan, plan.horizon_start, 2)
+        before = (
+            plan.plan_json,
+            plan.input_provenance_json,
+            plan.contract_revision_id,
+            plan.contract_hash,
+            plan.contract_state,
         )
-        db_session.add(plan)
-        await db_session.commit()
 
         response = await client.get("/api/thermal/indoor-forecast?hours=2")
 
@@ -683,6 +801,11 @@ class TestIndoorForecast:
         assert data["forecast_with_plan"][0]["predicted_indoor_temp"] == 22.0
         assert data["forecast_no_heating"][0]["predicted_indoor_temp"] == 19.5
         assert data["price_forecast"][0]["price_eur_per_kwh"] == 0.12
+        assert [point["ts"] for point in data["forecast_with_plan"]] == [
+            point["ts"] for point in window["forecast_with_plan"]
+        ]
+        assert data["target_schedule"] == window["target_schedule"]
+        await _assert_saved_forecast_unchanged(db_session, plan, before)
 
     async def test_active_plan_snapshot_shorter_than_requested_horizon_falls_back_to_live_forecast(
         self,
@@ -690,78 +813,24 @@ class TestIndoorForecast:
         db_session,
         seed_device_status,
         seed_weather,
+        monkeypatch,
     ):
-        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-        db_session.add(
-            IndoorTempReading(
-                timestamp=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
-                device_id="forecast-reference",
-                temperature=21.2,
-                is_stale=False,
-            )
-        )
-        db_session.add(SettingRecord(key="smartthings_device_ids", value="forecast-reference"))
-        db_session.add(SettingRecord(key="comfort_reference_sensor_id", value="forecast-reference"))
-        await db_session.commit()
-        snapshot = {
-            "version": "indoor_forecast_v1",
-            "current_indoor": 21.2,
-            "forecast": [],
-            "forecast_with_plan": [],
-            "forecast_no_heating": [],
-            "target_schedule": [],
-            "weather_forecast": [],
-            "price_forecast": [],
-        }
-        for hour in range(1, 15):
-            slot_start = now + dt.timedelta(hours=hour - 1)
-            state_ts = slot_start + dt.timedelta(hours=1)
-            snapshot["forecast"].append(
-                {"hour": hour, "ts": state_ts.isoformat(), "predicted_indoor_temp": 21.0 + hour}
-            )
-            snapshot["forecast_with_plan"].append(
-                {
-                    "hour": hour,
-                    "ts": state_ts.isoformat(),
-                    "predicted_indoor_temp": 21.0 + hour,
-                    "source": "milp_solution",
-                    "space_heating_fraction": 0.5,
-                }
-            )
-            snapshot["forecast_no_heating"].append(
-                {
-                    "hour": hour,
-                    "ts": state_ts.isoformat(),
-                    "predicted_indoor_temp": 20.5 - hour,
-                    "source": "milp_counterfactual",
-                }
-            )
-            snapshot["target_schedule"].append(
-                {"hour": hour, "ts": state_ts.isoformat(), "target": 20.5}
-            )
-            snapshot["weather_forecast"].append(
-                {
-                    "ts": slot_start.isoformat(),
-                    "hour": slot_start.hour,
-                    "outdoor_temp": 4.0,
-                    "wind_speed": 3.0,
-                    "irradiance": 0.0,
-                    "precipitation": 1.2,
-                }
-            )
-            snapshot["price_forecast"].append(
-                {"ts": slot_start.isoformat(), "price_eur_per_kwh": 0.12}
-            )
+        from packages.api.routers import models_router
 
-        plan = PlanRecord(
-            created_at=now - dt.timedelta(hours=1),
-            horizon_start=now - dt.timedelta(hours=1),
-            horizon_end=now + dt.timedelta(hours=23),
-            plan_json=json.dumps({"forecast_snapshot": snapshot}),
-            optimizer_version="milp_v2",
+        now = dt.datetime.now(dt.timezone.utc)
+        _freeze_forecast_clock(monkeypatch, now)
+        plan = await _seed_saved_forecast(
+            db_session, now, saved_hours=14, plan_hours=24, reference_sensor=True
         )
-        db_session.add(plan)
-        await db_session.commit()
+        await _assert_saved_forecast_qualified(plan, plan.horizon_start, 14)
+        assert models_router._plan_forecast_window(plan, plan.horizon_start, 24) is None
+        before = (
+            plan.plan_json,
+            plan.input_provenance_json,
+            plan.contract_revision_id,
+            plan.contract_hash,
+            plan.contract_state,
+        )
 
         response = await client.get("/api/thermal/indoor-forecast?hours=24")
 
@@ -772,3 +841,4 @@ class TestIndoorForecast:
         assert len(data["forecast_no_heating"]) == 24
         assert len(data["target_schedule"]) == 24
         assert len(data["weather_forecast"]) == 24
+        await _assert_saved_forecast_unchanged(db_session, plan, before)
