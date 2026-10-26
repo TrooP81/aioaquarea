@@ -15,6 +15,420 @@ from sqlalchemy.sql.dml import Delete, Insert
 from tests.e2e import ordinary_cleanup as cleanup
 
 
+def _fixture_producer(filename, name, namespace):
+    """Execute the real producer body without importing the owned E2E conftest."""
+    module = ast.parse(Path(cleanup.__file__).with_name(filename).read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name
+    )
+    function.decorator_list = []
+    isolated = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            function,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(isolated), filename, "exec"), namespace)
+    return namespace[name]
+
+
+@pytest.mark.parametrize("authority", ["valid", "settings_mismatch", "missing_revision"])
+async def test_seed_plan_with_real_contract_helpers_and_model(authority):
+    """A fabricated snapshot dict cannot prove the real producer is canonical."""
+    import datetime as dt
+    import json
+    from uuid import UUID
+
+    from packages.core.models import (
+        HouseContractRevisionRecord,
+        HouseInstallationRecord,
+        PlanActionRecord,
+        PlanRecord,
+    )
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime(2026, 10, 25, 0, 30, tzinfo=dt.timezone.utc)
+
+    session = SimpleNamespace(
+        execute=AsyncMock(),
+        get=AsyncMock(),
+        commit=AsyncMock(),
+    )
+    session.execute.return_value = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    effective = await cleanup.settings_service.get_all_settings(session=session)
+    installation = HouseInstallationRecord(
+        singleton_id=1,
+        installation_id=UUID(int=1),
+        house_id=UUID(int=2),
+        current_revision_id=17,
+    )
+    projection = cleanup.house_contract._settings_projection(
+        effective, installation.installation_id, installation.house_id
+    )
+    revision = HouseContractRevisionRecord(
+        id=17,
+        installation_id=installation.installation_id,
+        schema_version=cleanup.house_contract.SCHEMA_VERSION,
+        contract_json=projection,
+        contract_hash=cleanup.house_contract._contract_hash(projection),
+        effective_at=Clock.now(),
+        source="effective_settings_import",
+    )
+    if authority == "settings_mismatch":
+        revision.contract_hash = "0" * 64
+    original_revision = deepcopy(revision.contract_json)
+    reads, added = [], []
+
+    async def get(model, identifier):
+        reads.append((model, identifier))
+        if model is HouseInstallationRecord:
+            assert identifier == 1
+            return installation
+        assert model is HouseContractRevisionRecord and identifier == revision.id
+        return None if authority == "missing_revision" else revision
+
+    def add(row):
+        # Real ensure + historical projection must finish before any new row.
+        assert reads[-2:] == [
+            (HouseContractRevisionRecord, 17),
+            (HouseContractRevisionRecord, 17),
+        ]
+        if isinstance(row, PlanRecord):
+            row.id = 123
+        added.append(row)
+
+    session.get.side_effect = get
+    session.add = add
+    producer = _fixture_producer(
+        "conftest.py",
+        "seed_plan",
+        {
+            "dt": SimpleNamespace(datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta),
+            "json": json,
+            "PlanRecord": PlanRecord,
+            "PlanActionRecord": PlanActionRecord,
+        },
+    )
+    if authority != "valid":
+        error = (
+            cleanup.house_contract.ContractSettingsMismatch
+            if authority == "settings_mismatch"
+            else ValueError
+        )
+        with pytest.raises(error):
+            await producer(session)
+        assert added == []
+        session.commit.assert_not_awaited()
+    else:
+        plan = await producer(session)
+        snapshot = json.loads(plan.plan_json)["house_contract_snapshot"]
+        assert cleanup.house_contract.validate_plan_contract_snapshot(plan, snapshot)
+        assert plan.contract_revision_id == installation.current_revision_id == revision.id
+        assert plan.contract_hash == revision.contract_hash
+        assert plan.contract_state == "current"
+        assert snapshot == await cleanup.house_contract.snapshot_from_revision(
+            session, revision.id, plan.horizon_start, plan.horizon_end
+        )
+        assert plan.horizon_start == Clock.now() - dt.timedelta(hours=1)
+        assert plan.horizon_end == Clock.now() + dt.timedelta(hours=23)
+        assert [type(row) for row in added] == [PlanRecord] + [PlanActionRecord] * 3
+        assert [row.status for row in added[1:]] == ["pending", "pending", "executed"]
+        assert session.commit.await_count == 2
+    assert installation.current_revision_id == 17
+    assert revision.contract_json == original_revision
+
+
+async def test_legacy_negative_producer_respects_existing_active_plan_unique_index():
+    """Exercise actual negative-test writes against the real active uniqueness rule.
+
+    SQLite is only a disposable constraint witness, not PostgreSQL acceptance.
+    Copy the PG partial-index predicate explicitly: SQLite otherwise ignores it.
+    """
+    import datetime as dt
+    import json
+
+    from packages.core.models import PlanRecord
+    from sqlalchemy import BigInteger, Column, MetaData, Table, create_engine, select
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    metadata = MetaData()
+    Table("house_contract_revisions", metadata, Column("id", BigInteger, primary_key=True))
+    table = PlanRecord.__table__.to_metadata(metadata)
+    index = next(index for index in table.indexes if index.name == "ux_plans_one_active")
+    assert index.unique
+    index.dialect_options["sqlite"]["where"] = index.dialect_options["postgresql"]["where"]
+    engine = create_engine("sqlite://")
+    metadata.create_all(engine)
+    now = dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc)
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    try:
+        with Session(engine, expire_on_commit=False) as sync:
+            control = PlanRecord(
+                created_at=now,
+                horizon_start=now,
+                horizon_end=now + dt.timedelta(hours=24),
+                plan_json="{}",
+                contract_state="current",
+                contract_revision_id=17,
+                contract_hash="a" * 64,
+            )
+            sync.add(control)
+            sync.commit()
+            # Keep a real rejection witness: sequential setup must not hide a
+            # dropped/ineffective active-only index.
+            sync.add(
+                PlanRecord(
+                    created_at=now,
+                    horizon_start=now,
+                    horizon_end=now + dt.timedelta(hours=24),
+                    plan_json="{}",
+                )
+            )
+            with pytest.raises(IntegrityError, match="UNIQUE constraint failed: plans.status"):
+                sync.commit()
+            sync.rollback()
+            assert sync.scalars(select(PlanRecord.id)).all() == [control.id]
+            events = []
+
+            class Facade:
+                def add(self, row):
+                    assert events == ["dashboard", "retire_commit", "dashboard"]
+                    assert (
+                        sync.scalar(select(PlanRecord.status).where(PlanRecord.id == control.id))
+                        == "superseded"
+                    )
+                    events.append("legacy_add")
+                    sync.add(row)
+
+                async def commit(self):
+                    sync.commit()
+                    if len(events) == 1:
+                        assert control.status == "superseded"
+                        assert not sync.scalars(
+                            select(PlanRecord.id).where(PlanRecord.status == "active")
+                        ).all()
+                        events.append("retire_commit")
+                    else:
+                        assert events[-1] == "legacy_add"
+                        active = sync.scalars(
+                            select(PlanRecord).where(PlanRecord.status == "active")
+                        ).one()
+                        assert active.id != control.id
+                        assert active.contract_state == "legacy_unknown"
+                        events.append("legacy_commit")
+
+                async def refresh(self, row):
+                    sync.refresh(row)
+
+            class Client:
+                async def get(self, path):
+                    if path == "/api/dashboard":
+                        # Read the real committed rows; never return the old
+                        # positive control once its lifecycle is non-active.
+                        eligible = sync.scalars(
+                            select(PlanRecord).where(
+                                PlanRecord.status == "active",
+                                PlanRecord.contract_state == "current",
+                                PlanRecord.contract_revision_id == control.contract_revision_id,
+                                PlanRecord.contract_hash == control.contract_hash,
+                            )
+                        ).one_or_none()
+                        data = {"active_plan": {"id": eligible.id} if eligible else None}
+                        events.append("dashboard")
+                    else:
+                        legacy = sync.scalars(
+                            select(PlanRecord).where(PlanRecord.id != control.id)
+                        ).one()
+                        assert path == f"/api/plans/{legacy.id}"
+                        events.append("detail")
+                        data = {
+                            "id": legacy.id,
+                            "contract_state": legacy.contract_state,
+                            "contract_revision_id": legacy.contract_revision_id,
+                            "contract_hash": legacy.contract_hash,
+                            "house_contract_snapshot": {},
+                            "contract_snapshot_state": "unknown",
+                            "outcome": {"state": "unknown"},
+                            "ordinary_writes_allowed": False,
+                        }
+                    return SimpleNamespace(status_code=200, json=lambda: data)
+
+            producer = _fixture_producer(
+                "test_api_dashboard.py",
+                "test_dashboard_excludes_new_unbound_legacy_plan",
+                {
+                    "dt": SimpleNamespace(
+                        datetime=Clock, timezone=dt.timezone, timedelta=dt.timedelta
+                    ),
+                    "json": json,
+                    "PlanRecord": PlanRecord,
+                },
+            )
+            await producer(None, Client(), Facade(), control)
+            assert events == [
+                "dashboard",
+                "retire_commit",
+                "dashboard",
+                "legacy_add",
+                "legacy_commit",
+                "dashboard",
+                "detail",
+            ]
+            retained = sync.scalars(select(PlanRecord).order_by(PlanRecord.id)).all()
+            assert len(retained) == 2
+            assert retained[0].id == control.id and retained[0].status == "superseded"
+            assert retained[0].contract_revision_id == 17
+            assert retained[0].contract_hash == "a" * 64
+            assert retained[0].contract_state == "current"
+            assert retained[0].plan_json == "{}"
+            assert retained[1].status == "active"
+            assert retained[1].contract_state == "legacy_unknown"
+            assert retained[1].contract_revision_id is None
+            assert retained[1].contract_hash is None
+            assert retained[1].input_provenance_json is None
+            assert json.loads(retained[1].plan_json) == {"version": "rules_v1", "actions": []}
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("freeze_fails", [False, True])
+async def test_seed_plan_freezes_same_session_and_exact_horizon_before_new_plan(
+    monkeypatch, freeze_fails
+):
+    import datetime as dt
+    import json
+
+    events = []
+    snapshot = {"revision_id": 17, "contract_hash": "a" * 64, "canonical": ["saved"]}
+    session = SimpleNamespace()
+
+    async def freeze(actual_session, start, end):
+        assert actual_session is session
+        assert end - start == dt.timedelta(hours=24)
+        session.horizon = (start, end)
+        events.append("freeze")
+        if freeze_fails:
+            raise ValueError("snapshot rejected")
+        return snapshot
+
+    def plan_record(**values):
+        assert events == ["freeze"]
+        assert (values["horizon_start"], values["horizon_end"]) == session.horizon
+        assert values["contract_revision_id"] == snapshot["revision_id"]
+        assert values["contract_hash"] == snapshot["contract_hash"]
+        assert values["contract_state"] == "current"
+        assert json.loads(values["plan_json"]) == {
+            "version": "rules_v1",
+            "actions": [],
+            "house_contract_snapshot": snapshot,
+        }
+        assert values["optimizer_version"] == "rules_v1"
+        assert values["cost_estimate_eur"] == 2.85
+        events.append("construct")
+        return SimpleNamespace(id=123, **values)
+
+    def add(record):
+        events.append("plan" if record.id == 123 else "action")
+
+    async def commit():
+        events.append("commit")
+
+    session.add = add
+    session.commit = commit
+    monkeypatch.setattr(cleanup.house_contract, "freeze_contract_snapshot", freeze)
+    producer = _fixture_producer(
+        "conftest.py",
+        "seed_plan",
+        {
+            "dt": dt,
+            "json": json,
+            "PlanRecord": plan_record,
+            "PlanActionRecord": lambda **values: SimpleNamespace(id=None, **values),
+        },
+    )
+    if freeze_fails:
+        with pytest.raises(ValueError, match="snapshot rejected"):
+            await producer(session)
+        assert events == ["freeze"]
+    else:
+        result = await producer(session)
+        assert result.id == 123
+        assert events == [
+            "freeze",
+            "construct",
+            "plan",
+            "commit",
+            "action",
+            "action",
+            "action",
+            "commit",
+        ]
+
+
+@pytest.mark.parametrize("failure", [None, "ensure", "bulk"])
+async def test_g03_producer_uses_versioned_service_same_transaction_and_propagates_failure(
+    monkeypatch, failure
+):
+    events = []
+    session = SimpleNamespace()
+    current = SimpleNamespace(id=29)
+
+    async def ensure(actual_session):
+        assert actual_session is session
+        events.append("ensure")
+        if failure == "ensure":
+            raise ValueError("ensure rejected")
+        return current
+
+    async def bulk(values, *, session: object, expected_revision_id, source):
+        assert session is producer_session
+        assert expected_revision_id == current.id
+        assert source == "g03_read_only_fixture"
+        assert values == {
+            "aquarea_username": "g03-offline-test",
+            "aquarea_password": "g03-offline-test",
+            "device_status_max_age_minutes": "15",
+            "poll_interval_seconds": "300",
+            "smartthings_device_ids": "g03-room",
+            "comfort_temp_target": "21.5",
+            "outcome_experiments_enabled": "true",
+            "outcome_experiment_max_curve_step_c": "0.5",
+            "_heat_curve_verification_state": '{"status": "verified"}',
+        }
+        assert values.keys() <= cleanup.settings_service.SETTINGS_SCHEMA.keys()
+        events.append("bulk")
+        if failure == "bulk":
+            raise ValueError("bulk rejected")
+
+    async def commit():
+        assert events == ["ensure", "bulk"]
+        events.append("commit")
+
+    producer_session = session
+    session.commit = commit
+    monkeypatch.setattr(cleanup.house_contract, "ensure_current_contract", ensure)
+    monkeypatch.setattr(cleanup.settings_service, "set_settings_bulk", bulk)
+    producer = _fixture_producer("test_api_dashboard.py", "recorded_settings", {})
+    if failure:
+        with pytest.raises(ValueError, match=f"{failure} rejected"):
+            await producer(None, session)
+        assert events == (["ensure"] if failure == "ensure" else ["ensure", "bulk"])
+    else:
+        await producer(None, session)
+        assert events == ["ensure", "bulk", "commit"]
+
+
 def test_immutable_empty_probe_explicitly_covers_the_model_fk_closure():
     from packages.core.models import Base
 

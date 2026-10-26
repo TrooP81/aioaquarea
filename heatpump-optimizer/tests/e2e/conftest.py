@@ -379,14 +379,24 @@ async def seed_consumption(db_session: AsyncSession):
 @pytest_asyncio.fixture(loop_scope="session")
 async def seed_plan(db_session: AsyncSession):
     """Seed an optimizer plan with actions."""
+    from packages.core import house_contract
+
     now = dt.datetime.now(dt.timezone.utc)
+    horizon_start = now - dt.timedelta(hours=1)
+    horizon_end = now + dt.timedelta(hours=23)
+    snapshot = await house_contract.freeze_contract_snapshot(db_session, horizon_start, horizon_end)
     plan = PlanRecord(
         created_at=now - dt.timedelta(hours=1),
-        horizon_start=now - dt.timedelta(hours=1),
-        horizon_end=now + dt.timedelta(hours=23),
-        plan_json=json.dumps({"version": "rules_v1", "actions": []}),
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
+        plan_json=json.dumps(
+            {"version": "rules_v1", "actions": [], "house_contract_snapshot": snapshot}
+        ),
         optimizer_version="rules_v1",
         cost_estimate_eur=2.85,
+        contract_revision_id=snapshot["revision_id"],
+        contract_hash=snapshot["contract_hash"],
+        contract_state="current",
     )
     db_session.add(plan)
     await db_session.commit()
