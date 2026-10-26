@@ -899,6 +899,7 @@ class DemandModel:
     async def arefresh_committed(self, *, lifecycle=None, scope: dict | None = None) -> bool:
         from packages.ml.forecast_quality import (
             check_exact_fit,
+            locked_demand_scope,
             materialize_native_inputs,
             native_scope,
         )
@@ -927,19 +928,27 @@ class DemandModel:
             if payload.get("schema_version") != "demand_lifecycle_v1":
                 raise ValueError("demand_schema_mismatch")
             await asyncio.to_thread(check_exact_fit, "demand", payload)
-            current = (await authority.read()).reference("demand")
-            if current != reference or not reference_is_qualified(current, scope=scope):
-                raise ValueError("demand_authority_changed")
+            async with locked_demand_scope(reference.manifest["device_id"]) as (
+                current_scope,
+                session,
+            ):
+                current = (await authority.read(session=session)).reference("demand")
+                if (
+                    current != reference
+                    or current_scope != scope
+                    or not reference_is_qualified(current, scope=current_scope)
+                ):
+                    raise ValueError("demand_authority_changed")
+                self._model, self._model_lower, self._model_upper = (
+                    payload[name] for name in ("median", "lower", "upper")
+                )
+                self._metrics = dict(payload["metrics"])
+                self._version = reference.artifact_hash
+                self._qualified_reference = reference
         except Exception as error:
             self.reset()
             _logger.warning("demand_committed_unavailable", error_type=type(error).__name__)
             return False
-        self._model, self._model_lower, self._model_upper = (
-            payload[name] for name in ("median", "lower", "upper")
-        )
-        self._metrics = dict(payload["metrics"])
-        self._version = reference.artifact_hash
-        self._qualified_reference = reference
         return True
 
     def load_latest(self) -> bool:

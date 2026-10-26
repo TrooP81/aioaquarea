@@ -306,7 +306,6 @@ def test_failure_retry_spacing_survives_restarts_without_moving_success(worker):
 @pytest.mark.parametrize(
     "phase",
     [
-        "identity_start",
         "identity_changed",
         "dump",
         "toc",
@@ -326,6 +325,82 @@ def test_phase_failure_records_failed_attempt_and_preserves_success(worker, phas
     assert state["last_attempt"]["reason_code"] == "backup_attempt_failed"
     assert state["last_success"] == previous
     assert not list(worker.backups.glob("*.partial"))
+
+
+def test_identity_preflight_failure_cannot_create_an_attempt(worker):
+    previous = worker.seed()
+    worker.config(fail="identity_start")
+    worker.run()
+    assert worker.read("state.json") == previous
+    assert not worker.events("status")
+    assert not worker.events("pg_dump")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--unknown",),
+        ("--transition-legacy",),
+        ("--once", "--once-preserve-archives"),
+        ("--once", "--once"),
+        ("--once-preserve-archives",),
+    ],
+)
+def test_invalid_modes_fail_before_tools_or_scheduling(worker, args):
+    assert worker.run(args=args, check=False).returncode == 2
+    assert not worker.events()
+
+
+@pytest.mark.parametrize("transition", [False, True])
+@pytest.mark.parametrize("damage", [False, True])
+def test_preservation_initial_and_retry_never_enter_retention(worker, transition, damage):
+    initial = worker.seed(count=5, age=200 * 86400)
+    if damage:
+        (worker.backups / ("heatpump-" + "d" * 32 + ".dump.json")).write_text("{}")
+    originals = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in worker.backups.iterdir()
+    }
+    worker.env["BACKUP_EXPECTED_SCHEMA_REVISION"] = "039"
+    worker.config(revision="039")
+    args = ["--once-preserve-archives"]
+    if transition:
+        raw = ' \n{"status":"ok"}\n'
+        worker.config(legacy_raw=raw)
+        worker.write("state.json", {"status": "ok"})
+        worker.env.update(
+            BACKUP_LEGACY_EXPECTED_SHA256=hashlib.sha256(raw.encode()).hexdigest(),
+            BACKUP_LEGACY_EXPECTED_UPDATED_AT="2026-01-01T00:00:00Z",
+        )
+        args.append("--transition-legacy")
+    worker.run(args=args)
+    state = worker.read("state.json")
+    assert state["last_attempt"]["retention_mode"] == "preserve"
+    assert state["last_attempt"]["reason_code"] == ""
+    assert state["last_success"]["archive_id"] != initial["last_success"]["archive_id"]
+    assert not worker.events("retention")
+    assert not [event for event in worker.events("status") if event["phase"] == "diagnostic"]
+    assert not worker.events("sleep")
+    for name, (data, modified) in originals.items():
+        path = worker.backups / name
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == (data, modified)
+
+
+@pytest.mark.parametrize("phase", ["start", "finish", "diagnostic"])
+def test_lost_status_ack_never_relabels_committed_success(worker, phase):
+    worker.seed()
+    if phase == "diagnostic":
+        (worker.backups / ("heatpump-" + "d" * 32 + ".dump.json")).write_text("{}")
+    worker.config(lost_ack=phase)
+    worker.run()
+    state = worker.read("state.json")
+    assert state["last_attempt"]["status"] == "succeeded"
+    assert not [
+        event
+        for event in worker.events("status")
+        if event["values"]["status"] in {"failed", "interrupted"}
+    ]
+    if phase == "diagnostic":
+        assert state["last_attempt"]["reason_code"] == "backup_retention_blocked"
 
 
 @pytest.mark.parametrize(
@@ -377,6 +452,64 @@ def test_retention_keeps_two_and_protects_verified_and_latest_success(worker, co
     for archive in worker.dumps():
         assert Path(str(archive) + ".json").is_file()
         assert Path(str(archive) + ".sha256").is_file()
+
+
+@pytest.mark.parametrize("mode", ["normal", "preserve", "transition"])
+@pytest.mark.parametrize("shell_route", ["bash", "sh"])
+def test_aggregate_retention_budget_survives_terminal_reporting(worker, mode, shell_route):
+    if shell_route == "sh":
+        worker.bash = shutil.which("sh")
+        assert worker.bash
+    worker.seed(count=5, age=200 * 86400)
+    originals = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in worker.backups.iterdir()
+    }
+    worker.config(dump_elapsed=3597, slow_archive_seconds=2, archive_clock_step=2)
+    args = ["--once"]
+    if mode != "normal":
+        args = ["--once-preserve-archives"]
+        worker.env["BACKUP_EXPECTED_SCHEMA_REVISION"] = "039"
+        worker.config(revision="039")
+        if mode == "transition":
+            raw = '{"status":"ok"}'
+            worker.write("state.json", {"status": "ok"})
+            worker.env.update(
+                BACKUP_LEGACY_EXPECTED_SHA256=hashlib.sha256(raw.encode()).hexdigest(),
+                BACKUP_LEGACY_EXPECTED_UPDATED_AT="2026-01-01T00:00:00Z",
+            )
+            args.append("--transition-legacy")
+    started = time.monotonic()
+    worker.run(args=args)
+    elapsed = time.monotonic() - started
+    state = worker.read("state.json")
+    assert state["last_attempt"]["status"] == "succeeded"
+    assert state["last_success"]["completed_at"] == state["last_attempt"]["finished_at"]
+    assert elapsed < 8, "inventory checks must share the original remaining three seconds"
+    reports = worker.events("status")
+    finish = [event for event in reports if event["phase"] == "finish"]
+    assert len(finish) == 1 and finish[0]["timeout"] == 20
+    if mode == "normal":
+        checks = worker.events("slow_archive_check")
+        assert [event["timeout"] for event in checks] == [3, 1]
+        diagnostic = [event for event in reports if event["phase"] == "diagnostic"]
+        assert len(diagnostic) == 1 and diagnostic[0]["timeout"] == 20
+        assert state["last_attempt"]["reason_code"] == "backup_retention_blocked"
+    else:
+        assert not worker.events("retention") and not worker.events("slow_archive_check")
+        assert not [event for event in reports if event["phase"] == "diagnostic"]
+        assert state["last_attempt"]["reason_code"] == ""
+    assert all(event["values"]["status"] not in {"failed", "interrupted"} for event in reports)
+    for name, expected in originals.items():
+        path = worker.backups / name
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == expected
+    assert not worker.events("sleep")
+    assert not list(worker.backups.glob(".work-*"))
+    lock = subprocess.run(
+        [worker.env["HPO_BACKUP_REAL_FLOCK"], "-n", str(worker.backups / ".backup.lock"), "true"],
+        timeout=2,
+        check=False,
+    )
+    assert lock.returncode == 0, "bounded exit must release the staging/destination lock"
 
 
 @pytest.mark.parametrize(
@@ -515,7 +648,8 @@ def assert_group_dead(group):
 
 
 def exercise_resistant_tool(worker, cancel, pid_only, *, phase="dump", shell=None):
-    previous = worker.seed()["last_success"]
+    original_state = worker.seed()
+    previous = original_state["last_success"]
     original_archives = worker.dumps()
     grace = 8
     # Cancellation must beat the tool's OWN timer, rather than accidentally
@@ -549,9 +683,13 @@ def exercise_resistant_tool(worker, cancel, pid_only, *, phase="dump", shell=Non
         assert not process_alive(child["pid"])
         assert_group_dead(child["group"])
         state = worker.read("state.json")
-        assert state["last_attempt"]["status"] == ("interrupted" if cancel else "failed")
+        if phase == "identity":
+            assert state == original_state
+            assert not worker.events("status")  # no owner before preflight
+        else:
+            assert state["last_attempt"]["status"] == ("interrupted" if cancel else "failed")
+            assert state["last_attempt"]["reason_code"] == "backup_attempt_failed"
         assert state["last_success"] == previous
-        assert state["last_attempt"]["reason_code"] == "backup_attempt_failed"
         assert worker.dumps() == original_archives
         assert not list(worker.backups.glob(".work-*"))
         result = subprocess.run(

@@ -27,6 +27,7 @@ from packages.ml.forecast_quality import (
     prediction_interval_for_bucket,
     prediction_intervals_for_weather,
     score_bucket,
+    native_scope,
 )
 from packages.core.settings_service import SETTINGS_SCHEMA
 
@@ -2004,6 +2005,79 @@ class TestR03SavedEvidenceDeduplication:
         assert observed == (None if conflicting else 20.0 if method == "reference_sensor" else 21.0)
 
 
+def test_demand_scope_tracks_timezone_and_filter_but_not_comfort_schedule():
+    from packages.ml.forecast_quality import native_scope
+
+    base = TestProspectiveNativeEvidence._inputs()
+    base["schemas"] = {
+        **base["schemas"],
+        "artifact": "demand_lifecycle_v1",
+        "weather_provider": "open-meteo",
+    }
+    base["installation_id"] = "installation-a"
+    base["timezone"] = "Europe/Stockholm"
+    base["tzdata_version"] = "2026a"
+    base["weather_provider"] = "open-meteo"
+    base["max_rate_kw"] = 12.0
+    base["demand_dependency_generation"] = 1
+    baseline = native_scope(base)
+
+    schedule_changed = {
+        **base,
+        "comfort_schedule": {"weekday": [6, 7], "weekend": [9]},
+        "comfort_temp_target": 21.0,
+        "fixed_monthly_fee": 300,
+    }
+    assert native_scope(schedule_changed) == baseline
+    assert native_scope({**base, "timezone": "UTC"}) != baseline
+    assert (
+        native_scope(
+            {
+                **base,
+                "timezone": "Europe/Stockholm",
+                "demand_dependency_generation": 3,
+            }
+        )
+        != baseline
+    )
+    assert native_scope({**base, "max_rate_kw": 13.0}) != baseline
+    assert native_scope({**base, "demand_dependency_generation": 2}) != baseline
+
+    comfort = {
+        **base,
+        "schemas": {**base["schemas"], "artifact": "comfort_v8"},
+    }
+    assert native_scope({**comfort, "timezone": "UTC"}) == native_scope(comfort)
+
+
+def test_indoor_dependency_scope_tracks_sensor_generation_but_tank_scope_does_not():
+    from packages.ml.forecast_quality import native_scope
+
+    base = TestProspectiveNativeEvidence._inputs()
+    base.update(
+        installation_id="installation-a",
+        configured_sensor_ids=["sensor-a", "sensor-b"],
+        reference_sensor_id="sensor-a",
+        indoor_dependency_generation=1,
+        capabilities=("indoor_heating", "indoor_cooling"),
+    )
+    indoor = {**base, "schemas": {**base["schemas"], "artifact": "thermal_v5"}}
+    first = native_scope(indoor)
+    second = native_scope({**indoor, "indoor_dependency_generation": 2})
+    assert first != second
+    assert native_scope({**indoor, "indoor_dependency_generation": 3}) != first
+
+    tank = {
+        **base,
+        "capabilities": ("tank_heating",),
+        "schemas": {**base["schemas"], "artifact": "thermal_v5"},
+    }
+    assert native_scope({**tank, "indoor_dependency_generation": 2}) == native_scope(tank)
+
+    comfort = {**indoor, "schemas": {**indoor["schemas"], "artifact": "comfort_v8"}}
+    assert native_scope(comfort) != native_scope({**comfort, "indoor_dependency_generation": 2})
+
+
 @pytest.mark.parametrize("reference", ["", "selected", "deselected"])
 async def test_R07_native_scope_and_median_only_use_frozen_selected_sensors(monkeypatch, reference):
     from sqlalchemy.sql import operators, visitors
@@ -2107,7 +2181,19 @@ async def test_R07_native_scope_and_median_only_use_frozen_selected_sensors(monk
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
     monkeypatch.setattr(
-        forecast_quality, "get_session", lambda: _AsyncContext(SimpleNamespace(execute=execute))
+        forecast_quality,
+        "get_session",
+        lambda: _AsyncContext(
+            SimpleNamespace(
+                execute=execute,
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        installation_id="installation-1",
+                        indoor_dependency_generation=1,
+                    )
+                ),
+            )
+        ),
     )
 
     result = await forecast_quality.materialize_native_inputs("comfort", now=now)
@@ -2121,6 +2207,9 @@ async def test_R07_native_scope_and_median_only_use_frozen_selected_sensors(monk
         assert result["indoor_temperature"] == 20
         assert result["indoor_trend"] == 0
         assert result["schemas"]["input"] == "frozen_native_inputs_v2"
+        assert result["installation_id"] == "installation-1"
+        assert result["indoor_dependency_generation"] == 1
+        assert "component_dependency_fingerprint" in native_scope(result)
         assert all(row["temperature"] == 20 for row in result["sensor_history"])
         json.dumps(result, allow_nan=False)
 

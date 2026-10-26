@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from collections import Counter
 from contextlib import asynccontextmanager
 import datetime as dt
 import json
@@ -14,23 +13,38 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import pytest_asyncio
 
 
-@pytest.fixture
-def sink(monkeypatch):
-    from packages.core import log_sink
+@pytest_asyncio.fixture(loop_scope="function")
+async def sink(monkeypatch):
+    """Own a configured real generation; these tests drive each flush explicitly."""
+    import structlog
 
-    monkeypatch.setattr(log_sink, "_LOG_BUFFER", [])
-    monkeypatch.setattr(log_sink, "_DROP_COUNTS", Counter())
-    monkeypatch.setattr(log_sink, "_CLOSING", False)
-    monkeypatch.setattr(log_sink, "_ENCODING_ROWS", 0)
-    monkeypatch.setattr(log_sink, "_DIAGNOSTIC_LOCK", threading.Lock())
-    monkeypatch.setattr(log_sink, "_DIAGNOSTIC_THREAD", None)
-    monkeypatch.setattr(log_sink, "_DIAGNOSTIC_DROPS", 0)
-    monkeypatch.setattr(log_sink, "_INFLIGHT_TASK", None)
-    monkeypatch.setattr(log_sink, "_INFLIGHT_BATCH", [])
-    monkeypatch.setattr(log_sink, "_BUFFER_LOCK", asyncio.Lock())
-    return log_sink
+    from tests.test_logging_ownership_contracts import load_sink, successful_session
+
+    fresh, saved = load_sink(monkeypatch)
+    monkeypatch.setattr(
+        "packages.core.database.get_session",
+        lambda: pytest.fail("explicit S5 logging binding must not fall back"),
+    )
+    lease = fresh.bind_log_session_factory(successful_session)
+    try:
+        fresh.configure_structlog_with_db("s5_test")
+        # Retain a terminal periodic task, not a second producer of flush attempts.
+        fresh._FLUSH_TASK.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fresh._FLUSH_TASK
+        yield fresh
+    finally:
+        try:
+            await fresh.shutdown_log_sink()
+            lease.release()
+            if fresh._DIAGNOSTIC_THREAD is not None:
+                await asyncio.to_thread(fresh._DIAGNOSTIC_THREAD.join, 1)
+                assert not fresh._DIAGNOSTIC_THREAD.is_alive()
+        finally:
+            structlog.configure(**saved)
 
 
 def test_R35_full_queue_never_touches_event_before_rejecting(sink):
@@ -451,7 +465,7 @@ async def test_S4_earlier_represented_gate_remains_real_and_nonpublishing(fault)
     outcome = await _run_admission(plan, isolate_frozen_quality=False)
     assert outcome.result is None
     assert outcome.records == []
-    outcome.session_factory.assert_not_called()
+    outcome.session_factory.assert_called_once()
     assert outcome.cooldown == 0.0
     refusal = [log for log in outcome.logs if log.get("event") == "optimizer_no_plan"]
     assert refusal == [

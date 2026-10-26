@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
-REVIEWED_HEAD = "037"
+REVIEWED_HEAD = "039"
 
 
 def _constant(path: str, name: str):
@@ -31,7 +31,7 @@ def test_reviewed_head_and_historical_shape_are_distinct():
     assert _constant(module, "CURRENT_HEAD_REVISION") == REVIEWED_HEAD
     assert _constant(module, "LOCAL_PERIOD_REVISION") == "036"
     assert _constant("tests/e2e/test_phase2_safety_reverts.py", "CURRENT_HEAD") == REVIEWED_HEAD
-    assert scripts.get_revision(REVIEWED_HEAD).down_revision == "036"
+    assert scripts.get_revision(REVIEWED_HEAD).down_revision == "038"
     assert scripts.get_revision("036").down_revision == "035"
 
 
@@ -48,3 +48,27 @@ def test_no_stale_head_receipts_or_qualification_pins():
     restore = (ROOT / "tests/test_restore_db_integration.py").read_text(encoding="utf-8")
     assert f'"RESTORE_EXPECTED_REVISION": "{REVIEWED_HEAD}"' in restore
     assert f"INSERT INTO alembic_version VALUES ('{REVIEWED_HEAD}')" in restore
+
+
+def test_p2_1_migration_keeps_dependency_generation_additive_and_non_destructive():
+    migration = (ROOT / "migrations/versions/038_house_contract_foundation.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision = "038"' in migration
+    assert 'down_revision = "037"' in migration
+    assert '"demand_dependency_generation"' in migration
+    assert 'server_default="1"' in migration
+    assert "def downgrade()" in migration
+    assert "not destructively downgraded" in migration
+
+
+def test_indoor_dependency_generation_is_additive_and_non_destructive():
+    migration = (ROOT / "migrations/versions/039_indoor_model_dependency_generation.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision = "039"' in migration
+    assert 'down_revision = "038"' in migration
+    assert '"indoor_dependency_generation"' in migration
+    assert 'server_default="1"' in migration
+    assert "def downgrade()" in migration
+    assert "not destructively downgraded" in migration

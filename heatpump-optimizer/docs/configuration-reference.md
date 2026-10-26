@@ -1,5 +1,21 @@
 # Heat Pump Optimizer configuration reference
 
+### P2.1 planning contract precision and schedule boundaries
+
+Planning targets retain validated numeric precision (for example 20.55 °C) in
+settings, rules/MILP/fallback snapshots and forecast policy; display rounding
+does not quantize saved policy. Comfort hours are local half-open wall-hour
+intervals in accepted IANA timezones, including fractional UTC offsets and
+non-one-hour DST changes. Materialized UTC policy splits at local-hour, offset
+transition and UTC planner boundaries. Hourly planner control slots sample policy
+at the actual slot start; exact policy intervals remain independent of that grid.
+
+Settings transactions acquire advisory locks in one global order: house contract
+first, then settings/heat-gate, before merged settings or revision reads. Scoped,
+compatibility, direct bulk writes and initialization share this order. Concurrent
+versioned edits retain optimistic revision checks (409, then reload and retry);
+unversioned legacy writes remain explicitly unversioned.
+
 The backend image installs dependencies using `constraints.txt` and upgrades its
 bundled package installer to the qualified `pip==26.2.0` before installation.
 Release qualification audits the installed image graph, not the developer's shared
@@ -258,8 +274,123 @@ not meant to be edited.
 | `quiet_mode_end` | int | `6` | Night quiet-mode end hour (0–23). |
 | `price_comfort_override_pct` | int | `90` | Skip comfort above this price percentile. |
 | `price_eco_upgrade_pct` | int | `25` | Upgrade eco to normal below this price percentile. |
-| `comfort_schedule` | json | weekday `7–9, 17–21`; weekend `8–21` | Comfort hours by day type: `{"weekday": [...], "weekend": [...]}`. |
-| `learned_schedule_threshold` | float | `0.3` | Minimum heating activity score (0–1) to auto-add a comfort hour. |
+| `comfort_schedule` | json | weekday `7–9, 17–21`; weekend `8–21` | Authoritative comfort hours by day type: `{"weekday": [...], "weekend": [...]}`. Rules, MILP, forecasts, and plan snapshots resolve the same mask in the configured IANA timezone. |
+| `comfort_temp_min` | float | existing effective Settings value | Off-schedule/setback reference and lower envelope retained from DB-over-environment Settings. |
+| `comfort_temp_target` | float | existing effective Settings value | Scheduled comfort target; no model-specific hidden setpoint. |
+| `comfort_temp_max` | float | existing effective Settings value | Existing upper comfort envelope; P2.1 does not replace it or introduce a new preferred band. |
+| `learned_schedule_threshold` | float | `0.3` | Threshold used to display learned activity suggestions. Learned hours never alter planning unless explicitly applied and saved. |
+
+### SDK source identity and operation-status limitation
+
+The optimizer declares `aioaquarea` at VCS commit
+`f9a8eccb10a943f72cb1651e42a113835947e3f4`. This is **not** the final SDK
+source identity in the repository Dockerfile: after resolving dependencies,
+the image force-reinstalls the repository's local `aioaquarea/` source with
+`--no-deps`. Validate the installed module path and source behavior, not just
+its package version or the VCS requirement.
+
+Container-only mocked checks on 2026-10-23 found that the exact VCS pin and
+repository source both parse `operationStatus` independently of `specialStatus`
+and retain missing/invalid-status provenance. However, the pinned
+`Device.current_action` returns OFF when a missing/invalid `operationStatus`
+defaults to OFF; repository source instead consults component state when
+`operation_status_valid is False`. The exact-pin comparison has **5 passing,
+2 failing** cases; repository source and the installed local-source image each
+have **7 passing** cases. The two failures are a documented compatibility
+limitation, not a passing pin-only validation. A VCS-only installation cannot
+be assumed equivalent to this Docker build. No pin or library behavior was
+changed by the repair; any pin update requires separate approval. This is
+read-only/mocked validation, not authority for device operations or release.
+Evidence: `.agent-runs/20261023-140215-p21-approved-repairs/sdk-*.log`.
+### P2.1 contract revisions
+
+Comfort schedule, temperature targets/envelopes, and timezone are imported from
+the existing effective Settings (database values take precedence over
+environment/default values). The first P2.1 access stores a single-deployment
+installation identity and immutable contract revision; later semantic changes
+write a new revision, audit record, and stale-plan invalidations atomically.
+No-op writes do not create revisions. Direct/unversioned indoor sensor writes also
+initialize the singleton before advancing its dependency generation, in the same
+transaction. Provider changes advance demand and indoor/comfort generations;
+returning to a previous provider does not revive old artifacts or saved forecasts. The compatibility `/api/settings` and
+`/api/comfort-schedule` routes retain their response shapes and share the same
+validation and revision transaction. The canonical installation-scoped API is
+`GET` and `PUT /api/installations/{installation_id}/planning-settings`; PUT
+requires the current `If-Match` revision and returns HTTP 409 if it is stale.
+`POST /api/installations/{installation_id}/planning-settings/preview` resolves
+a proposed comfort schedule over a bounded (at most seven-day) UTC horizon
+against the same revision, requires `If-Match`, and does not persist settings
+or issue device commands. The compatibility settings GET returns
+`X-Installation-ID` so first-party clients can discover the scoped route.
+All routes remain behind the existing global bearer-token authentication;
+role headers do not grant authority. Compatibility writes may remain
+unversioned for existing clients, but are serialized and audited.
+
+The first-party Settings page always sends `If-Match`, including when using
+the compatibility route. Missing, malformed, or inconsistent revision headers
+block saving. **Reload planning settings** preserves the local draft (including
+edits made during the reload) and presents saved/draft differences for explicit
+acceptance or a versioned retry. Secret values remain hidden in this comparison.
+A conflict refresh without a trusted revision also blocks saving; an accepted
+write followed by an unversioned or failed reload cannot reuse the old revision.
+These safeguards do not change legacy third-party compatibility.
+
+Plan snapshots include the resolved half-open UTC hourly target projection.
+Spring-forward hours do not exist in the projection; repeated fall-back hours
+remain separate with their own offset and fold. Historical plans without a
+saved contract stay `legacy_unknown`; current settings are never invented as
+their historical inputs. The snapshot records the IANA timezone policy and
+timezone-database version used to resolve it. Replaying an old revision under a
+different timezone database is refused. Full saved interval projections are
+validated against the recorded timezone and the exact installed tzdata version,
+including local endpoints, folds, offsets, boundaries and schedule membership.
+An unavailable historical version is reported as unknown/unavailable, never
+silently reinterpreted with current tzdata. This applies to diagnostic detail,
+history presentation and measured outcomes as well as ordinary plan detail.
+These historical reads remain accessible even when installed tzdata makes the
+current revision fail settings qualification. Such snapshots are labeled
+`timezone_data_unavailable`, with unknown outcomes and no current eligibility;
+new planning and current-revision qualification still fail closed. This does
+not provide archived tzdata replay support.
+A saved plan remains observe-only regardless of revision freshness.
+Learned activity is a suggestion; the explicit
+“Apply Learned Schedule” action is the only learned-hours path into Settings.
+
+Target-policy projections are recomputed from the frozen revision; schedule or
+temperature edits do not revoke independent fitted model artifacts. Demand
+artifacts carry a separate dependency fingerprint for installation/device,
+weather source, timezone/tzdata, feature/target schema, and the physical
+maximum-rate filter. Direct and bulk weather-provider writers use the same
+canonical dependency lock and advance a monotonic generation on every semantic
+provider change, including A→B→A. Timezone or tzdata changes are revisioned as demand
+dependency changes and make older demand artifacts ineligible, including after
+a later reversion; serving fails closed if the effective timezone contract
+cannot be reconciled to a persisted revision. Indoor/thermal artifacts are not
+invalidated by schedule-only edits.
+
+Hourly control/thermal trajectories use `utc-hour-slot-start-v1`: sample the
+authoritative half-open policy interval containing the UTC slot's **start**,
+then advance the thermal predictor once for that whole hour. Exact fractional
+local-hour/DST splits remain in the saved target policy; they are not extra
+prediction steps. Forecast points identify their start/end interval and use
+`ts` for the resulting end-of-hour state. Saved older hourly trajectories
+without interval fields infer the start as `ts - 1h`. Comfort assessment joins
+each forecast to policy by that instant, including cached/saved forecasts.
+
+Demand planning captures the qualified model identity and dependency scope in
+the same database snapshot as the provider-filtered input batch. Final plan
+admission holds the canonical lock, rechecks the frozen generation, and for
+learned-demand plans rechecks the current qualified artifact/scope. Provenance
+records the model actually used, not a subsequently refreshed resident model.
+A dependency change during planning refuses publication; a stale learned
+artifact is never substituted into a rules fallback.
+
+Migration 038 is additive and follows head 037. Migration 039 adds the
+installation-scoped indoor dependency generation used to invalidate sensor-bound
+comfort/indoor thermal fits without revoking demand or tank-only qualifications.
+Existing plans are retained as unknown; revision-bound plan JSON and contract
+revisions are immutable, and schema downgrade refuses to delete revision history. Rehearsal,
+execution, deployment, and any database mutation require separate approval.
 
 COP retirement v1.0 adds no settings, default/value changes or migration. There is no COP-reactivation toggle. Status always reports the retired COP tombstone; `POST /api/ml/train` remains parameter-free and queues Demand-only maintenance. Demand still requires 168 usable intervals, and the former 50-sample COP threshold is retired rather than reduced. Planning uses the unchanged bounded assumed efficiency, not measured COP; the `+ml` label refers to Demand only.
 

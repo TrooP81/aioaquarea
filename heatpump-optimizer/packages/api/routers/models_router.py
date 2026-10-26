@@ -15,12 +15,14 @@ import structlog
 from packages.api._helpers import get_price_area
 from packages.api.schemas import IndoorForecastResponse
 from packages.core.database import get_session
-from packages.core.plan_lifecycle import active_plan_query
+from packages.core.plan_lifecycle import active_plan_query, current_diagnostic_query
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
     IndoorTempReading,
     PlanActionRecord,
+    PlanRecord,
+    HouseInstallationRecord,
     PriceRecord,
     SpaceHeatingGateRecord,
     WeatherRecord,
@@ -212,14 +214,179 @@ def _numeric_forecast_unavailable(reason: str) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
-def _plan_forecast_window(
-    plan_json: str,
+async def _forecast_dependency_context(session, revision) -> tuple:
+    installation = await session.get(HouseInstallationRecord, 1)
+    generation = installation.indoor_dependency_generation
+    if type(generation) is not int or generation < 0 or installation.installation_id is None:
+        raise ValueError("unqualified indoor dependency generation")
+    return (revision.id, revision.contract_hash, installation.installation_id, generation)
+
+
+async def _forecast_dependency_context_is_current(captured: tuple) -> bool:
+    from packages.core.house_contract import ensure_current_contract
+
+    try:
+        # A new session avoids reusing the initial installation identity map.
+        async with get_session() as session:
+            revision = await ensure_current_contract(session)
+            return await _forecast_dependency_context(session, revision) == captured
+    except (AttributeError, TypeError, ValueError, SQLAlchemyError):
+        return False
+
+
+def _forecast_instant(value: str) -> dt.datetime:
+    instant = dt.datetime.fromisoformat(value)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(dt.timezone.utc)
+
+
+def _forecast_interval(point: dict) -> tuple[dt.datetime, dt.datetime]:
+    end = _forecast_instant(point["ts"])
+    start_value, end_value = point.get("interval_start_utc"), point.get("interval_end_utc")
+    if start_value is None and end_value is None:
+        return end - dt.timedelta(hours=1), end
+    start, explicit_end = _forecast_instant(start_value), _forecast_instant(end_value)
+    if explicit_end != end or end - start != dt.timedelta(hours=1):
+        raise ValueError("invalid forecast interval")
+    return start, end
+
+
+def _target_policy_identity(row: dict) -> dict:
+    return {
+        key: _forecast_instant(value)
+        if key in {"ts", "interval_start_utc", "interval_end_utc"}
+        else value
+        for key, value in row.items()
+        if key != "hour"
+    }
+
+
+def _qualified_forecast_indexes(plan, payload, snapshot, forecast_start, hours):
+    from packages.core.comfort_schedule import CONTROL_SAMPLING_POLICY, sample_control_target
+    from packages.core.house_contract import (
+        canonical_target_schedule,
+        validate_plan_contract_snapshot,
+    )
+
+    authority = payload.get("house_contract_snapshot")
+    if not validate_plan_contract_snapshot(plan, authority):
+        return None
+    canonical = canonical_target_schedule(authority)
+    targets = snapshot.get("target_schedule")
+    if not isinstance(targets, list):
+        return None
+    if snapshot.get("forecast_status") == "unavailable":
+        # Unavailable snapshots may omit numeric policy, but cannot carry a forged one.
+        if targets and [_target_policy_identity(row) for row in targets] != [
+            _target_policy_identity(row) for row in canonical
+        ]:
+            return None
+        return []
+    curves = [
+        snapshot.get(key) for key in ("forecast", "forecast_with_plan", "forecast_no_heating")
+    ]
+    if not all(isinstance(curve, list) and curve for curve in curves):
+        return None
+    intervals = [_forecast_interval(point) for point in curves[1]]
+    if any(end != next_start for (_, end), (next_start, _) in zip(intervals, intervals[1:])):
+        return None
+    if any([_forecast_interval(point) for point in curve] != intervals for curve in curves):
+        return None
+    explicit_targets = any(
+        target.get("interval_start_utc") is not None or target.get("interval_end_utc") is not None
+        for target in targets
+    )
+    exact = bool(targets) and all(
+        target.get("interval_start_utc") is not None and target.get("interval_end_utc") is not None
+        for target in targets
+    )
+    if explicit_targets and not exact:
+        return None
+    if exact:
+        expected = [
+            row
+            for row in canonical
+            if _forecast_instant(row["interval_end_utc"]) > intervals[0][0]
+            and _forecast_instant(row["interval_start_utc"]) < intervals[-1][1]
+        ]
+        # Presentation indexes may be rebased; every policy/binding field must agree.
+        if [_target_policy_identity(row) for row in targets] != [
+            _target_policy_identity(row) for row in expected
+        ]:
+            return None
+    elif len(targets) != len(intervals):
+        return None
+    for index, (start, end) in enumerate(intervals):
+        sampled = sample_control_target(canonical, start)
+        if not sampled:
+            return None
+        if not exact:
+            target = targets[index]
+            if (
+                _forecast_instant(target["ts"]) != end
+                or target.get("target") != sampled["target"]
+                or target.get("comfort_hour") != sampled["comfort_hour"]
+            ):
+                return None
+            for key in (
+                "contract_revision_id",
+                "contract_hash",
+                "policy_dependency_fingerprint",
+                "resolver_schema",
+                "timezone_policy",
+                "tzdata_version",
+            ):
+                if key in target and target[key] != sampled.get(key):
+                    return None
+        for curve in curves:
+            point = curve[index]
+            if "control_target_c" in point and (
+                not is_finite_number(point["control_target_c"])
+                or point["control_target_c"] != sampled["target"]
+            ):
+                return None
+            # Represented-strategy v4/v5 producers use the earlier spelling of
+            # the same slot-start rule. Qualify its target above; reject other policies.
+            if "control_sampling_policy" in point and point["control_sampling_policy"] not in {
+                CONTROL_SAMPLING_POLICY,
+                "slot_start_utc",
+            }:
+                return None
+        for key in ("weather_forecast", "price_forecast"):
+            if _forecast_instant(snapshot[key][index]["ts"]) != start:
+                return None
+    indexes = []
+    for offset in range(hours):
+        start = forecast_start + dt.timedelta(hours=offset)
+        expected = (start, start + dt.timedelta(hours=1))
+        if expected not in intervals:
+            return None
+        indexes.append(intervals.index(expected))
+    return indexes
+
+
+def _plan_forecast_window(plan: PlanRecord, forecast_start: dt.datetime, hours: int) -> dict | None:
+    """Qualify saved data without allowing corrupt JSON to escape as a response error."""
+    try:
+        window = _read_plan_forecast_window(plan, forecast_start, hours)
+        if window is not None:
+            IndoorForecastResponse.model_validate(
+                {**window, "planned_actions": [], "forecast_source": "active_plan"}
+            )
+        return window
+    except (AttributeError, IndexError, KeyError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _read_plan_forecast_window(
+    plan: PlanRecord,
     forecast_start: dt.datetime,
     hours: int,
 ) -> dict[str, Any] | None:
     """Return the stored plan snapshot as a window relative to the current hour."""
     try:
-        payload = json.loads(plan_json)
+        payload = json.loads(plan.plan_json)
         snapshot = payload.get("forecast_snapshot") if isinstance(payload, dict) else None
         if isinstance(snapshot, dict):
             json.dumps(snapshot, allow_nan=False)
@@ -232,6 +399,13 @@ def _plan_forecast_window(
         "indoor_forecast_v4",
         "indoor_forecast_v5",
     }:
+        return None
+
+    try:
+        indexes = _qualified_forecast_indexes(plan, payload, snapshot, forecast_start, hours)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    if indexes is None:
         return None
 
     if snapshot.get("forecast_status") == "unavailable":
@@ -247,32 +421,29 @@ def _plan_forecast_window(
             "forecast_unavailable_reason": snapshot.get("forecast_unavailable_reason"),
         }
 
+    policy_targets = snapshot.get("target_schedule")
+    exact_policy = (
+        isinstance(policy_targets, list)
+        and bool(policy_targets)
+        and all(
+            isinstance(target, dict)
+            and "interval_start_utc" in target
+            and "interval_end_utc" in target
+            for target in policy_targets
+        )
+    )
     keys = (
         "forecast",
         "forecast_with_plan",
         "forecast_no_heating",
-        "target_schedule",
         "weather_forecast",
         "price_forecast",
     )
+    if not exact_policy:
+        keys += ("target_schedule",)
     sequences = [snapshot.get(key) for key in keys]
     if not all(isinstance(sequence, list) for sequence in sequences):
         return None
-
-    indexes: list[int] = []
-    for index, point in enumerate(snapshot["forecast_with_plan"]):
-        if not isinstance(point, dict) or not isinstance(point.get("ts"), str):
-            return None
-        try:
-            state_ts = dt.datetime.fromisoformat(point["ts"])
-        except ValueError:
-            return None
-        if state_ts.tzinfo is None:
-            state_ts = state_ts.replace(tzinfo=dt.timezone.utc)
-        if state_ts >= forecast_start:
-            indexes.append(index)
-        if len(indexes) == hours:
-            break
 
     if len(indexes) < hours or any(
         index >= len(sequence) for index in indexes for sequence in sequences
@@ -301,6 +472,16 @@ def _plan_forecast_window(
                 {
                     "hour": relative_hour,
                     "ts": source.get("ts"),
+                    **{
+                        key: source[key]
+                        for key in (
+                            "interval_start_utc",
+                            "interval_end_utc",
+                            "control_sampling_policy",
+                            "control_target_c",
+                        )
+                        if key in source
+                    },
                     "predicted_indoor_temp": source["predicted_indoor_temp"],
                     "source": source.get("source"),
                     "model_source": source.get("model_source"),
@@ -325,7 +506,7 @@ def _plan_forecast_window(
     weather = []
     prices = []
     for relative_hour, index in enumerate(indexes, start=1):
-        target = snapshot["target_schedule"][index]
+        target = snapshot["target_schedule"][0 if exact_policy else index]
         weather_row = snapshot["weather_forecast"][index]
         price = snapshot["price_forecast"][index]
         if not all(isinstance(row, dict) for row in (target, weather_row, price)):
@@ -374,6 +555,27 @@ def _plan_forecast_window(
             }
         )
 
+    if exact_policy:
+        # Exact local-hour policy boundaries need not align with the hourly
+        # forecast/control grid. Never zip or truncate them by forecast index.
+        try:
+            window_start = dt.datetime.fromisoformat(
+                with_plan[0].get("interval_start_utc") or with_plan[0]["ts"]
+            )
+            if not with_plan[0].get("interval_start_utc"):
+                window_start -= dt.timedelta(hours=1)
+            window_end = dt.datetime.fromisoformat(with_plan[-1]["ts"])
+            targets = [
+                dict(target)
+                for target in policy_targets
+                if dt.datetime.fromisoformat(target["interval_end_utc"]) > window_start
+                and dt.datetime.fromisoformat(target["interval_start_utc"]) < window_end
+            ]
+            if not targets or any(not is_finite_number(target.get("target")) for target in targets):
+                return None
+        except (TypeError, ValueError):
+            return None
+
     try:
         current_indoor = float(snapshot.get("current_indoor"))
     except (TypeError, ValueError):
@@ -412,6 +614,164 @@ def _plan_forecast_window(
             "room_comfort", {"status": "legacy"} if legacy_snapshot else {}
         ),
     }
+
+
+async def _saved_plan_model_dependencies_are_current(plan) -> bool:
+    """Check saved model and sensor dependencies against current persisted authority."""
+    from packages.core.house_contract import _lock_contract
+    from packages.core.models import HouseInstallationRecord, MLLifecycleStateRecord
+    from packages.ml.forecast_quality import locked_demand_scope, locked_native_scope
+    from packages.ml.lifecycle import reference_is_qualified
+
+    try:
+        provenance = json.loads(getattr(plan, "input_provenance_json", None) or "{}")
+        if not isinstance(provenance, dict):
+            return False
+        saved_generation = provenance.get("indoor_dependency_generation")
+        if (
+            isinstance(saved_generation, bool)
+            or not isinstance(saved_generation, int)
+            or saved_generation < 0
+        ):
+            return False
+        model_provenance = provenance.get("models")
+        dependencies = (
+            model_provenance.get("native_dependencies")
+            if isinstance(model_provenance, dict)
+            else None
+        )
+        if not isinstance(model_provenance, dict) or not isinstance(dependencies, list):
+            return False
+        by_component = {
+            item.get("component"): item
+            for item in dependencies
+            if isinstance(item, dict) and item.get("component") in {"comfort", "thermal"}
+        }
+        if set(by_component) != {"comfort", "thermal"}:
+            return False
+        async with get_session() as session:
+            await _lock_contract(session)
+            installation = await session.get(HouseInstallationRecord, 1)
+            if (
+                installation is None
+                or installation.indoor_dependency_generation != saved_generation
+            ):
+                return False
+            lifecycle_row = await session.scalar(
+                select(MLLifecycleStateRecord)
+                .where(MLLifecycleStateRecord.id == 1)
+                .with_for_update()
+            )
+            if lifecycle_row is None:
+                return False
+            lifecycle = Lifecycle()
+            state = await lifecycle.read(session=session)
+            for component in ("comfort", "thermal"):
+                dependency = by_component[component]
+                reference = state.reference(component)
+                expected_hash = dependency.get("artifact_digest")
+                if expected_hash is None:
+                    if reference is not None and reference_is_qualified(reference):
+                        capabilities = tuple(reference.manifest.get("capabilities", ()))
+                        async with locked_native_scope(
+                            component,
+                            device_id=reference.manifest["device_id"],
+                            capabilities=capabilities,
+                            session=session,
+                        ) as (scope, _):
+                            if reference_is_qualified(reference, scope=scope):
+                                return False
+                    continue
+                if reference is None or reference.artifact_hash != expected_hash:
+                    return False
+                capabilities = tuple(reference.manifest.get("capabilities", ()))
+                async with locked_native_scope(
+                    component,
+                    device_id=reference.manifest["device_id"],
+                    capabilities=capabilities,
+                    session=session,
+                ) as (scope, _):
+                    current = (await lifecycle.read(session=session)).reference(component)
+                    if (
+                        current != reference
+                        or scope != dependency.get("scope")
+                        or not reference_is_qualified(reference, scope=scope)
+                    ):
+                        return False
+            demand_dependency = model_provenance.get("demand_serving_dependency")
+            if isinstance(demand_dependency, dict):
+                digest = demand_dependency.get("artifact_digest")
+                dependency_schema = demand_dependency.get("dependency_schema")
+                fingerprint = demand_dependency.get("dependency_fingerprint")
+                dependency_generation = demand_dependency.get("dependency_generation")
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or not isinstance(dependency_schema, str)
+                    or not dependency_schema
+                    or not isinstance(fingerprint, str)
+                    or len(fingerprint) != 64
+                    or any(character not in "0123456789abcdef" for character in fingerprint)
+                    or isinstance(dependency_generation, bool)
+                    or not isinstance(dependency_generation, int)
+                    or dependency_generation < 0
+                    or type(demand_dependency.get("used_for_plan")) is not bool
+                ):
+                    return False
+            elif demand_dependency is not None:
+                return False
+            if isinstance(demand_dependency, dict) and demand_dependency["used_for_plan"]:
+                demand_generation = provenance.get("planning_dependency_generation")
+                if (
+                    isinstance(demand_generation, bool)
+                    or not isinstance(demand_generation, int)
+                    or installation.demand_dependency_generation != demand_generation
+                ):
+                    return False
+                demand_reference = state.reference("demand")
+                if (
+                    demand_reference is None
+                    or demand_reference.artifact_hash != demand_dependency.get("artifact_digest")
+                ):
+                    return False
+                async with locked_demand_scope(
+                    demand_reference.manifest["device_id"], session=session
+                ) as (demand_scope, _):
+                    current_demand = (await lifecycle.read(session=session)).reference("demand")
+                    if (
+                        current_demand != demand_reference
+                        or not reference_is_qualified(demand_reference, scope=demand_scope)
+                        or demand_scope.get("component_dependency_schema")
+                        != demand_dependency.get("dependency_schema")
+                        or demand_scope.get("component_dependency_fingerprint")
+                        != demand_dependency.get("dependency_fingerprint")
+                        or demand_scope.get("component_dependency_generation")
+                        != demand_dependency.get("dependency_generation")
+                    ):
+                        return False
+            elif (
+                demand_dependency is None
+                and bool(model_provenance.get("demand_trained"))
+                and str(getattr(plan, "optimizer_version", "")).startswith("milp")
+            ):
+                return False
+        return True
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        LifecycleUnavailable,
+        SQLAlchemyError,
+        OSError,
+    ) as error:
+        logger.warning(
+            "saved_plan_model_dependency_check_failed",
+            plan_id=getattr(plan, "id", None),
+            error_type=type(error).__name__,
+        )
+        return False
 
 
 def _enforce_physical_ordering(
@@ -578,6 +938,7 @@ async def get_thermal_status():
     from packages.ml.thermal import thermal_model
 
     await thermal_model.arefresh_if_changed()
+    thermal_dependency_context = thermal_model.capture_dependency_context()
     lifecycle_status = await get_model_status("thermal", MODEL_DIR)
     async with get_session() as session:
         result = await session.execute(
@@ -641,6 +1002,11 @@ async def get_thermal_status():
         if latest_indoor is not None
         else None
     )
+    if not await thermal_model.dependency_context_is_current(thermal_dependency_context):
+        raise HTTPException(
+            status_code=503,
+            detail="Thermal model dependencies changed during prediction; retry",
+        )
 
     return {
         "lifecycle": lifecycle_status,
@@ -735,20 +1101,23 @@ async def calibrate_thermal_model():
 async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     from packages.core.config import settings
     from packages.core.settings_service import (
-        get_comfort_schedule,
-        get_setting,
-        get_user_tz,
+        get_all_settings,
         is_comfort_hour,
     )
     from packages.ml.thermal import thermal_model
     from packages.optimizer.executor_core import LearningModeState, resolve_learning_mode_state
 
     await thermal_model.arefresh_if_changed()
+    thermal_dependency_context = thermal_model.capture_dependency_context()
     async with get_session() as session:
         result = await session.execute(
             select(DeviceStatusRecord).order_by(desc(DeviceStatusRecord.ts)).limit(1)
         )
         status = result.scalar_one_or_none()
+        from packages.core.house_contract import ensure_current_contract
+
+        contract_revision = await ensure_current_contract(session)
+        planning_settings = await get_all_settings(session=session)
 
     if not status:
         return {"error": "No device data available"}
@@ -764,11 +1133,12 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     # Per-hour tank reheat floor (deadband fallback), matching the optimizer
     # (milp.py): the tank may coast lower overnight/off-peak than during comfort
     # hours. Only used when there is no executable plan to follow.
-    comfort_schedule = await get_comfort_schedule()
-    tz_name = await get_user_tz()
-    tank_min_temp = int(await get_setting("tank_min_temp") or settings.tank_min_temp)
+    contract_projection = contract_revision.contract_json
+    comfort_schedule = contract_projection["comfort_schedule"]
+    tz_name = contract_projection["timezone"]
+    tank_min_temp = int(planning_settings.get("tank_min_temp") or settings.tank_min_temp)
     tank_min_temp_offpeak = int(
-        await get_setting("tank_min_temp_offpeak") or settings.tank_min_temp_offpeak
+        planning_settings.get("tank_min_temp_offpeak") or settings.tank_min_temp_offpeak
     )
     tank_min_per_hour = []
     for h in range(hours):
@@ -793,6 +1163,9 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
     async with get_session() as session:
         plan_result = await session.execute(active_plan_query(now))
         active_plan = plan_result.scalar_one_or_none()
+        if active_plan is None:
+            diagnostic_result = await session.execute(current_diagnostic_query(now))
+            active_plan = diagnostic_result.scalar_one_or_none()
         if active_plan:
             plan_id = active_plan.id
 
@@ -831,6 +1204,19 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
         is_tank=False,
     )
 
+    from packages.core.house_contract import current_revision_matches
+
+    async with get_session() as session:
+        if not await current_revision_matches(
+            session, contract_revision.id, contract_revision.contract_hash
+        ):
+            return {"error": "settings_changed_during_forecast"}
+    if not await thermal_model.dependency_context_is_current(thermal_dependency_context):
+        raise HTTPException(
+            status_code=503,
+            detail="Thermal model dependencies changed during forecast; retry",
+        )
+
     return {
         "current": {
             "tank_temp": current_tank,
@@ -844,6 +1230,11 @@ async def get_thermal_curve(hours: int = Query(24, ge=1, le=72)):
             "learning_mode_state": learning_mode_state.value,
             "learning_mode_reliable": learning_mode_state is not LearningModeState.UNKNOWN,
             "plan_id": plan_id,
+        },
+        "planning_contract": {
+            "revision_id": contract_revision.id,
+            "contract_hash": contract_revision.contract_hash,
+            "ordinary_writes_allowed": False,
         },
         "curves": {
             "tank_standby": tank_standby_curve,
@@ -1084,17 +1475,28 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         get_control_temperature,
     )
     from packages.core.settings_service import (
-        get_comfort_schedule,
-        get_float_setting,
         get_heat_curve_config,
         get_space_heating_gate_config,
-        get_setting,
-        get_user_tz,
-        is_comfort_hour,
     )
     from packages.ml.thermal import thermal_model
 
+    from packages.core.house_contract import ensure_current_contract
+    from packages.core.settings_service import get_setting
+
+    try:
+        # Capture persisted authority before any settings-dependent input read.
+        # Release the contract lock before refresh/helpers acquire their own sessions.
+        async with get_session() as session:
+            contract_revision = await ensure_current_contract(session)
+            dependency_context = await _forecast_dependency_context(session, contract_revision)
+            weather_provider = (
+                await get_setting("weather_provider", session=session) or "open-meteo"
+            )
+    except (AttributeError, TypeError, ValueError, SQLAlchemyError):
+        return _numeric_forecast_unavailable("indoor_dependency_changed_during_forecast")
+
     await thermal_model.arefresh_if_changed()
+    thermal_dependency_context = thermal_model.capture_dependency_context()
     forecast_quality = await _read_live_forecast_quality()
     price_area = await get_price_area()
     async with get_session() as session:
@@ -1122,7 +1524,11 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         forecast_end = forecast_start + dt.timedelta(hours=hours)
         weather_result = await session.execute(
             select(WeatherRecord)
-            .where(WeatherRecord.ts >= forecast_start, WeatherRecord.ts < forecast_end)
+            .where(
+                WeatherRecord.ts >= forecast_start,
+                WeatherRecord.ts < forecast_end,
+                WeatherRecord.source == weather_provider,
+            )
             .order_by(WeatherRecord.ts)
         )
         weather_records = weather_result.scalars().all()
@@ -1231,8 +1637,8 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
 
     try:
         heat_curve = await get_heat_curve_config()
-        comfort_temp_min = await get_float_setting("comfort_temp_min")
-        comfort_temp_max = await get_float_setting("comfort_temp_max")
+        comfort_temp_min = float(contract_revision.contract_json["comfort_temp_min"])
+        comfort_temp_max = float(contract_revision.contract_json["comfort_temp_max"])
     except ValueError:
         return _numeric_forecast_unavailable("nonfinite_or_invalid_forecast_setting")
     room_envelope = _safe_room_comfort_envelope(
@@ -1275,44 +1681,55 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     async with get_session() as session:
         plan_result = await session.execute(active_plan_query(now))
         active_plan = plan_result.scalar_one_or_none()
+        if active_plan is None:
+            diagnostic_result = await session.execute(current_diagnostic_query(now))
+            active_plan = diagnostic_result.scalar_one_or_none()
 
         if active_plan:
-            plan_snapshot = _plan_forecast_window(active_plan.plan_json, forecast_start, hours)
-            actions_result = await session.execute(
-                select(PlanActionRecord)
-                .where(PlanActionRecord.plan_id == active_plan.id)
-                .order_by(PlanActionRecord.scheduled_ts)
-            )
-            plan_actions = actions_result.scalars().all()
-            hour_start = now.replace(minute=0, second=0, microsecond=0)
-            for action in plan_actions:
-                hour_offset = int((action.scheduled_ts - hour_start).total_seconds() / 3600)
-                if hour_offset < 0 or hour_offset >= hours:
-                    continue
+            plan_snapshot = _plan_forecast_window(active_plan, forecast_start, hours)
+            if plan_snapshot is not None:
+                actions_result = await session.execute(
+                    select(PlanActionRecord)
+                    .where(PlanActionRecord.plan_id == active_plan.id)
+                    .order_by(PlanActionRecord.scheduled_ts)
+                )
+                plan_actions = actions_result.scalars().all()
+                hour_start = now.replace(minute=0, second=0, microsecond=0)
+                for action in plan_actions:
+                    hour_offset = int((action.scheduled_ts - hour_start).total_seconds() / 3600)
+                    if hour_offset < 0 or hour_offset >= hours:
+                        continue
 
-                if action.action_type in (
-                    "zone_temp_boost",
-                    "comfort_mode_on",
-                    "zone_temp_restore",
-                    "eco_mode_on",
-                    "eco_mode_off",
-                    "normal_mode_on",
-                    "force_dhw_on",
-                    "force_dhw_off",
-                    "quiet_mode_on",
-                    "quiet_mode_off",
-                ):
-                    payload = json.loads(action.payload_json) if action.payload_json else {}
-                    planned_actions.append(
-                        {
-                            "hour": hour_offset,
-                            "action_type": action.action_type,
-                            "status": action.status,
-                            "payload": payload,
-                        }
-                    )
+                    if action.action_type in (
+                        "zone_temp_boost",
+                        "comfort_mode_on",
+                        "zone_temp_restore",
+                        "eco_mode_on",
+                        "eco_mode_off",
+                        "normal_mode_on",
+                        "force_dhw_on",
+                        "force_dhw_off",
+                        "quiet_mode_on",
+                        "quiet_mode_off",
+                    ):
+                        payload = json.loads(action.payload_json) if action.payload_json else {}
+                        planned_actions.append(
+                            {
+                                "hour": hour_offset,
+                                "action_type": action.action_type,
+                                "status": action.status,
+                                "payload": payload,
+                            }
+                        )
+    if plan_snapshot is not None and active_plan is not None:
+        if not await _saved_plan_model_dependencies_are_current(active_plan):
+            plan_snapshot = None
 
     if plan_snapshot is not None and active_plan is not None:
+        if not await thermal_model.dependency_context_is_current(thermal_dependency_context):
+            return _numeric_forecast_unavailable("thermal_dependency_changed_during_forecast")
+        if not await _saved_plan_model_dependencies_are_current(active_plan):
+            return _numeric_forecast_unavailable("saved_plan_model_dependencies_changed")
         snapshot_indoor = plan_snapshot.get("current_indoor")
         snapshot_weather = plan_snapshot.get("weather_forecast", [])
         plan_age_seconds = max(0, round((now - active_plan.created_at).total_seconds()))
@@ -1344,6 +1761,8 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             room_envelope=room_envelope,
             comfort_temp_min=comfort_temp_min,
         )
+        if not await _forecast_dependency_context_is_current(dependency_context):
+            return _numeric_forecast_unavailable("indoor_dependency_changed_during_forecast")
         return {
             "current_indoor": snapshot_indoor if snapshot_indoor is not None else current_indoor,
             "outdoor_temp": snapshot_weather[0]["outdoor_temp"] if snapshot_weather else outdoor,
@@ -1354,7 +1773,9 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "weather_forecast": snapshot_weather,
             "price_forecast": plan_snapshot.get("price_forecast", []),
             "planned_actions": planned_actions,
-            "forecast_source": "active_plan"
+            "forecast_source": (
+                "diagnostic_plan" if active_plan.status == "diagnostic" else "active_plan"
+            )
             if plan_snapshot.get("forecast_status") != "unavailable"
             else "unavailable",
             "forecast_status": plan_snapshot.get("forecast_status", "unavailable"),
@@ -1364,6 +1785,9 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "comfort_assessment": assessment,
             "forecast_provenance": {
                 **(plan_snapshot.get("forecast_provenance", {})),
+                "contract_revision_id": active_plan.contract_revision_id,
+                "contract_hash": active_plan.contract_hash,
+                "contract_state": active_plan.contract_state,
                 "current_live_indoor_c": current_indoor,
                 "plan_start_indoor_c": snapshot_indoor,
                 "plan_created_at": active_plan.created_at.isoformat(),
@@ -1374,9 +1798,19 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             "current_vs_plan_delta_c": current_vs_plan_delta_c,
             "space_heating_gate": gate_payload,
             "forecast_quality": _reporting_forecast_quality(forecast_quality),
+            "contract_revision_id": active_plan.contract_revision_id,
+            "contract_hash": active_plan.contract_hash,
+            "contract_state": active_plan.contract_state,
+            "ordinary_writes_allowed": False,
         }
 
+    # Rejected saved data must not contribute actions to the live assessment.
+    planned_actions = []
     if current_indoor is None:
+        if not await thermal_model.dependency_context_is_current(thermal_dependency_context):
+            return _numeric_forecast_unavailable("thermal_dependency_changed_during_forecast")
+        if not await _forecast_dependency_context_is_current(dependency_context):
+            return _numeric_forecast_unavailable("indoor_dependency_changed_during_forecast")
         return {
             "current_indoor": None,
             "outdoor_temp": outdoor,
@@ -1405,26 +1839,70 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
     # Schedule-aware comfort setpoint per hour, matching the optimizer: the home
     # is held near comfort_temp_target during comfort hours and allowed to set
     # back toward comfort_temp_min overnight/off-peak.
-    comfort_schedule = await get_comfort_schedule()
-    comfort_temp_target = float(await get_setting("comfort_temp_target") or 20.5)
-    comfort_temp_min_val = float(await get_setting("comfort_temp_min") or 18.0)
-    tz_name = await get_user_tz()
+    contract_projection = contract_revision.contract_json
+    comfort_schedule = contract_projection["comfort_schedule"]
+    comfort_temp_target = float(contract_projection["comfort_temp_target"])
+    comfort_temp_min_val = float(contract_projection["comfort_temp_min"])
+    tz_name = contract_projection["timezone"]
 
+    from packages.core.comfort_schedule import (
+        CONTROL_SAMPLING_POLICY,
+        resolve_hourly_targets,
+        sample_control_target,
+    )
+    from packages.core.house_contract import RESOLVER_SCHEMA, policy_dependency_fingerprint
+
+    target_policy_fingerprint = policy_dependency_fingerprint(contract_projection)
+
+    resolved_targets = resolve_hourly_targets(
+        comfort_schedule,
+        tz_name,
+        forecast_start,
+        forecast_end,
+        scheduled_target_c=comfort_temp_target,
+        unscheduled_target_c=comfort_temp_min_val,
+        outer_max_c=float(contract_projection["comfort_temp_max"]),
+    )
     target_schedule = []
     indoor_target_per_hour = []
-    for h in range(hours):
-        hour_ts = hour_start + dt.timedelta(hours=h + 1)
-        in_comfort = is_comfort_hour(comfort_schedule, hour_ts, tz_name=tz_name)
-        target = comfort_temp_target if in_comfort else comfort_temp_min_val
-        indoor_target_per_hour.append(target)
+    for h, interval in enumerate(resolved_targets):
+        interval["contract_revision_id"] = contract_revision.id
+        interval["contract_hash"] = contract_revision.contract_hash
+        target = float(interval["target_c"])
+        in_comfort = bool(interval["scheduled"])
         target_schedule.append(
             {
                 "hour": h + 1,
+                "ts": interval["end_utc"],
                 "target": target,
                 "comfort_hour": in_comfort,
+                "interval_start_utc": interval["start_utc"],
+                "interval_end_utc": interval["end_utc"],
+                "local_start": interval["local_start"],
+                "local_end": interval["local_end"],
+                "local_date": interval["local_date"],
+                "local_hour": interval["local_hour"],
+                "utc_offset_minutes": interval["utc_offset_minutes"],
+                "fold": interval["fold"],
+                "preferred_comfort": interval["preferred_comfort"],
+                "outer_min_c": interval["outer_min_c"],
+                "outer_max_c": interval["outer_max_c"],
+                "reason": interval["reason"],
+                "contract_revision_id": contract_revision.id,
+                "contract_hash": contract_revision.contract_hash,
+                "policy_dependency_fingerprint": target_policy_fingerprint,
+                "resolver_schema": RESOLVER_SCHEMA,
+                "timezone_policy": contract_projection.get("timezone_policy"),
+                "tzdata_version": interval["tzdata_version"],
             }
         )
 
+    indoor_target_per_hour = [
+        float(
+            sample_control_target(target_schedule, forecast_start + dt.timedelta(hours=h))["target"]
+        )
+        for h in range(hours)
+    ]
     # "Predicted Indoor" = the home under the optimizer's schedule-aware control,
     # coasting toward the off-peak setback overnight and reheating during comfort
     # hours, rather than being held flat at the current zone temp.
@@ -1460,7 +1938,11 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         forecast_ts = forecast_start + dt.timedelta(hours=index)
         for curve in (forecast, forecast_with_plan, forecast_no_heating):
             if index < len(curve):
-                curve[index]["ts"] = forecast_ts.isoformat()
+                curve[index]["interval_start_utc"] = forecast_ts.isoformat()
+                curve[index]["interval_end_utc"] = (forecast_ts + dt.timedelta(hours=1)).isoformat()
+                curve[index]["ts"] = curve[index]["interval_end_utc"]
+                curve[index]["control_sampling_policy"] = CONTROL_SAMPLING_POLICY
+                curve[index]["control_target_c"] = indoor_target_per_hour[index]
 
     price_forecast = []
     for index in range(hours):
@@ -1473,6 +1955,11 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
             }
         )
 
+    if not await thermal_model.dependency_context_is_current(thermal_dependency_context):
+        return _numeric_forecast_unavailable("thermal_dependency_changed_during_forecast")
+
+    if not await _forecast_dependency_context_is_current(dependency_context):
+        return _numeric_forecast_unavailable("indoor_dependency_changed_during_forecast")
     return {
         "current_indoor": current_indoor,
         "outdoor_temp": outdoor,
@@ -1525,6 +2012,10 @@ async def get_indoor_forecast(hours: int = Query(24, ge=1, le=48)):
         },
         "forecast_quality": _reporting_forecast_quality(forecast_quality),
         "forecast_provenance": {
+            "contract_revision_id": contract_revision.id,
+            "contract_hash": contract_revision.contract_hash,
+            "resolver_schema": "comfort_schedule_utc_half_open_v1",
+            "ordinary_writes_allowed": False,
             "current_live_indoor_c": current_indoor,
             "control_input": {
                 "confidence": control_temperature.confidence,

@@ -977,6 +977,45 @@ class Lifecycle:
         reference = None
         try:
             async with self._sessions() as session:
+                if artifact.component == "demand":
+                    from packages.ml.forecast_quality import locked_demand_scope
+
+                    async with locked_demand_scope(
+                        artifact.manifest["device_id"], session=session
+                    ) as (current_scope, _):
+                        if current_scope != artifact.manifest.get("scope"):
+                            raise CASConflict("demand_scope_mismatch")
+                elif artifact.component == "comfort" or (
+                    artifact.component == "thermal"
+                    and any(
+                        str(capability).startswith("indoor_")
+                        for capability in artifact.manifest.get("capabilities", ())
+                    )
+                ):
+                    from packages.core.house_contract import _lock_contract
+                    from packages.ml.forecast_quality import materialize_native_inputs, native_scope
+
+                    await _lock_contract(session)
+                    inputs = await materialize_native_inputs(
+                        artifact.component,
+                        now=_now(),
+                        device_id=artifact.manifest["device_id"],
+                        capabilities=tuple(artifact.manifest.get("capabilities", ())),
+                        session=session,
+                    )
+                    if inputs is None:
+                        raise CASConflict("indoor_scope_unavailable")
+                    current_scope = native_scope(inputs)
+                    artifact_scope = artifact.manifest.get("scope")
+                    dependency_keys = (
+                        "component_dependency_schema",
+                        "component_dependency_generation",
+                        "component_dependency_fingerprint",
+                    )
+                    if not isinstance(artifact_scope, dict) or any(
+                        current_scope.get(key) != artifact_scope.get(key) for key in dependency_keys
+                    ):
+                        raise CASConflict("indoor_dependency_scope_mismatch")
                 await self._lock(session, lease)
                 state = await self._read(session)
                 if not _can_publish(

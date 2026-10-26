@@ -247,7 +247,13 @@ class TestLearningModeSettings:
             await settings_service.set_settings_bulk(
                 {"_seasonal_calibration_campaign_since": "2026-10-09T12:00:00+00:00"}
             )
-        assert session.execute.await_count == 2
+        statements = [str(call.args[0]).strip().upper() for call in session.execute.await_args_list]
+        assert statements
+        assert all(statement.startswith("SELECT ") for statement in statements)
+        assert "FROM SETTINGS" in statements[-1]
+        session.add.assert_not_called()
+        session.flush.assert_not_awaited()
+        session.commit.assert_not_awaited()
 
     def test_learning_mode_settings_registered(self):
         assert "learning_mode_enabled" in SETTINGS_SCHEMA
@@ -460,3 +466,81 @@ class TestIsMaskedSecret:
 
     def test_non_secret_never_flagged(self):
         assert is_masked_secret(get_setting_spec("price_provider"), "***") is False
+
+
+class TestVersionedBulkWrites:
+    @pytest.mark.asyncio
+    async def test_non_contract_bulk_write_rejects_stale_expected_revision_before_mutation(
+        self, monkeypatch
+    ):
+        from packages.core import settings_service
+        from packages.core import house_contract
+
+        session = SimpleNamespace(execute=AsyncMock())
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+        context.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(settings_service, "get_session", lambda: context)
+        lock_contract = AsyncMock()
+        ensure_contract = AsyncMock(return_value=SimpleNamespace(id=8))
+        monkeypatch.setattr(house_contract, "_lock_contract", lock_contract)
+        monkeypatch.setattr(house_contract, "ensure_current_contract", ensure_contract)
+
+        with pytest.raises(house_contract.ContractRevisionConflict) as exc_info:
+            await settings_service.set_settings_bulk(
+                {"manual_price_eur_per_kwh": "0.20"},
+                expected_revision_id=7,
+                source="versioned_api",
+            )
+
+        assert exc_info.value.current_revision_id == 8
+        lock_contract.assert_awaited_once_with(session)
+        ensure_contract.assert_awaited_once_with(session, lock=False, verify_current_settings=False)
+        session.execute.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("key", "old", "new", "expected_generation"),
+        [
+            ("smartthings_device_ids", "sensor-a", "sensor-b", 2),
+            ("smartthings_device_ids", "sensor-b", "sensor-a", 3),
+            ("comfort_reference_sensor_id", "sensor-a", "sensor-b", 2),
+            ("smartthings_device_ids", "sensor-a", "sensor-a", 1),
+        ],
+    )
+    async def test_sensor_dependency_writes_advance_only_changed_indoor_generation(
+        self, monkeypatch, key, old, new, expected_generation
+    ):
+        from packages.core import house_contract, settings_service
+
+        ensure_contract = AsyncMock()
+        monkeypatch.setattr(house_contract, "ensure_current_contract", ensure_contract)
+        starting_generation = expected_generation - (old != new)
+        installation = SimpleNamespace(indoor_dependency_generation=starting_generation)
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(scalars=lambda: [SimpleNamespace(key=key, value=old)])
+            ),
+            get=AsyncMock(return_value=installation),
+            flush=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            house_contract,
+            "_lock_contract",
+            AsyncMock(),
+        )
+
+        await settings_service.set_settings_bulk({key: new}, session=session)
+
+        assert installation.indoor_dependency_generation == expected_generation
+        ensure_contract.assert_awaited_once_with(session, lock=False)
+        session.get.assert_awaited_once()
+
+    async def test_single_sensor_setting_writer_uses_locked_bulk_path(self, monkeypatch):
+        from packages.core import settings_service
+
+        bulk_write = AsyncMock()
+        monkeypatch.setattr(settings_service, "set_settings_bulk", bulk_write)
+
+        await settings_service.set_setting("comfort_reference_sensor_id", "sensor-b")
+
+        bulk_write.assert_awaited_once_with({"comfort_reference_sensor_id": "sensor-b"})

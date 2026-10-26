@@ -98,10 +98,10 @@ def planning_rows(*, layer="rules_only", gate="valid"):
         "weather_provider": "open-meteo",
         "timezone": "UTC",
         "comfort_temp_min": "10",
-        "comfort_temp_max": "35",
+        "comfort_temp_max": "30",
         "comfort_temp_target": "21",
         "space_heating_baseline_mode": "off",
-        "learning_mode": "false",
+        "learning_mode_enabled": "false",
         "tank_min_temp": "30",
         "tank_min_temp_offpeak": "30",
     }

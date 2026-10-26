@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from packages.core.backup_health import BackupPolicy, project_backup_health
 from packages.core.operational_alerts import (
     _panasonic_adapter_alert,
     _safety_revert_cause_hint,
@@ -40,6 +41,21 @@ def _pending_safety_alert_session(action):
         ]
     )
     return session
+
+
+@pytest.fixture(autouse=True)
+def isolate_backup_health(monkeypatch):
+    async def load_projected_backup_health(*, now):
+        return project_backup_health(None, BackupPolicy(), now=now)
+
+    monkeypatch.setattr(
+        "packages.core.operational_alerts.load_backup_health",
+        load_projected_backup_health,
+    )
+    monkeypatch.setattr(
+        "packages.ml.seasonal_learning.get_seasonal_calibration_status",
+        AsyncMock(return_value={}),
+    )
 
 
 def test_fresh_adapter_outage_builds_actionable_alert() -> None:

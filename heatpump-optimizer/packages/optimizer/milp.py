@@ -108,6 +108,7 @@ class MILPOptimizer:
             raise ImportError("PuLP is required for MILP optimizer: pip install pulp")
         self._cop_model = None
         self._demand_model = demand_model
+        self._planning_demand_scope = None
 
     async def generate_plan(self) -> dict[str, Any] | None:
         """Fetch data from DB and solve the MILP, returning a standard plan dict."""
@@ -132,6 +133,25 @@ class MILPOptimizer:
             gate_row = await get_gate_snapshot(
                 session, last_status.device_id if last_status is not None else None
             )
+            if self._demand_model is not None and self._demand_model.is_trained:
+                from copy import copy
+                from packages.ml.forecast_quality import materialize_native_inputs, native_scope
+                from packages.ml.lifecycle import reference_is_qualified
+
+                # Capture model identity and its exact input interpretation in
+                # the same transaction as the provider-filtered weather batch.
+                self._demand_model = copy(self._demand_model)
+                inputs = await materialize_native_inputs(
+                    "demand",
+                    now=now,
+                    device_id=last_status.device_id if last_status else None,
+                    session=session,
+                )
+                scope = native_scope(inputs) if inputs is not None else None
+                reference = getattr(self._demand_model, "_qualified_reference", None)
+                if scope is None or not reference_is_qualified(reference, scope=scope):
+                    raise DataIncompleteError("Demand model does not match frozen planning inputs")
+                self._planning_demand_scope = scope
 
         if not prices:
             raise DataIncompleteError("No price data available for the planning horizon")
@@ -440,6 +460,13 @@ class MILPOptimizer:
             }
         if plan is not None:
             plan["planning_data_quality"] = input_quality
+            if self._planning_demand_scope is not None:
+                reference = self._demand_model._qualified_reference
+                plan["demand_planning_context"] = {
+                    "scope": self._planning_demand_scope,
+                    "artifact_hash": reference.artifact_hash,
+                    "device_id": reference.manifest["device_id"],
+                }
         return plan
 
     def _build_cop_function(self, last_status, weather_full: list[dict] | None = None):
@@ -474,6 +501,13 @@ class MILPOptimizer:
             )
 
         if self._demand_model and self._demand_model.is_trained:
+            if self._planning_demand_scope is not None:
+                from packages.ml.lifecycle import reference_is_qualified
+
+                if not reference_is_qualified(
+                    self._demand_model._qualified_reference, scope=self._planning_demand_scope
+                ):
+                    raise DataIncompleteError("Frozen demand model authority changed")
             logger.info("milp_using_ml_demand_model")
             weather_dicts = []
             for timestamp, temperature in weather:

@@ -1,0 +1,43 @@
+{
+  "id": "BZ-OPTION-A",
+  "owner": "TrooP81",
+  "nextVersion": "16.4.2",
+  "target": "node_modules/next/dist/compiled/zod/index.cjs",
+  "original": "af7deaaff50a14c7d8b52f518e10dac800a350bf8eef43f8454006fa7a44e4da",
+  "patched": "86767ee9919a7d904dc4e64641682af3a0daab5b8b8b5c0f507d33b4fa45227d",
+  "license": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8",
+  "provenance": {
+    "attribution": "Prior AppSec/public source review supplied in the approved design and user handoff; not independently fetched by this implementation.",
+    "nextCommit": "2864b1772c37242a9b40ab4d366eb7d368c2a070",
+    "nextSource": "packages/next/src/compiled/zod/index.cjs",
+    "zodVersion": "3.25.76",
+    "zodGitHead": "50606616c0d291caf3210a7521da51271b918333",
+    "pinChange": "f8afa172a0710575ca514b700d282935c5bd2d79",
+    "bundleChange": "af372099a81388043eb67841dbb87347ddcac638",
+    "urls": [
+      "https://github.com/vercel/next.js/blob/2864b1772c37242a9b40ab4d366eb7d368c2a070/packages/next/src/compiled/zod/index.cjs",
+      "https://github.com/vercel/next.js/blob/v16.4.2/packages/next/package.json",
+      "https://github.com/vercel/next.js/commit/f8afa172a0710575ca514b700d282935c5bd2d79",
+      "https://github.com/vercel/next.js/commit/af372099a81388043eb67841dbb87347ddcac638",
+      "https://registry.npmjs.org/zod/3.25.76",
+      "https://github.com/colinhacks/zod/tree/50606616c0d291caf3210a7521da51271b918333"
+    ]
+  },
+  "anchors": [
+    {
+      "id": "array",
+      "old": "if(a.maxLength!==null){if(t.data.length>a.maxLength.value){(0,i.addIssueToContext)(t,{code:r.ZodIssueCode.too_big,maximum:a.maxLength.value,type:\"array\",inclusive:true,exact:false,message:a.maxLength.message});s.dirty()}}if(t.common.async){",
+      "new": "if(a.maxLength!==null){if(t.data.length>a.maxLength.value){(0,i.addIssueToContext)(t,{code:r.ZodIssueCode.too_big,maximum:a.maxLength.value,type:\"array\",inclusive:true,exact:false,message:a.maxLength.message});s.dirty()}}if((a.exactLength!==null&&t.data.length>a.exactLength.value)||(a.maxLength!==null&&t.data.length>a.maxLength.value))return i.INVALID;if(t.common.async){"
+    },
+    {
+      "id": "set",
+      "old": "if(a.maxSize!==null){if(s.data.size>a.maxSize.value){(0,i.addIssueToContext)(s,{code:r.ZodIssueCode.too_big,maximum:a.maxSize.value,type:\"set\",inclusive:true,exact:false,message:a.maxSize.message});t.dirty()}}const n=this._def.valueType;",
+      "new": "if(a.maxSize!==null){if(s.data.size>a.maxSize.value){(0,i.addIssueToContext)(s,{code:r.ZodIssueCode.too_big,maximum:a.maxSize.value,type:\"set\",inclusive:true,exact:false,message:a.maxSize.message});t.dirty()}}if(a.maxSize!==null&&s.data.size>a.maxSize.value)return i.INVALID;const n=this._def.valueType;"
+    },
+    {
+      "id": "tuple",
+      "old": "const a=this._def.rest;if(!a&&s.data.length>this._def.items.length){(0,i.addIssueToContext)(s,{code:r.ZodIssueCode.too_big,maximum:this._def.items.length,inclusive:true,exact:false,type:\"array\"});t.dirty()}const n=[...s.data].map",
+      "new": "const a=this._def.rest;if(!a&&s.data.length>this._def.items.length){(0,i.addIssueToContext)(s,{code:r.ZodIssueCode.too_big,maximum:this._def.items.length,inclusive:true,exact:false,type:\"array\"});t.dirty()}if(!a&&s.data.length>this._def.items.length)return i.INVALID;const n=[...s.data].map"
+    }
+  ]
+}

@@ -21,6 +21,8 @@ from sqlalchemy import select, text
 from packages.core.models import (
     AuditLogRecord,
     Base,
+    HouseContractRevisionRecord,
+    HouseInstallationRecord,
     MLLifecycleStateRecord,
     PlanActionRecord,
     SettingRecord,
@@ -55,7 +57,14 @@ WIPE_TABLES = (
     "app_logs",
     "audit_log",
 )
-RETAIN_TABLES = ("settings", "smartthings_oauth_token", "price_scopes", "alembic_version")
+RETAIN_TABLES = (
+    "settings",
+    "smartthings_oauth_token",
+    "price_scopes",
+    "house_installations",
+    "house_contract_revisions",
+    "alembic_version",
+)
 AUDIT_ACTIONS = ("reset_operator_retirement", "settings_preserving_reset")
 TARGET = (11763, 11762, 26)
 MAINTENANCE_KEY = 521769314703255406
@@ -353,9 +362,9 @@ async def _guard(session, scope: dict, device_id: str) -> None:
         )
     )
     if (await session.scalars(text("SELECT version_num FROM public.alembic_version"))).all() != [
-        "037"
+        "039"
     ]:
-        raise ResetRefused("schema must remain at 037")
+        raise ResetRefused("schema must remain at 039")
     dependencies = (
         await session.execute(
             text(
@@ -626,9 +635,16 @@ async def apply(
                 or current["previous_epoch"] != manifest["previous_epoch"]
             ):
                 raise ResetRefused("settled target drift before wipe")
+            retained_models = (
+                SettingRecord,
+                SmartThingsToken,
+                PriceScopeRecord,
+                HouseInstallationRecord,
+                HouseContractRevisionRecord,
+            )
             retained = [
                 [row_values(row) for row in await _rows(session, model)]
-                for model in (SettingRecord, SmartThingsToken, PriceScopeRecord)
+                for model in retained_models
             ]
             # This is the only deletion statement; identifiers are compile-time constants.
             await session.execute(
@@ -670,7 +686,7 @@ async def apply(
             await session.flush()
             after = [
                 [row_values(row) for row in await _rows(session, model)]
-                for model in (SettingRecord, SmartThingsToken, PriceScopeRecord)
+                for model in retained_models
             ]
             if retained != after:
                 raise ResetRefused("retained configuration equality failed")

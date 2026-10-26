@@ -19,6 +19,28 @@ SCRIPT_DIR=${0%/*}
 export PGHOST PGUSER PGDATABASE
 export PGCONNECT_TIMEOUT=5 PGOPTIONS="-c statement_timeout=20000 -c lock_timeout=5000"
 
+# Parse before tools, locks or any destination mutation. Unknown options never
+# accidentally enter the scheduler.
+once=false; retention_mode=normal; transition_legacy=false
+for option in "$@"; do
+    case $option in
+        --once) [ "$once" = false ] || exit 2; once=true ;;
+        --once-preserve-archives)
+            [ "$once" = false ] || exit 2
+            once=true; retention_mode=preserve ;;
+        --transition-legacy)
+            [ "$transition_legacy" = false ] || exit 2; transition_legacy=true ;;
+        *) exit 2 ;;
+    esac
+done
+if [ "$retention_mode" = preserve ]; then
+    [ -n "${BACKUP_EXPECTED_SOURCE_ID:-}" ] && [ -n "${BACKUP_EXPECTED_SCHEMA_REVISION:-}" ] || exit 2
+fi
+if [ "$transition_legacy" = true ]; then
+    [ "$retention_mode" = preserve ] && [ -n "${BACKUP_LEGACY_EXPECTED_SHA256:-}" ] \
+        && [ -n "${BACKUP_LEGACY_EXPECTED_UPDATED_AT:-}" ] || exit 2
+fi
+
 sql() {
     bounded 20 psql -X -qAt --set=ON_ERROR_STOP=1 "$@"
 }
@@ -99,10 +121,13 @@ EOF
 
 record_status() {
     phase=$1
-    backup_start=false; backup_finish=false; succeeded=false
+    backup_start=false; backup_finish=false; backup_retention_diagnostic=false; succeeded=false
     [ "$phase" != start ] || backup_start=true
     [ "$phase" != finish ] || backup_finish=true
+    [ "$phase" != diagnostic ] || backup_retention_diagnostic=true
     [ "$status" != succeeded ] || succeeded=true
+    phase_transition=false
+    [ "$phase" != start ] || phase_transition=$transition_legacy
     sql -v backup_start="$backup_start" -v backup_finish="$backup_finish" \
         -v verification_start=false -v verification_finish=false \
         -v succeeded="$succeeded" \
@@ -110,7 +135,54 @@ record_status() {
         -v finished="${finished:-}" -v status="$status" -v reason="${reason:-}" \
         -v replica="${replica:-pending}" -v checksum="${checksum:-}" \
         -v source="${source:-}" -v revision="${revision:-}" \
-        -f "$SCRIPT_DIR/backup_status.sql" >/dev/null
+        -v backup_retention_diagnostic="$backup_retention_diagnostic" \
+        -v transition_legacy="$phase_transition" \
+        -v retention_mode="$retention_mode" -v expected_state="${expected_state:-}" \
+        -v expected_source="${BACKUP_EXPECTED_SOURCE_ID:-}" \
+        -v expected_revision="${BACKUP_EXPECTED_SCHEMA_REVISION:-}" \
+        -v legacy_sha256="${BACKUP_LEGACY_EXPECTED_SHA256:-}" \
+        -v legacy_updated_at="${BACKUP_LEGACY_EXPECTED_UPDATED_AT:-}" \
+        -v interval="$interval" -v timeout="$dump_timeout" \
+        -f "$SCRIPT_DIR/backup_status.sql" >/dev/null 2>&1
+}
+
+reconcile_start() {
+    capture sql -v attempt="$attempt" -v archive="$archive_id" -v started="$started" \
+        -v source="$source" -v revision="$revision" -v mode="$retention_mode" <<'SQL' || return 1
+SELECT COALESCE((SELECT details_json::jsonb->'last_attempt' @>
+ jsonb_build_object('id',:'attempt','archive_id',:'archive','started_at',:'started',
+ 'source_id',:'source','schema_revision',:'revision','retention_mode',:'mode','status','running')
+ FROM service_heartbeats WHERE service='backup'),false);
+SQL
+    [ "$captured" = t ]
+}
+
+fingerprint() {
+    sql <<'SQL'
+SELECT COALESCE((SELECT encode(sha256(convert_to(updated_at::text||'/'||details_json,'UTF8')),'hex')
+ FROM service_heartbeats WHERE service='backup'),'absent');
+SQL
+}
+
+settle_source() {
+    # Killing a libpq client is not proof that its server-side query stopped.
+    # Cancel only this random, source-bound owner's sessions, then prove absence.
+    sql -v attempt="$attempt" -v source="$source" <<'SQL' >/dev/null 2>&1 || return 1
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+WHERE application_name='backup:'||:'attempt' AND pid<>pg_backend_pid()
+ AND :'source'=(SELECT md5(system_identifier::text||'/'||current_database()) FROM pg_control_system());
+SQL
+    settlement_tries=0
+    while [ "$settlement_tries" -lt 3 ]; do
+        capture sql -v attempt="$attempt" <<'SQL' || return 1
+SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity
+ WHERE application_name='backup:'||:'attempt' AND pid<>pg_backend_pid());
+SQL
+        [ "$captured" != t ] || return 0
+        bounded 2 sleep 1 || return 1
+        settlement_tries=$((settlement_tries+1))
+    done
+    return 1
 }
 
 source_identity() {
@@ -124,6 +196,8 @@ SQL
 }
 
 due() {
+    # The transaction, not this shortcut, authenticates the exact legacy shape.
+    [ "$transition_legacy" != true ] || { printf 't\n'; return; }
     # Invalid/legacy state is not a clean activation. Invalid casts fail closed.
     sql -v interval="$interval" -v timeout="$dump_timeout" <<'SQL'
 WITH h AS (SELECT details_json::jsonb AS s FROM service_heartbeats WHERE service='backup')
@@ -157,10 +231,33 @@ replicate() {
     [ -n "$BACKUP_REPLICA_ENCRYPTION_KEY" ] || return 1
     [ -d "$BACKUP_REPLICA_DIR" ] && [ ! -L "$BACKUP_REPLICA_DIR" ] || return 1
     target="$BACKUP_REPLICA_DIR/$archive_id.dump.enc"
+    (set -C; : > "$target.partial") || return 1
+    replica_scratch_owned=true
     bounded "$dump_timeout" openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
         -pass env:BACKUP_REPLICA_ENCRYPTION_KEY -in "$archive" -out "$target.partial" || return 1
-    mv "$target.partial" "$target" || return 1
-    bounded "$dump_timeout" sha256sum "$target" > "$target.sha256" || return 1
+    publish "$target.partial" "$target" || return 1
+    replica_scratch_owned=false
+    (set -C; : > "$target.sha256.partial") || return 1
+    replica_checksum_scratch_owned=true
+    bounded "$dump_timeout" sha256sum "$target" > "$target.sha256.partial" || return 1
+    publish "$target.sha256.partial" "$target.sha256" || return 1
+    replica_checksum_scratch_owned=false
+}
+
+cleanup_scratch() {
+    [ "${scratch_owned:-false}" != true ] || rm -f "$partial"
+    [ "${checksum_scratch_owned:-false}" != true ] || rm -f "$archive.sha256.partial"
+    [ "${manifest_scratch_owned:-false}" != true ] || rm -f "$archive.json.partial"
+    [ "${replica_scratch_owned:-false}" != true ] || rm -f "$target.partial"
+    [ "${replica_checksum_scratch_owned:-false}" != true ] || rm -f "$target.sha256.partial"
+    scratch_owned=false; checksum_scratch_owned=false; manifest_scratch_owned=false
+    replica_scratch_owned=false; replica_checksum_scratch_owned=false
+}
+
+publish() {
+    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+    mv -n "$1" "$2" || return 1
+    [ ! -e "$1" ] && [ ! -L "$1" ]
 }
 
 manifest_fields() {
@@ -249,6 +346,9 @@ EOF
 }
 
 attempt_backup() {
+    owns_attempt=false; start_pending=false; terminal_pending=false; scratch_owned=false
+    checksum_scratch_owned=false; manifest_scratch_owned=false
+    replica_scratch_owned=false; replica_checksum_scratch_owned=false
     capture bounded 5 tr -d '-' < /proc/sys/kernel/random/uuid || return 1
     attempt=$captured
     archive_id="heatpump-$attempt"
@@ -259,7 +359,9 @@ attempt_backup() {
     capture bounded 5 date -u +%s || return 1
     deadline_epoch=$((captured+dump_timeout))
     status=running; checksum=""; source=""; revision=""; reason=""; replica=pending
-    record_status start || return 1
+    # Preflight cannot create history or archive files.
+    capture fingerprint || return 1
+    expected_state=$captured
     capture source_identity || return 1
     identity=$captured
     IFS='|' read -r source major timescale revision size <<EOF
@@ -267,6 +369,23 @@ $identity
 EOF
     [ "$major" = 16 ] && [ "$timescale" = 2.26.4 ] || return 1
     [ -z "${BACKUP_EXPECTED_SOURCE_ID:-}" ] || [ "$source" = "$BACKUP_EXPECTED_SOURCE_ID" ] || return 1
+    [ -z "${BACKUP_EXPECTED_SCHEMA_REVISION:-}" ] || [ "$revision" = "$BACKUP_EXPECTED_SCHEMA_REVISION" ] || return 1
+    for output in "$partial" "$archive" "$archive.sha256" "$archive.sha256.partial" \
+        "$archive.json" "$archive.json.partial" "$BACKUP_REPLICA_DIR/$archive_id.dump.enc" \
+        "$BACKUP_REPLICA_DIR/$archive_id.dump.enc.partial" "$BACKUP_REPLICA_DIR/$archive_id.dump.enc.sha256" \
+        "$BACKUP_REPLICA_DIR/$archive_id.dump.enc.sha256.partial"; do
+        [ ! -e "$output" ] && [ ! -L "$output" ] || return 1
+    done
+    PGAPPNAME="backup:$attempt"; export PGAPPNAME
+    start_pending=true
+    if record_status start || reconcile_start; then
+        owns_attempt=true; start_pending=false
+    else
+        return 1
+    fi
+    # Only invocation-created scratch is eligible for cleanup.
+    (set -C; : > "$partial") || return 1
+    scratch_owned=true
     bounded "$dump_timeout" pg_dump --format=custom --no-owner \
         --lock-wait-timeout=10000 --file="$partial" || return 1
     bounded 30 pg_restore --list "$partial" >/dev/null || return 1
@@ -277,9 +396,13 @@ EOF
     capture bounded "$dump_timeout" sha256sum "$partial" || return 1
     checksum=$captured
     checksum=${checksum%% *}
-    mv "$partial" "$archive" || return 1
+    publish "$partial" "$archive" || return 1
+    scratch_owned=false
+    (set -C; : > "$archive.sha256.partial") || return 1
+    checksum_scratch_owned=true
     printf '%s  %s\n' "$checksum" "$archive_id.dump" > "$archive.sha256.partial"
-    mv "$archive.sha256.partial" "$archive.sha256" || return 1
+    publish "$archive.sha256.partial" "$archive.sha256" || return 1
+    checksum_scratch_owned=false
     replica=disabled
     if replicate; then
         [ "$BACKUP_REPLICA_ENABLED" != true ] || replica=succeeded
@@ -290,6 +413,8 @@ EOF
     fi
     capture bounded 5 date -u +%Y-%m-%dT%H:%M:%SZ || return 1
     finished=$captured
+    (set -C; : > "$archive.json.partial") || return 1
+    manifest_scratch_owned=true
     if ! sql -v archive="$archive_id" -v checksum="$checksum" -v source="$source" \
         -v revision="$revision" -v major="$major" -v timescale="$timescale" \
         -v size="$size" -v started="$started" -v finished="$finished" <<'SQL' > "$archive.json.partial"
@@ -299,13 +424,28 @@ SELECT jsonb_build_object('schema_version',1,'eligible',true,'archive_id',:'arch
  'snapshot_at',:'started','completed_at',:'finished');
 SQL
     then return 1; fi
-    mv "$archive.json.partial" "$archive.json" || return 1
+    publish "$archive.json.partial" "$archive.json" || return 1
+    manifest_scratch_owned=false
     status=succeeded
-    record_status finish || { status=failed; return 1; }
+    terminal_pending=true
+    # Replaying this exact event reconciles a lost commit acknowledgement. Never
+    # generate a new timestamp or downgrade a possibly committed success.
+    retention_deadline_epoch=$deadline_epoch
+    deadline_epoch=""
+    record_status finish || record_status finish || {
+        printf '%s\n' backup_reporting_incomplete >&2; return 1;
+    }
+    terminal_pending=false
+    # Retention shares the original absolute attempt budget, not a fresh budget
+    # after reporting. Diagnostics alone get a separate bounded opportunity.
+    deadline_epoch=$retention_deadline_epoch
+    [ "$retention_mode" != preserve ] || return 0
     if ! retain; then
         reason=backup_retention_blocked
-        # Preserve the completed success while making blocked retention visible.
-        record_status finish || return 1
+        deadline_epoch=""
+        record_status diagnostic || record_status diagnostic || {
+            printf '%s\n' backup_reporting_incomplete >&2; return 1;
+        }
     fi
 }
 
@@ -321,16 +461,20 @@ settle() {
     fi
     # A failed terminal attempt has already been reported. Normal --once exit
     # must not relabel that failure as interruption.
-    if [ "${status:-}" = running ]; then
+    deadline_epoch=""
+    if [ "${start_pending:-false}" = true ] && reconcile_start; then
+        owns_attempt=true
+    fi
+    if [ "${owns_attempt:-false}" = true ] && [ "${status:-}" = running ] && settle_source; then
         status=interrupted
         reason=backup_attempt_failed
         deadline_epoch="" # interruption reporting has its own bounded opportunity
         if capture bounded 5 date -u +%Y-%m-%dT%H:%M:%SZ; then
             finished=$captured
-            record_status finish || true
+            record_status finish || record_status finish || true
         fi
     fi
-    [ -z "${partial:-}" ] || rm -f "$partial" "$archive.json.partial" "$archive.sha256.partial"
+    cleanup_scratch
     if [ "${work_created:-false}" = true ]; then
         rm -f "$work/output" "$work/clock" "$work/inventory" || result=1
         rmdir "$work" || result=1
@@ -368,26 +512,37 @@ while [ "$workspace_tries" -lt 10 ]; do
 done
 [ "$work_created" = true ] || exit 2
 while :; do
+    disposition=1
     # Nonblocking acquisition; policy and durable due state are read under the lock.
     if flock -n 9; then
         deadline_epoch=""
         if read_policy && capture due && [ "$captured" = t ]; then
             # The shell remains the lifecycle owner; timeout bounds/reaps each tool.
             if ! attempt_backup; then
-                status=failed
-                # Terminal reporting gets its own bounded 20-second opportunity.
                 deadline_epoch=""
-                reason=${reason:-backup_attempt_failed}
-                if capture bounded 5 date -u +%Y-%m-%dT%H:%M:%SZ; then
-                    finished=$captured
-                    record_status finish || true
+                if [ "${owns_attempt:-false}" = true ] && [ "${status:-}" = running ] && settle_source; then
+                    status=failed
+                    # Terminal reporting gets its own bounded opportunity.
+                    reason=${reason:-backup_attempt_failed}
+                    if capture bounded 5 date -u +%Y-%m-%dT%H:%M:%SZ; then
+                        finished=$captured
+                        record_status finish || record_status finish || true
+                    fi
                 fi
-                [ -z "${partial:-}" ] || rm -f "$partial"
+            else
+                disposition=0
             fi
+            cleanup_scratch
         fi
         flock -u 9
     fi
-    [ "${1:-}" != --once ] || break
+    if [ "$once" = true ]; then
+        if [ "$retention_mode" = preserve ]; then
+            [ "$disposition" = 0 ] || printf '%s\n' 'backup_reporting_incomplete' >&2
+            exit "$disposition"
+        fi
+        break
+    fi
     setsid sleep 60 &
     child=$!; wait "$child"; child=""
 done
