@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from packages.core.backup_health import BackupPolicy, project_backup_health
+from packages.core.backup_health import BackupPolicy, decode_state, project_backup_health
 
 NOW = dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc)
 
@@ -46,6 +46,108 @@ def evidence():
 
 def project(state, now=NOW):
     return project_backup_health(state, BackupPolicy(), now=now)
+
+
+def transition_evidence():
+    import hashlib
+
+    state = evidence()
+    raw = ' \n{ "status": "ok" }\n'
+    first = {
+        **state["last_attempt"],
+        "id": "a" * 32,
+        "archive_id": "heatpump-" + "a" * 32,
+        "source_id": "private-source",
+        "schema_revision": "123",
+        "retention_mode": "preserve",
+        "replica_status": "disabled",
+        "reason_code": "",
+        "sha256": "b" * 64,
+    }
+    state["last_attempt"] = first
+    state["legacy_transition"] = {
+        "schema_version": 1,
+        "kind": "legacy-status-ok-to-v1",
+        "transitioned_at": NOW.isoformat(),
+        "source_id": "private-source",
+        "schema_revision": "123",
+        "first_attempt_id": first["id"],
+        "first_attempt": dict(first),
+        "original": {
+            "service": "backup",
+            "updated_at": NOW.isoformat(),
+            "details_json": raw,
+            "details_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+        },
+        "private_note": "SENTINEL",
+    }
+    return state
+
+
+def test_private_transition_valid_and_never_projected():
+    state = transition_evidence()
+    assert decode_state(state) == state
+    public = json.dumps(project(state))
+    for value in ("SENTINEL", "legacy_transition", "details_json", "private-source", "a" * 32):
+        assert value not in public
+
+
+@pytest.mark.parametrize("damage", ["digest", "duplicate", "version", "first", "source", "null"])
+def test_malformed_private_transition_fails_closed(damage):
+    state = transition_evidence()
+    envelope = state["legacy_transition"]
+    if damage == "digest":
+        envelope["original"]["details_sha256"] = "c" * 64
+    elif damage == "duplicate":
+        envelope["original"]["details_json"] = '{"status":"ok","status":"ok"}'
+    elif damage == "version":
+        envelope["schema_version"] = 2
+    elif damage == "first":
+        envelope["first_attempt"]["status"] = "failed"
+    elif damage == "source":
+        envelope["source_id"] = "other"
+    else:
+        state["legacy_transition"] = None
+    assert decode_state(state) is None
+    assert "backup_state_unknown" in project(state)["reason_codes"]
+
+
+@pytest.mark.parametrize("replica_status", [None, "unrecognized"])
+def test_private_transition_rejects_missing_or_invalid_first_replica_status(replica_status):
+    """The audit snapshot must satisfy the same required event shape as SQL."""
+    state = transition_evidence()
+    for event in (state["last_attempt"], state["legacy_transition"]["first_attempt"]):
+        event["replica_status"] = "disabled"
+    assert decode_state(state) == state
+    assert project(state)["ready"]
+    for event in (state["last_attempt"], state["legacy_transition"]["first_attempt"]):
+        if replica_status is None:
+            del event["replica_status"]
+        else:
+            event["replica_status"] = replica_status
+    assert decode_state(state) is None
+    assert "backup_state_unknown" in project(state)["reason_codes"]
+    assert not project(state)["ready"]
+
+
+@pytest.mark.parametrize(
+    "replica_status", ["pending", "disabled", "succeeded", "required_failed", "optional_failed"]
+)
+def test_private_transition_accepts_sql_recognized_replica_status(replica_status):
+    state = transition_evidence()
+    for event in (state["last_attempt"], state["legacy_transition"]["first_attempt"]):
+        event["replica_status"] = replica_status
+    assert decode_state(state) == state
+
+
+@pytest.mark.parametrize("replica_status", [None, False, 1, [], {}])
+def test_private_transition_rejects_non_string_replica_status(replica_status):
+    state = transition_evidence()
+    for event in (state["last_attempt"], state["legacy_transition"]["first_attempt"]):
+        event["replica_status"] = replica_status
+    assert decode_state(state) is None
+    assert "backup_state_unknown" in project(state)["reason_codes"]
+    assert not project(state)["ready"]
 
 
 def test_histories_and_explicit_public_allowlist():

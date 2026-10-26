@@ -135,6 +135,8 @@ jobs:
       # Inventory collects with --noconftest; only the ordinary phase keeps conftest.
       - name: Collect complete E2E verification inventory
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase e2e-inventory -m pytest --noconftest tests/e2e --collect-only -q
+      - name: Collect required backup status SQL matrix inventory
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase backup-status-inventory -m pytest --noconftest tests/helpers/qualify_backup_status_postgresql.py --collect-only -q
       - name: Verify reviewed migration head pins
         run: python -m pytest --noconftest tests/test_migration_head_contract.py -q
       - name: Verify migration graph
@@ -169,6 +171,8 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase ordinary -m pytest tests/e2e --ignore=tests/e2e/test_manual_cop_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_postgresql.py --ignore=tests/e2e/test_ml_lifecycle_verification.py --ignore=tests/e2e/test_backup_roundtrip.py -q
       - name: Compare schema after ordinary E2E teardown
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase check-ordinary -m alembic check
+      - name: Require real PostgreSQL backup CAS replay concurrency and failure matrix
+        run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase backup-status -m pytest --noconftest tests/helpers/qualify_backup_status_postgresql.py -q --tb=short
       - name: Qualify backup worker and isolated coordinator on the owned source
         run: timeout --signal=TERM --kill-after=10s 660s python tests/e2e/test_manual_cop_postgresql.py phase backup-roundtrip -m pytest --noconftest tests/e2e/test_backup_roundtrip.py -q --tb=short
       - name: Compare schema after backup roundtrip teardown

@@ -61,14 +61,18 @@ def test_retention_is_nonrecursive_and_count_protected_before_deletion():
 
 
 def test_status_histories_fenced_and_source_parameters_not_interpolated_sql():
-    assert "state->'last_attempt'->>'id' = :'attempt'" in STATUS
-    assert "state->'last_verification'->>'id' = :'attempt'" in STATUS
-    assert "state->'last_verification'->>'sha256' = :'checksum'" in STATUS
-    assert "\\if :succeeded\nUPDATE backup_state" in STATUS
-    assert "'last_success', jsonb_build_object" in STATUS
-    assert "'last_verified', jsonb_build_object" in STATUS
-    assert "'source_id', :'source'" in STATUS
-    assert "updated_at = EXCLUDED.updated_at" in STATUS
+    assert "event->>'id'=r.attempt AND event->>'archive_id'=r.archive" in STATUS
+    assert "s->'last_verification'->>'id'=r.attempt" in STATUS
+    assert "s->'last_verification'->>'sha256'=r.checksum" in STATUS
+    assert "IF r.succeeded THEN" in STATUS
+    assert "'last_success',binding" in STATUS
+    assert "'last_verified',jsonb_build_object" in STATUS
+    assert ":'source'::text AS source" in STATUS
+    assert "WHERE service='backup' AND updated_at=h.updated_at" in STATUS
+    assert "details_json IS NOT DISTINCT FROM h.details_json" in STATUS
+    assert "pg_temp.require(changed_rows=1)" in STATUS
+    assert "IF s IS DISTINCT FROM old THEN" in STATUS
+    assert "fingerprint=r.fingerprint" in STATUS
 
 
 def test_staging_selects_and_validates_before_unlock():

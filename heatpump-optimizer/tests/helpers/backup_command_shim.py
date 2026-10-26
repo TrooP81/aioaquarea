@@ -106,13 +106,28 @@ def psql(args, config, now):
     state = load("state.json")
     fail = config.get("fail")
     if "-f" in args:
-        phase = "start" if values["backup_start"] == "true" else "finish"
-        event("status", phase=phase, values=values)
+        phase = (
+            "start"
+            if values["backup_start"] == "true"
+            else "diagnostic"
+            if values.get("backup_retention_diagnostic") == "true"
+            else "finish"
+        )
+        event(
+            "status",
+            phase=phase,
+            values=values,
+            timeout=float(os.environ["HPO_BACKUP_ACTIVE_TIMEOUT"]),
+        )
         if fail == "status_" + phase:
             return 1
         state = state or {"schema_version": 1}
-        if state.get("schema_version") != 1:
+        transition = values.get("transition_legacy") == "true"
+        legacy = state == {"status": "ok"} and transition
+        if state.get("schema_version") != 1 and not legacy:
             return 1
+        if legacy:
+            state = {"schema_version": 1}
         if phase == "start":
             state["last_attempt"] = {
                 "id": values["attempt"],
@@ -120,16 +135,53 @@ def psql(args, config, now):
                 "started_at": values["started"],
                 "status": "running",
                 "replica_status": "pending",
+                "retention_mode": values["retention_mode"],
+                "source_id": values["source"],
+                "schema_revision": values["revision"],
             }
+            if legacy:
+                import hashlib
+
+                raw = config.get("legacy_raw", '{"status":"ok"}')
+                if hashlib.sha256(raw.encode()).hexdigest() != values["legacy_sha256"]:
+                    return 1
+                state["legacy_transition"] = {
+                    "schema_version": 1,
+                    "kind": "legacy-status-ok-to-v1",
+                    "transitioned_at": values["started"],
+                    "source_id": values["source"],
+                    "schema_revision": values["revision"],
+                    "first_attempt_id": values["attempt"],
+                    "original": {
+                        "service": "backup",
+                        "updated_at": values["legacy_updated_at"],
+                        "details_json": raw,
+                        "details_sha256": values["legacy_sha256"],
+                    },
+                    "first_attempt": dict(state["last_attempt"]),
+                }
+        elif phase == "diagnostic":
+            if (
+                state["last_attempt"].get("retention_mode") != "normal"
+                or state["last_attempt"]["status"] != "succeeded"
+            ):
+                return 1
+            state["last_attempt"]["reason_code"] = values["reason"]
         else:
             if state["last_attempt"]["id"] != values["attempt"]:
                 return 1
+            if state["last_attempt"]["status"] != "running":
+                # Immutable terminal outcome; diagnostic overlay is independent.
+                return 0 if state["last_attempt"]["status"] == values["status"] else 1
             state["last_attempt"].update(
                 finished_at=values["finished"],
                 status=values["status"],
                 reason_code=values["reason"],
                 replica_status=values["replica"],
+                sha256=values["checksum"],
             )
+            if state.get("legacy_transition", {}).get("first_attempt_id") == values["attempt"]:
+                state["legacy_transition"]["first_attempt"] = dict(state["last_attempt"])
             if values["succeeded"] == "true":
                 state["last_success"] = {
                     "archive_id": values["archive"],
@@ -140,9 +192,24 @@ def psql(args, config, now):
                     "schema_revision": values["revision"],
                 }
         save("state.json", state)
+        if config.get("lost_ack") == phase:
+            return 1
         return 0
     query = sys.stdin.read()
-    if "WITH defaults" in query:
+    if "pg_cancel_backend" in query:
+        event("settle_source")
+    elif "SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity" in query:
+        print("t")
+    elif "sha256(convert_to(updated_at" in query:
+        print("modeled-fingerprint")
+    elif "jsonb_build_object('id',:'attempt'" in query:
+        attempt = (state or {}).get("last_attempt", {})
+        print(
+            "t"
+            if attempt.get("id") == values["attempt"] and attempt.get("status") == "running"
+            else "f"
+        )
+    elif "WITH defaults" in query:
         event("policy")
         print(config.get("policy", "2592000|100|2764800|3600"))
     elif "WITH h AS" in query:
@@ -165,7 +232,7 @@ def psql(args, config, now):
         if fail == "identity_start" and count == 1:
             return 1
         source = "changed" if fail == "identity_changed" and count == 2 else "source"
-        print(f"{source}|16|2.26.4|036|100")
+        print(f"{source}|16|2.26.4|{config.get('revision', '036')}|100")
     elif "'database_size_bytes'" in query:
         event("manifest")
         if fail == "manifest":
@@ -250,10 +317,18 @@ def main() -> int:
             resist("dump")
         if fail == "dump":
             return 1
+        if config.get("dump_elapsed"):
+            save("clock.json", now + int(config["dump_elapsed"]))
     elif command == "pg_restore":
         if fail == "toc" or not read_bytes(args[-1]).startswith(b"synthetic"):
             return 1
     elif command == "sha256sum":
+        if args[-1].endswith(".dump") and config.get("slow_archive_seconds"):
+            import time
+
+            event("slow_archive_check", timeout=float(os.environ["HPO_BACKUP_ACTIVE_TIMEOUT"]))
+            time.sleep(config["slow_archive_seconds"])
+            save("clock.json", now + int(config["archive_clock_step"]))
         if config.get("resistant_phase") == "checksum" and args[-1].endswith(".dump.partial"):
             resist("checksum")
         if fail == "checksum" and args[-1].endswith(".dump.partial"):

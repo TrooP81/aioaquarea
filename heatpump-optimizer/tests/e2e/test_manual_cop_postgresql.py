@@ -545,6 +545,7 @@ SOURCE_MANIFEST_NAME = "source-manifest.json"
 SOURCE_MANIFEST_DIGEST_ENV = "COP_MANUAL_TEST_SOURCE_MANIFEST_SHA256"
 BACKUP_BINDING_PATHS = (
     "heatpump-optimizer/tests/e2e/test_backup_roundtrip.py",
+    "heatpump-optimizer/tests/helpers/qualify_backup_status_postgresql.py",
     "heatpump-optimizer/scripts/backup_db.sh",
     "heatpump-optimizer/scripts/backup_status.sql",
     "heatpump-optimizer/scripts/stage_backup.sh",
@@ -609,8 +610,8 @@ SOURCE_MANIFEST_DECLARATIONS = (
     "heatpump-optimizer/constraints.txt",
 )
 SOURCE_MANIFEST_MODES = frozenset({"100644", "100755"})
-assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 43
-assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 48
+assert len(set(VERIFICATION_BINDING_PATHS)) == len(VERIFICATION_BINDING_PATHS) == 44
+assert len(set(VERIFICATION_BINDING_PATHS + VERIFICATION_REPAIR_PATHS)) == 49
 
 
 def _source_checkout():
@@ -983,6 +984,18 @@ def pytest_sessionfinish(session, exitstatus):
         )
 
 
+def verification_phase_environment(name, environment):
+    """Keep the SQL matrix's no-configured-database guard without relaxing ours.
+
+    The parent still proves the prepared SQL/platform/source profile before any
+    phase. The matrix creates its own networkless PG, never consuming that URL.
+    """
+    child = dict(environment)
+    if name in {"backup-status-inventory", "backup-status"}:
+        child.pop("DATABASE_URL", None)
+    return child
+
+
 def run_verification_phase(name, arguments, *, limit=600, owned_sql=True):
     assert re.fullmatch(r"[a-z0-9-]+", name)
     assert 0 < limit <= 600
@@ -993,7 +1006,7 @@ def run_verification_phase(name, arguments, *, limit=600, owned_sql=True):
     evidence = Path(os.environ["COP_MANUAL_TEST_EVIDENCE"])
     phase = evidence / name
     phase.mkdir()
-    environment = dict(os.environ)
+    environment = verification_phase_environment(name, os.environ)
     if arguments[1:3] == ["-m", "pytest"]:
         assert environment.get("PYTEST_PLUGINS") in {
             None,
@@ -1144,6 +1157,7 @@ MANUAL_MODULE = "tests/e2e/test_manual_cop_postgresql.py"
 LIFECYCLE_MODULE = "tests/e2e/test_ml_lifecycle_postgresql.py"
 LIFECYCLE_VERIFICATION_MODULE = "tests/e2e/test_ml_lifecycle_verification.py"
 BACKUP_MODULE = "tests/e2e/test_backup_roundtrip.py"
+BACKUP_STATUS_MODULE = "tests/helpers/qualify_backup_status_postgresql.py"
 # Ordinary E2E keeps conftest and ignores exactly these coordinator-owned modules.
 COORDINATOR_MODULES = (
     MANUAL_MODULE,
@@ -1187,8 +1201,9 @@ def _verification_phase_owns(name, nodeid):
         "obs5-real-migration": real_migration,
         "obs5-pg-original": module == LIFECYCLE_MODULE,
         "obs5-pg-supplement": module == LIFECYCLE_VERIFICATION_MODULE and not real_migration,
-        "ordinary": module not in COORDINATOR_MODULES,
+        "ordinary": module not in COORDINATOR_MODULES and module != BACKUP_STATUS_MODULE,
         "backup-roundtrip": module == BACKUP_MODULE,
+        "backup-status": module == BACKUP_STATUS_MODULE,
     }
     assert name in owners, f"unknown verification phase {name}"
     return owners[name]
@@ -1675,6 +1690,21 @@ def seal_verification_evidence(evidence=None, proof=None):
     expected, partitions = reconcile_verification_partitions(
         evidence, "e2e-inventory", SEALED_TEST_PHASES
     )
+    # Separate actual inventory: no change to ordinary E2E discovery/partitions.
+    sql_expected, sql_partitions = reconcile_verification_partitions(
+        evidence, "backup-status-inventory", ("backup-status",)
+    )
+    for name in ("backup-status-inventory", "backup-status"):
+        nodes = json.loads((evidence / name / "nodes.json").read_text(encoding="utf-8"))
+        assert nodes.get("source_manifest_sha256") == digest, (
+            "backup status inventory source mismatch"
+        )
+        assert (
+            len(nodes["collected"]) == len(sql_expected) and set(nodes["collected"]) == sql_expected
+        ), "backup status collection differs from complete inventory"
+    assert not expected & sql_expected, "backup status and E2E inventories overlap"
+    expected |= sql_expected
+    partitions.update(sql_partitions)
     outside = sorted(
         {node.split("::", 1)[0] for node in expected}
         - {path.removeprefix("heatpump-optimizer/") for path in binding}
@@ -2505,6 +2535,7 @@ class SyntheticVerificationEvidence:
     COMMIT = "a" * 40
     DIGEST = "b" * 64
     TOKEN = "cop-manual-mon-1-1"
+    SQL_NODES = [BACKUP_STATUS_MODULE + "::test_transition_exact_original_and_terminal_replay"]
     NODES = {
         "migration": [MANUAL_MODULE + "::TestManualCOPPostgreSQLMigration::test_migrate"],
         "manual": [MANUAL_MODULE + "::TestOwnedResourceGuard::test_guard"],
@@ -2538,7 +2569,8 @@ class SyntheticVerificationEvidence:
     def binding(self):
         modules = {node.split("::", 1)[0] for nodes in self.NODES.values() for node in nodes}
         return {"heatpump-optimizer/" + module: "c" * 64 for module in sorted(modules)} | {
-            "heatpump-optimizer/scripts/backup_db.sh": "c" * 64
+            "heatpump-optimizer/scripts/backup_db.sh": "c" * 64,
+            "heatpump-optimizer/" + BACKUP_STATUS_MODULE: "c" * 64,
         }
 
     def process(self, evidence, name, **changes):
@@ -2594,6 +2626,8 @@ class SyntheticVerificationEvidence:
         every = [node for nodes in self.NODES.values() for node in nodes]
         manual = self.NODES["migration"] + self.NODES["manual"] + self.NODES["exhaustion"]
         self.phase(evidence, "e2e-inventory", [], every)
+        self.phase(evidence, "backup-status-inventory", [], self.SQL_NODES)
+        self.phase(evidence, "backup-status", self.SQL_NODES)
         self.phase(evidence, "manual-inventory", [], manual)
         obs5 = [node for name in OBS5_TEST_PHASES for node in self.NODES[name]]
         self.phase(evidence, "obs5-inventory", [], obs5)
@@ -3243,7 +3277,10 @@ class TestVerificationSeal(SyntheticVerificationEvidence):
         seal_verification_evidence(evidence, proof)
         seal = json.loads((evidence / "seal.json").read_text(encoding="utf-8"))
         assert (seal["commit"], seal["source_manifest_sha256"]) == (self.COMMIT, self.DIGEST)
-        assert seal["partitions"] == {name: sorted(nodes) for name, nodes in self.NODES.items()}
+        assert seal["partitions"] == {
+            name: sorted(nodes)
+            for name, nodes in (self.NODES | {"backup-status": self.SQL_NODES}).items()
+        }
         assert seal["primary_head"]["after"] == CURRENT_HEAD_REVISION
         # The resource-free supplement node needs (and has) no lifecycle receipt.
         free = self.NODES["obs5-pg-supplement"][1]
@@ -3365,6 +3402,16 @@ class TestVerificationSeal(SyntheticVerificationEvidence):
             ("inventory_drops_obligation", "lifecycle receipt inventory drifted"),
             ("obligation_outside_lifecycle", "ran outside a lifecycle phase"),
             ("phase_inventory_drift", "lifecycle receipt inventory drifted"),
+            ("sql_phase_missing", "did not succeed"),
+            ("sql_inventory_missing", "did not succeed"),
+            ("sql_unrun", "not completely partitioned"),
+            ("sql_skip", "skip/xfail/failure"),
+            ("sql_teardown_missing", "exactly one setup/call/teardown"),
+            ("sql_foreign", "does not own"),
+            ("sql_node_source", "backup status inventory source mismatch"),
+            ("sql_collection_filtered", "backup status collection differs"),
+            ("sql_collection_duplicate", "backup status collection differs"),
+            ("sql_outside_manifest", "outside the source manifest"),
         ],
     )
     async def test_incomplete_or_unbound_evidence_refuses_seal(self, tmp_path, case, message):
@@ -3420,6 +3467,37 @@ class TestVerificationSeal(SyntheticVerificationEvidence):
                 [],
                 self.NODES["migration"] + self.NODES["manual"],
             )
+        elif case in {"sql_phase_missing", "sql_inventory_missing"}:
+            name = "backup-status" if case == "sql_phase_missing" else "backup-status-inventory"
+            (evidence / name / "process.json").unlink()
+        elif case == "sql_unrun":
+            self.phase(
+                evidence,
+                "backup-status-inventory",
+                [],
+                self.SQL_NODES + [BACKUP_STATUS_MODULE + "::test_not_executed"],
+            )
+        elif case in {"sql_skip", "sql_teardown_missing"}:
+            path, reports = self.reports(evidence, "backup-status")
+            if case == "sql_skip":
+                reports[1]["outcome"] = "skipped"
+            else:
+                reports.pop()
+            path.write_text("".join(json.dumps(report) + "\n" for report in reports))
+        elif case == "sql_foreign":
+            self.phase(evidence, "backup-status", self.NODES["ordinary"])
+        elif case in {"sql_node_source", "sql_collection_filtered", "sql_collection_duplicate"}:
+            path = evidence / "backup-status" / "nodes.json"
+            nodes = json.loads(path.read_text(encoding="utf-8"))
+            if case == "sql_node_source":
+                nodes["source_manifest_sha256"] = "d" * 64
+            elif case == "sql_collection_duplicate":
+                nodes["collected"] += self.SQL_NODES
+            else:
+                nodes["collected"] += [BACKUP_STATUS_MODULE + "::test_deselected"]
+            path.write_text(json.dumps(nodes), encoding="utf-8")
+        elif case == "sql_outside_manifest":
+            proof["binding"].pop("heatpump-optimizer/" + BACKUP_STATUS_MODULE)
         else:
             self.mutate(evidence, case)
         with pytest.raises(AssertionError, match=message):
