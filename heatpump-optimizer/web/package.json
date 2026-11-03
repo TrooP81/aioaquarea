@@ -27,7 +27,8 @@
   },
   "overrides": {
     "postcss": "8.5.23",
-    "zod": "4.6.6"
+    "zod": "4.6.6",
+    "minimatch": "11.0.4"
   },
   "devDependencies": {
     "@playwright/test": "^1.44.0",
