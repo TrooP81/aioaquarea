@@ -74,7 +74,7 @@ Raises `ValueError` when `environment` is `PRODUCTION` and `username` or
 
 | Method | Returns | Description |
 | --- | --- | --- |
-| `async login()` | `None` | Initializes the app version and runs the OAuth2/PKCE login. In `DEMO`, issues one unauthenticated request and sets a 1-day expiry. Serialized with `refresh_login()`. |
+| `async login()` | `None` | In `PRODUCTION`, first validates the Android app version from Google Play (see [App version](#app-version)), then runs the OAuth2/PKCE login. If the version cannot be validated it raises `AuthenticationError` (`API_ERROR`) before any Panasonic request. In `DEMO`, performs no version lookup, issues one unauthenticated request and sets a 1-day expiry. Serialized with `refresh_login()`. |
 | `async refresh_login()` | `None` | Refreshes the access token with the stored refresh token. Serialized with `login()`. |
 | `async close()` | `None` | Closes the `aiohttp.ClientSession` passed to the constructor. |
 
@@ -134,6 +134,43 @@ are `@auth_required` and return `PanasonicCommandResult`.
 | `post_device_holiday_timer(long_id, holiday_timer)` | Holiday timer |
 | `post_device_request_defrost(long_id)` | Forced defrost |
 | `post_device_set_powerful_time(long_id, powerful_time)` | Powerful mode |
+
+### App version
+
+Panasonic requests use the Android app identity (OAuth client, redirect and
+`x-app-type: 1`), so `x-app-version` is the version published for Android
+(upstream reports in cjaliaga/aioaquarea#96 say Panasonic checks the version
+per platform; that backend behavior is not independently verified). In
+`PRODUCTION` it is read from the public Google Play listing
+`https://play.google.com/store/apps/details?id=com.panasonic.ACCsmart&hl=en`
+by a private, fail-closed lookup (`aioaquarea._android_version`):
+
+- one credential-free `GET` (one physical send; no redirects; HTTP 200
+  `text/html` only), at most 8 MiB decompressed and 30 seconds including the
+  body;
+- the page must prove the `com.panasonic.ACCsmart` details-page identity
+  through its canonical link, and the version is read only from the embedded
+  JSON array of exactly one whole `AF_initDataCallback` script keyed `ds:5`,
+  at `data[1][2][140][0][0][0]`. This wrapper/location was extracted from the
+  authorized credential-free public listing GET on 2026-10-28 (HTTP 200);
+  comments, strings, unrelated callbacks and duplicate data are not version proof.
+  Canonical fragments, ports, userinfo and duplicate identity are unsupported;
+  the evidenced `hl=en` canonical and optional valid locale remain supported;
+- exactly one distinct version of three ASCII numeric components (1-6 digits
+  each, not all zero) is accepted; missing, conflicting, malformed or
+  unsupported pages fail.
+
+There is no default, stale or iOS fallback. When Panasonic answers the ACC
+login with code `4106` the version is invalidated and looked up again; the ACC
+login is retried once only after a successful lookup, and a second `4106`
+stops. `DEFAULT_X_APP_VERSION` is a diagnostic value used only in `DEMO`,
+which performs no external lookup. The pre-existing `DEMO` login defect
+(the request chain raises `AuthenticationError` "Access token is missing from
+settings.") is unchanged.
+
+The same parser backs the scheduled `update-appstore-version.yml` workflow
+(`python -m aioaquarea._android_version`); a failed lookup ends that job
+without edits or a pull request.
 
 ---
 
@@ -389,3 +426,6 @@ Exception
 | --- | --- |
 | `AQUAREA_SERVICE_BASE` | `https://accsmart.panasonic.com/` |
 | `AQUAREA_SERVICE_DEMO_BASE` | `https://accsmart.panasonic.com/` (same host as production) |
+| `DEFAULT_X_APP_VERSION` | Diagnostic `x-app-version` used only in `DEMO`; never a production fallback. |
+| `ANDROID_APP_PACKAGE` | `com.panasonic.ACCsmart` |
+| `ANDROID_APP_VERSION_URL` | `https://play.google.com/store/apps/details?id=com.panasonic.ACCsmart&hl=en` |

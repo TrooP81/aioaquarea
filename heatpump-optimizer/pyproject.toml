@@ -8,7 +8,7 @@ version = "0.15.0"
 description = "Cost-optimizing controller for Panasonic Aquarea heat pumps"
 requires-python = ">=3.11"
 dependencies = [
-    "aioaquarea @ git+https://github.com/TrooP81/aioaquarea.git@d8d53fffd06495fa05569157aba8538367222583",
+    "aioaquarea @ git+https://github.com/TrooP81/aioaquarea.git@5e0c227b6d1b3a3150d51976dcf1c3ce2c09d353",
     "aiohttp>=3.14.5,<4",
     "sqlalchemy[asyncio]>=2.0,<3",
     "asyncpg>=0.29",

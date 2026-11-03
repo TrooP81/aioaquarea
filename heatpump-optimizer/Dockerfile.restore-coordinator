@@ -3,7 +3,8 @@
 ARG RESTORE_COORDINATOR_BASE_IMAGE=docker:29.9.0-cli@sha256:1a4c7cb63513f349bdad01fcc6e0f3f2f67d37b9da86f14dc0d4a0942eecda00
 FROM ${RESTORE_COORDINATOR_BASE_IMAGE}
 # Alpine 3.24 main, confirmed for x86_64/aarch64; missing exact version fails the build.
-RUN apk add --no-cache python3=3.14.8-r0
+# --upgrade lets apk lift base-image libraries (e.g. libexpat) to python3's minimums.
+RUN apk add --no-cache --upgrade python3=3.14.10-r1
 # Run with --network none, private encrypted scratch, and the local Unix socket.
 WORKDIR /drill
 COPY scripts/restore_drill.py scripts/restore_archive.sh scripts/backup_status.sql /drill/

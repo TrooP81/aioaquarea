@@ -150,8 +150,10 @@ This is the multi-platform **index** digest, not an image-config digest. The
 inspected Linux/amd64 child is
 `sha256:4caa52207e95c68c3087006eefb3a5f6ca48ad1c0ba3aa3e6843549a0720b7bb`;
 its annotations identify Alpine 3.24. The derived image adds only the authorized
-`python3=3.14.8-r0` package, confirmed in the official Alpine 3.24 main indexes
-for x86_64 and aarch64. The coordinator uses only the standard library and requires
+`python3=3.14.10-r1` package, confirmed in the official Alpine 3.24 main indexes
+for x86_64 and aarch64 on 2026-11-03. It is installed with `--upgrade` so its
+transitive minimums (for example `libexpat>=2.9.0`) can lift older base-image
+libraries. The coordinator uses only the standard library and requires
 Python 3.11 or newer; it does not import the application.
 
 The official CLI base avoids separately downloading and maintaining a static

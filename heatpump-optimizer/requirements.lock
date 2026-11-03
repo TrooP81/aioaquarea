@@ -1,6 +1,6 @@
 # Legacy resolver record. The portable, consumed lock is constraints.txt.
 # Do not use this file for installation or regeneration.
-aioaquarea @ git+https://github.com/TrooP81/aioaquarea.git@d8d53fffd06495fa05569157aba8538367222583
+aioaquarea @ git+https://github.com/TrooP81/aioaquarea.git@5e0c227b6d1b3a3150d51976dcf1c3ce2c09d353
     # via
     #   heatpump-optimizer
     #   heatpump-optimizer (pyproject.toml)

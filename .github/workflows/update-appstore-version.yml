@@ -1,4 +1,4 @@
-name: Update App Store App Version
+name: Update Android App Version
 
 on:
   schedule:
@@ -12,102 +12,119 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Get App Store version
-        id: appstore
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install library
+        run: python -m pip install .
+
+      - name: Get Google Play Android version
+        id: android
+        # Same fixed source, bounded lookup and fail-closed parser as the SDK
+        # (aioaquarea/_android_version.py). On any lookup failure this step
+        # fails, so no later step edits files or opens a pull request. Only
+        # the validated version or a sanitized reason is printed; the page
+        # content is never logged.
         run: |
-          APP_ID="1348640525"
-          
-          # Call iTunes Lookup API
-          RESPONSE=$(curl -s "https://itunes.apple.com/lookup?id=$APP_ID")
-          
-          # Extract version using jq
-          VERSION=$(echo "$RESPONSE" | jq -r '.results[0].version')
-          
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "Error: version not found"
-            echo "Response: $RESPONSE"
+          set -euo pipefail
+          VERSION="$(python -m aioaquarea._android_version)"
+          if ! [[ "$VERSION" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || [[ "$VERSION" =~ ^0+\.0+\.0+$ ]]; then
+            echo "Error: lookup returned an unsupported version format"
             exit 1
           fi
-          
-          echo "Version found: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          # Also get app name for logging
-          APP_NAME=$(echo "$RESPONSE" | jq -r '.results[0].trackName')
-          echo "App: $APP_NAME"
-      
+          echo "Validated Android version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Check current version in const.py
         id: check
+        env:
+          NEW_VERSION: ${{ steps.android.outputs.version }}
         run: |
+          set -euo pipefail
           CURRENT_VERSION=$(grep "DEFAULT_X_APP_VERSION" aioaquarea/const.py | grep -oP '"\K[^"]+')
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          echo "Current version in code: $CURRENT_VERSION"
-          echo "Version on App Store: ${{ steps.appstore.outputs.version }}"
-          
-          if [ "$CURRENT_VERSION" = "${{ steps.appstore.outputs.version }}" ]; then
-            echo "needs_update=false" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current diagnostic version in code: $CURRENT_VERSION"
+          echo "Version on Google Play (Android): $NEW_VERSION"
+
+          if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
             echo "Version is already up to date"
           else
-            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
             echo "Update is needed"
           fi
-      
+
       - name: Update const.py
-        if: steps.check.outputs.needs_update == 'true'
+        if: steps.android.outcome == 'success' && steps.check.outputs.needs_update == 'true'
+        env:
+          NEW_VERSION: ${{ steps.android.outputs.version }}
         run: |
-          NEW_VERSION="${{ steps.appstore.outputs.version }}"
-          
-          # Update the line with DEFAULT_X_APP_VERSION
+          set -euo pipefail
+          # DEFAULT_X_APP_VERSION is the DEMO diagnostic baseline only; production
+          # always validates the version from Google Play at runtime.
           sed -i "s/DEFAULT_X_APP_VERSION = \".*\"/DEFAULT_X_APP_VERSION = \"$NEW_VERSION\"/" aioaquarea/const.py
-          
+
           echo "File updated"
-          
+
           # Show changes
           echo "Applied changes:"
           git diff aioaquarea/const.py
-      
+
       - name: Create Pull Request
-        if: steps.check.outputs.needs_update == 'true'
+        if: steps.android.outcome == 'success' && steps.check.outputs.needs_update == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update Panasonic app version to ${{ steps.appstore.outputs.version }}"
-          title: "Update Panasonic ACCsmart app version to ${{ steps.appstore.outputs.version }}"
+          commit-message: "chore: update Panasonic Android app version to ${{ steps.android.outputs.version }}"
+          title: "Update Panasonic ACCsmart Android app version to ${{ steps.android.outputs.version }}"
           body: |
             ## Automatic app version update
-            
-            This PR automatically updates the Panasonic ACCsmart app version from the Apple App Store.
-            
+
+            This PR updates the diagnostic Panasonic ACCsmart Android app version
+            from the public Google Play listing, read with the SDK's own parser.
+
             ### Details
             - **Previous version**: `${{ steps.check.outputs.current_version }}`
-            - **New version**: `${{ steps.appstore.outputs.version }}`
-            - **App ID**: `1348640525`
+            - **New version**: `${{ steps.android.outputs.version }}`
+            - **Package**: `com.panasonic.ACCsmart` (Android, `x-app-type: 1`)
             - **Modified file**: `aioaquarea/const.py`
-            
+
             ### Links
-            - [App on App Store](https://apps.apple.com/app/id1348640525)
-            
+            - [App on Google Play](https://play.google.com/store/apps/details?id=com.panasonic.ACCsmart&hl=en)
+
             ---
             This PR was automatically created by GitHub Actions.
-          branch: update-app-version-${{ steps.appstore.outputs.version }}
+          branch: update-app-version-${{ steps.android.outputs.version }}
           delete-branch: true
           labels: |
             dependencies
             automated
-      
+
       - name: Summary
         if: always()
+        env:
+          LOOKUP_OUTCOME: ${{ steps.android.outcome }}
+          NEW_VERSION: ${{ steps.android.outputs.version }}
+          CURRENT_VERSION: ${{ steps.check.outputs.current_version }}
+          NEEDS_UPDATE: ${{ steps.check.outputs.needs_update }}
         run: |
-          echo "## Execution Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **App ID**: 1348640525" >> $GITHUB_STEP_SUMMARY
-          echo "- **App Store Version**: ${{ steps.appstore.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Current Version**: ${{ steps.check.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Update Needed**: ${{ steps.check.outputs.needs_update }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Execution Summary"
+            echo ""
+            echo "- **Source**: Google Play \`com.panasonic.ACCsmart\` (Android)"
+            echo "- **Lookup outcome**: ${LOOKUP_OUTCOME}"
+            echo "- **Google Play Version**: ${NEW_VERSION}"
+            echo "- **Current Version**: ${CURRENT_VERSION}"
+            echo "- **Update Needed**: ${NEEDS_UPDATE}"
+          } >> "$GITHUB_STEP_SUMMARY"

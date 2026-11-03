@@ -33,7 +33,7 @@ def api_client():
     settings = PanasonicSettings()
     settings.access_token = "access-token"
     app_version = CCAppVersion()
-    app_version.version = "1.2.3"
+    app_version.inject_validated("1.2.3")
     return AquareaAPIClient(
         session=session,
         settings=settings,

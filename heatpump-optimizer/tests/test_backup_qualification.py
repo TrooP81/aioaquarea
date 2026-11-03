@@ -31,7 +31,9 @@ def test_coordinator_base_and_ci_default_are_the_same_immutable_official_image()
     )
     assert workflow["jobs"]["backend-e2e"]["env"]["RESTORE_COORDINATOR_BASE_IMAGE"] == base
     assert "FROM ${RESTORE_COORDINATOR_BASE_IMAGE}" in dockerfile
-    assert re.search(r"^RUN apk add --no-cache python3=\d+\.\d+\.\d+-r\d+$", dockerfile, re.M)
+    assert re.search(
+        r"^RUN apk add --no-cache --upgrade python3=\d+\.\d+\.\d+-r\d+$", dockerfile, re.M
+    )
     assert 'ENTRYPOINT ["python3", "/drill/restore_drill.py"]' in dockerfile
 
 

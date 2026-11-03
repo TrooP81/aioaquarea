@@ -3,7 +3,6 @@ import datetime as dt
 import hashlib
 import json
 import logging
-import re
 import secrets
 import string
 import time
@@ -12,6 +11,7 @@ import urllib.parse
 import aiohttp
 from bs4 import BeautifulSoup
 
+from . import _android_version
 from .const import (
     APP_CLIENT_ID,
     AUTH_0_CLIENT,
@@ -46,46 +46,93 @@ class PanasonicSettings:
 
 
 class CCAppVersion:
-    def __init__(self):
-        self.version = DEFAULT_X_APP_VERSION  # Default version
-        self._initialized = False
+    """Android app version sent as ``x-app-version`` with ``x-app-type: 1``.
+
+    PRODUCTION only uses a version validated from the public Google Play
+    listing (or injected through the same validator); there is no default,
+    stale or iOS fallback. ``refresh()`` invalidates the usable state before
+    fetching, so failures and cancellation leave no usable version.
+
+    DEMO performs no external lookup and keeps the pre-change diagnostic
+    baseline ``DEFAULT_X_APP_VERSION``; production can never select it.
+    """
+
+    def __init__(self, environment: AquareaEnvironment = AquareaEnvironment.PRODUCTION):
+        environment = AquareaEnvironment(environment)
+        self._environment = environment
+        self._generation = 0
+        if environment is AquareaEnvironment.DEMO:
+            self.version: str | None = DEFAULT_X_APP_VERSION
+            self._validated = True
+        else:
+            self.version = None
+            self._validated = False
+
+    @property
+    def is_validated(self) -> bool:
+        """Return True when a usable version is available."""
+        return self._validated
+
+    def _invalidate(self) -> int:
+        self._generation += 1
+        if self._environment is not AquareaEnvironment.DEMO:
+            self.version = None
+            self._validated = False
+        return self._generation
+
+    def inject_validated(self, version: str) -> None:
+        """Use an already looked-up version after re-validating its format."""
+        if self._environment is AquareaEnvironment.DEMO:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Validated Android app versions are only used in production.",
+            )
+        generation = self._invalidate()
+        try:
+            value = _android_version.validate_version(version)
+        except _android_version.AndroidVersionLookupError:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Android app version failed validation.",
+            ) from None
+        if generation == self._generation:
+            self.version = value
+            self._validated = True
 
     async def init(self):
-        if not self._initialized:
-            self._initialized = await self.refresh()
-
-    async def refresh(self):
-        # Fetch the latest app version from App Store
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://apps.apple.com/de/app/panasonic-comfort-cloud/id1348640525"
-                ) as response:
-                    if response.status == 200:
-                        html_content = await response.text()
-                        # Look for version pattern in the HTML
-                        version_match = re.search(
-                            r"Version\s+(\d+\.\d+\.\d+)", html_content
-                        )
-                        if version_match:
-                            new_version = version_match.group(1)
-                            _LOGGER.debug(f"Found new app version: {new_version}")
-                            self.version = new_version
-                        else:
-                            _LOGGER.warning(
-                                f"Could not parse version from App Store page, keeping current version: {self.version}"
-                            )
-                        return True
-                    _LOGGER.error(
-                        f"Failed to fetch App Store page: {response.status}, keeping current version: {self.version}"
-                    )
-        except Exception as e:
-            _LOGGER.error(
-                f"Error fetching app version: {e}, keeping current version: {self.version}"
+        """Ensure a usable version, raising ``AuthenticationError`` otherwise."""
+        if self._validated:
+            return
+        if not await self.refresh():
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Could not validate the Android app version from Google Play.",
             )
-        return False
 
-    async def get(self):
+    async def refresh(self) -> bool:
+        """Re-validate the Android version; return True only on success."""
+        if self._environment is AquareaEnvironment.DEMO:
+            return True
+        generation = self._invalidate()
+        try:
+            version = await _android_version.fetch_android_app_version()
+        except _android_version.AndroidVersionLookupError as err:
+            _LOGGER.warning("Android app version lookup failed: %s", err.reason)
+            return False
+        if generation != self._generation:
+            # A newer refresh or injection superseded this lookup.
+            return False
+        self.version = version
+        self._validated = True
+        _LOGGER.debug("Validated Android app version: %s", version)
+        return True
+
+    async def get(self) -> str:
+        if not self._validated or self.version is None:
+            raise AuthenticationError(
+                AuthenticationErrorCodes.API_ERROR,
+                "Android app version has not been validated.",
+            )
         return self.version
 
 
@@ -552,7 +599,12 @@ class Authenticator:
         )
         if await has_new_version_been_published(response):
             self._logger.info("New version of acc client id has been published")
-            await self._app_version.refresh()
+            response.release()
+            if not await self._app_version.refresh():
+                raise AuthenticationError(
+                    AuthenticationErrorCodes.API_ERROR,
+                    "Android app version refresh failed after a version rejection.",
+                )
             response = await self._sess.post(
                 f"{BASE_PATH_ACC}/auth/v2/login",
                 headers=await PanasonicRequestHeader.get(
