@@ -26,6 +26,13 @@ INVALID_TEMPERATURE = 126
 
 DEFAULT_X_APP_VERSION = "4.4.0"
 
+# Public Google Play listing of the Android app whose OAuth identity and
+# ``x-app-type: 1`` the SDK uses; the source of the validated app version.
+ANDROID_APP_PACKAGE = "com.panasonic.ACCsmart"
+ANDROID_APP_VERSION_URL = (
+    f"https://play.google.com/store/apps/details?id={ANDROID_APP_PACKAGE}&hl=en"
+)
+
 MAX_VERSION_AGE = 2
 
 SETTING_ACCESS_TOKEN = "access_token"

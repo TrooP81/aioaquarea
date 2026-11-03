@@ -92,7 +92,7 @@ class AquareaClient:  # Renamed Client to AquareaClient
             device_direct if environment == AquareaEnvironment.PRODUCTION else False
         )
         self._settings = PanasonicSettings()
-        self._app_version = CCAppVersion()
+        self._app_version = CCAppVersion(environment)
         self._authenticator = Authenticator(
             self._sess,
             self._settings,

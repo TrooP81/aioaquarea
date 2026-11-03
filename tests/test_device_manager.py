@@ -67,6 +67,12 @@ def device_info():
     )
 
 
+def _validated_app_version() -> CCAppVersion:
+    app_version = CCAppVersion()
+    app_version.inject_validated("1.2.3")
+    return app_version
+
+
 @pytest.fixture
 def device_manager():
     settings = PanasonicSettings()
@@ -75,7 +81,7 @@ def device_manager():
     return DeviceManager(
         client=client,
         settings=settings,
-        app_version=CCAppVersion(),
+        app_version=_validated_app_version(),
         logger=SimpleNamespace(
             info=lambda *args, **kwargs: None,
             warning=lambda *args, **kwargs: None,

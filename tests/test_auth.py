@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from aioaquarea import _android_version
+from aioaquarea._android_version import AndroidVersionLookupError
 from aioaquarea.auth import (
     Authenticator,
     CCAppVersion,
@@ -16,6 +18,12 @@ from aioaquarea.auth import (
 )
 from aioaquarea.const import AquareaEnvironment
 from aioaquarea.errors import AuthenticationError, AuthenticationErrorCodes
+
+
+def _validated_app_version(version="5.1.0"):
+    app_version = CCAppVersion()
+    app_version.inject_validated(version)
+    return app_version
 
 
 class DummyResponse:
@@ -58,7 +66,7 @@ async def test_panasonic_request_header_includes_expected_fields():
     settings.access_token = "token-123"
     settings.clientId = "client-abc"
     app_version = CCAppVersion()
-    app_version.version = "9.9.9"
+    app_version.inject_validated("9.9.9")
 
     headers = await PanasonicRequestHeader.get(settings, app_version)
 
@@ -69,15 +77,19 @@ async def test_panasonic_request_header_includes_expected_fields():
 
 
 @pytest.mark.asyncio
-async def test_app_version_init_retries_failures_then_caches_success():
+async def test_app_version_init_retries_failures_then_caches_success(monkeypatch):
+    fetch = AsyncMock(side_effect=[AndroidVersionLookupError("timeout"), "5.1.0"])
+    monkeypatch.setattr(_android_version, "fetch_android_app_version", fetch)
     app_version = CCAppVersion()
-    app_version.refresh = AsyncMock(side_effect=[False, True])
 
-    await app_version.init()
+    with pytest.raises(AuthenticationError) as exc:
+        await app_version.init()
+    assert exc.value.error_code == AuthenticationErrorCodes.API_ERROR
     await app_version.init()
     await app_version.init()
 
-    assert app_version.refresh.await_count == 2
+    assert fetch.await_count == 2
+    assert await app_version.get() == "5.1.0"
 
 
 def test_generate_random_string_uses_requested_length():
@@ -244,7 +256,7 @@ async def test_retrieve_client_acc_rejects_missing_client_id():
     authenticator = Authenticator(
         session,
         settings,
-        CCAppVersion(),
+        _validated_app_version(),
         AquareaEnvironment.PRODUCTION,
         logging.getLogger(__name__),
     )
@@ -265,7 +277,7 @@ async def test_retrieve_client_acc_rejects_malformed_json(payload):
     authenticator = Authenticator(
         session,
         settings,
-        CCAppVersion(),
+        _validated_app_version(),
         AquareaEnvironment.PRODUCTION,
         logging.getLogger(__name__),
     )
