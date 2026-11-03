@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.api.schemas import OverrideCreate, PlanDetailResponse, PlanResponse
 from packages.core.database import get_session
 from packages.core.models import (
     AuditLogRecord,
     DeviceStatusRecord,
+    HouseContractRevisionRecord,
     OptimizationRequestRecord,
     OverrideRecord,
     PlanActionRecord,
@@ -51,10 +55,88 @@ def _json_object(value: str | None) -> dict[str, object]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def _captured_plan_measurement_scope(
+    plan: PlanRecord, snapshot: dict[str, object]
+) -> tuple[float, float, str] | None:
+    """Return only validated comfort inputs captured with a revisioned plan."""
+    from packages.core.house_contract import validate_plan_contract_snapshot
+
+    if getattr(plan, "contract_state", None) not in {"current", "stale"}:
+        return None
+    if (
+        type(getattr(plan, "contract_revision_id", None)) is not int
+        or plan.contract_revision_id <= 0
+        or not validate_plan_contract_snapshot(plan, snapshot)
+    ):
+        return None
+    minimum = snapshot.get("comfort_temp_min")
+    target = snapshot.get("comfort_temp_target")
+    maximum = snapshot.get("comfort_temp_max")
+    timezone_name = snapshot.get("timezone")
+    temperatures = (minimum, target, maximum)
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in temperatures
+    ):
+        return None
+    if not (10 <= minimum <= target <= maximum <= 30):
+        return None
+    if not isinstance(timezone_name, str) or not timezone_name:
+        return None
+    try:
+        ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    return float(minimum), float(maximum), timezone_name
+
+
+def _unknown_historical_measurement(
+    *, corrupt: bool = False, snapshot: object = None
+) -> dict[str, object]:
+    from packages.core.comfort_schedule import timezone_data_version
+
+    reason = "historical_contract_corrupt" if corrupt else "historical_contract_unavailable"
+    snapshot_state = "corrupt" if corrupt else "unknown"
+    if (
+        isinstance(snapshot, dict)
+        and isinstance(snapshot.get("tzdata_version"), str)
+        and snapshot["tzdata_version"] != timezone_data_version()
+    ):
+        reason = "historical_timezone_data_unavailable"
+        snapshot_state = "timezone_data_unavailable"
+    return {
+        "state": "unknown",
+        "contract_snapshot_state": snapshot_state,
+        "reason": reason,
+        "comfort": {"status": "unknown", "reason": reason},
+        "cost": {"status": "unknown", "reason": reason},
+        "weather_matched_comparison": {
+            "status": "unknown",
+            "reason": reason,
+        },
+    }
+
+
+async def _current_contract_for_history(
+    session: AsyncSession,
+) -> HouseContractRevisionRecord | None:
+    from packages.core.house_contract import ContractSettingsMismatch, ensure_current_contract
+
+    try:
+        return await ensure_current_contract(session)
+    except ContractSettingsMismatch:
+        # History can use saved evidence without qualifying a current revision.
+        return None
+
+
 @router.get("/api/plans", response_model=list[PlanResponse])
 async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bool = False):
     """Get recent optimizer plans."""
     async with get_session() as session:
+        from packages.core.house_contract import plan_matches_current_revision
+
+        current_contract = await _current_contract_for_history(session)
+        now = dt.datetime.now(dt.timezone.utc)
         count_subq = (
             select(
                 PlanActionRecord.plan_id,
@@ -78,6 +160,8 @@ async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bo
         for p, count in result.all():
             if not include_diagnostics and p.status == DIAGNOSTIC_PLAN_STATUS:
                 continue
+            saved_contract = _json_object(p.plan_json).get("house_contract_snapshot")
+            snapshot_valid = _captured_plan_measurement_scope(p, saved_contract) is not None
             responses.append(
                 PlanResponse(
                     id=p.id,
@@ -93,6 +177,28 @@ async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bo
                     status_reason=p.status_reason,
                     superseded_at=p.superseded_at,
                     superseded_by_plan_id=p.superseded_by_plan_id,
+                    contract_revision_id=p.contract_revision_id,
+                    contract_hash=p.contract_hash,
+                    contract_state=p.contract_state or "legacy_unknown",
+                    contract_snapshot_state=(
+                        "valid"
+                        if snapshot_valid
+                        else _unknown_historical_measurement(snapshot=saved_contract)[
+                            "contract_snapshot_state"
+                        ]
+                    ),
+                    contract_invalidated_at=p.contract_invalidated_at,
+                    invalidated_by_revision_id=p.invalidated_by_revision_id,
+                    contract_invalidation_reason=p.contract_invalidation_reason,
+                    is_current=(
+                        p.status == DIAGNOSTIC_PLAN_STATUS
+                        and current_contract is not None
+                        and snapshot_valid
+                        and p.horizon_start <= now < p.horizon_end
+                        and plan_matches_current_revision(p, current_contract)
+                    ),
+                    eligible_for_current_presentation=False,
+                    ordinary_writes_allowed=False,
                 )
             )
     return responses
@@ -102,6 +208,9 @@ async def get_plans(limit: int = Query(10, ge=1, le=50), include_diagnostics: bo
 async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
     """Get plan details with actions."""
     async with get_session() as session:
+        from packages.core.house_contract import plan_matches_current_revision
+
+        current_contract = await _current_contract_for_history(session)
         query = select(PlanRecord).where(PlanRecord.id == plan_id)
         if not include_diagnostics:
             query = query.where(PlanRecord.status != DIAGNOSTIC_PLAN_STATUS)
@@ -110,9 +219,26 @@ async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
         if not plan or (plan.status == DIAGNOSTIC_PLAN_STATUS and not include_diagnostics):
             raise HTTPException(status_code=404, detail="Plan not found")
 
+        plan_data = _json_object(plan.plan_json)
+        snapshot_present = "house_contract_snapshot" in plan_data
+        raw_house_contract_snapshot = plan_data.get("house_contract_snapshot")
+        house_contract_snapshot = raw_house_contract_snapshot
+        if not isinstance(house_contract_snapshot, dict):
+            house_contract_snapshot = {}
+
         if plan.status == DIAGNOSTIC_PLAN_STATUS:
             actions = []
-            outcome = {"status": "diagnostic", "execution_allowed": False}
+            if _captured_plan_measurement_scope(plan, house_contract_snapshot) is None:
+                outcome = _unknown_historical_measurement(
+                    corrupt=snapshot_present, snapshot=house_contract_snapshot
+                )
+                outcome["execution_allowed"] = False
+            else:
+                outcome = {
+                    "status": "diagnostic",
+                    "execution_allowed": False,
+                    "contract_snapshot_state": "valid",
+                }
         else:
             actions_result = await session.execute(
                 select(PlanActionRecord)
@@ -120,19 +246,32 @@ async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
                 .order_by(PlanActionRecord.scheduled_ts)
             )
             actions = actions_result.scalars().all()
-            from packages.core.settings_service import get_float_setting, get_user_tz
+            measurement_scope = _captured_plan_measurement_scope(plan, house_contract_snapshot)
+            if measurement_scope is None:
+                outcome = _unknown_historical_measurement(
+                    corrupt=snapshot_present, snapshot=house_contract_snapshot
+                )
+            else:
+                comfort_min_c, comfort_max_c, timezone_name = measurement_scope
+                outcome = await plan_measurement(
+                    session,
+                    plan=plan,
+                    price_area="",
+                    comfort_min_c=comfort_min_c,
+                    comfort_max_c=comfort_max_c,
+                    timezone_name=timezone_name,
+                )
+                outcome["contract_snapshot_state"] = "valid"
 
-            outcome = await plan_measurement(
-                session,
-                plan=plan,
-                price_area="",
-                comfort_min_c=await get_float_setting("comfort_temp_min"),
-                comfort_max_c=await get_float_setting("comfort_temp_max"),
-                timezone_name=await get_user_tz(),
-            )
-
-    plan_data = _json_object(plan.plan_json)
     provenance = _json_object(plan.input_provenance_json)
+    now = dt.datetime.now(dt.timezone.utc)
+    is_current = (
+        plan.status == DIAGNOSTIC_PLAN_STATUS
+        and current_contract is not None
+        and _captured_plan_measurement_scope(plan, house_contract_snapshot) is not None
+        and plan.horizon_start <= now < plan.horizon_end
+        and plan_matches_current_revision(plan, current_contract)
+    )
     statuses: dict[str, int] = {}
     lateness_values = []
     for action in actions:
@@ -172,9 +311,26 @@ async def get_plan_detail(plan_id: int, include_diagnostics: bool = False):
         status_reason=plan.status_reason,
         superseded_at=plan.superseded_at,
         superseded_by_plan_id=plan.superseded_by_plan_id,
+        contract_revision_id=plan.contract_revision_id,
+        contract_hash=plan.contract_hash,
+        contract_state=plan.contract_state or "legacy_unknown",
+        contract_invalidated_at=plan.contract_invalidated_at,
+        invalidated_by_revision_id=plan.invalidated_by_revision_id,
+        contract_invalidation_reason=plan.contract_invalidation_reason,
+        is_current=is_current,
+        eligible_for_current_presentation=False,
+        ordinary_writes_allowed=False,
         outcome=outcome,
         change_summary=_json_object(plan_data.get("change_summary")),
         provenance=provenance,
+        house_contract_snapshot=house_contract_snapshot,
+        contract_snapshot_state=outcome.get("contract_snapshot_state", "unknown"),
+        contract_history_note=(
+            "Current diagnostic settings snapshot; observe-only and never control eligible."
+            if is_current
+            else "Historical diagnostic. Replay uses its saved settings snapshot where available; "
+            "legacy plans without one remain unknown and are not reinterpreted under current settings."
+        ),
         actions=[
             {
                 "id": a.id,
@@ -637,7 +793,14 @@ async def get_optimizer_status():
 async def optimize_now():
     """Queue a durable manual optimization request for the optimizer service."""
     async with get_session() as session:
-        request = OptimizationRequestRecord(requested_by="api")
+        from packages.core.house_contract import ensure_current_contract
+
+        contract = await ensure_current_contract(session)
+        request = OptimizationRequestRecord(
+            requested_by="api",
+            contract_revision_id=contract.id,
+            contract_hash=contract.contract_hash,
+        )
         session.add(request)
         await session.flush()
         request_id = request.id
@@ -662,4 +825,5 @@ async def get_optimization_request(request_id: int):
         "completed_at": request.completed_at,
         "plan_id": request.plan_id,
         "error": request.error,
+        "contract_revision_id": getattr(request, "contract_revision_id", None),
     }

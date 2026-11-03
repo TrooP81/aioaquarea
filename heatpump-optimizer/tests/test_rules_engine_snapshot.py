@@ -33,23 +33,62 @@ from packages.core.space_heating_baseline import (
 from packages.optimizer.rules_engine import RulesOptimizer, minimum_floor_protection_duties
 
 
+async def _owned_forecast_fixture(snapshot, start, *, scheduled=True):
+    from uuid import UUID
+    from packages.core.house_contract import (
+        HousePlanningContract,
+        _contract_hash,
+        snapshot_from_revision,
+    )
+
+    projection = HousePlanningContract.from_settings(
+        {
+            "timezone": "UTC",
+            "comfort_schedule": json.dumps(
+                {
+                    "weekday": list(range(24)) if scheduled else [],
+                    "weekend": list(range(24)) if scheduled else [],
+                }
+            ),
+            "comfort_temp_min": "18",
+            "comfort_temp_target": "20",
+            "comfort_temp_max": "25",
+        },
+        UUID(int=1),
+        UUID(int=2),
+    ).to_projection()
+    revision = SimpleNamespace(
+        id=1,
+        contract_hash=_contract_hash(projection),
+        contract_json=projection,
+        effective_at=start,
+        source="fixture",
+    )
+    end = start + dt.timedelta(hours=len(snapshot["forecast_with_plan"]))
+    authority = await snapshot_from_revision(
+        SimpleNamespace(get=AsyncMock(return_value=revision)), 1, start, end
+    )
+    for row in snapshot["target_schedule"]:
+        row.setdefault("comfort_hour", scheduled)
+    return SimpleNamespace(
+        contract_revision_id=1,
+        contract_hash=revision.contract_hash,
+        horizon_start=start,
+        horizon_end=end,
+        plan_json=json.dumps({"house_contract_snapshot": authority, "forecast_snapshot": snapshot}),
+    )
+
+
 class TestR09SavedForecastValidity:
     @staticmethod
-    def _snapshot():
-        start = dt.datetime(2026, 10, 10, 12, tzinfo=dt.timezone.utc)
-        timestamp = (start + dt.timedelta(hours=1)).isoformat()
-        return start, {
-            "version": "indoor_forecast_v5",
-            "forecast_status": "fallback",
-            "current_indoor": 20.0,
-            "forecast": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
-            "forecast_with_plan": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
-            "forecast_no_heating": [{"ts": timestamp, "predicted_indoor_temp": 20.0}],
-            "target_schedule": [{"ts": timestamp, "target": 20.0}],
-            "weather_forecast": [{"ts": timestamp, "outdoor_temp": 0.0}],
-            "price_forecast": [{"ts": timestamp, "price_eur_per_kwh": -0.2, "price_per_kwh": -0.2}],
-            "forecast_quality": {},
-        }
+    async def _snapshot():
+        from tests.test_forecast_serving_repairs import saved_plan
+
+        plan, authority, snapshot = await saved_plan()
+        snapshot["forecast_quality"] = {}
+        snapshot["weather_forecast"][0]["outdoor_temp"] = 0.0
+        snapshot["price_forecast"][0].update(price_per_kwh=-0.2, price_eur_per_kwh=-0.2)
+        return plan, authority, snapshot
 
     @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
     @pytest.mark.parametrize(
@@ -68,8 +107,8 @@ class TestR09SavedForecastValidity:
             "metadata",
         ],
     )
-    def test_SC058_nonfinite_saved_windows_are_unusable(self, invalid, field):
-        start, snapshot = self._snapshot()
+    async def test_SC058_nonfinite_saved_windows_are_unusable(self, invalid, field):
+        plan, authority, snapshot = await self._snapshot()
         if field in {"forecast", "forecast_with_plan", "forecast_no_heating"}:
             snapshot[field][0]["predicted_indoor_temp"] = invalid
         elif field in {"prediction_lower_c", "prediction_upper_c"}:
@@ -85,11 +124,14 @@ class TestR09SavedForecastValidity:
         else:
             snapshot["price_forecast"][0][field] = invalid
 
-        assert _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1) is None
+        plan.plan_json = json.dumps(
+            {"house_contract_snapshot": authority, "forecast_snapshot": snapshot}
+        )
+        assert _plan_forecast_window(plan, plan.horizon_start, 1) is None
 
     @pytest.mark.parametrize("field", ["prediction", "target", "price"])
-    def test_nonfinite_numeric_strings_are_not_valid_curve_numbers(self, field):
-        start, snapshot = self._snapshot()
+    async def test_nonfinite_numeric_strings_are_not_valid_curve_numbers(self, field):
+        plan, authority, snapshot = await self._snapshot()
         if field == "prediction":
             snapshot["forecast_with_plan"][0]["predicted_indoor_temp"] = "NaN"
         elif field == "target":
@@ -97,11 +139,17 @@ class TestR09SavedForecastValidity:
         else:
             snapshot["price_forecast"][0]["price_eur_per_kwh"] = "NaN"
 
-        assert _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1) is None
+        plan.plan_json = json.dumps(
+            {"house_contract_snapshot": authority, "forecast_snapshot": snapshot}
+        )
+        assert _plan_forecast_window(plan, plan.horizon_start, 1) is None
 
-    def test_zero_outdoor_and_negative_prices_remain_valid(self):
-        start, snapshot = self._snapshot()
-        result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    async def test_zero_outdoor_and_negative_prices_remain_valid(self):
+        plan, authority, snapshot = await self._snapshot()
+        plan.plan_json = json.dumps(
+            {"house_contract_snapshot": authority, "forecast_snapshot": snapshot}
+        )
+        result = _plan_forecast_window(plan, plan.horizon_start, 1)
         assert result is not None
         assert result["weather_forecast"][0]["outdoor_temp"] == 0.0
         assert result["price_forecast"][0]["price_per_kwh"] == -0.2
@@ -136,6 +184,9 @@ async def test_R09_live_numeric_fault_returns_valid_unavailable_api(monkeypatch,
             scalars=lambda: SimpleNamespace(all=lambda: rows),
         )
 
+    monkeypatch.setattr(
+        "packages.core.settings_service.get_setting", AsyncMock(return_value="open-meteo")
+    )
     model = ThermalModel()
     model.arefresh_if_changed = AsyncMock(return_value=False)
     monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
@@ -146,7 +197,40 @@ async def test_R09_live_numeric_fault_returns_valid_unavailable_api(monkeypatch,
     )
     monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
     monkeypatch.setattr(
-        models_router, "get_session", lambda: _session_context(SimpleNamespace(execute=execute))
+        models_router,
+        "get_session",
+        lambda: _session_context(
+            SimpleNamespace(
+                execute=execute,
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        installation_id="00000000-0000-0000-0000-000000000001",
+                        indoor_dependency_generation=1,
+                    )
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "packages.core.house_contract.ensure_current_contract",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=1,
+                contract_hash="a" * 64,
+                contract_json={
+                    "schema_version": 2,
+                    "installation_id": "00000000-0000-0000-0000-000000000001",
+                    "house_id": "00000000-0000-0000-0000-000000000002",
+                    "timezone": "UTC",
+                    "comfort_schedule": {"weekday": [], "weekend": []},
+                    "comfort_temp_min": 18.0,
+                    "comfort_temp_target": 20.5,
+                    "comfort_temp_max": 25.0,
+                    "timezone_policy": "local-wall-hour-by-utc-half-open-v1",
+                    "tzdata_version": "test-tzdata",
+                },
+            )
+        ),
     )
     monkeypatch.setattr(
         "packages.core.control_temperature.get_control_temperature",
@@ -178,7 +262,7 @@ async def test_R09_live_numeric_fault_returns_valid_unavailable_api(monkeypatch,
 
 
 @pytest.mark.parametrize("version", ["indoor_forecast_v1", "indoor_forecast_v2"])
-def test_legacy_v1_v2_snapshot_read(version):
+async def test_legacy_v1_v2_snapshot_read(version):
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -192,7 +276,7 @@ def test_legacy_v1_v2_snapshot_read(version):
         "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
     }
 
-    result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
     assert result is not None
     assert result["forecast_quality"] == {"status": "legacy"}
@@ -322,7 +406,7 @@ def test_failed_scorecard_uses_fallback_and_never_on_target():
     assert assessment["state"] != "on_target"
 
 
-def test_stored_fallback_snapshot_remains_fallback_and_degraded():
+async def test_stored_fallback_snapshot_remains_fallback_and_degraded():
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -337,7 +421,7 @@ def test_stored_fallback_snapshot_remains_fallback_and_degraded():
         "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
     }
 
-    result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
     assessment = build_comfort_assessment(
         forecast=result["forecast_with_plan"],
         targets=result["target_schedule"],
@@ -369,7 +453,7 @@ def test_live_gate_denial_is_fallback_and_never_on_target():
     assert assessment["state"] != "on_target"
 
 
-def test_legacy_snapshot_returns_legacy_status():
+async def test_legacy_snapshot_returns_legacy_status():
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -383,7 +467,7 @@ def test_legacy_snapshot_returns_legacy_status():
         "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
     }
 
-    result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
     assert result is not None
     assert result["forecast_status"] == "legacy"
@@ -443,6 +527,111 @@ def test_rules_snapshot_uses_target_timestamp_weather():
     assert snapshot["weather_forecast"][0]["ts"] == (start + dt.timedelta(hours=1)).isoformat()
     assert snapshot["weather_forecast"][0]["outdoor_temp"] == 9.0
     assert snapshot["target_schedule"][0]["ts"] == (start + dt.timedelta(hours=1)).isoformat()
+
+
+def test_represented_indoor_predictor_weather_matches_saved_control_slots(monkeypatch):
+    from packages.ml.thermal import thermal_model
+    from packages.core.config import settings
+    from packages.optimizer.represented_strategy import NATIVE_ASSUMPTION, build_represented_plan
+
+    start = dt.datetime(2026, 1, 1, 6, tzinfo=dt.timezone.utc)
+    prices = [(start + dt.timedelta(hours=hour), 0.1) for hour in range(2)]
+    weather = [(timestamp, 5.0) for timestamp, _price in prices]
+    full_weather = [
+        {
+            "ts": start,
+            "temperature": -12.0,
+            "wind_speed": 8.5,
+            "irradiance": 410.0,
+            "precipitation": 1.2,
+            "source": "weather-provider",
+            "forecast_issued_at": start - dt.timedelta(hours=2),
+        },
+        {
+            "ts": start + dt.timedelta(hours=1),
+            "temperature": 18.0,
+            "wind_speed": 2.0,
+            "irradiance": 75.0,
+            "precipitation": 0.0,
+            "source": "weather-provider",
+            "forecast_issued_at": start - dt.timedelta(hours=2),
+        },
+    ]
+    represented_weather = RulesOptimizer._represented_weather_forecast(
+        prices=prices,
+        weather=weather,
+        weather_full=full_weather,
+    )
+    predictor_inputs = []
+
+    def predict(**kwargs):
+        predictor_inputs.append(kwargs["weather_forecast"])
+        return [
+            {"predicted_indoor_temp": kwargs["current_indoor"] + 0.1 * (index + 1)}
+            for index in range(kwargs["hours"])
+        ]
+
+    monkeypatch.setattr(thermal_model, "predict_indoor_controlled_curve", predict)
+    rates = RulesOptimizer._represented_indoor_rates(
+        prices=prices,
+        weather=weather,
+        weather_full=full_weather,
+        current_indoor=20.0,
+        heat_curve=HeatCurveConfig(),
+        use_learned_forecast=False,
+        max_passive_change_c_per_hour=0.5,
+        represented_weather_forecast=represented_weather,
+    )
+
+    assert len(rates) == 2
+    assert len(predictor_inputs) == 2
+    expected = represented_weather
+    for forecast in predictor_inputs:
+        assert forecast == expected
+    end = start + dt.timedelta(hours=2)
+    captured = start - dt.timedelta(minutes=1)
+    power = settings.sh_max_power_kw
+    represented = build_represented_plan(
+        prices=prices,
+        weather=[
+            (dt.datetime.fromisoformat(row["ts"]), row["outdoor_temp"])
+            for row in represented_weather
+        ],
+        represented_weather_forecast=represented_weather,
+        cop_fn=lambda *_args: 3.0,
+        demand_per_hour=[power / 2] * 2,
+        current_tank_temp=55.0,
+        current_indoor_temp=20.0,
+        gate_states=["ALLOWED"] * 2,
+        hardware_tank_ceiling=55.0,
+        context={
+            "device_id": "weather-alignment-device",
+            "observed_at": captured.isoformat(),
+            "captured_at": start.isoformat(),
+            "max_age_seconds": 900,
+            "tank_target_c": 55.0,
+            "force_dhw": 0,
+            "tank_hardware_floor_c": 40.0,
+            "auxiliary_power_kw": 0.0,
+            "native_sh_provenance": {
+                "kind": "explicit_conditional_assumption",
+                "method": NATIVE_ASSUMPTION,
+                "device_id": "weather-alignment-device",
+                "captured_at": start.isoformat(),
+                "horizon_start": start.isoformat(),
+                "horizon_end": end.isoformat(),
+                "maximum_electrical_power_kw": power,
+                "hourly_electrical_kw": [power / 2] * 2,
+            },
+        },
+        indoor_rates=rates,
+        indoor_targets=[18.0] * 2,
+        tank_min_per_hour=[40.0] * 2,
+        indoor_max_temp_setting=25.0,
+        serialized_actions=[],
+    )
+    saved_weather = represented["forecast_snapshot"]["weather_forecast"]
+    assert saved_weather == expected
 
 
 @pytest.mark.parametrize(("source", "fraction"), [("history", 0.8), ("default", 0.35)])
@@ -808,7 +997,7 @@ def test_snapshot_baseline_evaluation_uses_resolved_learning_mode(learning_mode_
     assert snapshot["baseline_evaluation"] == expected
 
 
-def test_private_baseline_curves_are_not_returned_by_plan_forecast_api():
+async def test_private_baseline_curves_are_not_returned_by_plan_forecast_api():
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -826,14 +1015,14 @@ def test_private_baseline_curves_are_not_returned_by_plan_forecast_api():
         ],
         "forecast_no_heating": [point],
         "target_schedule": [{"ts": point["ts"], "target": 20.0}],
-        "weather_forecast": [{"ts": point["ts"], "outdoor_temp": 5.0}],
-        "price_forecast": [{"ts": point["ts"], "price_eur_per_kwh": 0.1}],
+        "weather_forecast": [{"ts": start.isoformat(), "outdoor_temp": 5.0}],
+        "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
         "forecast_with_plan_baseline": [point],
         "forecast_with_plan_zero_baseline": [point],
         "baseline_evaluation": {"eligible": True},
     }
 
-    response = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    response = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
     assert response is not None
     assert response["forecast_with_plan"][0]["baseline_heating_source"] == "default"
@@ -843,7 +1032,7 @@ def test_private_baseline_curves_are_not_returned_by_plan_forecast_api():
 
 
 @pytest.mark.parametrize("version", ["indoor_forecast_v4", "indoor_forecast_v5"])
-def test_v5_snapshot_round_trips_plan_forecast_window(version):
+async def test_v5_snapshot_round_trips_plan_forecast_window(version):
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -854,18 +1043,18 @@ def test_v5_snapshot_round_trips_plan_forecast_window(version):
         "forecast_with_plan": [point],
         "forecast_no_heating": [point],
         "target_schedule": [{"ts": point["ts"], "target": 20.0}],
-        "weather_forecast": [{"ts": point["ts"], "outdoor_temp": 5.0}],
-        "price_forecast": [{"ts": point["ts"], "price_eur_per_kwh": 0.1}],
+        "weather_forecast": [{"ts": start.isoformat(), "outdoor_temp": 5.0}],
+        "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
     }
 
-    result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
     assert result is not None
     assert result["forecast_with_plan"][0]["predicted_indoor_temp"] == 20.0
     assert result["forecast_status"] == "fallback"
 
 
-def test_v5_snapshot_is_nonlegacy_and_exposes_source_metadata():
+async def test_v5_snapshot_is_nonlegacy_and_exposes_source_metadata():
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     point = {"ts": (start + dt.timedelta(hours=1)).isoformat(), "predicted_indoor_temp": 20.0}
     snapshot = {
@@ -883,12 +1072,12 @@ def test_v5_snapshot_is_nonlegacy_and_exposes_source_metadata():
         ],
         "forecast_no_heating": [point],
         "target_schedule": [{"ts": point["ts"], "target": 20.0}],
-        "weather_forecast": [{"ts": point["ts"], "outdoor_temp": 5.0}],
-        "price_forecast": [{"ts": point["ts"], "price_eur_per_kwh": 0.1}],
+        "weather_forecast": [{"ts": start.isoformat(), "outdoor_temp": 5.0}],
+        "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
         "space_heating_baseline": {"effective_mode": "on", "live_baseline_applied": True},
     }
 
-    result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
     assert result is not None
     assert result["forecast_status"] == "available"
@@ -896,7 +1085,7 @@ def test_v5_snapshot_is_nonlegacy_and_exposes_source_metadata():
     assert result["forecast_with_plan"][0]["space_heating_source"] == "baseline"
 
 
-def test_observing_plan_persists_scoreable_shadow_without_changing_live_forecast_or_actions():
+async def test_observing_plan_persists_scoreable_shadow_without_changing_live_forecast_or_actions():
     start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     live = [{"hour": 1, "predicted_indoor_temp": 19.8, "source": "linear_controlled"}]
     shadow = [
@@ -942,7 +1131,11 @@ def test_observing_plan_persists_scoreable_shadow_without_changing_live_forecast
         "segment_kind": "direct",
         "space_heating_fraction": 0.0,
     }
-    response = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+    # This serving fixture supplies verified slot-start weather, not the builder's end-labelled fallback.
+    snapshot["weather_forecast"][0]["ts"] = start.isoformat()
+    response = _plan_forecast_window(
+        await _owned_forecast_fixture(snapshot, start, scheduled=False), start, 1
+    )
     assert response is not None
     assert "shadow_forecast_with_plan" not in response
 
@@ -1381,7 +1574,11 @@ async def test_rules_room_evidence_failure_keeps_non_comfort_actions_and_private
             patch.object(rules_engine, "project_gate_states", return_value=[projection])
         )
         stack.enter_context(
-            patch.object(rules_engine, "get_effective_schedule", new=AsyncMock(return_value={}))
+            patch.object(
+                rules_engine,
+                "get_comfort_schedule",
+                new=AsyncMock(return_value={"weekday": [], "weekend": []}),
+            )
         )
         stack.enter_context(
             patch.object(rules_engine, "get_user_tz", new=AsyncMock(return_value="UTC"))
@@ -1599,7 +1796,11 @@ async def _generate_with_passive_policy(limit, curve, *, gate=None):
             )
         )
         stack.enter_context(
-            patch.object(rules_engine, "get_effective_schedule", new=AsyncMock(return_value={}))
+            patch.object(
+                rules_engine,
+                "get_comfort_schedule",
+                new=AsyncMock(return_value={"weekday": [], "weekend": []}),
+            )
         )
         stack.enter_context(
             patch.object(rules_engine, "get_user_tz", new=AsyncMock(return_value="UTC"))
@@ -2086,7 +2287,7 @@ class TestControlBasisAndForecastContract:
         assert envelope.rooms_above_max == ()
         assert duties == [0.0]
 
-    def test_api_preserves_plan_start_observation_and_declared_sensor_basis(self):
+    async def test_api_preserves_plan_start_observation_and_declared_sensor_basis(self):
         start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         point = {
             "ts": (start + dt.timedelta(hours=1)).isoformat(),
@@ -2105,7 +2306,7 @@ class TestControlBasisAndForecastContract:
             "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
         }
 
-        result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+        result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
         assert result is not None
         assert result["observed_history"][0]["hour"] == 0
@@ -2114,7 +2315,7 @@ class TestControlBasisAndForecastContract:
         assert result["sensor_basis"] == snapshot["sensor_basis"]
         assert result["observed_history"][0]["temperature"] != pytest.approx(25.225)
 
-    def test_api_legacy_snapshot_without_history_remains_usable(self):
+    async def test_api_legacy_snapshot_without_history_remains_usable(self):
         start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         point = {
             "ts": (start + dt.timedelta(hours=1)).isoformat(),
@@ -2131,7 +2332,7 @@ class TestControlBasisAndForecastContract:
             "price_forecast": [{"ts": start.isoformat(), "price_eur_per_kwh": 0.1}],
         }
 
-        result = _plan_forecast_window(json.dumps({"forecast_snapshot": snapshot}), start, 1)
+        result = _plan_forecast_window(await _owned_forecast_fixture(snapshot, start), start, 1)
 
         assert result is not None
         assert result["observed_history"] == []

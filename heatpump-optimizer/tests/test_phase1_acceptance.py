@@ -102,6 +102,13 @@ def _committed_comfort(monkeypatch):
     monkeypatch.setattr(
         "packages.ml.forecast_quality.materialize_native_inputs", AsyncMock(return_value=inputs)
     )
+    from packages.ml import forecast_quality
+
+    monkeypatch.setattr(
+        forecast_quality,
+        "locked_native_scope",
+        lambda *_args, **_kwargs: _context((reference.manifest["scope"], None)),
+    )
     return authority, reference, fitted
 
 
@@ -197,6 +204,11 @@ class TestAC8ArtifactLifecycle:
         refresh = AsyncMock()
         quality = {"ready": False, "reasons": ["credentials_missing"]}
         with (
+            patch.object(
+                optimizer_main,
+                "_freeze_contract_revision",
+                new=AsyncMock(return_value=(7, "a" * 64)),
+            ),
             patch.object(
                 optimizer_main,
                 "_select_optimizer",
@@ -801,6 +813,11 @@ class TestAC10FreshnessSafety:
         # coroutine return values and leaks an unawaited coroutine in validation.
         planner = SimpleNamespace(generate_plan=AsyncMock(return_value=None))
         with (
+            patch.object(
+                optimizer_main,
+                "_freeze_contract_revision",
+                new=AsyncMock(return_value=(7, "a" * 64)),
+            ),
             patch.object(
                 optimizer_main, "_select_optimizer", new=AsyncMock(return_value=("rules", planner))
             ),

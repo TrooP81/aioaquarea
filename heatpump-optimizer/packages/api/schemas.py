@@ -5,7 +5,17 @@ from __future__ import annotations
 import datetime as dt
 from typing import Literal, Optional
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 class ManualCOPRevision(BaseModel):
@@ -209,6 +219,16 @@ class PlanResponse(BaseModel):
     status_reason: Optional[str] = None
     superseded_at: Optional[dt.datetime] = None
     superseded_by_plan_id: Optional[int] = None
+    contract_revision_id: Optional[int] = None
+    contract_hash: Optional[str] = None
+    contract_state: str = "legacy_unknown"
+    contract_snapshot_state: str = "unknown"
+    contract_invalidated_at: Optional[dt.datetime] = None
+    invalidated_by_revision_id: Optional[int] = None
+    contract_invalidation_reason: Optional[str] = None
+    is_current: bool = False
+    eligible_for_current_presentation: bool = False
+    ordinary_writes_allowed: Literal[False] = False
 
 
 class PlanDetailResponse(PlanResponse):
@@ -216,6 +236,8 @@ class PlanDetailResponse(PlanResponse):
     outcome: dict = Field(default_factory=dict)
     change_summary: dict = Field(default_factory=dict)
     provenance: dict = Field(default_factory=dict)
+    house_contract_snapshot: dict = Field(default_factory=dict)
+    contract_history_note: str = ""
 
 
 class PlanActivityResponse(BaseModel):
@@ -336,6 +358,49 @@ class ComfortScheduleUpdate(BaseModel):
     weekend: list[int]
 
 
+class PlanningSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comfort_schedule: dict[str, list[StrictInt]] | None = None
+    comfort_temp_min: StrictFloat | StrictInt | None = None
+    comfort_temp_target: StrictFloat | StrictInt | None = None
+    comfort_temp_max: StrictFloat | StrictInt | None = None
+    timezone: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self):
+        contract_fields = {
+            "comfort_schedule",
+            "comfort_temp_min",
+            "comfort_temp_target",
+            "comfort_temp_max",
+            "timezone",
+        }
+        supplied_fields = self.model_fields_set & contract_fields
+        if not supplied_fields:
+            raise ValueError("at least one planning setting must be supplied")
+        for key in supplied_fields:
+            value = getattr(self, key)
+            if value is None:
+                raise ValueError(f"{key} must not be null")
+            if key.startswith("comfort_temp_"):
+                if isinstance(value, bool) or not 10 <= value <= 30:
+                    raise ValueError(f"{key} must be between 10 and 30 °C")
+        return self
+
+
+class PlanningSettingsPreviewRequest(PlanningSettingsPatch):
+    horizon_start: AwareDatetime
+    horizon_end: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_preview_horizon(self):
+        duration = self.horizon_end - self.horizon_start
+        if duration.total_seconds() <= 0 or duration.total_seconds() > 7 * 24 * 3600:
+            raise ValueError("preview horizon must be positive and no longer than seven days")
+        return self
+
+
 class IndoorTempResponse(BaseModel):
     id: int
     timestamp: dt.datetime
@@ -365,6 +430,10 @@ class IndoorForecastPointResponse(BaseModel):
     hour: int
     predicted_indoor_temp: float
     ts: dt.datetime | None = None
+    interval_start_utc: dt.datetime | None = None
+    interval_end_utc: dt.datetime | None = None
+    control_sampling_policy: str | None = None
+    control_target_c: float | None = None
     source: str | None = None
     model_source: str | None = None
     space_heating_fraction: float | None = Field(default=None, ge=0, le=1)
@@ -381,6 +450,24 @@ class IndoorForecastTargetResponse(BaseModel):
     ts: dt.datetime | None = None
     target: float
     comfort_hour: bool
+    interval_start_utc: dt.datetime | None = None
+    interval_end_utc: dt.datetime | None = None
+    local_start: str | None = None
+    local_end: str | None = None
+    local_date: str | None = None
+    local_hour: int | None = None
+    utc_offset_minutes: int | None = None
+    fold: int | None = None
+    preferred_comfort: bool | None = None
+    outer_min_c: float | None = None
+    outer_max_c: float | None = None
+    reason: str | None = None
+    contract_revision_id: int | None = None
+    contract_hash: str | None = None
+    policy_dependency_fingerprint: str | None = None
+    resolver_schema: str | None = None
+    timezone_policy: str | None = None
+    tzdata_version: str | None = None
 
 
 class IndoorForecastWeatherResponse(BaseModel):
@@ -433,6 +520,10 @@ class IndoorForecastResponse(BaseModel):
     plan_created_at: dt.datetime | None = None
     comfort_assessment: dict = Field(default_factory=dict)
     forecast_provenance: dict = Field(default_factory=dict)
+    contract_revision_id: int | None = None
+    contract_hash: str | None = None
+    contract_state: str = "unknown"
+    ordinary_writes_allowed: Literal[False] = False
     display_status: str = "fresh"
     plan_age_seconds: int | None = None
     sensor_age_seconds: int | None = None

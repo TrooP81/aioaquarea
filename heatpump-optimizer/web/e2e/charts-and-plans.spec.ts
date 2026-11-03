@@ -203,6 +203,86 @@ test.describe("Price Chart", () => {
     await expect(page.getByRole("button", { name: "Show hot water" })).toBeVisible();
   });
 
+  test("aligns timestamp-only saved-plan forecasts to control slots", async ({ page }) => {
+    await page.route("**/api/thermal/indoor-forecast*", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...mockIndoorForecast,
+        forecast_with_plan: [
+          { hour: 3, ts: "2026-10-19T00:10:00+00:00", predicted_indoor_temp: 20.0 },
+          { hour: 4, ts: "2026-10-19T01:10:00+00:00", predicted_indoor_temp: 20.1 },
+        ],
+        forecast_no_heating: [
+          { hour: 3, ts: "2026-10-19T00:10:00+00:00", predicted_indoor_temp: 19.7 },
+          { hour: 4, ts: "2026-10-19T01:10:00+00:00", predicted_indoor_temp: 19.4 },
+        ],
+        target_schedule: [
+          {
+            hour: 1,
+            ts: "2026-10-18T23:10:00Z",
+            interval_start_utc: "2026-10-18T22:40:00Z",
+            interval_end_utc: "2026-10-18T23:10:00Z",
+            target: 20.05,
+            comfort_hour: false,
+          },
+          {
+            hour: 2,
+            ts: "2026-10-18T23:40:00Z",
+            interval_start_utc: "2026-10-18T23:10:00Z",
+            interval_end_utc: "2026-10-18T23:40:00Z",
+            target: 20.05,
+            comfort_hour: false,
+          },
+          {
+            hour: 3,
+            ts: "2026-10-19T00:10:00Z",
+            interval_start_utc: "2026-10-18T23:40:00Z",
+            interval_end_utc: "2026-10-19T00:10:00Z",
+            target: 20.55,
+            comfort_hour: true,
+          },
+          {
+            hour: 4,
+            ts: "2026-10-19T01:10:00Z",
+            interval_start_utc: "2026-10-19T00:10:00Z",
+            interval_end_utc: "2026-10-19T01:10:00Z",
+            target: 20.55,
+            comfort_hour: true,
+          },
+        ],
+        weather_forecast: [
+          { ts: "2026-10-18T23:10:00+00:00", outdoor_temp: 5 },
+          { ts: "2026-10-19T00:10:00+00:00", outdoor_temp: 99 },
+        ],
+        price_forecast: [
+          { ts: "2026-10-18T23:10:00+00:00", price_eur_per_kwh: 0.08 },
+          { ts: "2026-10-19T00:10:00+00:00", price_eur_per_kwh: 0.99 },
+        ],
+      }),
+    }));
+    await page.route("**/api/currency", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh",
+      }),
+    }));
+    await page.goto("/?view=under-the-hood");
+    const chart = page.getByRole("region", { name: "Indoor comfort, weather and price forecast" });
+    const surface = chart.locator(".recharts-surface").first();
+    await expect(surface).toBeVisible();
+    const bounds = await surface.boundingBox();
+    expect(bounds).not.toBeNull();
+    await page.mouse.move(bounds!.x + bounds!.width * 0.35, bounds!.y + bounds!.height * 0.5);
+    const tooltip = chart.locator(".recharts-tooltip-wrapper");
+    await expect(tooltip).toContainText("20.05");
+    await expect(tooltip).not.toContainText("20.55");
+    await expect(tooltip.locator(".recharts-tooltip-item").filter({ hasText: "Outdoor" }))
+      .toContainText("5");
+    await expect(tooltip.locator(".recharts-tooltip-item").filter({ hasText: "Price" }))
+      .toContainText("8");
+    await expect(tooltip).toContainText("19.7");
+  });
+
   test("marks now and explains the price history and forecast window", async ({ page }) => {
     const pageErrors: Error[] = [];
     page.on("pageerror", (error) => pageErrors.push(error));

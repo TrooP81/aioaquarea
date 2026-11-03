@@ -107,7 +107,17 @@ async function manualLedger(page: Page, initialRows = [] as ReturnType<typeof ma
         getCount: 0,
     };
     await page.route("**/api/settings", async (route) => {
-        const body = route.request().postDataJSON();
+        const request = route.request();
+        if (request.method() === "GET") {
+            return route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                headers: { ETag: '"7"', "X-Contract-Revision": "7" },
+                body: JSON.stringify({}),
+            });
+        }
+        if (request.method() !== "PUT") return route.fallback();
+        const body = request.postDataJSON();
         state.settings.push(body);
         state.enabled = body.settings.manual_cop_monitoring_enabled === "true";
         return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });

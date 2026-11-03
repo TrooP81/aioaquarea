@@ -50,7 +50,7 @@ class RestoreStack:
             "RESTORE_PRODUCTION_TEST_BACKUP_DIR": backup_dir.as_posix(),
             "RESTORE_SOURCE_IMAGE": PINNED_IMAGE,
             "RESTORE_SOURCE_TIMESCALE_VERSION": "2.26.4",
-            "RESTORE_EXPECTED_REVISION": "037",
+            "RESTORE_EXPECTED_REVISION": "039",
             "RESTORE_REQUIRED_ROLES": "heatpump",
             "RESTORE_DISPOSABLE": "true",
             "RESTORE_ISOLATED_PROJECT": self.project,
@@ -228,7 +228,7 @@ def _seed(stack: RestoreStack, database: str, sentinel: str) -> None:
         f"""
         SET ROLE heatpump;
         CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY);
-        INSERT INTO alembic_version VALUES ('037');
+        INSERT INTO alembic_version VALUES ('039');
         CREATE TABLE plans (id integer PRIMARY KEY);
         INSERT INTO plans VALUES (1);
         CREATE TABLE restore_sentinel (value text);
@@ -291,7 +291,7 @@ def synthetic_archive(stack: RestoreStack) -> Path:
 
 
 def _assert_restored(stack: RestoreStack, database: str) -> None:
-    assert stack.sql(database, "SELECT version_num FROM alembic_version") == "037"
+    assert stack.sql(database, "SELECT version_num FROM alembic_version") == "039"
     assert stack.sql(database, "SELECT value FROM restore_sentinel") == "archive"
     assert stack.sql(database, "SHOW timescaledb.restoring") == "off"
     assert stack.sql(database, "SELECT count(*) FROM timescaledb_information.hypertables") == "4"

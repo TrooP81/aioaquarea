@@ -182,6 +182,13 @@ class TestComfortArtifactRefresh:
         )
         authority.load_committed.return_value = payload
         monkeypatch.setattr("packages.ml.comfort_model.MODEL_DIR", tmp_path)
+        from packages.ml import forecast_quality
+
+        monkeypatch.setattr(
+            forecast_quality,
+            "locked_native_scope",
+            lambda *_args, **_kwargs: _AsyncContextManager((reference.manifest["scope"], None)),
+        )
         legacy_load = MagicMock(side_effect=AssertionError("directory adoption"))
         monkeypatch.setattr("packages.ml.safe_persistence.safe_load", legacy_load)
         good_path = tmp_path / "comfort_model_weather_delta_v7_window_heat_1.pkl"

@@ -12,8 +12,11 @@ import { Banner } from "./Banner";
 interface ForecastPoint {
   hour: number;
   ts?: string;
+  interval_start_utc?: string;
+  interval_end_utc?: string;
   predicted_indoor_temp?: number | null;
   target?: number | null;
+  control_target_c?: number | null;
 }
 
 interface ComfortForecast {
@@ -25,6 +28,43 @@ interface ComfortForecast {
   target_schedule: ForecastPoint[];
   weather_forecast?: Array<{ ts: string; outdoor_temp?: number | null }>;
   price_forecast?: Array<{ ts: string; price_eur_per_kwh?: number | null }>;
+}
+
+function intervalStart(point: ForecastPoint): string | undefined {
+  if (point.interval_start_utc) return point.interval_start_utc;
+  if (!point.ts) return undefined;
+  const end = Date.parse(point.ts);
+  return Number.isFinite(end) ? new Date(end - 3_600_000).toISOString() : undefined;
+}
+
+function sameInstant(left: string, right: string): boolean {
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  return Number.isFinite(leftMs) && leftMs === rightMs;
+}
+
+function targetAtControlStart(
+  schedule: ForecastPoint[],
+  point: ForecastPoint,
+  start: string | undefined,
+): number | undefined {
+  if (typeof point.control_target_c === "number") return point.control_target_c;
+  if (typeof point.target === "number") return point.target;
+  if (start) {
+    const instant = Date.parse(start);
+    const interval = schedule.find((candidate) => {
+      if (!candidate.interval_start_utc || !candidate.interval_end_utc) return false;
+      return Date.parse(candidate.interval_start_utc) <= instant
+        && instant < Date.parse(candidate.interval_end_utc);
+    });
+    if (interval) return interval.target ?? undefined;
+  }
+  if (!point.interval_start_utc && !point.interval_end_utc) {
+    const target = schedule.find((candidate) => candidate.ts === point.ts)?.target
+      ?? schedule.find((candidate) => candidate.hour === point.hour)?.target;
+    return typeof target === "number" ? target : undefined;
+  }
+  return undefined;
 }
 
 /** The combined view uses the same persisted forecast as the detailed charts. */
@@ -57,15 +97,31 @@ export function ComfortImpactChart() {
   }, [refreshEpoch, retry]);
 
   const points = forecast?.forecast_with_plan.map((point) => {
-    // Join independent series by their server timestamps, never array position.
-    const timestamp = point.ts ? Date.parse(point.ts) : NaN;
-    const weather = forecast.weather_forecast?.find((weather) => Date.parse(weather.ts) === timestamp);
-    const price = forecast.price_forecast?.find((price) => Date.parse(price.ts) === timestamp);
+    const start = intervalStart(point);
+    const weatherTs = start ?? point.ts;
+    const weather = weatherTs
+      ? forecast.weather_forecast?.find((candidate) => sameInstant(candidate.ts, weatherTs))
+      : undefined;
+    const price = weatherTs
+      ? forecast.price_forecast?.find((candidate) => sameInstant(candidate.ts, weatherTs))
+      : undefined;
+    const noHeating = forecast.forecast_no_heating.find((candidate) => {
+      if (point.interval_start_utc && candidate.interval_start_utc) {
+        return candidate.interval_start_utc === point.interval_start_utc;
+      }
+      if (point.interval_end_utc && candidate.interval_end_utc) {
+        return candidate.interval_end_utc === point.interval_end_utc;
+      }
+      if (point.ts && candidate.ts) return candidate.ts === point.ts;
+      if (point.interval_start_utc || point.interval_end_utc) return false;
+      return !candidate.interval_start_utc && !candidate.interval_end_utc
+        && candidate.hour === point.hour;
+    });
     return {
       hour: point.hour,
       indoor: point.predicted_indoor_temp,
-      noHeating: forecast.forecast_no_heating.find((other) => other.hour === point.hour)?.predicted_indoor_temp,
-      target: forecast.target_schedule.find((other) => other.hour === point.hour)?.target,
+      noHeating: noHeating?.predicted_indoor_temp,
+      target: targetAtControlStart(forecast.target_schedule, point, start),
       outdoor: weather?.outdoor_temp,
       price: price?.price_eur_per_kwh != null && currency.loaded
         ? price.price_eur_per_kwh * currency.multiplier : null,

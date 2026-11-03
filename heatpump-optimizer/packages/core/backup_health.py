@@ -7,6 +7,7 @@ Internal archive bindings never cross the public projection boundary.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -92,7 +93,66 @@ def decode_state(raw: object) -> dict[str, Any] | None:
         for key in ("last_attempt", "last_success", "last_verification", "last_verified")
     ):
         return None
+    if "legacy_transition" in state and not _legacy_transition_valid(state):
+        return None
     return state
+
+
+def _legacy_transition_valid(state: dict[str, Any]) -> bool:
+    """Validate private audit evidence; never repair or project its contents."""
+    try:
+        envelope = state["legacy_transition"]
+        original = envelope["original"]
+        first = envelope["first_attempt"]
+        now = dt.datetime.now(UTC)
+        transitioned = timestamp(envelope["transitioned_at"], now=now)
+        updated = timestamp(original["updated_at"], now=now)
+        started = timestamp(first["started_at"], now=now)
+        raw = original["details_json"]
+        if not (
+            type(envelope["schema_version"]) is int
+            and envelope["schema_version"] == 1
+            and envelope["kind"] == "legacy-status-ok-to-v1"
+            and original["service"] == "backup"
+            and isinstance(raw, str)
+            and json.loads(raw, object_pairs_hook=list) == [("status", "ok")]
+            and hashlib.sha256(raw.encode("utf-8")).hexdigest() == original["details_sha256"]
+            and transitioned
+            and updated
+            and updated <= transitioned
+            and started
+            and started <= transitioned
+            and re.fullmatch(r"[0-9a-f]{32}", first["id"])
+            and first["id"] == envelope["first_attempt_id"]
+            and first["archive_id"] == "heatpump-" + first["id"]
+            and first["retention_mode"] == "preserve"
+            and first["source_id"] == envelope["source_id"]
+            and first["schema_revision"] == envelope["schema_revision"]
+            and all(
+                isinstance(envelope[key], str) and envelope[key]
+                for key in ("source_id", "schema_revision")
+            )
+            and first["status"] in {"running", "succeeded", "failed", "interrupted"}
+            and first["replica_status"]
+            in {"pending", "disabled", "succeeded", "required_failed", "optional_failed"}
+        ):
+            return False
+        if first["status"] == "running":
+            if "finished_at" in first:
+                return False
+        else:
+            finished = timestamp(first["finished_at"], now=now)
+            if not finished or finished < started:
+                return False
+            if first["status"] == "succeeded" and (
+                first.get("reason_code") != ""
+                or not re.fullmatch(r"[0-9a-f]{64}", first.get("sha256", ""))
+            ):
+                return False
+        current = state["last_attempt"]
+        return current["id"] != first["id"] or current == first
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
 
 
 def timestamp(value: object, *, now: dt.datetime) -> dt.datetime | None:

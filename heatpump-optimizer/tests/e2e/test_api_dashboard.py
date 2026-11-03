@@ -1,5 +1,7 @@
 """E2E tests: Health and Dashboard endpoints."""
 
+import json
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
@@ -8,12 +10,25 @@ from packages.core.models import (
     DeviceStatusRecord,
     IndoorTempReading,
     OverrideRecord,
-    SettingRecord,
+    PlanRecord,
     SpaceHeatingGateRecord,
 )
 from packages.core.optimizer_control_state import ControlStateOverrideUnavailableError
 from packages.core.space_heating_gate import HeatingGateConfig
+from tests.e2e.ordinary_cleanup import (
+    _house_boundary,
+    _settings_rows,
+    assert_ordinary_contract_consistent,
+)
 import datetime as dt
+
+
+async def _recorded_boundary(session):
+    """Materialize values, not ORM identities that a request rollback can expire."""
+    from packages.core.settings_service import get_all_settings
+
+    await assert_ordinary_contract_consistent(session, await get_all_settings(session=session))
+    return await _settings_rows(session), await _house_boundary(session)
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -144,14 +159,125 @@ class TestDashboard:
         assert data["today_cost_priced_amount"] > 0
 
     async def test_dashboard_with_active_plan(
-        self, client: AsyncClient, seed_device_status, seed_plan
+        self, client: AsyncClient, db_session, seed_device_status, seed_plan
     ):
         """Dashboard shows active optimizer plan."""
+        from packages.core.house_contract import (
+            snapshot_from_revision,
+            validate_plan_contract_snapshot,
+        )
+
+        persisted = await db_session.get(PlanRecord, seed_plan.id, populate_existing=True)
+        snapshot = json.loads(persisted.plan_json)["house_contract_snapshot"]
+        assert persisted.contract_state == "current"
+        assert validate_plan_contract_snapshot(persisted, snapshot)
+        assert snapshot == await snapshot_from_revision(
+            db_session,
+            persisted.contract_revision_id,
+            persisted.horizon_start,
+            persisted.horizon_end,
+        )
         resp = await client.get("/api/dashboard")
+        assert resp.status_code == 200
         data = resp.json()
         assert data["active_plan"] is not None
+        assert data["active_plan"]["id"] == seed_plan.id
         assert data["active_plan"]["optimizer_version"] == "rules_v1"
         assert data["active_plan"]["cost_estimate_eur"] == 2.85
+
+        detail = await client.get(f"/api/plans/{seed_plan.id}")
+        assert detail.status_code == 200
+        assert detail.json()["house_contract_snapshot"] == snapshot
+        assert detail.json()["contract_snapshot_state"] == "valid"
+        assert detail.json()["contract_revision_id"] == persisted.contract_revision_id
+        assert detail.json()["contract_hash"] == persisted.contract_hash
+
+    async def test_dashboard_excludes_new_unbound_legacy_plan(
+        self, client: AsyncClient, db_session, seed_plan
+    ):
+        """Prove visibility first, then exclude the sole active unbound legacy plan."""
+        before = await client.get("/api/dashboard")
+        assert before.status_code == 200
+        assert before.json()["active_plan"]["id"] == seed_plan.id
+        now = dt.datetime.now(dt.timezone.utc)
+        control_provenance = (
+            seed_plan.contract_revision_id,
+            seed_plan.contract_hash,
+            seed_plan.contract_state,
+            seed_plan.plan_json,
+        )
+        # Synthetic setup must respect ux_plans_one_active: retire the positive
+        # control in its own commit before constructing the active legacy row.
+        seed_plan.status = "superseded"
+        seed_plan.status_reason = "legacy_exclusion_test_control"
+        seed_plan.superseded_at = now
+        await db_session.commit()
+        await db_session.refresh(seed_plan)
+        assert seed_plan.status == "superseded"
+        assert (
+            seed_plan.contract_revision_id,
+            seed_plan.contract_hash,
+            seed_plan.contract_state,
+            seed_plan.plan_json,
+        ) == control_provenance
+        without_active = await client.get("/api/dashboard")
+        assert without_active.status_code == 200
+        assert without_active.json()["active_plan"] is None
+
+        legacy = PlanRecord(
+            created_at=now,
+            horizon_start=now,
+            horizon_end=now + dt.timedelta(hours=24),
+            plan_json=json.dumps({"version": "rules_v1", "actions": []}),
+            optimizer_version="rules_v1",
+            cost_estimate_eur=2.85,
+        )
+        db_session.add(legacy)
+        await db_session.commit()
+        await db_session.refresh(legacy)
+        assert legacy.status == "active"
+        assert legacy.contract_state == "legacy_unknown"
+        assert legacy.contract_revision_id is None
+        assert legacy.contract_hash is None
+        legacy_provenance = (
+            legacy.contract_revision_id,
+            legacy.contract_hash,
+            legacy.contract_state,
+            legacy.plan_json,
+            legacy.input_provenance_json,
+        )
+
+        response = await client.get("/api/dashboard")
+        assert response.status_code == 200
+        assert response.json()["active_plan"] is None
+        detail = await client.get(f"/api/plans/{legacy.id}")
+        assert detail.status_code == 200
+        historical = detail.json()
+        assert historical["id"] == legacy.id
+        assert historical["contract_state"] == "legacy_unknown"
+        assert historical["contract_revision_id"] is None
+        assert historical["contract_hash"] is None
+        assert historical["house_contract_snapshot"] == {}
+        assert historical["contract_snapshot_state"] == "unknown"
+        assert historical["outcome"]["state"] == "unknown"
+        assert historical["ordinary_writes_allowed"] is False
+        await db_session.refresh(legacy)
+        assert legacy.status == "active"
+        assert (
+            legacy.contract_revision_id,
+            legacy.contract_hash,
+            legacy.contract_state,
+            legacy.plan_json,
+            legacy.input_provenance_json,
+        ) == legacy_provenance
+        await db_session.refresh(seed_plan)
+        assert seed_plan.status == "superseded"
+        assert (
+            seed_plan.contract_revision_id,
+            seed_plan.contract_hash,
+            seed_plan.contract_state,
+            seed_plan.plan_json,
+        ) == control_provenance
 
     async def test_dashboard_with_override(
         self, client: AsyncClient, seed_device_status, seed_override
@@ -184,6 +310,9 @@ class TestG03ReadOnlyRoutes:
 
     @pytest_asyncio.fixture(loop_scope="session")
     async def recorded_settings(self, db_session):
+        from packages.core.house_contract import ensure_current_contract
+        from packages.core.settings_service import set_settings_bulk
+
         values = {
             "aquarea_username": "g03-offline-test",
             "aquarea_password": "g03-offline-test",
@@ -195,7 +324,13 @@ class TestG03ReadOnlyRoutes:
             "outcome_experiment_max_curve_step_c": "0.5",
             "_heat_curve_verification_state": '{"status": "verified"}',
         }
-        db_session.add_all(SettingRecord(key=key, value=value) for key, value in values.items())
+        current = await ensure_current_contract(db_session)
+        await set_settings_bulk(
+            values,
+            session=db_session,
+            expected_revision_id=current.id,
+            source="g03_read_only_fixture",
+        )
         await db_session.commit()
 
     async def seed_heating_context(self, db_session, *, indoor):
@@ -249,7 +384,9 @@ class TestG03ReadOnlyRoutes:
         if case != "empty":
             await self.seed_heating_context(db_session, indoor=case == "populated")
 
+        before = await _recorded_boundary(db_session)
         response = await client.get("/api/thermal/heat-curve-advice")
+        assert await _recorded_boundary(db_session) == before
 
         assert response.status_code == 200
         data = response.json()
@@ -282,7 +419,9 @@ class TestG03ReadOnlyRoutes:
         if has_data:
             await self.seed_heating_context(db_session, indoor=False)
 
+        before = await _recorded_boundary(db_session)
         response = await client.get("/api/outcomes/summary?days=1")
+        assert await _recorded_boundary(db_session) == before
 
         assert response.status_code == 200
         data = response.json()

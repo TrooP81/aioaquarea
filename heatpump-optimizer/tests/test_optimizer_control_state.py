@@ -23,6 +23,7 @@ from packages.api.schemas import ControlStateResponse
 def reset_dashboard_comfort_assessment_cache(monkeypatch):
     from packages.api.routers import dashboard
 
+    monkeypatch.setattr(dashboard, "_comfort_assessment_context", AsyncMock(return_value=(7, 1, 1)))
     monkeypatch.setattr(dashboard, "_comfort_assessment_cache", None)
     monkeypatch.setattr(dashboard, "_comfort_assessment_lock", asyncio.Lock())
     monkeypatch.setattr(
@@ -196,7 +197,7 @@ async def test_control_state_caches_successful_comfort_assessment(monkeypatch):
     monkeypatch.setattr(
         dashboard,
         "_comfort_assessment_cache",
-        (time.monotonic() - 31, {"state": "at_risk"}),
+        (time.monotonic() - 31, (7, 1, 1), {"state": "at_risk"}),
     )
     await dashboard.get_control_state()
 
@@ -709,3 +710,70 @@ def test_control_state_schema_preserves_utc_actions_and_notices():
     assert response.primary_action is not None
     assert response.primary_action.kind == "link"
     assert response.notices[0].severity == "warning"
+
+
+@pytest.mark.parametrize("old_assessment", [None, {"state": "safe"}])
+async def test_AC2_settings_change_invalidates_cached_absent_or_old_warning(
+    monkeypatch, old_assessment
+):
+    from packages.api.routers import dashboard
+
+    context = [7, 1, 1]
+    monkeypatch.setattr(
+        dashboard, "_comfort_assessment_context", AsyncMock(side_effect=lambda: tuple(context))
+    )
+    warning = {"state": "at_risk", "reason": "new target"}
+    forecast = AsyncMock(
+        side_effect=[{"comfort_assessment": old_assessment}, {"comfort_assessment": warning}]
+    )
+    monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
+    assert await dashboard._get_comfort_assessment() == old_assessment
+    context[0] = 8
+    assert await dashboard._get_comfort_assessment() == warning
+    assert await dashboard._get_comfort_assessment() == warning
+    assert forecast.await_count == 2
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+async def test_AC2_inflight_refresh_retries_changed_contract_or_dependency(monkeypatch, index):
+    from packages.api.routers import dashboard
+
+    context = [7, 1, 1]
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    warning = {"state": "at_risk"}
+
+    async def forecast(*, hours):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+            return {"comfort_assessment": None}
+        return {"comfort_assessment": warning}
+
+    monkeypatch.setattr(
+        dashboard, "_comfort_assessment_context", AsyncMock(side_effect=lambda: tuple(context))
+    )
+    monkeypatch.setattr("packages.api.routers.models_router.get_indoor_forecast", forecast)
+    task = asyncio.create_task(dashboard._get_comfort_assessment())
+    await asyncio.wait_for(entered.wait(), 1)
+    context[index] += 1
+    release.set()
+    assert await asyncio.wait_for(task, 1) == warning
+    assert calls == 2
+    assert dashboard._comfort_assessment_cache[1:] == (tuple(context), warning)
+
+
+async def test_AC2_continuous_change_never_caches_missing_warning(monkeypatch):
+    from packages.api.routers import dashboard
+
+    monkeypatch.setattr(
+        dashboard, "_comfort_assessment_context", AsyncMock(side_effect=[(7,), (8,), (8,), (9,)])
+    )
+    monkeypatch.setattr(
+        "packages.api.routers.models_router.get_indoor_forecast",
+        AsyncMock(return_value={"comfort_assessment": None}),
+    )
+    assert await dashboard._get_comfort_assessment() is None
+    assert dashboard._comfort_assessment_cache is None

@@ -38,7 +38,7 @@ from packages.core.models import (
 from packages.ml.models_common import MODEL_DIR, is_finite_number
 
 if TYPE_CHECKING:
-    from packages.ml.lifecycle import Lifecycle
+    from packages.ml.lifecycle import ArtifactReference, Lifecycle
 
 logger = structlog.get_logger(__name__)
 
@@ -210,15 +210,19 @@ class ThermalModel:
         self.params = ThermalParams()
         self.validation: dict[str, dict] = {}
         self._qualified_reference = None
+        self._serving_generation = 0
         self._committed_checked_at: float | None = None
         self._committed_refresh_lock = asyncio.Lock()
 
     def reset(self) -> None:
         """Discard learned calibration and return to default thermal parameters."""
+        changed = self._qualified_reference is not None or self.params != ThermalParams()
         self.params = ThermalParams()
         self.validation = {}
         self._qualified_reference = None
         self._committed_checked_at = None
+        if changed:
+            self._serving_generation += 1
 
     @staticmethod
     def _fit_rate(samples: list[tuple[float, float, float]]) -> tuple[float, float]:
@@ -433,8 +437,7 @@ class ThermalModel:
         from packages.ml.lifecycle import Lifecycle, reference_is_qualified
         from packages.ml.forecast_quality import (
             check_exact_fit,
-            materialize_native_inputs,
-            native_scope,
+            locked_native_scope,
         )
 
         lifecycle = lifecycle if lifecycle is not None else Lifecycle()
@@ -442,16 +445,14 @@ class ThermalModel:
             reference = (await lifecycle.read()).reference("thermal")
             if not reference_is_qualified(reference):
                 raise ValueError("thermal_not_qualified")
-            if scope is None:
-                inputs = await materialize_native_inputs(
-                    "thermal",
-                    now=dt.datetime.now(dt.timezone.utc),
-                    device_id=reference.manifest["device_id"],
-                    capabilities=tuple(reference.manifest["capabilities"]),
-                )
-                if inputs is None:
-                    raise ValueError("current_thermal_scope_unavailable")
-                scope = native_scope(inputs)
+            async with locked_native_scope(
+                "thermal",
+                device_id=reference.manifest["device_id"],
+                capabilities=tuple(reference.manifest["capabilities"]),
+            ) as (current_scope, session):
+                if scope is not None and scope != current_scope:
+                    raise ValueError("thermal_scope_mismatch")
+                scope = current_scope
             if not reference_is_qualified(reference, scope=scope):
                 raise ValueError("thermal_scope_mismatch")
             payload = await lifecycle.load_committed(
@@ -460,8 +461,6 @@ class ThermalModel:
             if not isinstance(payload, dict) or payload.get("schema_version") != 5:
                 raise ValueError("invalid committed thermal schema")
             await asyncio.to_thread(check_exact_fit, "thermal", payload)
-            if (await lifecycle.read()).reference("thermal") != reference:
-                raise ValueError("thermal_authority_changed")
             loaded = self._decode_params(payload.get("params"))
             defaults = ThermalParams()
             for component, (base_key, factor_key, _) in _RATE_COMPONENTS.items():
@@ -472,33 +471,112 @@ class ThermalModel:
                 ):
                     setattr(loaded, base_key, getattr(defaults, base_key))
                     setattr(loaded, factor_key, getattr(defaults, factor_key))
+            async with locked_native_scope(
+                "thermal",
+                device_id=reference.manifest["device_id"],
+                capabilities=tuple(reference.manifest["capabilities"]),
+            ) as (latest_scope, session):
+                latest = (await lifecycle.read(session=session)).reference("thermal")
+                if (
+                    latest != reference
+                    or latest_scope != scope
+                    or not reference_is_qualified(latest, scope=latest_scope)
+                ):
+                    raise ValueError("thermal_authority_or_dependency_changed")
+                self.params = loaded
+                self.validation = {}
+                self._qualified_reference = reference
+                self._serving_generation += 1
         except Exception as error:
             self.reset()
             logger.warning("thermal_committed_unavailable", error_type=type(error).__name__)
             return False
-        self.params = loaded
-        self.validation = {}
-        self._qualified_reference = reference
         return True
 
     async def arefresh_if_changed(self, *, force: bool = False) -> bool:
+        from packages.ml.forecast_quality import locked_native_scope
+        from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
         async with self._committed_refresh_lock:
             checked = self._committed_checked_at
-            if not force and checked is not None and 0 <= time.monotonic() - checked < 60:
-                available = self.load_latest()
-                self._committed_checked_at = checked
-                return available
+            reference = self._qualified_reference
+            if (
+                not force
+                and checked is not None
+                and 0 <= time.monotonic() - checked < 60
+                and self.load_latest()
+                and reference is not None
+            ):
+                try:
+                    async with locked_native_scope(
+                        "thermal",
+                        device_id=reference.manifest["device_id"],
+                        capabilities=tuple(reference.manifest["capabilities"]),
+                    ) as (scope, session):
+                        current = (await Lifecycle().read(session=session)).reference("thermal")
+                        if current == reference and reference_is_qualified(current, scope=scope):
+                            return True
+                except Exception as error:
+                    self.reset()
+                    logger.warning(
+                        "thermal_cached_dependency_unavailable",
+                        error_type=type(error).__name__,
+                    )
+                    return False
             available = await self.arefresh_committed()
             self._committed_checked_at = time.monotonic()
             return available
 
-    def load_latest(self) -> bool:
+    def load_latest(self, *, scope: dict | None = None) -> bool:
         from packages.ml.lifecycle import reference_is_qualified
 
-        if not reference_is_qualified(self._qualified_reference):
+        if not reference_is_qualified(self._qualified_reference, scope=scope):
             self.reset()
             return False
         return True
+
+    def capture_dependency_context(self) -> tuple[ArtifactReference | None, int]:
+        """Capture the exact committed thermal reference used for a prediction."""
+        import copy
+
+        return copy.deepcopy(self._qualified_reference), self._serving_generation
+
+    async def dependency_context_is_current(
+        self, context: tuple[ArtifactReference | None, int]
+    ) -> bool:
+        """Recheck the captured thermal reference immediately before serving predictions."""
+        from packages.ml.forecast_quality import locked_native_scope
+        from packages.ml.lifecycle import Lifecycle, reference_is_qualified
+
+        reference, generation = context
+        if self._serving_generation != generation:
+            return False
+        if self._qualified_reference != reference:
+            return False
+        if reference is None:
+            return True
+        capabilities = tuple(reference.manifest.get("capabilities", ()))
+        if not reference_is_qualified(reference):
+            return False
+        try:
+            async with locked_native_scope(
+                "thermal",
+                device_id=reference.manifest["device_id"],
+                capabilities=capabilities,
+            ) as (scope, session):
+                current = (await Lifecycle().read(session=session)).reference("thermal")
+                return (
+                    self._serving_generation == generation
+                    and self._qualified_reference == reference
+                    and current == reference
+                    and reference_is_qualified(current, scope=scope)
+                )
+        except Exception as error:
+            logger.warning(
+                "thermal_serving_dependency_unavailable",
+                error_type=type(error).__name__,
+            )
+            return False
 
     def confidence_for(self, component: str) -> str:
         """Return evidence-based confidence for one thermal sub-model."""
@@ -1736,7 +1814,9 @@ class ThermalModel:
             current_indoor: current indoor air temperature (°C).
             indoor_target_per_hour: per-hour comfort setpoint — ``comfort_temp_target``
                 during comfort hours, ``comfort_temp_min`` overnight/off-peak.
-                Index ``h`` is the setpoint for hour ``h``; the last value is
+                Index ``h`` samples exact policy at the UTC control-slot start
+                (``utc-hour-slot-start-v1``), never one entry per policy split.
+                The last value is
                 reused if the list is shorter than ``hours``.
             weather_forecast: list of dicts with key ``outdoor_temp`` driving the
                 learned indoor heating/cooling rates.
@@ -1789,7 +1869,7 @@ class ThermalModel:
                 {
                     "hour": h + 1,
                     "predicted_indoor_temp": round(indoor, 1),
-                    "target": round(target, 1),
+                    "target": target,
                     "state": state,
                     "source": "managed_schedule",
                 }

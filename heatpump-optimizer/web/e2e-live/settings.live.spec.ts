@@ -11,15 +11,18 @@ test.describe("Live settings page", () => {
 
     // Loading state must resolve into real grouped settings.
     await expect(page.getByRole("heading", { name: "Optimizer Layer" })).toBeVisible({ timeout: 15000 });
+    await page.getByRole("tab", { name: "Data Sources", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Price Provider" })).toBeVisible();
+    await page.getByRole("tab", { name: "Integrations", exact: true }).click();
     await expect(page.getByRole("heading", { name: "SmartThings Integration" })).toBeVisible();
 
     // The save control is present (settings form fully rendered).
-    await expect(page.getByRole("button", { name: "Save Settings" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save changes", exact: true })).toBeVisible();
   });
 
   test("shows the reset-data danger zone", async ({ page }) => {
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "System", exact: true }).click();
     await expect(page.getByText("Danger Zone — Reset Data")).toBeVisible({ timeout: 15000 });
   });
 

@@ -90,9 +90,9 @@ interface IndoorForecastData {
   current_indoor: number | null;
   outdoor_temp: number | null;
   forecast: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null }[];
-  forecast_with_plan: { hour: number; ts?: string; predicted_indoor_temp: number; source?: string | null; model_source?: string | null; space_heating_fraction?: number | null; baseline_heating_fraction?: number | null; baseline_heating_source?: string | null; space_heating_source?: string | null }[];
-  forecast_no_heating: { hour: number; ts?: string; predicted_indoor_temp: number }[];
-  target_schedule: { hour: number; ts?: string; target: number; comfort_hour: boolean }[];
+  forecast_with_plan: { hour: number; ts?: string; interval_start_utc?: string; interval_end_utc?: string; predicted_indoor_temp: number; target?: number | null; control_target_c?: number | null; source?: string | null; model_source?: string | null; space_heating_fraction?: number | null; baseline_heating_fraction?: number | null; baseline_heating_source?: string | null; space_heating_source?: string | null }[];
+  forecast_no_heating: { hour: number; ts?: string; interval_start_utc?: string; interval_end_utc?: string; predicted_indoor_temp: number }[];
+  target_schedule: { hour: number; ts?: string; interval_start_utc?: string; interval_end_utc?: string; target: number; comfort_hour: boolean }[];
   planned_actions: PlannedAction[];
   forecast_status?: "available" | "unavailable" | "fallback" | "legacy";
   forecast_unavailable_reason?: string | null;
@@ -109,6 +109,46 @@ interface IndoorForecastData {
   observed_history?: { hour: number; ts: string; temperature: number }[];
   sensor_basis?: { label?: string };
   space_heating_baseline?: { effective_mode?: "off" | "shadow" | "on" };
+}
+
+function forecastSlotStart(point: {
+  interval_start_utc?: string;
+  ts?: string;
+}): string | undefined {
+  if (point.interval_start_utc) return point.interval_start_utc;
+  if (!point.ts) return undefined;
+  const end = Date.parse(point.ts);
+  return Number.isFinite(end) ? new Date(end - 3_600_000).toISOString() : undefined;
+}
+
+function controlTargetForPoint(
+  point: {
+    hour: number;
+    ts?: string;
+    interval_start_utc?: string;
+    control_target_c?: number | null;
+    target?: number | null;
+  },
+  schedule: IndoorForecastData["target_schedule"],
+): number | undefined {
+  if (typeof point.control_target_c === "number") return point.control_target_c;
+  if (typeof point.target === "number") return point.target;
+  const start = forecastSlotStart(point);
+  if (start) {
+    const instant = Date.parse(start);
+    const interval = schedule.find((slot) =>
+      slot.interval_start_utc != null
+      && slot.interval_end_utc != null
+      && Date.parse(slot.interval_start_utc) <= instant
+      && instant < Date.parse(slot.interval_end_utc),
+    );
+    if (interval) return interval.target;
+  }
+  if (!point.interval_start_utc) {
+    return schedule.find((slot) => slot.ts === point.ts)?.target
+      ?? schedule.find((slot) => slot.hour === point.hour)?.target;
+  }
+  return undefined;
 }
 
 interface IndoorTempReading {
@@ -223,14 +263,27 @@ export function ThermalPredictionChart() {
         indoorNoHeating: undefined as number | undefined,
         comfortTarget: undefined as number | undefined,
       }));
-      const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => ({
+      const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => {
+        const matchingNoHeating = indoorForecast.forecast_no_heating.find((slot) => {
+          if (f.interval_start_utc && slot.interval_start_utc) {
+            return slot.interval_start_utc === f.interval_start_utc;
+          }
+          if (f.interval_end_utc && slot.interval_end_utc) {
+            return slot.interval_end_utc === f.interval_end_utc;
+          }
+          if (f.interval_start_utc || f.interval_end_utc) return false;
+          if (f.ts && slot.ts) return slot.ts === f.ts;
+          return !slot.interval_start_utc && !slot.interval_end_utc && slot.hour === f.hour;
+        });
+        return ({
         hour: `+${f.hour}h`,
         ts: f.ts,
         actualIndoor: undefined as number | undefined,
         indoorWithPlan: f.predicted_indoor_temp,
-        indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
-        comfortTarget: indoorForecast.target_schedule[i]?.target,
-      }));
+        indoorNoHeating: matchingNoHeating?.predicted_indoor_temp ?? indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
+        comfortTarget: controlTargetForPoint(f, indoorForecast.target_schedule),
+      });
+      });
       return [...historyPoints, ...forecastPoints];
     }
 
@@ -265,14 +318,27 @@ export function ThermalPredictionChart() {
     }
 
     // Build forecast points (positive hours)
-    const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => ({
+    const forecastPoints = indoorForecast.forecast_with_plan.map((f, i) => {
+      const matchingNoHeating = indoorForecast.forecast_no_heating.find((slot) => {
+        if (f.interval_start_utc && slot.interval_start_utc) {
+          return slot.interval_start_utc === f.interval_start_utc;
+        }
+        if (f.interval_end_utc && slot.interval_end_utc) {
+          return slot.interval_end_utc === f.interval_end_utc;
+        }
+        if (f.interval_start_utc || f.interval_end_utc) return false;
+        if (f.ts && slot.ts) return slot.ts === f.ts;
+        return !slot.interval_start_utc && !slot.interval_end_utc && slot.hour === f.hour;
+      });
+      return ({
       hour: `+${f.hour}h`,
       ts: f.ts,
       actualIndoor: undefined as number | undefined,
       indoorWithPlan: f.predicted_indoor_temp,
-      indoorNoHeating: indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
-      comfortTarget: indoorForecast.target_schedule[i]?.target,
-    }));
+      indoorNoHeating: matchingNoHeating?.predicted_indoor_temp ?? indoorForecast.forecast_no_heating[i]?.predicted_indoor_temp,
+      comfortTarget: controlTargetForPoint(f, indoorForecast.target_schedule),
+    });
+    });
 
     return [...historyPoints, ...forecastPoints];
   })();

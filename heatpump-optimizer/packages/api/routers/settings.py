@@ -3,12 +3,18 @@ from __future__ import annotations
 import datetime as dt
 import json
 from typing import Optional
+from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Header, HTTPException, Query, Response
+from pydantic import BaseModel, model_validator
 from sqlalchemy import desc, select
 
-from packages.api.schemas import TestConnectionRequest, TestConnectionResponse
+from packages.api.schemas import (
+    PlanningSettingsPatch,
+    PlanningSettingsPreviewRequest,
+    TestConnectionRequest,
+    TestConnectionResponse,
+)
 from packages.core.database import get_session
 from packages.core.pricing import get_active_price_context
 from packages.core.models import (
@@ -20,7 +26,6 @@ from packages.core.models import (
 from packages.core.settings_service import (
     SETTINGS_SCHEMA,
     get_all_settings,
-    get_comfort_schedule,
     get_effective_schedule,
     get_float_setting,
     get_learned_usage,
@@ -28,11 +33,22 @@ from packages.core.settings_service import (
     get_setting_spec,
     get_string_setting,
     is_masked_secret,
-    set_setting,
+    normalize_contract_settings_updates,
     set_settings_bulk,
     set_heat_curve_verification_state,
     validate_setting_value,
 )
+from packages.core.comfort_schedule import normalize_schedule
+from packages.core.house_contract import (
+    ContractRevisionConflict,
+    HousePlanningContract,
+    _contract_hash,
+    canonical_target_schedule,
+    ensure_current_contract,
+    policy_dependency_fingerprint,
+    RESOLVER_SCHEMA,
+)
+from packages.core.models import HouseInstallationRecord
 from packages.core.heat_curve import (
     HEAT_CURVE_SETTING_KEYS,
     HeatCurveConfig,
@@ -64,6 +80,241 @@ class ComfortScheduleUpdate(BaseModel):
     weekday: list[int]
     weekend: list[int]
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_raw_schedule(cls, value):
+        normalized = normalize_schedule(value)
+        return {key: normalized[key] for key in value}
+
+
+def _revision_from_if_match(value: str | None) -> int | None:
+    if value is None or not isinstance(value, str):
+        return None
+    normalized = value.strip().removeprefix("W/").strip('"')
+    try:
+        revision = int(normalized)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="If-Match must contain a contract revision"
+        ) from exc
+    if revision < 1:
+        raise HTTPException(
+            status_code=400, detail="If-Match must contain a positive contract revision"
+        )
+    return revision
+
+
+async def _set_contract_etag(response: Response, session, settings: dict[str, str]) -> int:
+    revision = await ensure_current_contract(session, settings)
+    response.headers["ETag"] = f'"{revision.id}"'
+    response.headers["X-Contract-Revision"] = str(revision.id)
+    response.headers["X-Installation-ID"] = str(revision.contract_json["installation_id"])
+    return revision.id
+
+
+def _planning_contract_payload(revision) -> dict:
+    contract = {
+        key: value for key, value in revision.contract_json.items() if key != "field_sources"
+    }
+    return {
+        **contract,
+        "revision_id": revision.id,
+        "contract_hash": revision.contract_hash,
+        "effective_at": revision.effective_at.isoformat(),
+        "source": revision.source,
+        "field_sources": revision.contract_json.get("field_sources", {}),
+        "validation": {
+            "comfort_schedule_hours": {"minimum": 0, "maximum": 23, "unique": True},
+            "comfort_temperature_c": {"minimum": 10, "maximum": 30},
+            "timezone": "IANA",
+        },
+        "scope": {
+            "protected_rooms": "not_configured_in_p2_1",
+            "dhw_custom_schedule": "not_configured_in_p2_1",
+            "tariff_contract": "unchanged_existing_price_scope",
+            "controller_curve_attestation": "not_configured_in_p2_1",
+        },
+        "p2_defaults": {
+            "protected_rooms": [],
+            "dhw_schedule_mode": "inherit_comfort",
+            "dhw_custom_schedule": None,
+            "tariff_settings": None,
+            "curve_attestation": "unknown_not_recorded_by_p2_1",
+        },
+        "ordinary_writes_allowed": False,
+    }
+
+
+async def _load_scoped_contract(session, installation_id: UUID):
+    from packages.core.house_contract import _lock_contract
+
+    await _lock_contract(session)
+    installation = await session.get(HouseInstallationRecord, 1)
+    if installation is None or installation.installation_id != installation_id:
+        raise HTTPException(status_code=404, detail="Installation not found")
+    values = await get_all_settings(session=session)
+    try:
+        revision = await ensure_current_contract(session, values)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "planning_contract_unavailable", "message": str(exc)},
+        ) from exc
+    if revision.contract_json.get("installation_id") != str(installation_id):
+        raise HTTPException(status_code=404, detail="Installation not found")
+    return installation, values, revision
+
+
+def _planning_patch_values(body: PlanningSettingsPatch) -> dict[str, str]:
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        contract_fields = {
+            "comfort_schedule",
+            "comfort_temp_min",
+            "comfort_temp_target",
+            "comfort_temp_max",
+            "timezone",
+        }
+        return normalize_contract_settings_updates(
+            {key: value for key, value in patch.items() if key in contract_fields}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/installations/{installation_id}/planning-settings")
+async def get_planning_settings(installation_id: UUID, response: Response):
+    """Read the configured installation's redacted, revisioned P2.1 contract."""
+    async with get_session() as session:
+        _, _, revision = await _load_scoped_contract(session, installation_id)
+        response.headers["ETag"] = f'"{revision.id}"'
+        response.headers["X-Contract-Revision"] = str(revision.id)
+        response.headers["X-Installation-ID"] = str(installation_id)
+        return _planning_contract_payload(revision)
+
+
+@router.put("/api/installations/{installation_id}/planning-settings")
+async def put_planning_settings(
+    installation_id: UUID,
+    body: PlanningSettingsPatch,
+    response: Response,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+):
+    """Atomically update a partial P2.1 contract under its expected revision."""
+    expected_revision_id = _revision_from_if_match(if_match)
+    if expected_revision_id is None:
+        raise HTTPException(status_code=428, detail="If-Match contract revision is required")
+    updates = _planning_patch_values(body)
+    async with get_session() as session:
+        await _load_scoped_contract(session, installation_id)
+        try:
+            revision_id = await set_settings_bulk(
+                updates,
+                session=session,
+                expected_revision_id=expected_revision_id,
+                source="scoped_planning_settings_api",
+            )
+        except ContractRevisionConflict as exc:
+            response.headers["ETag"] = f'"{exc.current_revision_id}"'
+            response.headers["X-Contract-Revision"] = str(exc.current_revision_id)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "contract_revision_changed",
+                    "current_revision": exc.current_revision_id,
+                },
+                headers={
+                    "ETag": f'"{exc.current_revision_id}"',
+                    "X-Contract-Revision": str(exc.current_revision_id),
+                },
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        values = await get_all_settings(session=session)
+        try:
+            revision = await ensure_current_contract(session, values)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail={"reason": "invalid_planning_contract", "message": str(exc)}
+            ) from exc
+        if revision.id != revision_id or revision.contract_json.get("installation_id") != str(
+            installation_id
+        ):
+            raise HTTPException(status_code=404, detail="Installation not found")
+        response.headers["ETag"] = f'"{revision.id}"'
+        response.headers["X-Contract-Revision"] = str(revision.id)
+        response.headers["X-Installation-ID"] = str(installation_id)
+        return _planning_contract_payload(revision)
+
+
+@router.post("/api/installations/{installation_id}/planning-settings/preview")
+async def preview_planning_settings(
+    installation_id: UUID,
+    body: PlanningSettingsPreviewRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+):
+    """Resolve a proposed P2.1 contract without saving or invoking device services."""
+    expected_revision_id = _revision_from_if_match(if_match)
+    if expected_revision_id is None:
+        raise HTTPException(status_code=428, detail="If-Match contract revision is required")
+    updates = _planning_patch_values(body)
+    async with get_session() as session:
+        installation, current_values, current = await _load_scoped_contract(
+            session, installation_id
+        )
+        if current.id != expected_revision_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "contract_revision_changed",
+                    "current_revision": current.id,
+                },
+                headers={"ETag": f'"{current.id}"', "X-Contract-Revision": str(current.id)},
+            )
+        proposed_values = dict(current_values)
+        proposed_values.update(updates)
+        try:
+            contract = HousePlanningContract.from_settings(
+                proposed_values, installation.installation_id, installation.house_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        projection = contract.to_projection()
+        digest = _contract_hash(projection)
+        from packages.core.comfort_schedule import resolve_hourly_targets
+
+        intervals = resolve_hourly_targets(
+            projection["comfort_schedule"],
+            projection["timezone"],
+            body.horizon_start,
+            body.horizon_end,
+            scheduled_target_c=projection["comfort_temp_target"],
+            unscheduled_target_c=projection["comfort_temp_min"],
+            outer_max_c=projection["comfort_temp_max"],
+        )
+        for interval in intervals:
+            interval["contract_revision_id"] = current.id
+            interval["contract_hash"] = digest
+        preview_snapshot = {
+            **projection,
+            "revision_id": current.id,
+            "contract_hash": digest,
+            "policy_dependency_fingerprint": policy_dependency_fingerprint(projection),
+            "resolver_schema": RESOLVER_SCHEMA,
+            "schedule_projection": intervals,
+        }
+        return {
+            "installation_id": str(installation_id),
+            "base_revision_id": current.id,
+            "base_contract_hash": current.contract_hash,
+            "proposed_contract_hash": digest,
+            "proposed_contract": projection,
+            "schedule_projection": intervals,
+            "target_schedule": canonical_target_schedule(preview_snapshot),
+            "preview_only": True,
+            "ordinary_writes_allowed": False,
+        }
+
 
 async def get_baseline_promotion_readiness() -> bool:
     """Read promotion evidence without allowing scorer failures to promote."""
@@ -78,9 +329,12 @@ async def get_baseline_promotion_readiness() -> bool:
 
 
 @router.get("/api/settings")
-async def get_settings():
+async def get_settings(response: Response = None):
+    response = response or Response()
     try:
-        values = await get_all_settings()
+        async with get_session() as session:
+            values = await get_all_settings(session=session)
+            await _set_contract_etag(response, session, values)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = {}
@@ -108,7 +362,13 @@ async def get_settings():
 
 
 @router.put("/api/settings")
-async def update_settings(body: SettingsUpdate):
+async def update_settings(
+    body: SettingsUpdate,
+    response: Response = None,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+):
+    response = response or Response()
+    expected_revision_id = _revision_from_if_match(if_match)
     invalid_keys = [
         key for key in body.settings if key.startswith("_") or key not in SETTINGS_SCHEMA
     ]
@@ -183,9 +443,37 @@ async def update_settings(body: SettingsUpdate):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        await set_settings_bulk(cleaned)
+        if expected_revision_id is None:
+            revision_id = await set_settings_bulk(cleaned)
+        else:
+            revision_id = await set_settings_bulk(
+                cleaned,
+                expected_revision_id=expected_revision_id,
+                source="versioned_api",
+            )
+    except ContractRevisionConflict as exc:
+        response.headers["X-Contract-Revision"] = str(exc.current_revision_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "contract_revision_changed",
+                "current_revision": exc.current_revision_id,
+            },
+            headers={
+                "ETag": f'"{exc.current_revision_id}"',
+                "X-Contract-Revision": str(exc.current_revision_id),
+            },
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if revision_id is not None:
+        response.headers["ETag"] = f'"{revision_id}"'
+        response.headers["X-Contract-Revision"] = str(revision_id)
+    else:
+        async with get_session() as session:
+            values = await get_all_settings(session=session)
+            await _set_contract_etag(response, session, values)
 
     if heat_curve_changed and applied_curve is not None:
         async with get_session() as session:
@@ -239,20 +527,48 @@ async def update_settings(body: SettingsUpdate):
 
 
 @router.get("/api/comfort-schedule")
-async def get_schedule():
-    return await get_comfort_schedule()
+async def get_schedule(response: Response = None):
+    response = response or Response()
+    async with get_session() as session:
+        values = await get_all_settings(session=session)
+        await _set_contract_etag(response, session, values)
+        schedule = normalize_schedule(json.loads(values["comfort_schedule"]))
+    return schedule
 
 
 @router.put("/api/comfort-schedule")
-async def update_schedule(body: ComfortScheduleUpdate):
-    for h in body.weekday + body.weekend:
-        if not (0 <= h <= 23):
-            raise HTTPException(status_code=400, detail=f"Invalid hour: {h}. Must be 0-23.")
-    if len(set(body.weekday)) > 24 or len(set(body.weekend)) > 24:
-        raise HTTPException(status_code=400, detail="Too many hours specified.")
-
-    schedule = {"weekday": sorted(set(body.weekday)), "weekend": sorted(set(body.weekend))}
-    await set_setting("comfort_schedule", json.dumps(schedule))
+async def update_schedule(
+    body: ComfortScheduleUpdate,
+    response: Response = None,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+):
+    response = response or Response()
+    schedule = normalize_schedule(body.model_dump())
+    expected_revision_id = _revision_from_if_match(if_match)
+    try:
+        if expected_revision_id is None:
+            revision_id = await set_settings_bulk({"comfort_schedule": json.dumps(schedule)})
+        else:
+            revision_id = await set_settings_bulk(
+                {"comfort_schedule": json.dumps(schedule)},
+                expected_revision_id=expected_revision_id,
+                source="versioned_api",
+            )
+    except ContractRevisionConflict as exc:
+        response.headers["X-Contract-Revision"] = str(exc.current_revision_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "contract_revision_changed",
+                "current_revision": exc.current_revision_id,
+            },
+            headers={
+                "ETag": f'"{exc.current_revision_id}"',
+                "X-Contract-Revision": str(exc.current_revision_id),
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async with get_session() as session:
         session.add(
@@ -264,6 +580,9 @@ async def update_schedule(body: ComfortScheduleUpdate):
             )
         )
 
+    if revision_id is not None:
+        response.headers["ETag"] = f'"{revision_id}"'
+        response.headers["X-Contract-Revision"] = str(revision_id)
     return schedule
 
 
@@ -277,9 +596,34 @@ async def get_learned_schedule(days: int = Query(14, ge=1, le=90)):
 
 
 @router.post("/api/comfort-schedule/apply-learned")
-async def apply_learned_schedule(threshold: float = Query(0.3, ge=0.1, le=0.9)):
+async def apply_learned_schedule(
+    response: Response = None,
+    threshold: float = Query(0.3, ge=0.1, le=0.9),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+):
+    response = response or Response()
     merged = await get_effective_schedule(learned_threshold=threshold)
-    await set_setting("comfort_schedule", json.dumps(merged))
+    try:
+        revision_id = await set_settings_bulk(
+            {"comfort_schedule": json.dumps(merged)},
+            expected_revision_id=_revision_from_if_match(if_match),
+            source="learned_schedule_opt_in",
+        )
+    except ContractRevisionConflict as exc:
+        response.headers["X-Contract-Revision"] = str(exc.current_revision_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "contract_revision_changed",
+                "current_revision": exc.current_revision_id,
+            },
+            headers={
+                "ETag": f'"{exc.current_revision_id}"',
+                "X-Contract-Revision": str(exc.current_revision_id),
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async with get_session() as session:
         session.add(
@@ -291,6 +635,9 @@ async def apply_learned_schedule(threshold: float = Query(0.3, ge=0.1, le=0.9)):
             )
         )
 
+    if revision_id is not None:
+        response.headers["ETag"] = f'"{revision_id}"'
+        response.headers["X-Contract-Revision"] = str(revision_id)
     return merged
 
 

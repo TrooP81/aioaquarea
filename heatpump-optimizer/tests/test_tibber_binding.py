@@ -358,8 +358,23 @@ async def test_switched_home_has_no_old_feed_and_planning_admission_is_suspended
 
 
 async def test_binding_diagnostic_is_visible_through_settings_api(monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
     from packages.api.routers import settings as settings_router
 
+    @asynccontextmanager
+    async def fake_session():
+        yield SimpleNamespace(execute=AsyncMock())
+
+    revision = SimpleNamespace(
+        id=7,
+        contract_json={"installation_id": "00000000-0000-0000-0000-000000000001"},
+    )
+    monkeypatch.setattr(settings_router, "get_session", fake_session)
+    monkeypatch.setattr(
+        settings_router, "ensure_current_contract", AsyncMock(return_value=revision)
+    )
     diagnostic = json.dumps({"home_id": "A", "reason": "selected_home_not_found"})
     monkeypatch.setattr(
         settings_router,

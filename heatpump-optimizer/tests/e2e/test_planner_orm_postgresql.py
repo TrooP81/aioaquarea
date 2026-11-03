@@ -16,10 +16,15 @@ import pytest
 from sqlalchemy import func, inspect, select, text
 
 from packages.core import database
-from packages.core.models import ConsumptionRecord, PlanActionRecord, PlanRecord
+from packages.core.models import ConsumptionRecord, PlanActionRecord, PlanRecord, SettingRecord
 from packages.core.plan_outcome import observed_rate_baseline
 from packages.optimizer import main, milp, rules_engine
 from packages.optimizer.rules_engine import RulesOptimizer
+from tests.e2e.ordinary_cleanup import (
+    _house_boundary,
+    _settings_rows,
+    assert_ordinary_contract_consistent,
+)
 from tests.planner_orm_support import (
     DEVICE,
     UTC,
@@ -29,12 +34,39 @@ from tests.planner_orm_support import (
 )
 
 
+async def _planning_boundary():
+    from packages.core.settings_service import get_all_settings
+
+    async with database.get_session(read_only=True) as session:
+        await assert_ordinary_contract_consistent(session, await get_all_settings(session=session))
+        return await _settings_rows(session), await _house_boundary(session)
+
+
+async def _seed_planning_rows(db_session, *, layer="rules_only", gate="valid"):
+    """Version settings and evidence together; release locks before planning."""
+    from packages.core.house_contract import ensure_current_contract
+    from packages.core.settings_service import SETTINGS_SCHEMA, set_settings_bulk
+
+    rows = planning_rows(layer=layer, gate=gate)
+    values = {row.key: row.value for row in rows if isinstance(row, SettingRecord)}
+    assert set(values) <= set(SETTINGS_SCHEMA)
+    current = await ensure_current_contract(db_session)
+    await set_settings_bulk(
+        values,
+        session=db_session,
+        expected_revision_id=current.id,
+        source="p17_planning_fixture",
+    )
+    db_session.add_all(row for row in rows if not isinstance(row, SettingRecord))
+    await db_session.commit()
+    return await _planning_boundary()
+
+
 @pytest.mark.asyncio(loop_scope="session")
 class TestP17ReadOnlyPlanning:
     @pytest.mark.parametrize("gate", ["valid", "absent", "mismatch"])
     async def test_populated_rules_status_and_gate(self, db_session, monkeypatch, gate):
-        db_session.add_all(planning_rows(gate=gate))
-        await db_session.commit()
+        boundary = await _seed_planning_rows(db_session, gate=gate)
         isolate_model_evidence(monkeypatch)
         captured = []
         original = rules_engine.resolve_effective_gate
@@ -59,6 +91,7 @@ class TestP17ReadOnlyPlanning:
                 "mismatch": "config_fingerprint_mismatch",
             }[gate]
         )
+        assert await _planning_boundary() == boundary
 
     @pytest.mark.parametrize("gate", ["valid", "absent", "mismatch"])
     async def test_milp_diagnostic_persists_without_fallback_or_actions(
@@ -67,8 +100,7 @@ class TestP17ReadOnlyPlanning:
         monkeypatch,
         gate,
     ):
-        db_session.add_all(planning_rows(layer="milp_preferred", gate=gate))
-        await db_session.commit()
+        boundary = await _seed_planning_rows(db_session, layer="milp_preferred", gate=gate)
         isolate_model_evidence(monkeypatch)
         captured = []
         original = milp.resolve_effective_gate
@@ -106,6 +138,7 @@ class TestP17ReadOnlyPlanning:
         assert policy["ordinary_writes_allowed"] is False
         assert policy["control_ready"] is False
         assert policy["build_policy"] == "observe_only"
+        assert await _planning_boundary() == boundary
 
     @pytest.mark.parametrize("timezone", ["Europe/Stockholm", "UTC"])
     async def test_counter_source_day_and_timezone_reset(self, db_session, timezone):

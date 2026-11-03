@@ -377,8 +377,28 @@ class TestIndoorForecastApiLimitationReason:
     """G12: the live /api/thermal/indoor-forecast response carries the real reason."""
 
     @staticmethod
-    async def call_api(monkeypatch, *, quality, indoor_value, reason=None):
+    async def call_api(
+        monkeypatch,
+        *,
+        quality,
+        indoor_value,
+        reason=None,
+        contract=None,
+        instant=None,
+        saved_snapshot=None,
+        saved_plan_status="active",
+        thermal_context_current=True,
+        weather_rows=(),
+        provider="open-meteo",
+        input_hook=None,
+        installation_get=None,
+        corrupt_owner=False,
+        hours=2,
+        owner_start=None,
+        learned_context=False,
+    ):
         import datetime as dt
+        import json
         from unittest.mock import AsyncMock
 
         import httpx
@@ -388,36 +408,140 @@ class TestIndoorForecastApiLimitationReason:
         from packages.api.schemas import IndoorForecastResponse
         from packages.core import settings_service
         from packages.core.control_temperature import ControlTemperature
-        from packages.core.models import DeviceStatusRecord
+        from packages.core.models import DeviceStatusRecord, PlanRecord, WeatherRecord
+        from packages.core.house_contract import (
+            HousePlanningContract,
+            _contract_hash,
+            snapshot_from_revision,
+        )
+        from uuid import UUID
         from packages.ml.thermal import ThermalModel
         from tests.test_optimizer_api_contracts import _session_context
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = instant or dt.datetime.now(dt.timezone.utc)
+        if instant is not None:
+
+            class FrozenDatetime(dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+            monkeypatch.setattr(
+                models_router,
+                "dt",
+                SimpleNamespace(
+                    datetime=FrozenDatetime, timedelta=dt.timedelta, timezone=dt.timezone
+                ),
+            )
         status = DeviceStatusRecord(ts=now, device_id="g12-device", outdoor_temp=5, zone1_temp=35)
+        projection = (
+            contract
+            or HousePlanningContract.from_settings(
+                {
+                    "timezone": "UTC",
+                    "comfort_schedule": '{"weekday":[],"weekend":[]}',
+                    "comfort_temp_min": "20",
+                    "comfort_temp_target": "20.5",
+                    "comfort_temp_max": "23",
+                },
+                UUID(int=1),
+                UUID(int=2),
+            ).to_projection()
+        )
+        revision = SimpleNamespace(
+            id=1,
+            contract_hash=_contract_hash(projection),
+            contract_json=projection,
+            effective_at=now,
+            source="fixture",
+        )
+        start = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+        owner_start = owner_start or start
+        owner_end = (
+            dt.datetime.fromisoformat(saved_snapshot["forecast_with_plan"][-1]["ts"])
+            if saved_snapshot and saved_snapshot.get("forecast_with_plan")
+            else owner_start + dt.timedelta(hours=hours)
+        )
+        authority = await snapshot_from_revision(
+            SimpleNamespace(get=AsyncMock(return_value=revision)), 1, owner_start, owner_end
+        )
+        if corrupt_owner:
+            authority["schedule_projection"][0]["target_c"] += 1
+        saved_plan = (
+            SimpleNamespace(
+                id=91,
+                plan_json=json.dumps(
+                    {"forecast_snapshot": saved_snapshot, "house_contract_snapshot": authority}
+                ),
+                created_at=now,
+                horizon_start=owner_start,
+                horizon_end=owner_end,
+                contract_revision_id=1,
+                contract_hash=revision.contract_hash,
+                contract_state="current",
+                status=saved_plan_status,
+            )
+            if saved_snapshot is not None
+            else None
+        )
 
         async def execute(statement):
             model = statement.column_descriptions[0]["entity"]
+            if model is WeatherRecord:
+                compiled = statement.compile()
+                assert "weather.source =" in str(compiled)
+                assert provider in compiled.params.values()
+                rows = [row for row in weather_rows if row.source == provider]
+                return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
             return SimpleNamespace(
-                scalar_one_or_none=lambda: status if model is DeviceStatusRecord else None,
+                scalar_one_or_none=lambda: (
+                    status
+                    if model is DeviceStatusRecord
+                    else saved_plan
+                    if model is PlanRecord
+                    else None
+                ),
                 scalars=lambda: SimpleNamespace(all=lambda: []),
             )
 
         floats = {"comfort_temp_min": 20.0, "comfort_temp_max": 23.0}
         model = ThermalModel()
+        if learned_context:
+            model.capture_dependency_context = lambda: ("qualified-learned-reference", 1)
         model.arefresh_if_changed = AsyncMock(return_value=False)
+        model.dependency_context_is_current = AsyncMock(return_value=thermal_context_current)
         monkeypatch.setattr("packages.ml.thermal.thermal_model", model)
         monkeypatch.setattr(
             models_router, "_read_live_forecast_quality", AsyncMock(return_value=quality)
+        )
+        monkeypatch.setattr(
+            models_router,
+            "_saved_plan_model_dependencies_are_current",
+            AsyncMock(return_value=True),
         )
         monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
         monkeypatch.setattr(
             models_router,
             "get_session",
-            lambda: _session_context(SimpleNamespace(execute=execute)),
+            lambda: _session_context(
+                SimpleNamespace(
+                    execute=execute,
+                    get=installation_get
+                    or AsyncMock(
+                        return_value=SimpleNamespace(
+                            installation_id=UUID(int=1), indoor_dependency_generation=0
+                        )
+                    ),
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "packages.core.house_contract.ensure_current_contract", AsyncMock(return_value=revision)
         )
         monkeypatch.setattr(
             "packages.core.control_temperature.get_control_temperature",
-            AsyncMock(
+            input_hook
+            or AsyncMock(
                 return_value=ControlTemperature(
                     value=indoor_value,
                     confidence="high" if indoor_value is not None else "low",
@@ -442,17 +566,17 @@ class TestIndoorForecastApiLimitationReason:
         monkeypatch.setattr(
             settings_service, "get_comfort_schedule", AsyncMock(return_value={"weekday": []})
         )
-        monkeypatch.setattr(settings_service, "get_setting", AsyncMock(return_value=None))
+        monkeypatch.setattr(settings_service, "get_setting", AsyncMock(return_value=provider))
         monkeypatch.setattr(settings_service, "get_user_tz", AsyncMock(return_value="UTC"))
         monkeypatch.setattr(settings_service, "is_comfort_hour", lambda *a, **k: True)
 
         app = FastAPI()
         app.include_router(models_router.router)
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
             base_url="http://g12.invalid",
         ) as client:
-            response = await client.get("/api/thermal/indoor-forecast?hours=2")
+            response = await client.get(f"/api/thermal/indoor-forecast?hours={hours}")
 
         assert response.status_code == 200
         payload = response.json()

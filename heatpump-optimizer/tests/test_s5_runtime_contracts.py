@@ -12,6 +12,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_service_logging_configuration(monkeypatch):
+    # Service ownership tests already replace shutdown; do not start a real sink
+    # (or change the global structlog configuration) behind that fake cleanup.
+    monkeypatch.setattr("packages.core.logging.configure_structlog_with_db", lambda name: None)
+
+
 @pytest.mark.parametrize("service", ["api", "poller"])
 @pytest.mark.parametrize("failure", ["error", "cancel"])
 async def test_R23_startup_failure_disposes_engine_after_owned_drain(monkeypatch, service, failure):
@@ -168,12 +175,39 @@ async def test_R23_successful_API_lifespan_disposes_after_serving(monkeypatch):
 
 def _cooldown_harness(monkeypatch, *, failure=None):
     """Isolate publication ownership; S4's physical/input validators are separate gates."""
+    from packages.core import house_contract
     from packages.optimizer import main
     from packages.optimizer.executor_core import LearningModeState
+    from packages.core.comfort_schedule import TIMEZONE_POLICY, timezone_data_version
 
     sentinel = -1_000_000_000.0
+    contract_json = {
+        "schema_version": 2,
+        "installation_id": "00000000-0000-0000-0000-000000000001",
+        "house_id": "00000000-0000-0000-0000-000000000002",
+        "timezone": "Europe/Stockholm",
+        "comfort_schedule": {"weekday": [], "weekend": []},
+        "comfort_temp_min": 18.0,
+        "comfort_temp_target": 20.0,
+        "comfort_temp_max": 25.0,
+        "timezone_policy": TIMEZONE_POLICY,
+        "tzdata_version": timezone_data_version(),
+    }
+    revision = SimpleNamespace(
+        id=7,
+        contract_hash="a" * 64,
+        contract_json=contract_json,
+        effective_at=dt.datetime.now(dt.timezone.utc),
+        source="unit_test",
+    )
     monkeypatch.setattr(main, "_last_plan_generated_at", sentinel)
     monkeypatch.setattr(main, "_optimization_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        main,
+        "_freeze_contract_revision",
+        AsyncMock(return_value=(revision.id, revision.contract_hash)),
+    )
+    monkeypatch.setattr(house_contract, "ensure_current_contract", AsyncMock(return_value=revision))
     monkeypatch.setattr(
         main, "resolve_learning_mode_state", AsyncMock(return_value=LearningModeState.ACTIVE)
     )
@@ -218,7 +252,11 @@ def _cooldown_harness(monkeypatch, *, failure=None):
 
     @asynccontextmanager
     async def session():
-        yield SimpleNamespace(add=add, flush=flush)
+        yield SimpleNamespace(
+            add=add,
+            flush=flush,
+            get=AsyncMock(return_value=revision),
+        )
         events.append(("commit_enter", main._last_plan_generated_at))
         entered.set()
         await release.wait()
@@ -281,7 +319,10 @@ async def test_R30_unsuccessful_publication_never_consumes_cooldown(monkeypatch,
 
 @pytest.fixture
 def isolated_sink(monkeypatch):
-    from packages.core import log_sink
+    from tests.test_logging_ownership_contracts import load_sink
+
+    log_sink, _saved = load_sink(monkeypatch)
+    log_sink._OWNER = log_sink._Owner(state="RUNNING")
 
     monkeypatch.setattr(log_sink, "_LOG_BUFFER", [])
     monkeypatch.setattr(log_sink, "_DROP_COUNTS", Counter())

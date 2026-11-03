@@ -8,14 +8,70 @@ function unknownScope(row: ReturnType<typeof manualCOPObservation>): Row {
 
 interface Ledger {
     rows: Row[];
-    writes: Array<{ method: string; path: string; body: Record<string, unknown> }>;
+    writes: Array<{ method: string; path: string; body: Record<string, unknown>; headers: Record<string, string> }>;
     getStatus: number;
     monitoring: Record<string, unknown> | null;
     nextRevision: string;
+    settingsRevision: string | null;
+    settingsGetStatus: number;
+    settingsPutStatus: number;
+    manualForecastEnabled: boolean;
 }
 
 async function ledger(page: Page, rows: Row[] = []): Promise<Ledger> {
-    const state: Ledger = { rows, writes: [], getStatus: 200, monitoring: null, nextRevision: "9007199254740993" };
+    const state: Ledger = {
+        rows,
+        writes: [],
+        getStatus: 200,
+        monitoring: null,
+        nextRevision: "9007199254740993",
+        settingsRevision: "7",
+        settingsGetStatus: 200,
+        settingsPutStatus: 200,
+        manualForecastEnabled: false,
+    };
+    await page.route("**/api/settings", async (route) => {
+        const request = route.request();
+        if (request.method() === "GET") {
+            if (state.settingsGetStatus !== 200) {
+                return route.fulfill({ status: state.settingsGetStatus, contentType: "application/json", body: "{}" });
+            }
+            return route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                headers: state.settingsRevision ? { "X-Contract-Revision": state.settingsRevision } : {},
+                body: JSON.stringify({
+                    manual_cop_monitoring_enabled: {
+                        value: state.manualForecastEnabled ? "true" : "false",
+                        type: "bool",
+                        description: "Experimental forecasting toggle",
+                    },
+                }),
+            });
+        }
+        const body = request.postDataJSON();
+        state.writes.push({
+            method: request.method(),
+            path: "/api/settings",
+            body,
+            headers: Object.fromEntries(Object.entries(request.headers()).map(([key, value]) => [key.toLowerCase(), value])),
+        });
+        if (state.settingsPutStatus !== 200) {
+            return route.fulfill({ status: state.settingsPutStatus, contentType: "application/json", body: "{}" });
+        }
+        const ifMatch = request.headers()["if-match"];
+        if (!state.settingsRevision || ifMatch !== state.settingsRevision) {
+            return route.fulfill({ status: 409, contentType: "application/json", body: "{}" });
+        }
+        state.manualForecastEnabled = body.settings?.manual_cop_monitoring_enabled === "true";
+        state.settingsRevision = String(Number(state.settingsRevision) + 1);
+        return route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            headers: { "X-Contract-Revision": state.settingsRevision },
+            body: JSON.stringify({ status: "updated", count: 1 }),
+        });
+    });
     await page.route("**/api/cop/manual**", async (route) => {
         const request = route.request();
         const url = new URL(request.url());
@@ -38,7 +94,12 @@ async function ledger(page: Page, rows: Row[] = []): Promise<Ledger> {
             });
         }
         const body = request.postDataJSON();
-        state.writes.push({ method: request.method(), path: url.pathname, body });
+        state.writes.push({
+            method: request.method(),
+            path: url.pathname,
+            body,
+            headers: Object.fromEntries(Object.entries(request.headers()).map(([key, value]) => [key.toLowerCase(), value])),
+        });
         const [, , , , , series, periodDate] = url.pathname.split("/");
         const existing = state.rows.find((row) => row.granularity === series && row.period_date === periodDate);
         if (body.expected_revision !== (existing?.revision ?? "0")) return route.fulfill({ status: 409, body: "{}" });
@@ -142,5 +203,30 @@ test.describe("Manual controller COP local-calendar contract", () => {
         await expect(panel.getByRole("alert")).toHaveText("Manual readings unavailable (503)");
         await expect(panel.getByTestId("manual-projection")).toHaveCount(0);
         await expect(panel.getByTestId("manual-forecast")).toContainText("Forecast unavailable");
+    });
+
+    test("uses versioned settings writes for forecasting toggle", async ({ page }) => {
+        const state = await ledger(page, [unknownScope(manualCOPObservation())]);
+        const panel = await openPanel(page);
+        const toggle = panel.getByRole("checkbox", { name: "Experimental forecasting" });
+        await expect(toggle).toBeEnabled();
+        await expect(toggle).not.toBeChecked();
+        await toggle.check();
+        await expect.poll(() => state.writes.some((entry) => entry.path === "/api/settings")).toBe(true);
+
+        const settingsWrite = state.writes.find((entry) => entry.path === "/api/settings");
+        expect(settingsWrite).toBeDefined();
+        expect(settingsWrite?.headers["if-match"]).toBe("7");
+        expect(settingsWrite?.body).toEqual({
+            settings: { manual_cop_monitoring_enabled: "true" },
+        });
+    });
+
+    test("shows explicit stale-settings error when toggle precondition conflicts", async ({ page }) => {
+        const state = await ledger(page, [unknownScope(manualCOPObservation())]);
+        state.settingsPutStatus = 409;
+        const panel = await openPanel(page);
+        await panel.getByRole("checkbox", { name: "Experimental forecasting" }).check();
+        await expect(panel.getByRole("alert")).toContainText("Settings changed elsewhere; reload and retry");
     });
 });

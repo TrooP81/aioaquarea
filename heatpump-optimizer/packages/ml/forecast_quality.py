@@ -9,7 +9,7 @@ import math
 import statistics
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +24,7 @@ from packages.core.database import copy_materialized_rows, get_session
 from packages.core.models import (
     ConsumptionRecord,
     DeviceStatusRecord,
+    HouseInstallationRecord,
     IndoorTempReading,
     OverrideRecord,
     PlanActionRecord,
@@ -122,7 +123,7 @@ def timer_fingerprint(timer: Mapping[str, Any]) -> str:
 
 
 def native_scope(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    scope = {
         "policy_schema": NATIVE_POLICY_SCHEMA,
         "estimator_schema": NATIVE_ESTIMATOR_SCHEMA,
         "sensor_fingerprint": evidence_hash(snapshot["sensor_basis"]),
@@ -135,6 +136,39 @@ def native_scope(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "schema_fingerprint": evidence_hash(snapshot["schemas"]),
         "tolerances": dict(NATIVE_TOLERANCES),
     }
+    if snapshot.get("schemas", {}).get("artifact") == "demand_lifecycle_v1":
+        scope["component_dependency_schema"] = "demand_p2_1_dependencies_v1"
+        scope["component_dependency_generation"] = snapshot.get("demand_dependency_generation")
+        scope["component_dependency_fingerprint"] = evidence_hash(
+            {
+                "installation_id": snapshot.get("installation_id"),
+                "device_id": snapshot.get("device_id"),
+                "weather_provider": snapshot.get("weather_provider"),
+                "timezone": snapshot.get("timezone"),
+                "tzdata_version": snapshot.get("tzdata_version"),
+                "max_rate_kw": snapshot.get("max_rate_kw"),
+                "dependency_generation": snapshot.get("demand_dependency_generation"),
+                "feature_schema": "demand_model_weather_v3",
+                "target_schema": "electrical_heating_kwh_per_hour_v1",
+            }
+        )
+    capabilities = snapshot.get("capabilities", ())
+    if (
+        snapshot.get("schemas", {}).get("artifact") == "thermal_v5"
+        and any(str(capability).startswith("indoor_") for capability in capabilities)
+    ) or snapshot.get("schemas", {}).get("artifact") == "comfort_v8":
+        scope["component_dependency_schema"] = "indoor_sensor_dependencies_v1"
+        scope["component_dependency_generation"] = snapshot.get("indoor_dependency_generation")
+        scope["component_dependency_fingerprint"] = evidence_hash(
+            {
+                "installation_id": snapshot.get("installation_id"),
+                "configured_sensor_ids": sorted(snapshot.get("configured_sensor_ids", ())),
+                "reference_sensor_id": snapshot.get("reference_sensor_id") or None,
+                "selection_schema": "selected_indoor_sensors_v2",
+                "generation": snapshot.get("indoor_dependency_generation"),
+            }
+        )
+    return scope
 
 
 @dataclass(frozen=True)
@@ -779,6 +813,48 @@ def _plain_record(row: Any, model: Any) -> dict[str, Any]:
     return result
 
 
+@asynccontextmanager
+async def locked_demand_scope(device_id: str, *, session=None):
+    """Keep dependency settings stable through the caller's publication boundary."""
+    from packages.core.house_contract import _lock_contract
+
+    async with get_session() if session is None else nullcontext(session) as session:
+        await _lock_contract(session)
+        inputs = await materialize_native_inputs(
+            "demand", now=dt.datetime.now(dt.timezone.utc), device_id=device_id, session=session
+        )
+        if inputs is None:
+            raise ValueError("current_demand_scope_unavailable")
+        yield native_scope(inputs), session
+
+
+@asynccontextmanager
+async def locked_native_scope(
+    component: str,
+    *,
+    device_id: str,
+    capabilities: tuple[str, ...] = (),
+    timer_reader: Any | None = None,
+    session=None,
+):
+    """Freeze component dependencies under the same lock used by settings writers."""
+    from packages.core.house_contract import _lock_contract
+
+    async with get_session() if session is None else nullcontext(session) as session:
+        await _lock_contract(session)
+        inputs = await materialize_native_inputs(
+            component,
+            now=dt.datetime.now(dt.timezone.utc),
+            device_id=device_id,
+            capabilities=capabilities,
+            timer_reader=timer_reader,
+            session=session,
+        )
+        if inputs is None:
+            raise ValueError(f"current_{component}_scope_unavailable")
+        yield native_scope(inputs), session
+
+
 async def materialize_native_inputs(
     component: str,
     *,
@@ -819,6 +895,10 @@ async def materialize_native_inputs(
         timer = timer_reader.cached_native_timer_provenance()
     else:
         timer = None
+    demand_contract = None
+    demand_dependency_generation = None
+    indoor_dependency_generation = None
+    installation_id = None
     since = now - dt.timedelta(hours=2)
     async with get_session() if session is None else nullcontext(session) as session:
         query = select(DeviceStatusRecord).where(
@@ -838,6 +918,25 @@ async def materialize_native_inputs(
             return None
         latest = statuses[-1]
         device_id = latest.device_id
+        if component == "demand":
+            from packages.core.house_contract import ensure_current_contract
+
+            demand_contract = await ensure_current_contract(session)
+            if demand_contract.contract_json.get("timezone") != str(
+                values.get("timezone") or "Europe/Amsterdam"
+            ):
+                return None
+            installation = await session.get(HouseInstallationRecord, 1)
+            if installation is None:
+                return None
+            demand_dependency_generation = installation.demand_dependency_generation
+            installation_id = str(installation.installation_id)
+        elif component == "comfort" or component == "thermal":
+            installation = await session.get(HouseInstallationRecord, 1)
+            if installation is None:
+                return None
+            indoor_dependency_generation = installation.indoor_dependency_generation
+            installation_id = str(installation.installation_id)
         weather_provider = str(values.get("weather_provider") or "open-meteo")
         weather = (
             (
@@ -924,6 +1023,20 @@ async def materialize_native_inputs(
             "price_area": price_area,
             "timer": timer,
             "capabilities": capabilities,
+            "house_contract_context": (
+                {
+                    "installation_id": installation_id,
+                    "tzdata_version": (
+                        demand_contract.contract_json.get("tzdata_version")
+                        if demand_contract is not None
+                        else None
+                    ),
+                    "demand_dependency_generation": demand_dependency_generation,
+                    "indoor_dependency_generation": indoor_dependency_generation,
+                }
+                if installation_id is not None
+                else {}
+            ),
         }
         for name, rows, model in (
             ("statuses", statuses, DeviceStatusRecord),
@@ -959,6 +1072,7 @@ def _prepare_native_inputs(data: dict, *, component=None, capabilities=None) -> 
     )
     latest, since, timer = statuses[-1], now - dt.timedelta(hours=2), data["timer"]
     weather_provider = data["weather_provider"]
+    house_contract_context = data.get("house_contract_context", {})
     raw_indoor = [
         row
         for row in data["raw_indoor"]
@@ -1054,6 +1168,11 @@ def _prepare_native_inputs(data: dict, *, component=None, capabilities=None) -> 
     )
     if component == "comfort" and not _finite_number(trend):
         return None
+    max_rate_kw = None
+    if component == "demand":
+        from packages.ml.demand_model_core import DemandModel
+
+        max_rate_kw = DemandModel._max_plausible_rate_kw()
     return {
         "issued_at": now.isoformat(),
         "device_id": device_id,
@@ -1086,6 +1205,12 @@ def _prepare_native_inputs(data: dict, *, component=None, capabilities=None) -> 
         "indoor_sensor_history": indoor_history if indoor_available else [],
         "weather_provider": weather_provider,
         "timezone": str(values.get("timezone") or "Europe/Amsterdam"),
+        "max_rate_kw": max_rate_kw,
+        "tzdata_version": house_contract_context.get("tzdata_version"),
+        "installation_id": house_contract_context.get("installation_id"),
+        "demand_dependency_generation": house_contract_context.get("demand_dependency_generation"),
+        "indoor_dependency_generation": house_contract_context.get("indoor_dependency_generation"),
+        "capabilities": tuple(capabilities),
     }
 
 

@@ -224,6 +224,7 @@ async def test_api_lifespan_start_failure_leaves_wrapper_unset_and_stops_partial
     dispose = AsyncMock()
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=dispose))
     monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", AsyncMock())
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
 
     class FailingWrapper:
         instances = []
@@ -1261,6 +1262,7 @@ async def test_quota_response_contains_all_fields_without_identifiers() -> None:
 
 @pytest.mark.asyncio
 async def test_api_lifespan_success_exposes_then_removes_one_wrapper(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     drain = AsyncMock()
     monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
@@ -1283,6 +1285,7 @@ async def test_api_lifespan_success_exposes_then_removes_one_wrapper(monkeypatch
 
 @pytest.mark.asyncio
 async def test_lifespan_start_failure_leaves_other_routes_available(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     drain = AsyncMock()
     monkeypatch.setattr("packages.core.log_sink.shutdown_log_sink", drain)
@@ -1305,6 +1308,7 @@ async def test_lifespan_start_failure_leaves_other_routes_available(monkeypatch)
 async def test_api_lifespan_disabled_quota_creates_no_wrapper_and_still_drains_logs(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", False)
     constructor = MagicMock()
@@ -1324,6 +1328,7 @@ async def test_api_lifespan_disabled_quota_creates_no_wrapper_and_still_drains_l
 async def test_api_lifespan_failed_start_disposes_once_before_final_log_drain(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     events = []
@@ -1350,6 +1355,7 @@ async def test_api_lifespan_failed_start_disposes_once_before_final_log_drain(
 async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_stop(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     dispose_engine = AsyncMock()
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=dispose_engine))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
@@ -1372,10 +1378,25 @@ async def test_api_lifespan_failed_start_disposal_error_propagates_after_single_
     assert not hasattr(application.state, "aquarea_wrapper")
 
 
+async def _wait_lifespan_event(event, task):
+    """Bound synthetic startup and surface its exception instead of hanging."""
+    waiter = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait({waiter, task}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            await task
+            pytest.fail("lifespan ended before the expected event")
+        assert waiter in done, "lifespan did not reach the expected event within 2 seconds"
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_stops_once(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     stopping = asyncio.Event()
@@ -1404,16 +1425,22 @@ async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_s
             events.append("yielded")
 
     task = asyncio.create_task(run_lifespan())
-    await stopping.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert events == ["wrapper_stop_started"]
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await _wait_lifespan_event(stopping, task)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert events == ["wrapper_stop_started"]
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
 
     assert events == ["wrapper_stop_started", "wrapper_stop_finished", "log_drain"]
     wrapper.stop.assert_awaited_once()
@@ -1424,6 +1451,7 @@ async def test_api_lifespan_repeated_cancellation_during_failed_start_disposal_s
 async def test_api_lifespan_cancellation_during_start_disposes_partial_wrapper_once(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(api_main, "configure_logging", MagicMock())
     monkeypatch.setattr("packages.core.database.engine", SimpleNamespace(dispose=AsyncMock()))
     monkeypatch.setattr(settings, "panasonic_distributed_read_quota_enabled", True)
     starting = asyncio.Event()
@@ -1443,14 +1471,30 @@ async def test_api_lifespan_cancellation_during_start_disposes_partial_wrapper_o
             pytest.fail("cancelled startup must not yield")
 
     task = asyncio.create_task(run_lifespan())
-    await starting.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await _wait_lifespan_event(starting, task)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
 
     wrapper.stop.assert_awaited_once()
     drain.assert_awaited_once()
     assert not hasattr(application.state, "aquarea_wrapper")
+
+
+@pytest.mark.asyncio
+async def test_lifespan_event_wait_surfaces_early_start_failure():
+    async def fail():
+        raise RuntimeError("synthetic early startup failure")
+
+    task = asyncio.create_task(fail())
+    with pytest.raises(RuntimeError, match="synthetic early startup failure"):
+        await _wait_lifespan_event(asyncio.Event(), task)
+    assert task.done()
 
 
 @pytest.mark.asyncio

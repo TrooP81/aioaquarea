@@ -87,6 +87,10 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
     source_state = None
     cleanup_verified = False
     seeded = False
+    legacy_raw = ' \n{ "status" : "ok" }\n\n'
+    legacy_sha256 = hashlib.sha256(legacy_raw.encode()).hexdigest()
+    legacy_at = None
+    expected_source = None
     coordinator_verified = False
     engine = create_async_engine(
         os.environ["DATABASE_URL"],
@@ -108,6 +112,25 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
                     {"key": key, "value": key},
                 )
                 seeded = True
+                assert (
+                    await connection.execute(text("SELECT version_num FROM alembic_version"))
+                ).scalar_one() == "039"
+                expected_source = (
+                    await connection.execute(
+                        text(
+                            "SELECT md5(system_identifier::text||'/'||current_database()) FROM pg_control_system()"
+                        )
+                    )
+                ).scalar_one()
+                legacy_at = (
+                    await connection.execute(
+                        text(
+                            "INSERT INTO service_heartbeats(service,updated_at,details_json) "
+                            "VALUES ('backup',now(),:raw) RETURNING updated_at"
+                        ),
+                        {"raw": legacy_raw},
+                    )
+                ).scalar_one()
         platform = inspect(ownership["services"]["postgres"]["id"])
         assert platform["Config"]["Image"] == IMAGE
         network = ownership["namespace"]
@@ -132,6 +155,14 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
             "BACKUP_REPLICA_ENABLED=false",
             "-e",
             "BACKUP_REPLICA_REQUIRED=false",
+            "-e",
+            f"BACKUP_EXPECTED_SOURCE_ID={expected_source}",
+            "-e",
+            "BACKUP_EXPECTED_SCHEMA_REVISION=039",
+            "-e",
+            f"BACKUP_LEGACY_EXPECTED_SHA256={legacy_sha256}",
+            "-e",
+            f"BACKUP_LEGACY_EXPECTED_UPDATED_AT={legacy_at.isoformat()}",
             "--entrypoint",
             "sh",
             IMAGE,
@@ -142,7 +173,15 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
         scripts = Path(__file__).parents[2] / "scripts"
         for name in ("backup_db.sh", "backup_status.sql", "stage_backup.sh"):
             docker("cp", str(scripts / name), f"{worker}:/scripts/{name}")
-        docker("exec", worker, "sh", "/scripts/backup_db.sh", "--once", limit=120)
+        docker(
+            "exec",
+            worker,
+            "sh",
+            "/scripts/backup_db.sh",
+            "--once-preserve-archives",
+            "--transition-legacy",
+            limit=120,
+        )
         binding = docker_json(
             "exec",
             worker,
@@ -153,6 +192,7 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
             "WHERE service='backup'",
         )
         assert binding["archive_id"].startswith("heatpump-")
+        assert binding["schema_revision"] == "039" and binding["source_id"] == expected_source
         source = inspect(worker)
         receipt = {
             "container_id": worker,
@@ -232,6 +272,12 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
                 )
                 assert history["last_verified"]["sha256"] == binding["sha256"]
                 assert history["last_success"] == binding
+                audit = history["legacy_transition"]
+                assert audit["original"]["details_json"] == legacy_raw
+                assert audit["original"]["details_sha256"] == legacy_sha256
+                assert audit["first_attempt"]["status"] == "succeeded"
+                assert audit["first_attempt"]["retention_mode"] == "preserve"
+                assert audit["first_attempt"]["reason_code"] == ""
     finally:
         errors = []
         for identity in reversed(created):
@@ -267,9 +313,11 @@ async def test_owned_worker_and_coordinator_image_roundtrip(request):
                         await connection.execute(
                             text(
                                 "DELETE FROM service_heartbeats WHERE service='backup' "
-                                "AND details_json::jsonb->'last_success'->>'archive_id'=:archive"
+                                "AND ((details_json::jsonb->'legacy_transition'->'original'->>'details_sha256'=:digest "
+                                "AND (details_json::jsonb->'legacy_transition'->'original'->>'updated_at')::timestamptz=:timestamp) "
+                                "OR (details_json=:raw AND updated_at=:timestamp))"
                             ),
-                            {"archive": binding["archive_id"] if "binding" in locals() else ""},
+                            {"digest": legacy_sha256, "raw": legacy_raw, "timestamp": legacy_at},
                         )
                         assert await retained_storage_state(connection) == source_state
         except Exception as error:

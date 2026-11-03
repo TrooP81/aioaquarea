@@ -34,7 +34,7 @@ from packages.core.panasonic_control_state import (
     panasonic_zone_heating_available,
 )
 from packages.core.settings_service import (
-    get_effective_schedule,
+    get_comfort_schedule,
     get_float_setting,
     get_heat_curve_config,
     get_int_setting,
@@ -500,8 +500,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             if len(prices) == len(weather) == len(gate_projections)
             else None
         )
-        learned_threshold = await get_float_setting("learned_schedule_threshold")
-        comfort_schedule = await get_effective_schedule(learned_threshold=learned_threshold)
+        comfort_schedule = await get_comfort_schedule()
         tz_name = await get_user_tz()
         comfort_temp_target = await get_float_setting("comfort_temp_target")
         comfort_temp_min = await get_float_setting("comfort_temp_min")
@@ -679,6 +678,11 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         from packages.optimizer.rule_mixins import local_dhw_deadlines_in_horizon
         from packages.ml.thermal import assumed_heating_efficiency
 
+        represented_weather_forecast = self._represented_weather_forecast(
+            prices=prices,
+            weather=weather,
+            weather_full=weather_full,
+        )
         unproven_actions = [
             action for action in actions if action["type"] not in {"force_dhw_on", "force_dhw_off"}
         ]
@@ -828,7 +832,10 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             tank_comfort_floor = await get_float_setting("tank_min_temp")
             represented = build_represented_plan(
                 prices=prices,
-                weather=weather,
+                weather=[
+                    (dt.datetime.fromisoformat(row["ts"]), row["outdoor_temp"])
+                    for row in represented_weather_forecast
+                ],
                 cop_fn=lambda outdoor, hour=12: assumed_heating_efficiency(outdoor),
                 demand_per_hour=native_demand,
                 current_tank_temp=getattr(last_status, "tank_temp", None),
@@ -837,10 +844,17 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 dhw_deadlines=dhw_deadlines,
                 dhw_deadline_tank_floors_c=[tank_comfort_floor] * len(dhw_deadlines),
                 indoor_targets=[comfort_temp_min] * len(prices),
+                reported_indoor_targets=[
+                    comfort_temp_target
+                    if is_comfort_hour(comfort_schedule, timestamp, tz_name=tz_name)
+                    else comfort_temp_min
+                    for timestamp, _ in prices
+                ],
                 indoor_rates=self._represented_indoor_rates(
                     prices=prices,
                     weather=weather,
                     weather_full=weather_full,
+                    represented_weather_forecast=represented_weather_forecast,
                     current_indoor=current_indoor_temp,
                     heat_curve=heat_curve,
                     use_learned_forecast=learned_forecast_allowed,
@@ -856,6 +870,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
                 gate_states=native_gates,
                 indoor_max_temp_setting=comfort_temp_max,
                 hardware_tank_ceiling=getattr(last_status, "tank_heat_max", None),
+                represented_weather_forecast=represented_weather_forecast,
                 serialized_actions=actions,
             )
             if represented["diagnostic_status"] != "conditional_feasible":
@@ -878,7 +893,12 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             "forecast_with_plan"
         ]
         forecast_snapshot["forecast"] = forecast_snapshot["forecast_with_plan"]
-        for key in ("forecast_no_heating", "no_heating_basis", "price_forecast"):
+        for key in (
+            "forecast_no_heating",
+            "no_heating_basis",
+            "price_forecast",
+            "weather_forecast",
+        ):
             forecast_snapshot[key] = represented["forecast_snapshot"][key]
         forecast_snapshot["represented_strategy"] = represented["represented_strategy"]
         forecast_snapshot["serialized_replay"] = represented["serialized_replay"]
@@ -1021,6 +1041,7 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         heat_curve: HeatCurveConfig,
         use_learned_forecast: bool,
         max_passive_change_c_per_hour: float,
+        represented_weather_forecast: list[dict[str, Any]] | None = None,
     ) -> list[tuple[float, float]]:
         """Hourly (full-heat, passive) room deltas for the represented native SH trace.
 
@@ -1031,21 +1052,14 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         """
         from packages.optimizer import DataIncompleteError
 
-        weather_forecast = []
-        for hour, (slot_ts, _price) in enumerate(prices):
-            target_ts = slot_ts + dt.timedelta(hours=1)
-            fallback_temperature = (
-                weather[hour][1] if hour < len(weather) and weather[hour][1] is not None else 5.0
+        weather_forecast = represented_weather_forecast
+        if weather_forecast is None:
+            weather_forecast = RulesOptimizer._represented_weather_forecast(
+                prices=prices,
+                weather=weather,
+                weather_full=weather_full,
             )
-            weather_forecast.append(
-                {
-                    "ts": target_ts.isoformat(),
-                    "hour": target_ts.hour,
-                    **RulesOptimizer._forecast_weather_slot(
-                        weather_full, target_ts, float(fallback_temperature)
-                    ),
-                }
-            )
+
         hours = len(weather_forecast)
         try:
             zone_water_temps = [
@@ -1078,6 +1092,30 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
         except (IndexError, KeyError, TypeError, ValueError) as error:
             raise DataIncompleteError("Policy-aware indoor rates unavailable") from error
         return rates
+
+    @staticmethod
+    def _represented_weather_forecast(
+        *,
+        prices: list[tuple[dt.datetime, float]],
+        weather: list[tuple[dt.datetime, float]],
+        weather_full: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Freeze the slot-start weather grid shared by prediction and saved forecasts."""
+        weather_forecast = []
+        for hour, (slot_ts, _price) in enumerate(prices):
+            fallback_temperature = (
+                weather[hour][1] if hour < len(weather) and weather[hour][1] is not None else 5.0
+            )
+            weather_forecast.append(
+                {
+                    "ts": slot_ts.isoformat(),
+                    "hour": slot_ts.hour,
+                    **RulesOptimizer._forecast_weather_slot(
+                        weather_full, slot_ts, float(fallback_temperature)
+                    ),
+                }
+            )
+        return weather_forecast
 
     @staticmethod
     def _build_forecast_snapshot(
@@ -1225,15 +1263,15 @@ class RulesOptimizer(DHWRulesMixin, PreheatRulesMixin, GuardrailRulesMixin, Mode
             )
             target = (
                 comfort_temp_target
-                if is_comfort_hour(comfort_schedule, target_ts, tz_name=tz_name)
+                if is_comfort_hour(comfort_schedule, slot_ts, tz_name=tz_name)
                 else comfort_temp_min
             )
             targets.append(
                 {
                     "hour": hour + 1,
                     "ts": target_ts.isoformat(),
-                    "target": round(target, 1),
-                    "comfort_hour": is_comfort_hour(comfort_schedule, target_ts, tz_name=tz_name),
+                    "target": target,
+                    "comfort_hour": is_comfort_hour(comfort_schedule, slot_ts, tz_name=tz_name),
                 }
             )
 

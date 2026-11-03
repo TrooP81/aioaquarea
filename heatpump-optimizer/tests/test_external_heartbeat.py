@@ -304,6 +304,21 @@ async def test_save_time_validation_is_applied_to_direct_bulk_setting(monkeypatc
 async def test_api_secret_is_fully_redacted_and_mask_round_trip_preserves_it(monkeypatch):
     from packages.api.routers import settings as api_settings
 
+    session = SimpleNamespace(add=MagicMock())
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=session)
+    context.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(api_settings, "get_session", lambda: context)
+    monkeypatch.setattr(
+        api_settings,
+        "ensure_current_contract",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=7,
+                contract_json={"installation_id": "00000000-0000-0000-0000-000000000001"},
+            )
+        ),
+    )
     monkeypatch.setattr(
         api_settings,
         "get_all_settings",
@@ -313,12 +328,8 @@ async def test_api_secret_is_fully_redacted_and_mask_round_trip_preserves_it(mon
     assert result["external_heartbeat_url"]["value"] == "***"
     assert SENTINEL not in str(result)
 
-    writes = AsyncMock()
-    context = MagicMock()
-    context.__aenter__ = AsyncMock(return_value=SimpleNamespace(add=MagicMock()))
-    context.__aexit__ = AsyncMock(return_value=False)
+    writes = AsyncMock(return_value=8)
     monkeypatch.setattr(api_settings, "set_settings_bulk", writes)
-    monkeypatch.setattr(api_settings, "get_session", lambda: context)
     await api_settings.update_settings(
         api_settings.SettingsUpdate(settings={"external_heartbeat_url": "***"})
     )
@@ -543,7 +554,15 @@ async def test_dns_save_rejection_precedes_any_setting_write(monkeypatch):
         await settings_service.set_setting("external_heartbeat_url", SENTINEL)
 
     validate.assert_awaited_once_with(SENTINEL)
-    assert fake_session.execute.await_count == 2
+    statements = [
+        str(call.args[0]).strip().upper() for call in fake_session.execute.await_args_list
+    ]
+    assert statements
+    assert all(statement.startswith("SELECT ") for statement in statements)
+    assert "FROM SETTINGS" in statements[-1]
+    fake_session.add.assert_not_called()
+    fake_session.flush.assert_not_called()
+    fake_session.commit.assert_not_called()
 
 
 @pytest.mark.asyncio

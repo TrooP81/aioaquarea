@@ -47,6 +47,13 @@ def qualified_reference(component="thermal", capabilities=("indoor_heating",)):
     now = module._now()
     inputs = TestProspectiveNativeEvidence._inputs()
     inputs["schemas"]["artifact"] = module.LIFECYCLE_SCHEMAS[component]
+    inputs.update(
+        installation_id="installation-a",
+        configured_sensor_ids=["room"],
+        reference_sensor_id="room",
+        indoor_dependency_generation=1,
+        capabilities=capabilities,
+    )
     scope = native_scope(inputs)
     return ArtifactReference(
         "a" * 64,
@@ -281,6 +288,263 @@ async def test_demand_preprocessing_uses_lifecycle_owned_worker(state, monkeypat
         assert owner._executor is not None
     finally:
         await owner.close()
+
+
+@pytest.mark.usefixtures("windows_directory_fsync")
+@pytest.mark.parametrize("boundary", ["before_refresh", "during_load", "resident_reload"])
+@pytest.mark.parametrize(
+    ("change", "relevant"),
+    [
+        ({"timezone": "Asia/Kolkata"}, True),
+        ({"tzdata_version": "changed"}, True),
+        ({"demand_dependency_generation": 2}, True),
+        ({"max_rate_kw": 13.0}, True),
+        ({"comfort_schedule": {"weekday": [6], "weekend": []}}, False),
+        ({"comfort_temp_target": 20.55}, False),
+        ({"fixed_monthly_fee": 300}, False),
+    ],
+)
+async def test_p21_demand_real_fit_artifact_load_and_resident_context(
+    state, lease, tmp_path, monkeypatch, change, relevant, boundary
+):
+    import copy
+    import numpy as np
+    from packages.ml import forecast_quality as quality
+    from packages.ml.demand_model_core import DemandModel
+    from tests.test_forecast_quality import TestProspectiveNativeEvidence
+
+    monkeypatch.setattr(module.safe_persistence.settings, "model_dir", str(tmp_path))
+    inputs = TestProspectiveNativeEvidence._inputs()
+    inputs["schemas"]["artifact"] = "demand_lifecycle_v1"
+    inputs.update(
+        installation_id="p21-owned",
+        timezone="UTC",
+        tzdata_version="2026a",
+        demand_dependency_generation=1,
+        max_rate_kw=12.0,
+    )
+    current_inputs = copy.deepcopy(inputs)
+    session = AsyncMock()
+
+    @asynccontextmanager
+    async def offline_context():
+        yield session
+
+    monkeypatch.setattr(quality, "get_session", offline_context)
+    monkeypatch.setattr(
+        quality, "materialize_native_inputs", AsyncMock(side_effect=lambda *a, **k: current_inputs)
+    )
+    database = MemoryLifecycle(state)
+    owner = module.MaintenanceRunner(database, enabled_reader=AsyncMock(return_value=True))
+    features = np.zeros((500, 10))
+    features[:, 0] = np.tile(np.arange(-5.0, 20.0), 20)
+    start = module._now() - dt.timedelta(days=30)
+    materialized = {
+        "inputs": copy.deepcopy(inputs),
+        "data_cutoff": module._now(),
+        "data": {
+            "features": features,
+            "targets": 3.0 - 0.1 * features[:, 0],
+            "bounds": [
+                (start + dt.timedelta(hours=i), start + dt.timedelta(hours=i + 1))
+                for i in range(500)
+            ],
+            "device_id": inputs["device_id"],
+        },
+    }
+    entered, release = threading.Event(), threading.Event()
+
+    def fit():
+        entered.set()
+        assert release.wait(10)
+        return owner.hooks["demand"].fit(materialized)
+
+    task = asyncio.create_task(asyncio.to_thread(fit))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        current_inputs.update(change)
+        release.set()
+        fitted = await task
+        assert fitted is not None
+        current_inputs.clear()
+        current_inputs.update(copy.deepcopy(inputs))
+        artifacts = []
+
+        async def publish(_lease, artifact, **_options):
+            artifacts.append(artifact)
+            return module.PublicationResult(True, state.revision + 1)
+
+        # Storage/signing/round-trip and the real demand hooks execute. The
+        # lifecycle DB authority is simulated here, not claimed as a PG test.
+        database.publish = publish
+        assert (await owner.hooks["demand"].commit_candidate(lease, fitted, state)).committed
+        artifact = artifacts[0]
+        scope = artifact.manifest["scope"]
+        assert scope == quality.native_scope(inputs)
+        reference = replace(
+            qualified_reference("demand", ("demand",)),
+            artifact_hash=artifact.artifact_hash,
+            manifest=artifact.manifest,
+            qualification_scope={
+                **scope,
+                "qualification_policy": quality.QUALIFICATION_POLICY_SCHEMA,
+                "horizons": [60],
+                "capabilities": ["demand"],
+            },
+        )
+        reader = Lifecycle()
+        reader.read = AsyncMock(return_value=replace(state, references=(reference,)))
+        demand = DemandModel()
+        assert await demand.arefresh_committed(lifecycle=reader, scope=scope)
+        expected = fitted["payload"]["median"].predict(features[:3])
+        assert np.array_equal(demand._model.predict(features[:3]), expected)
+        assert demand.is_trained
+        original_load = reader.load_committed
+
+        async def load_with_context_change(*args, **kwargs):
+            payload = await original_load(*args, **kwargs)
+            current_inputs.update(change)
+            return payload
+
+        if boundary == "during_load":
+            reader.load_committed = load_with_context_change
+            current_scope = scope
+        else:
+            current_inputs.update(change)
+            current_scope = (
+                quality.native_scope(current_inputs) if boundary == "before_refresh" else scope
+            )
+        assert (
+            await demand.arefresh_committed(lifecycle=reader, scope=current_scope) is not relevant
+        )
+        assert demand.is_trained is not relevant
+        if relevant:
+            assert demand._model is None
+            monkeypatch.setattr(
+                quality, "materialize_native_inputs", AsyncMock(return_value=current_inputs)
+            )
+            await owner.hooks["demand"].review_candidate(
+                lease, replace(reference, role="candidate")
+            )
+            assert (
+                database.invalidate_component.await_args.args[2]
+                == "incompatible_sensor_policy_scope"
+            )
+        else:
+            assert demand._qualified_reference.artifact_hash == artifact.artifact_hash
+            assert np.array_equal(demand._model.predict(features[:3]), expected)
+    finally:
+        release.set()
+        await task
+        await owner.close()
+
+
+@pytest.mark.parametrize("relevant", [True, False])
+async def test_p21_fitted_demand_publication_revalidates_locked_scope(
+    state, lease, monkeypatch, relevant
+):
+    import copy
+    from packages.ml import forecast_quality as quality
+    from tests.test_forecast_quality import TestProspectiveNativeEvidence
+
+    inputs = TestProspectiveNativeEvidence._inputs()
+    inputs["schemas"]["artifact"] = "demand_lifecycle_v1"
+    old_scope = quality.native_scope(inputs)
+    current_inputs = copy.deepcopy(inputs)
+    current_inputs.update(
+        {"demand_dependency_generation": 2} if relevant else {"fixed_monthly_fee": 300}
+    )
+    sessions = Sessions([])
+    sessions.session.execute.side_effect = None
+    authority = Lifecycle(sessions)
+    authority._lock = AsyncMock()
+    authority._read = AsyncMock(return_value=state)
+
+    def certify(*args, **kwargs):
+        assert all("pg_advisory_xact_lock" in sql for sql in sessions.sql())
+        authority._lock.assert_awaited_once()
+        raise ValueError("durability_boundary_reached")
+
+    materialize = AsyncMock(return_value=current_inputs)
+    monkeypatch.setattr(quality, "materialize_native_inputs", materialize)
+    monkeypatch.setattr(module.safe_persistence, "_require_publication_owner", Mock())
+    certification = Mock(side_effect=certify)
+    monkeypatch.setattr(module.safe_persistence, "certify_durable_artifact", certification)
+    artifact = SimpleNamespace(
+        component="demand",
+        schema_version="demand_lifecycle_v1",
+        manifest={"device_id": "heatpump", "scope": old_scope},
+        artifact_hash="a" * 64,
+    )
+    if relevant:
+        result = await authority.publish(
+            lease, artifact, expected_revision=state.revision, expected_incumbent=None
+        )
+        assert not result.committed and result.reason == "demand_scope_mismatch"
+        certification.assert_not_called()
+        authority._lock.assert_not_awaited()
+    else:
+        with pytest.raises(ValueError, match="durability_boundary_reached"):
+            await authority.publish(
+                lease, artifact, expected_revision=state.revision, expected_incumbent=None
+            )
+        certification.assert_called_once()
+    materialize.assert_awaited_once()
+    assert materialize.await_args.kwargs["session"] is sessions.session
+    assert len(sessions.sql()) == 2
+    assert all("pg_advisory_xact_lock" in sql for sql in sessions.sql())
+    sessions.session.add.assert_not_called()
+
+
+@pytest.mark.parametrize("component", ["thermal", "comfort"])
+async def test_p21_indoor_publication_rejects_weather_aba_generation(
+    state, lease, monkeypatch, component
+):
+    import copy
+    from packages.ml import forecast_quality as quality
+    from tests.test_forecast_quality import TestProspectiveNativeEvidence
+
+    inputs = TestProspectiveNativeEvidence._inputs()
+    inputs.update(
+        installation_id="installation-a",
+        configured_sensor_ids=["room-a"],
+        reference_sensor_id="room-a",
+        indoor_dependency_generation=1,
+        capabilities=("indoor_heating",),
+    )
+    inputs["schemas"]["artifact"] = module.LIFECYCLE_SCHEMAS[component]
+    old_scope = quality.native_scope(inputs)
+    current_inputs = copy.deepcopy(inputs)
+    current_inputs["indoor_dependency_generation"] = 3  # A→B→A, same provider.
+    sessions = Sessions([])
+    sessions.session.execute.side_effect = None
+    authority = Lifecycle(sessions)
+    authority._lock = AsyncMock()
+    authority._read = AsyncMock(return_value=state)
+    materialize = AsyncMock(return_value=current_inputs)
+    monkeypatch.setattr(quality, "materialize_native_inputs", materialize)
+    monkeypatch.setattr(module.safe_persistence, "_require_publication_owner", Mock())
+    artifact = SimpleNamespace(
+        component=component,
+        schema_version=module.LIFECYCLE_SCHEMAS[component],
+        manifest={
+            "device_id": "heatpump",
+            "capabilities": ["indoor_heating"],
+            "scope": old_scope,
+        },
+        artifact_hash="a" * 64,
+    )
+
+    result = await authority.publish(
+        lease, artifact, expected_revision=state.revision, expected_incumbent=None
+    )
+
+    assert not result.committed
+    assert result.reason == "indoor_dependency_scope_mismatch"
+    materialize.assert_awaited_once()
+    assert materialize.await_args.kwargs["session"] is sessions.session
+    authority._lock.assert_not_awaited()
+    sessions.session.add.assert_not_called()
 
 
 def test_reference_expiry_is_outcome_based_and_scope_bound(state):
@@ -2493,6 +2757,7 @@ async def test_disabled_poller_job_and_seasonal_cycle_do_not_queue(monkeypatch):
 
 async def test_committed_thermal_reader_keeps_component_validation(monkeypatch):
     from dataclasses import asdict
+    from packages.ml import forecast_quality
     from packages.ml.thermal import ThermalModel
 
     model = ThermalModel()
@@ -2502,6 +2767,12 @@ async def test_committed_thermal_reader_keeps_component_validation(monkeypatch):
     evaluated.params.last_calibrated = module._now()
     assert evaluated.params.calibration_status["tank_heating"] == "validated"
     reference = qualified_reference()
+
+    @asynccontextmanager
+    async def current_scope(*args, **kwargs):
+        yield reference.manifest["scope"], kwargs.get("session", object())
+
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", current_scope)
     database = AsyncMock()
     database.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
     database.load_committed.return_value = {
@@ -2522,6 +2793,87 @@ async def test_committed_thermal_reader_keeps_component_validation(monkeypatch):
     assert model._tank_heating_rate(10) == 4.8
     model.calibrate.assert_not_awaited()
     model.load_latest.assert_not_called()
+
+
+async def test_thermal_adoption_rejects_sensor_generation_change_during_load(monkeypatch):
+    from dataclasses import asdict
+    from packages.ml import forecast_quality
+    from packages.ml.thermal import ThermalModel, ThermalParams
+
+    model = ThermalModel()
+    reference = qualified_reference()
+    original_scope = reference.manifest["scope"]
+    changed_scope = {
+        **original_scope,
+        "component_dependency_generation": 2,
+        "component_dependency_fingerprint": "f" * 64,
+    }
+    scopes = iter((original_scope, changed_scope))
+
+    @asynccontextmanager
+    async def changing_scope(*args, **kwargs):
+        yield next(scopes), kwargs.get("session", object())
+
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", changing_scope)
+    monkeypatch.setattr(forecast_quality, "check_exact_fit", lambda *_args: None)
+    database = AsyncMock()
+    database.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
+    database.load_committed.return_value = {
+        "schema_version": 5,
+        "params": asdict(ThermalParams()),
+        "validation": {},
+    }
+
+    available = await model.arefresh_committed(lifecycle=database)
+
+    assert not available
+    assert model._qualified_reference is None
+    assert model.confidence_for("indoor_heating") == "default"
+
+
+async def test_thermal_serving_rejects_changed_sensor_generation(monkeypatch):
+    from dataclasses import replace
+
+    from packages.ml import forecast_quality
+    from packages.ml.thermal import ThermalModel
+
+    model = ThermalModel()
+    reference = qualified_reference()
+    model._qualified_reference = reference
+    captured_context = model.capture_dependency_context()
+    changed_scope = {
+        **reference.manifest["scope"],
+        "component_dependency_generation": 2,
+        "component_dependency_fingerprint": "f" * 64,
+    }
+
+    @asynccontextmanager
+    async def current_scope(*args, **kwargs):
+        yield changed_scope, kwargs.get("session", object())
+
+    database = AsyncMock()
+    database.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", current_scope)
+    monkeypatch.setattr(module, "Lifecycle", lambda: database)
+
+    assert not await model.dependency_context_is_current(captured_context)
+
+    model._qualified_reference = replace(reference, artifact_hash="d" * 64)
+    assert not await model.dependency_context_is_current(captured_context)
+
+
+async def test_thermal_serving_rejects_reset_and_reload_aba():
+    from packages.ml.thermal import ThermalModel
+
+    model = ThermalModel()
+    reference = qualified_reference()
+    model._qualified_reference = reference
+    context = model.capture_dependency_context()
+
+    model.reset()
+    model._qualified_reference = reference
+
+    assert not await model.dependency_context_is_current(context)
 
 
 @pytest.mark.parametrize(
@@ -2553,14 +2905,25 @@ def test_thermal_confidence_requires_current_head_qualification(qualification):
 
 
 async def test_thermal_committed_cache_refreshes_within_sixty_seconds(monkeypatch):
+    from packages.ml import forecast_quality
     from packages.ml import thermal
 
     tick = [0.0]
     monkeypatch.setattr(thermal, "time", SimpleNamespace(monotonic=lambda: tick[0]))
     model = thermal.ThermalModel()
+    reference = qualified_reference()
+
+    @asynccontextmanager
+    async def current_scope(*args, **kwargs):
+        yield reference.manifest["scope"], kwargs.get("session", object())
+
+    database = AsyncMock()
+    database.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", current_scope)
+    monkeypatch.setattr(module, "Lifecycle", lambda: database)
 
     async def refresh():
-        model._qualified_reference = qualified_reference()
+        model._qualified_reference = reference
         model.params.last_calibrated = module._now()
         model.params.calibration_status["indoor_heating"] = "validated"
         return True
@@ -2715,7 +3078,7 @@ async def test_setting_disable_revokes_lease_in_its_own_transaction(monkeypatch,
     records.scalars.return_value.__iter__ = Mock(return_value=iter(()))
     responses = [Mock(), scalar(1), Mock(rowcount=1)]
     if bulk:
-        responses = [Mock(), records, *responses]
+        responses = [Mock(), Mock(), records, *responses]
     sessions = Sessions(responses)
     monkeypatch.setattr(settings_service, "get_session", sessions)
     if bulk:
@@ -2798,3 +3161,43 @@ async def test_fitting_worker_cannot_publish_files_or_lifecycle_authority(state,
     sessions.session.execute.assert_not_awaited()
     assert not (tmp_path / "legacy.pkl").exists()
     module.safe_persistence._require_publication_owner()
+
+
+@pytest.mark.parametrize("component", ["thermal", "comfort"])
+async def test_AC1_indoor_adoption_rejects_provider_aba_during_load(monkeypatch, component):
+    from dataclasses import asdict
+    from packages.ml import forecast_quality
+    from packages.ml.comfort_model import ComfortModel, COMFORT_MODEL_FORMAT_VERSION
+    from packages.ml.thermal import ThermalModel, ThermalParams
+
+    model = ThermalModel() if component == "thermal" else ComfortModel()
+    reference = qualified_reference(component)
+    old = reference.manifest["scope"]
+    changed = {
+        **old,
+        "component_dependency_generation": 3,
+        "component_dependency_fingerprint": "f" * 64,
+    }
+    scopes = iter((old, changed))
+
+    @asynccontextmanager
+    async def changing_scope(*args, **kwargs):
+        yield next(scopes), kwargs.get("session", object())
+
+    monkeypatch.setattr(forecast_quality, "locked_native_scope", changing_scope)
+    monkeypatch.setattr(forecast_quality, "check_exact_fit", lambda *_args: None)
+    database = AsyncMock()
+    database.read.return_value = LifecycleSnapshot("epoch", 7, 8, True, None, None, (reference,))
+    database.load_committed.return_value = {
+        "schema_version": 5,
+        "params": asdict(ThermalParams()),
+        "validation": {},
+        "format_version": COMFORT_MODEL_FORMAT_VERSION,
+    }
+    assert not await model.arefresh_committed(lifecycle=database)
+    database.load_committed.assert_awaited_once()
+    assert model._qualified_reference is None
+    if component == "thermal":
+        assert model.confidence_for("indoor_heating") == "default"
+    else:
+        assert not model.is_trained

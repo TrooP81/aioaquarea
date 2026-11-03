@@ -86,6 +86,7 @@ def build_represented_plan(
     indoor_max_temp_setting=None,
     forecast_bias_corrections_c=None,
     reported_indoor_targets=None,
+    represented_weather_forecast=None,
     serialized_actions=None,
     timeout_seconds=40,
     version="milp_v2",
@@ -97,6 +98,16 @@ def build_represented_plan(
     hours = len(prices)
     if not hours or any(len(values) != hours for values in (weather, demand_per_hour, gate_states)):
         raise DataIncompleteError("Incomplete physical, gate or forecast horizon")
+    if represented_weather_forecast is not None:
+        if len(represented_weather_forecast) != hours:
+            raise DataIncompleteError("Incomplete represented weather horizon")
+        for index, row in enumerate(represented_weather_forecast):
+            if (
+                not isinstance(row, dict)
+                or _instant(row.get("ts")) != _instant(prices[index][0])
+                or _number(row.get("outdoor_temp")) != _number(weather[index][1])
+            ):
+                raise DataIncompleteError("Represented weather differs from physical inputs")
     for values in (
         indoor_rates,
         indoor_targets,
@@ -229,13 +240,27 @@ def build_represented_plan(
     passive = _number(current_indoor_temp)
     counterfactual = []
     for hour, row in enumerate(rows):
-        instant = (_instant(row["ts"]) + dt.timedelta(hours=1)).isoformat()
+        slot_start = _instant(row["ts"])
+        slot_end = slot_start + dt.timedelta(hours=1)
+        instant = slot_end.isoformat()
         state = next(item for item in replay["states"] if item["ts"] == instant)
         bias = forecast_bias_corrections_c[hour] if forecast_bias_corrections_c else 0
+        control_target = (
+            reported_indoor_targets[hour]
+            if reported_indoor_targets is not None
+            else row["indoor_floor_c"]
+        )
+        interval = {
+            "interval_start_utc": slot_start.isoformat(),
+            "interval_end_utc": instant,
+            "control_sampling_policy": "slot_start_utc",
+            "control_target_c": control_target,
+        }
         forecast.append(
             {
                 "hour": hour + 1,
                 "ts": instant,
+                **interval,
                 "predicted_indoor_temp": state["indoor_c"] + bias,
                 "source": "milp_solution",
             }
@@ -245,6 +270,7 @@ def build_represented_plan(
             {
                 "hour": hour + 1,
                 "ts": instant,
+                **interval,
                 "predicted_indoor_temp": passive + bias,
                 "source": "milp_counterfactual",
             }
@@ -264,19 +290,21 @@ def build_represented_plan(
             }
             for row in rows
         ],
-        "weather_forecast": [
-            {"ts": (timestamp + dt.timedelta(hours=1)).isoformat(), "outdoor_temp": temp}
-            for timestamp, temp in weather
-        ],
+        "weather_forecast": (
+            deepcopy(represented_weather_forecast)
+            if represented_weather_forecast is not None
+            else [
+                {"ts": _instant(timestamp).isoformat(), "outdoor_temp": temp}
+                for timestamp, temp in weather
+            ]
+        ),
         "target_schedule": [
             {
                 "ts": forecast[hour]["ts"],
                 "hour": hour + 1,
-                "target": (
-                    reported_indoor_targets[hour]
-                    if reported_indoor_targets is not None
-                    else row["indoor_floor_c"]
-                ),
+                "interval_start_utc": forecast[hour]["interval_start_utc"],
+                "interval_end_utc": forecast[hour]["interval_end_utc"],
+                "target": forecast[hour]["control_target_c"],
             }
             for hour, row in enumerate(rows)
         ],

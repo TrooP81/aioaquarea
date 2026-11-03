@@ -9,13 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import dis
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import sys
+import threading
 import uuid
-from contextlib import asynccontextmanager
+import weakref
+from contextvars import ContextVar
+from contextlib import asynccontextmanager, contextmanager
+from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,26 +30,44 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import pytest
 import pytest_asyncio
-from sqlalchemy import Column, MetaData, Table, func, select, text, update
+import structlog
+from sqlalchemy import Column, MetaData, Table, event, func, select, text, update
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
-from sqlalchemy.schema import CreateSchema, DropSchema
+from sqlalchemy.schema import CreateSchema, DropSchema, Sequence
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.selectable import Select, TableClause
+from sqlalchemy.sql.elements import ClauseElement, quoted_name
 
 from packages.core.config import settings
 from packages.core.models import (
+    AuditLogRecord,
+    AppLogRecord,
+    ConsumptionRecord,
     DeviceStatusRecord,
+    HouseContractRevisionRecord,
+    HouseInstallationRecord,
+    IndoorTempReading,
     MLArtifactRecord,
     MLForecastIssueRecord,
     MLForecastOutcomeRecord,
     MLLifecycleStateRecord,
     MLMaintenanceRequestRecord,
+    OverrideRecord,
+    PlanActionRecord,
+    PlanRecord,
+    PriceRecord,
+    SettingRecord,
+    WeatherRecord,
 )
 from packages.ml.lifecycle import (
     CASConflict,
     Lifecycle,
     LeaseLost,
     LifecycleUnavailable,
+    PublicationResult,
     invalidate_lifecycle,
 )
 from packages.ml.safe_persistence import publish_signed_artifact, verify_signed_artifact
@@ -60,6 +85,1138 @@ from tests.e2e.test_manual_cop_postgresql import (
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 
+class _Investigation:
+    """Passive, session-owned evidence. Never owns application work or transactions."""
+
+    EVENT_LIMIT = 4096
+    EVENT_BYTES = 2048
+    ARENA_BYTES = 4 * 1024 * 1024
+    RESERVE_BYTES = 16 * 1024
+    ALIAS_LIMITS = {"engine": 128, "connection": 256, "task": 256, "operation": 128}
+    # Non-borrowing lanes: 51 * (72 credits / 80 KiB) + session (16 / 16 KiB).
+    LANES = {
+        "candidate": (8, 12 * 1024),
+        "incumbent": (8, 12 * 1024),
+        "inputs": (4, 8 * 1024),
+        "logging": (12, 16 * 1024),
+        "sequence": (12, 16 * 1024),
+        "batch": (12, 8 * 1024),
+        "boundary": (16, 8 * 1024),
+    }
+    SELECTION_KEYS = (
+        "routine_filtered",
+        "classification_uncertain",
+        "correlation_unknown",
+        "relevance_overflow",
+        "relevance_ambiguous",
+        "relevance_unassociated",
+        "retired_without_terminal",
+        "owner_unknown",
+        "saturated",
+    )
+    REASONS = (
+        "events",
+        "arena",
+        "event_bytes",
+        "serialization",
+        "aliases",
+        "sensors",
+        "thread",
+        "profile",
+        "install",
+        "restore",
+        "ownership",
+        "emission",
+    )
+    STAGES = (
+        "session",
+        "node",
+        "node_end",
+        "baseline",
+        "call",
+        "pre-drop",
+        "drop",
+        "absence",
+        "post-drop",
+        "engine-dispose",
+        "control-dispose",
+        "receipt",
+        "acceptance",
+    )
+
+    def __init__(self):
+        self.events = []
+        self.bytes = 0
+        self.drops = dict.fromkeys(self.REASONS, 0)
+        self.aliases = {kind: {} for kind in self.ALIAS_LIMITS}
+        self.next_alias = dict.fromkeys(self.ALIAS_LIMITS, 0)
+        self.thread = threading.get_ident()
+        self.node = 0
+        self.stage = "session"
+        self.operation = ContextVar("lifecycle-investigation-operation", default=0)
+        self.scope = ContextVar("lifecycle-investigation-scope", default=None)
+        self.active = 0
+        self.listeners = []
+        self.wrappers = []
+        self.profile = None
+        self.codes = {}
+        self.stack_codes = {}
+        self.closed = False
+        self.source = {}
+        self.origins = {}
+        self.pending_bytes = b'{"state":"UNKNOWN"}'
+        # Each lane stores retained count, encoded bytes, and capacity losses.
+        self.lanes = [[[0, 0, 0] for _ in self.LANES] for _ in range(52)]
+        self.selection = dict.fromkeys(self.SELECTION_KEYS, 0)
+        self.relevance = {}
+
+    def selected(self, key):
+        if self.selection[key] == 2**31 - 1:
+            self.selection["saturated"] = 1
+        else:
+            self.selection[key] += 1
+
+    def context(self):
+        scope = self.scope.get()
+        return scope if scope is not None and scope["live"] else None
+
+    def lane(self, event, scope, category, owner):
+        owner = scope["owner"] if owner is None and scope is not None else owner
+        owner = self.node if owner is None else owner
+        if type(owner) is not int or not 1 <= owner <= 51:
+            if owner != 0:
+                self.selected("owner_unknown")
+            owner = 0
+        if category is None:
+            if event.startswith("publish_") or event == "inputs_returned":
+                category = scope["role"] if scope is not None else "inputs"
+                if category not in ("candidate", "incumbent"):
+                    category = "inputs"
+            elif event.startswith("batch_"):
+                category = "batch"
+            else:
+                category = "boundary"
+        index = tuple(self.LANES).index(category) if owner else 0
+        limits = self.LANES[category] if owner else (16, 16 * 1024)
+        return owner, self.lanes[owner][index], limits
+
+    def gap(self, reason):
+        # Fixed keys and saturating counters also bound fault paths.
+        self.drops[reason] = min(self.drops[reason] + 1, 2**31 - 1)
+
+    def reserve(self):
+        if self.closed:
+            return False
+        if threading.get_ident() != self.thread:
+            self.gap("thread")
+            return False
+        if len(self.events) >= self.EVENT_LIMIT:
+            self.gap("events")
+            return False
+        if self.bytes + self.EVENT_BYTES > self.ARENA_BYTES:
+            self.gap("arena")
+            return False
+        return True
+
+    def alias(self, kind, value):
+        if value is None:
+            return 0
+        mapping = self.aliases[kind]
+        key = id(value)
+        previous = mapping.get(key)
+        if previous is not None and previous[0]() is value:
+            return previous[1]
+        if self.next_alias[kind] >= self.ALIAS_LIMITS[kind]:
+            self.gap("aliases")
+            return 0
+        number = self.next_alias[kind] + 1
+        # Only weak ownership: a completed task/closed connection is not kept alive.
+        mapping[key] = (weakref.ref(value), number)
+        self.next_alias[kind] = number
+        return number
+
+    def task(self):
+        try:
+            return self.alias("task", asyncio.current_task())
+        except RuntimeError:
+            return 0
+
+    def stack(self):
+        result = []
+        frame = sys._getframe(1)
+        try:
+            for _ in range(24):
+                if frame is None:
+                    break
+                code = frame.f_code
+                entry = self.stack_codes.get(id(code))
+                if entry is not None and entry[0] is code:
+                    result.append([entry[1], frame.f_lineno])
+                    if len(result) == 6:
+                        break
+                frame = frame.f_back
+        finally:
+            del frame
+        return result
+
+    def record(self, event, detail=None, *, category=None, owner=None, association=None):
+        """Detail producers run only after capacity reservation; never retain payloads."""
+        try:
+            if not self.reserve():
+                return
+            scope = self.scope.get()
+            metadata = scope if scope is not None else association
+            if scope is None and association is not None and association["ambiguous"]:
+                # Preserve its budget owner, not an invented operation attribution.
+                metadata = None
+            owner, lane, limits = self.lane(event, metadata, category, owner)
+            if lane[0] >= limits[0] or lane[1] + self.EVENT_BYTES > limits[1]:
+                if lane[2] == 2**31 - 1:
+                    self.selection["saturated"] = 1
+                lane[2] = min(lane[2] + 1, 2**31 - 1)
+                self.gap("events" if lane[0] >= limits[0] else "arena")
+                return
+            operation = self.operation.get() if scope is None or scope["live"] else 0
+            record = {
+                "event": event,
+                "node": self.node,
+                "stage": self.enum(self.stage, self.STAGES),
+                "task": self.task(),
+                "operation": operation,
+                "operation_origin": metadata["entry"] if metadata is not None else 0,
+                "reservation_owner_node": owner,
+                "wrapper_kind": metadata["kind"] if metadata is not None else "UNKNOWN",
+                "publication_role": metadata["role"] if metadata is not None else "UNKNOWN",
+                "correlation": "known" if operation else "UNKNOWN",
+                "scope_live": scope is not None and scope["live"],
+                "operation_origin_kind": "wrapper_entry",
+                "batch_admission_origin": "UNKNOWN",
+                "task_origin": "UNKNOWN",
+            }
+            if detail is not None:
+                record.update(detail())
+            encoded = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode(
+                "ascii"
+            )
+            if len(encoded) > self.EVENT_BYTES:
+                self.gap("event_bytes")
+                return
+            self.events.append(encoded)
+            self.bytes += len(encoded)
+            lane[0] += 1
+            lane[1] += len(encoded)
+        except BaseException:
+            self.gap("serialization")
+
+    @staticmethod
+    def enum(value, allowed):
+        return value if type(value) is str and len(value) <= 64 and value in allowed else "UNKNOWN"
+
+    @staticmethod
+    def count(value, limit):
+        return (
+            len(value) if type(value) in (list, tuple, set) and len(value) <= limit else "UNKNOWN"
+        )
+
+    @staticmethod
+    def loaded(row, key):
+        # Bypass mapped descriptors, including expired/unloaded attributes.
+        comfort = sys.modules.get("packages.ml.comfort_model")
+        observation = vars(comfort).get("_IndoorObservation") if comfort is not None else None
+        if type(row) not in (
+            DeviceStatusRecord,
+            IndoorTempReading,
+            SimpleNamespace,
+            HouseInstallationRecord,
+            observation,
+        ):
+            return None
+        values = object.__getattribute__(row, "__dict__")
+        return values.get(key) if type(values) is dict else None
+
+    def inputs(self, frame, result):
+        local = frame.f_locals
+        now = local.get("now")
+        values = local.get("values")
+        values = values if type(values) is dict else {}
+        component = self.enum(local.get("component"), ("cop", "demand", "comfort", "thermal"))
+        detail = {
+            "observer": self.codes[id(frame.f_code)][1],
+            "result": "none" if result is None else "present",
+            "component": component,
+            "clock": now.timestamp() if type(now) is dt.datetime else "UNKNOWN",
+            "status_count": self.count(local.get("statuses"), 1001),
+            "selected_count": self.count(local.get("selected_ids"), 64),
+            "sensor_count": self.count(local.get("sensor_ids"), 64),
+            "fresh_count": self.count(local.get("fresh_ids"), 64),
+            "reading_count": self.count(local.get("readings"), 5001),
+            "filtered_count": self.count(local.get("raw_indoor"), 5001),
+            "sensor_freshness_seconds": 900,
+            "indoor_available": (
+                local["indoor_available"]
+                if type(local.get("indoor_available")) is bool
+                else "NOT_REACHED"
+            ),
+            "reference_blocked": (
+                local["reference_blocked"]
+                if type(local.get("reference_blocked")) is bool
+                else "NOT_REACHED"
+            ),
+            "provider": self.enum(values.get("weather_provider"), ("open-meteo", "smhi")),
+            "timezone": self.enum(
+                values.get("timezone"), ("Europe/Amsterdam", "Europe/Stockholm", "UTC")
+            ),
+            "reference": self.enum(local.get("reference_sensor"), ("selected-room", "second-room")),
+            "selected_ids": [],
+            "installation": "UNKNOWN",
+            "capabilities": [],
+        }
+        capabilities = local.get("capabilities")
+        if type(capabilities) in (tuple, list) and len(capabilities) <= 8:
+            detail["capabilities"] = [
+                self.enum(item, ("indoor_heating", "indoor_cooling", "dhw"))
+                for item in capabilities
+            ]
+        for name in ("selected_ids", "sensor_ids", "fresh_ids"):
+            value = local.get(name)
+            if type(value) in (list, set, tuple) and len(value) > 64:
+                self.gap("sensors")
+            elif type(value) in (list, set, tuple):
+                detail[name + "_aliases"] = sorted(
+                    self.enum(item, ("selected-room", "second-room")) for item in value
+                )
+        for name in ("readings", "raw_indoor"):
+            value = local.get(name)
+            if type(value) is list and len(value) > 5001:
+                self.gap("sensors")
+        statuses = local.get("statuses")
+        if type(statuses) is list and statuses:
+            stamp = self.loaded(statuses[-1], "ts")
+            detail["latest_status_age"] = (
+                (now - stamp).total_seconds()
+                if type(now) is dt.datetime and type(stamp) is dt.datetime
+                else "UNKNOWN"
+            )
+        readings = local.get("readings")
+        if type(readings) is list and 0 < len(readings) <= 5001:
+            stamp = self.loaded(readings[-1], "timestamp")
+            detail["latest_selected_age"] = (
+                (now - stamp).total_seconds()
+                if type(now) is dt.datetime and type(stamp) is dt.datetime
+                else "UNKNOWN"
+            )
+        installation = local.get("installation")
+        generation = self.loaded(installation, "indoor_dependency_generation")
+        detail["indoor_generation"] = (
+            generation if type(generation) is int and 0 <= generation < 2**63 else "UNKNOWN"
+        )
+        generation = self.loaded(installation, "demand_dependency_generation")
+        detail["demand_generation"] = (
+            generation if type(generation) is int and 0 <= generation < 2**63 else "UNKNOWN"
+        )
+        # Do not retain data, row collections, settings values, frames or return objects.
+        return detail
+
+    def install_profile(self, functions):
+        if sys.getprofile() is not None:
+            self.gap("profile")
+            return
+        if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 11), (3, 12)):
+            self.gap("profile")
+            return
+        for alias, function in functions:
+            code = function.__code__
+            returns = frozenset(
+                instruction.offset
+                for instruction in dis.get_instructions(code)
+                if instruction.opname in ("RETURN_VALUE", "RETURN_CONST")
+            )
+            self.codes[id(code)] = (code, alias, returns)
+            self.stack_codes[id(code)] = (code, alias)
+
+        def observe(frame, event, result):
+            try:
+                if event != "return":
+                    return
+                code = frame.f_code
+                entry = self.codes.get(id(code))
+                if entry is None or entry[0] is not code:
+                    return
+                if frame.f_lasti not in entry[2]:
+                    # Includes suspension, exceptional exit and cancellation.
+                    return
+                self.record("inputs_returned", lambda: self.inputs(frame, result))
+            except BaseException:
+                self.gap("profile")
+
+        self.profile = observe
+        sys.setprofile(observe)
+
+    def wrap(self, owner, name, role):
+        original = getattr(owner, name)
+        code = original.__code__
+        self.stack_codes[id(code)] = (code, role)
+
+        @wraps(original, updated=())
+        async def observed(*args, **kwargs):
+            token = None
+            parent = self.scope.get()
+            scope = {
+                "kind": self.enum(role, ("publish", "batch")),
+                "role": self.enum(kwargs.get("role", "candidate"), ("candidate", "incumbent"))
+                if role == "publish"
+                else "UNKNOWN",
+                "entry": self.node,
+                # Even an expired copied scope must never steal the current node's lane.
+                "owner": parent["owner"] if parent is not None else self.node,
+                "live": True,
+            }
+            scope_token = self.scope.set(scope)
+            try:
+                if self.next_alias["operation"] >= self.ALIAS_LIMITS["operation"]:
+                    self.gap("aliases")
+                    self.selected("correlation_unknown")
+                    number = 0
+                else:
+                    self.next_alias["operation"] += 1
+                    number = self.next_alias["operation"]
+                    self.origins[number] = self.node
+                token = self.operation.set(number)
+                self.active += 1
+                self.record(
+                    role + "_started",
+                    lambda: {
+                        "origin_node": self.node,
+                        "publication_role": self.enum(
+                            kwargs.get("role", "candidate"), ("candidate", "incumbent")
+                        )
+                        if role == "publish"
+                        else "UNKNOWN",
+                        "qualification": (
+                            "SUPPLIED" if kwargs.get("qualification") is not None else "NONE"
+                        )
+                        if role == "publish"
+                        else "UNKNOWN",
+                        "batch_count": self.count(args[0], 1000)
+                        if role == "batch" and args
+                        else "UNKNOWN",
+                    },
+                )
+            except BaseException:
+                self.gap("serialization")
+            try:
+                result = await original(*args, **kwargs)
+            except asyncio.CancelledError:
+                self.record(role + "_cancelled")
+                raise
+            except BaseException as exc:
+                self.record(role + "_failed", lambda error=exc: self.failure(error))
+                raise
+            else:
+                self.record(
+                    role + "_returned",
+                    (lambda: self.publication(result)) if role == "publish" else None,
+                )
+                return result
+            finally:
+                scope["live"] = False
+                try:
+                    self.retire_scope(scope)
+                except BaseException:
+                    self.gap("restore")
+                finally:
+                    self.scope.reset(scope_token)
+                try:
+                    if token is not None:
+                        self.active -= 1
+                        self.operation.reset(token)
+                except BaseException:
+                    self.gap("restore")
+
+        self.wrappers.append((owner, name, original, observed))
+        setattr(owner, name, observed)
+
+    @staticmethod
+    def publication(result):
+        if type(result) is not PublicationResult:
+            return {"publication_result": "UNKNOWN"}
+        return {
+            "publication_result": "known",
+            "committed": result.committed if type(result.committed) is bool else "UNKNOWN",
+            "readback": result.readback if type(result.readback) is bool else "UNKNOWN",
+            "revision_present": result.revision is not None,
+            "reason": _Investigation.enum(
+                result.reason,
+                (
+                    "indoor_scope_unavailable",
+                    "indoor_dependency_scope_mismatch",
+                    "demand_scope_mismatch",
+                    "publication_conflict",
+                    "committed",
+                    "readback_failed",
+                    "lease_lost",
+                ),
+            ),
+        }
+
+    @staticmethod
+    def failure(error):
+        reason = "UNKNOWN"
+        if type(error) is CASConflict:
+            arguments = BaseException.args.__get__(error)
+            if len(arguments) == 1 and type(arguments[0]) is str and len(arguments[0]) <= 64:
+                reason = {
+                    "indoor_scope_unavailable": "inputs_unavailable",
+                    "indoor_dependency_scope_mismatch": "dependency_mismatch",
+                    "demand_scope_mismatch": "dependency_mismatch",
+                    "publication_conflict": "publication_fenced",
+                }.get(arguments[0], "UNKNOWN")
+        return {"failure_class": reason}
+
+    def target(self, context, statement):
+        compiled = context.compiled if context is not None else None
+        clause = compiled.statement if compiled is not None else None
+        operation = "UNKNOWN"
+        table = None
+        if isinstance(clause, (Insert, Delete, Update)):
+            operation = (
+                "insert"
+                if isinstance(clause, Insert)
+                else ("delete" if isinstance(clause, Delete) else "update")
+            )
+            table = clause.table
+        elif isinstance(clause, Select):
+            operation = "select"
+        if isinstance(table, TableClause):
+            name = "app_logs" if table.name == "app_logs" else "OTHER"
+            schema = (
+                "public"
+                if table.schema == "public"
+                else ("UNQUALIFIED" if table.schema is None else "OTHER")
+            )
+        else:
+            name, schema = "UNKNOWN", "UNKNOWN"
+        sequence = False
+        if clause is not None and not isinstance(clause, ClauseElement):
+            self.selected("classification_uncertain")
+        # Trusted SQLAlchemy nodes only; fixed width/depth, no compilation or SQL.
+        if isinstance(clause, ClauseElement):
+            todo = [clause]
+            seen = set()
+            for _ in range(64):
+                if not todo:
+                    break
+                current = todo.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                if type(current).__module__.startswith("sqlalchemy."):
+                    # Expression/alias names are not relation provenance. Follow
+                    # their children to real tables or Sequence/next_value nodes.
+                    current_name = (
+                        current.name if isinstance(current, (TableClause, Sequence)) else None
+                    )
+                    if type(current_name) in (str, quoted_name) and current_name in (
+                        "app_logs",
+                        "app_logs_id_seq",
+                    ):
+                        sequence |= current_name == "app_logs_id_seq"
+                        name = current_name
+                        current_schema = getattr(current, "schema", None)
+                        schema = (
+                            "public"
+                            if current_schema == "public"
+                            else ("UNQUALIFIED" if current_schema is None else "OTHER")
+                        )
+                    if type(current) is Sequence:
+                        continue
+                    children = iter(current.get_children())
+                    # SQLAlchemy next_value keeps its Sequence outside get_children().
+                    if (
+                        type(current).__module__ == "sqlalchemy.sql.functions"
+                        and type(current).__name__ == "next_value"
+                    ):
+                        todo.append(current.sequence)
+                    for _ in range(16):
+                        child = next(children, None)
+                        if child is None:
+                            break
+                        if len(todo) < 64:
+                            todo.append(child)
+                        else:
+                            self.selected("classification_uncertain")
+                    else:
+                        self.selected("classification_uncertain")
+                else:
+                    self.selected("classification_uncertain")
+            if todo:
+                self.selected("classification_uncertain")
+        # One bounded lexical pass: comment markers inside literals/identifiers
+        # must never hide subsequent SQL. Tokens are transient, never emitted.
+        if type(statement) is str:
+            if len(statement) > 2048:
+                self.selected("classification_uncertain")
+            prefix = statement[:2048]
+            tokens = []
+            index = 0
+            while index < len(prefix):
+                char = prefix[index]
+                if char.isspace():
+                    index += 1
+                elif prefix.startswith("--", index):
+                    index += 2
+                    while index < len(prefix) and prefix[index] not in "\r\n":
+                        index += 1
+                elif prefix.startswith("/*", index):
+                    depth = 1
+                    index += 2
+                    while index < len(prefix) and depth:
+                        if prefix.startswith("/*", index):
+                            depth += 1
+                            index += 2
+                        elif prefix.startswith("*/", index):
+                            depth -= 1
+                            index += 2
+                        else:
+                            index += 1
+                    if depth:
+                        self.selected("classification_uncertain")
+                elif char in ("'", '"'):
+                    quote = char
+                    # E strings have escapes; ordinary PostgreSQL strings do not.
+                    escaped = (
+                        quote == "'"
+                        and index > 0
+                        and prefix[index - 1] in "eE"
+                        and (
+                            index < 2
+                            or not (prefix[index - 2].isalnum() or prefix[index - 2] in "_$")
+                        )
+                    )
+                    if escaped and tokens and tokens[-1] == ("word", "e"):
+                        tokens.pop()
+                    value = []
+                    index += 1
+                    closed = False
+                    while index < len(prefix):
+                        char = prefix[index]
+                        index += 1
+                        if char == quote:
+                            if index < len(prefix) and prefix[index] == quote:
+                                value.append(quote)
+                                index += 1
+                            else:
+                                closed = True
+                                break
+                        elif escaped and char == "\\":
+                            # Correctly skip escaped delimiters without claiming
+                            # to decode PostgreSQL octal/Unicode/regclass values.
+                            self.selected("classification_uncertain")
+                            if index < len(prefix):
+                                index += 1
+                            value.append("?")
+                        else:
+                            value.append(char)
+                    if not closed:
+                        self.selected("classification_uncertain")
+                        break
+                    if len(tokens) >= 2 and tokens[-2:] == [("word", "u"), ("symbol", "&")]:
+                        self.selected("classification_uncertain")
+                        value = ["?"]
+                    tokens.append(("string" if quote == "'" else "identifier", "".join(value)))
+                elif char == "$":
+                    delimiter = re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$", prefix[index:])
+                    if delimiter is None:
+                        parameter = re.match(r"\$[0-9]+", prefix[index:])
+                        if parameter is None:
+                            self.selected("classification_uncertain")
+                            break
+                        tokens.append(("parameter", "?"))
+                        index += len(parameter[0])
+                    else:
+                        start = index + len(delimiter[0])
+                        end = prefix.find(delimiter[0], start)
+                        if end < 0:
+                            self.selected("classification_uncertain")
+                            break
+                        tokens.append(("string", prefix[start:end]))
+                        index = end + len(delimiter[0])
+                elif char.isascii() and (char.isalpha() or char == "_"):
+                    end = index + 1
+                    while (
+                        end < len(prefix)
+                        and prefix[end].isascii()
+                        and (prefix[end].isalnum() or prefix[end] in "_$")
+                    ):
+                        end += 1
+                    if end == len(prefix) and len(statement) > len(prefix):
+                        self.selected("classification_uncertain")
+                        break
+                    tokens.append(("word", prefix[index:end].lower()))
+                    index = end
+                else:
+                    if not char.isascii() or char in ("\\", "`", "[", "]"):
+                        self.selected("classification_uncertain")
+                        break
+                    tokens.append(("symbol", char))
+                    index += 1
+
+            for position, (kind, value) in enumerate(tokens):
+                if kind == "string":
+                    # Only explicit sequence-function arguments / regclass casts,
+                    # never arbitrary literals or result-column aliases.
+                    call = tokens[max(0, position - 2) : position]
+                    cast = tokens[position + 1 : position + 4]
+                    if (
+                        len(call) == 2
+                        and call[0][0] in ("word", "identifier")
+                        and call[0][1] in ("nextval", "currval", "setval")
+                        and call[1] == ("symbol", "(")
+                    ) or cast == [("symbol", ":"), ("symbol", ":"), ("word", "regclass")]:
+                        sequence |= bool(
+                            re.fullmatch(
+                                r'(?:(?:public|"public")\.)?(?:app_logs_id_seq|"app_logs_id_seq")',
+                                value,
+                            )
+                        )
+                if kind != "word":
+                    continue
+                offset = 1
+                if value == "insert" and tokens[position + 1 : position + 2] == [("word", "into")]:
+                    offset = 2
+                elif value not in ("from", "join", "update", "sequence"):
+                    continue
+                target = tokens[position + offset : position + offset + 3]
+                target_schema = "UNQUALIFIED"
+                if len(target) == 3 and target[1] == ("symbol", "."):
+                    target_schema = "public" if target[0][1] == "public" else "OTHER"
+                    target = target[2:]
+                if not target or target[0][0] not in ("word", "identifier"):
+                    continue
+                found = target[0][1]
+                if found not in ("app_logs", "app_logs_id_seq"):
+                    continue
+                sequence |= found == "app_logs_id_seq"
+                # Structural positives still take precedence over text.
+                if name not in ("app_logs", "app_logs_id_seq"):
+                    name, schema = found, target_schema
+                if operation == "UNKNOWN":
+                    operation = (
+                        value
+                        if value in ("insert", "update")
+                        else "delete"
+                        if tokens[max(0, position - 1) : position] == [("word", "delete")]
+                        else "select"
+                        if value in ("from", "join")
+                        else "alter"
+                        if tokens[max(0, position - 1) : position] == [("word", "alter")]
+                        else "UNKNOWN"
+                    )
+        return {
+            "sql_kind": operation,
+            "declared_relation": name,
+            "declared_schema": schema,
+            # No connection-local dependency/search-path evidence is collected by SQL.
+            "resolved_relation": "UNKNOWN",
+            "sequence_consumer": "UNKNOWN",
+            "target_sequence": sequence,
+        }
+
+    def sql(self, label, connection, context=None, statement=None):
+        try:
+            if self.closed:
+                return
+            if threading.get_ident() != self.thread:
+                self.gap("thread")
+                return
+            scope = self.context()
+            origin = self.scope.get()
+            association = self.connection_relevance(connection)
+            terminal = label in ("commit_notified", "rollback_notified")
+            try:
+                if terminal:
+                    if scope is None and association is None:
+                        self.selected("relevance_unassociated")
+                        return
+                    result = self.target(None, None)
+                    category = association["category"] if association is not None else "logging"
+                else:
+                    result = self.target(context, statement)
+                    category = "sequence" if result["target_sequence"] else "logging"
+                    if not result["target_sequence"] and result["declared_relation"] != "app_logs":
+                        if scope is None or scope["kind"] != "batch":
+                            self.selected("routine_filtered")
+                            return
+                    # Admission is independent of event retention and alias availability.
+                    association = self.admit(connection, origin, category)
+
+                def detail():
+                    result.update(
+                        {
+                            "engine": self.alias("engine", connection.engine)
+                            if connection is not None
+                            else 0,
+                            "connection": self.alias("connection", connection),
+                            "backend": "UNKNOWN",
+                            "factory": "UNKNOWN",
+                            "stack": self.stack(),
+                            "association": "ambiguous"
+                            if association is not None and association["ambiguous"]
+                            else "UNKNOWN",
+                        }
+                    )
+                    return result
+
+                self.record(
+                    label,
+                    detail,
+                    category=category,
+                    owner=origin["owner"]
+                    if origin is not None
+                    else (association["owner"] if association is not None else self.node),
+                    association=association,
+                )
+            finally:
+                if terminal and connection is not None:
+                    self.relevance.pop(id(connection), None)
+        except BaseException:
+            self.gap("serialization")
+
+    def connection_relevance(self, connection):
+        entry = self.relevance.get(id(connection))
+        return entry if entry is not None and entry["ref"]() is connection else None
+
+    def admit(self, connection, scope, category):
+        if connection is None:
+            return None
+        entry = self.connection_relevance(connection)
+        owner = scope["owner"] if scope is not None else self.node
+        if entry is not None:
+            if entry["scope"] is not scope or entry["owner"] != owner:
+                if not entry["ambiguous"]:
+                    self.selected("relevance_ambiguous")
+                entry["ambiguous"] = True
+            return entry
+        # Bounded dead-reference sweep; never evict a live owner at a node boundary.
+        for key, value in tuple(self.relevance.items()):
+            if value["ref"]() is None:
+                self.relevance.pop(key, None)
+        if len(self.relevance) >= 256:
+            self.selected("relevance_overflow")
+            return None
+        try:
+            reference = weakref.ref(connection)
+        except TypeError:
+            self.selected("relevance_unassociated")
+            return None
+        entry = {
+            "ref": reference,
+            "owner": owner,
+            "entry": scope["entry"] if scope else 0,
+            "kind": scope["kind"] if scope else "UNKNOWN",
+            "role": scope["role"] if scope else "UNKNOWN",
+            "scope": scope,
+            "category": category,
+            "ambiguous": False,
+        }
+        self.relevance[id(connection)] = entry
+        return entry
+
+    def retire_scope(self, scope):
+        for key, entry in tuple(self.relevance.items()):
+            if entry["scope"] is scope:
+                self.selected("retired_without_terminal")
+                self.relevance.pop(key, None)
+
+    def install_events(self):
+        def before(connection, cursor, statement, parameters, context, executemany):
+            self.sql("sql_attempted", connection, context, statement)
+
+        def after(connection, cursor, statement, parameters, context, executemany):
+            self.sql("cursor_completed", connection, context, statement)
+
+        def failed(context):
+            try:
+                self.sql(
+                    "sql_failed", context.connection, context.execution_context, context.statement
+                )
+            except BaseException:
+                self.gap("serialization")
+
+        def commit(connection):
+            self.sql("commit_notified", connection)
+
+        def rollback(connection):
+            self.sql("rollback_notified", connection)
+
+        for name, callback in (
+            ("before_cursor_execute", before),
+            ("after_cursor_execute", after),
+            ("handle_error", failed),
+            ("commit", commit),
+            ("rollback", rollback),
+        ):
+            # Include attempted registrations in cleanup even if installation raises.
+            self.listeners.append((name, callback))
+            try:
+                event.listen(Engine, name, callback)
+            except BaseException:
+                self.gap("install")
+
+    def pending(self):
+        from packages.core import log_sink
+
+        # No locks, task settlement, clock reads or application status callbacks.
+        # Status uses the separate header/footer reserve: an exhausted event arena
+        # must not discard the final pending-work boundary.
+        self.pending_bytes = json.dumps(
+            {
+                "active_operations": self.active,
+                "buffered_rows": len(log_sink._LOG_BUFFER),
+                "inflight_rows": len(log_sink._INFLIGHT_BATCH),
+                "flusher_present": log_sink._FLUSH_TASK is not None,
+                "writer_present": log_sink._INFLIGHT_TASK is not None,
+                "thread_boundary": "UNKNOWN",
+                "process_boundary": "OPEN",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        self.record("observation_boundary", lambda: json.loads(self.pending_bytes))
+
+    def emit(self, capture):
+        """Synchronous capture-independent emission, with one bounded fallback."""
+        global_capture = fixture_capture = None
+        global_started = fixture_started = False
+        fallback_attempted = False
+
+        def fallback():
+            nonlocal fallback_attempted
+            if fallback_attempted:
+                return
+            fallback_attempted = True
+            try:
+                sys.stdout.write("LIFECYCLE_DIAGNOSTIC_INCOMPLETE emission\n")
+                sys.stdout.flush()
+            except BaseException:
+                pass
+
+        try:
+            # CaptureManager's own context resumes global before fixture capture;
+            # a failed global resume can otherwise prevent the fixture attempt.
+            global_capture = capture._global_capturing
+            fixture_capture = capture._capture_fixture
+            global_started = bool(global_capture and global_capture.is_started())
+            fixture_started = bool(fixture_capture and fixture_capture._is_started())
+            with capture.global_and_fixture_disabled():
+                try:
+                    digest = hashlib.sha256()
+                    for record in self.events:
+                        digest.update(record)
+                    stream = sys.stderr
+                    header = {
+                        "investigation": "lifecycle-v1",
+                        "kind": "header",
+                        "source": self.source,
+                        "interpreter": list(sys.version_info[:3]),
+                        "alias_zero": "UNKNOWN",
+                        "return_observer": "installed"
+                        if self.profile is not None
+                        else "UNAVAILABLE",
+                    }
+                    footer = {
+                        "investigation": "lifecycle-v1",
+                        "kind": "footer",
+                        "count": len(self.events),
+                        "bytes": self.bytes,
+                        "sha256": digest.hexdigest(),
+                        "drops": self.drops,
+                        "coverage_complete": False,
+                        "coverage": [
+                            "backend_UNKNOWN",
+                            "factory_UNKNOWN",
+                            "resolution_UNKNOWN",
+                            "sequence_UNKNOWN",
+                            "task_origin_UNKNOWN",
+                            "thread_UNOBSERVED",
+                            "process_OPEN",
+                            "preexisting_connections_UNKNOWN",
+                            "source_present" if len(self.source) == 2 else "source_UNKNOWN",
+                        ],
+                        "pending_operations": self.active,
+                        "pending": json.loads(self.pending_bytes),
+                        "selection": {
+                            "policy": "origin-lanes-v2",
+                            "limits": self.LANES,
+                            "session": [16, 16384],
+                            "credits": 3688,
+                            "arena": self.ARENA_BYTES,
+                            "counters": self.selection,
+                            "totals": [
+                                [
+                                    sum(lanes[index][0] for lanes in self.lanes[1:]),
+                                    sum(lanes[index][1] for lanes in self.lanes[1:]),
+                                ]
+                                for index in range(len(self.LANES))
+                            ],
+                            # Fixed-size sparse loss matrix; no operation histories.
+                            "losses": [
+                                [node, index, lane[2]]
+                                for node, lanes in enumerate(self.lanes)
+                                for index, lane in enumerate(lanes)
+                                if lane[2]
+                            ],
+                        },
+                    }
+                    header_text = json.dumps(header, sort_keys=True) + "\n"
+                    footer_text = json.dumps(footer, sort_keys=True) + "\n"
+                    if len((header_text + footer_text).encode("ascii")) > self.RESERVE_BYTES:
+                        raise ValueError("diagnostic reserve exceeded")
+                    stream.write(header_text)
+                    for record in self.events:
+                        stream.write(record.decode("ascii"))
+                    stream.write(footer_text)
+                    stream.flush()
+                except BaseException:
+                    self.gap("emission")
+                    # Still inside disabled global AND fixture capture.
+                    fallback()
+        except BaseException:
+            self.gap("emission")
+            for started, saved, attribute, check, resume in (
+                (
+                    global_started,
+                    global_capture,
+                    "_global_capturing",
+                    "is_started",
+                    "resume_global_capture",
+                ),
+                (
+                    fixture_started,
+                    fixture_capture,
+                    "_capture_fixture",
+                    "_is_started",
+                    "resume_fixture",
+                ),
+            ):
+                if started:
+                    try:
+                        if getattr(capture, attribute) is not saved:
+                            self.gap("ownership")
+                        elif not getattr(saved, check)():
+                            getattr(capture, resume)()
+                    except BaseException:
+                        self.gap("restore")
+            fallback()
+
+    def restore(self):
+        self.relevance.clear()
+        # Each removal/restoration is independent, including partial installation.
+        for name, callback in self.listeners:
+            try:
+                event.remove(Engine, name, callback)
+            except BaseException:
+                self.gap("restore")
+        for owner, name, original, observed in self.wrappers:
+            try:
+                if getattr(owner, name) is observed:
+                    setattr(owner, name, original)
+                else:
+                    self.gap("ownership")
+            except BaseException:
+                self.gap("restore")
+        if self.profile is not None:
+            try:
+                if sys.getprofile() is self.profile:
+                    sys.setprofile(None)
+                else:
+                    self.gap("ownership")
+            except BaseException:
+                self.gap("restore")
+
+
+_INVESTIGATION = None
+
+
+def _investigation_stage(stage, source=None):
+    observer = _INVESTIGATION
+    if observer is None:
+        return
+    try:
+        observer.stage = observer.enum(stage, observer.STAGES)
+        if type(source) is dict:
+            for name, size in (("commit", 40), ("source_manifest_sha256", 64)):
+                value = source.get(name)
+                if (
+                    type(value) is str
+                    and len(value) == size
+                    and all(character in "0123456789abcdef" for character in value)
+                ):
+                    observer.source[name] = value
+        observer.record("stage")
+    except BaseException:
+        observer.gap("serialization")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _lifecycle_investigation(request):
+    global _INVESTIGATION
+    observer = _Investigation()
+    _INVESTIGATION = observer
+
+    def finish():
+        global _INVESTIGATION
+        try:
+            observer.pending()
+        except BaseException:
+            observer.gap("serialization")
+        try:
+            observer.restore()
+        finally:
+            if _INVESTIGATION is observer:
+                _INVESTIGATION = None
+            else:
+                observer.gap("ownership")
+            observer.closed = True
+            observer.emit(request.config.pluginmanager.getplugin("capturemanager"))
+        if any(
+            observer.drops[reason]
+            for reason in ("install", "restore", "ownership", "serialization", "emission")
+        ):
+            raise RuntimeError("lifecycle investigation infrastructure incomplete")
+
+    # Installed before any observer mutation, including partial installation failures.
+    request.addfinalizer(finish)
+    from packages.core import log_sink
+    from packages.ml import forecast_quality
+
+    for install in (
+        observer.install_events,
+        lambda: observer.wrap(Lifecycle, "publish", "publish"),
+        lambda: observer.wrap(log_sink, "_write_batch", "batch"),
+        lambda: observer.install_profile(
+            (
+                ("materialize", forecast_quality.materialize_native_inputs),
+                ("prepare", forecast_quality._prepare_native_inputs),
+            )
+        ),
+    ):
+        try:
+            install()
+        except BaseException:
+            observer.gap("install")
+    return observer
+
+
+@pytest.fixture(autouse=True)
+def _lifecycle_investigation_node(_lifecycle_investigation):
+    observer = _lifecycle_investigation
+    observer.node += 1
+    _investigation_stage("node")
+    yield
+    _investigation_stage("node_end")
+
+
 def _migration():
     path = Path(__file__).parents[2] / "migrations/versions/033_ml_observation_lifecycle.py"
     spec = importlib.util.spec_from_file_location("migration_033_pg", path)
@@ -74,10 +1231,42 @@ def _run_migration(connection, direction):
         getattr(_migration(), direction)()
 
 
-def _pre_lifecycle_device_table():
+SUPPORTING_MODELS = (
+    AppLogRecord,
+    ConsumptionRecord,
+    IndoorTempReading,
+    PriceRecord,
+    WeatherRecord,
+    SettingRecord,
+    HouseInstallationRecord,
+    HouseContractRevisionRecord,
+    PlanRecord,
+    PlanActionRecord,
+    AuditLogRecord,
+    OverrideRecord,
+)
+LIFECYCLE_MODELS = (
+    MLLifecycleStateRecord,
+    MLArtifactRecord,
+    MLMaintenanceRequestRecord,
+    MLForecastIssueRecord,
+    MLForecastOutcomeRecord,
+)
+FIXTURE_MODELS = (DeviceStatusRecord, *SUPPORTING_MODELS, *LIFECYCLE_MODELS)
+
+
+def _fixture_metadata(schema):
+    """Private metadata: circular house/plan FKs must never bind to public."""
+    metadata = MetaData(schema=schema)
+    for model in SUPPORTING_MODELS:
+        model.__table__.to_metadata(metadata, schema=schema)
+    return metadata
+
+
+def _pre_lifecycle_device_table(schema):
     return Table(
         "device_status",
-        MetaData(),
+        MetaData(schema=schema),
         *(
             Column(
                 column.name,
@@ -92,6 +1281,338 @@ def _pre_lifecycle_device_table():
             if column.name != "native_policy_provenance"
         ),
     )
+
+
+def _require_local_table(connection, table):
+    """Later fixture helpers may require storage, never create via public search_path."""
+    schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+    local, resolved = connection.execute(
+        text("SELECT to_regclass(:local)::oid, to_regclass(:name)::oid"),
+        {"local": f"{schema}.{table.name}", "name": table.name},
+    ).one()
+    assert local is not None and local == resolved, f"nonlocal fixture table: {table.name}"
+
+
+async def _assert_fixture_storage(connection, schema):
+    """Prove OIDs, columns, every FK, serial ownership and token defaults before writes."""
+    oids = {}
+    for model in FIXTURE_MODELS:
+        name = model.__tablename__
+        local, resolved, kind = (
+            await connection.execute(
+                text(
+                    "SELECT c.oid, to_regclass(:name)::oid, c.relkind::text "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=:schema AND c.relname=:name"
+                ),
+                {"schema": schema, "name": name},
+            )
+        ).one()
+        assert local == resolved and kind == "r", f"nonlocal fixture relation: {name}"
+        oids[name] = local
+        columns = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT attname FROM pg_attribute "
+                        "WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped"
+                    ),
+                    {"oid": local},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert set(columns) == set(model.__table__.columns.keys()), name
+    for model in FIXTURE_MODELS:
+        expected = sorted(
+            (
+                tuple(element.parent.name for element in fk.elements),
+                oids[fk.referred_table.name],
+                tuple(element.column.name for element in fk.elements),
+            )
+            for fk in model.__table__.foreign_key_constraints
+        )
+        actual = (
+            await connection.execute(
+                text(
+                    "SELECT ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY "
+                    "k(num,ord) JOIN pg_attribute a ON a.attrelid=c.conrelid "
+                    "AND a.attnum=k.num ORDER BY k.ord), c.confrelid, "
+                    "ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY "
+                    "k(num,ord) JOIN pg_attribute a ON a.attrelid=c.confrelid "
+                    "AND a.attnum=k.num ORDER BY k.ord) "
+                    "FROM pg_constraint c WHERE c.contype='f' AND c.conrelid=:oid"
+                ),
+                {"oid": oids[model.__tablename__]},
+            )
+        ).all()
+        assert sorted((tuple(a), b, tuple(c)) for a, b, c in actual) == expected, (
+            f"nonlocal/missing fixture FK: {model.__tablename__}"
+        )
+        for column in model.__table__.columns:
+            # PostgreSQL SERIAL is generated for these autoincrement PKs.
+            if (
+                column is not model.__table__.autoincrement_column
+                or column.server_default is not None
+            ):
+                continue
+            sequence = (
+                await connection.execute(
+                    text("SELECT pg_get_serial_sequence(:table, :column)::regclass::oid"),
+                    {"table": f"{schema}.{model.__tablename__}", "column": column.name},
+                )
+            ).scalar_one()
+            assert sequence is not None, f"missing owned sequence: {model.__tablename__}"
+            await _assert_local_sequence(
+                connection, schema, sequence, oids[model.__tablename__], column.name
+            )
+    token = (
+        await connection.execute(
+            text("SELECT to_regclass(:name)::oid"),
+            {"name": f"{schema}.ml_lifecycle_token_seq"},
+        )
+    ).scalar_one()
+    assert token is not None
+    for column in ("revision", "fence"):
+        await _assert_local_sequence(
+            connection, schema, token, oids["ml_lifecycle_state"], column, owned=False
+        )
+
+
+async def _assert_local_sequence(connection, schema, sequence, table, column, *, owned=True):
+    namespace, kind, resolved, default_bound, ownership_bound = (
+        await connection.execute(
+            text(
+                "SELECT n.nspname, c.relkind::text, to_regclass(c.relname)::oid, "
+                "EXISTS(SELECT 1 FROM pg_attrdef ad "
+                "JOIN pg_attribute a ON a.attrelid=ad.adrelid AND a.attnum=ad.adnum "
+                "JOIN pg_depend d ON d.classid='pg_attrdef'::regclass AND d.objid=ad.oid "
+                "WHERE ad.adrelid=:table AND a.attname=:column "
+                "AND d.refclassid='pg_class'::regclass AND d.refobjid=c.oid), "
+                "EXISTS(SELECT 1 FROM pg_depend d JOIN pg_attribute a "
+                "ON a.attrelid=d.refobjid AND a.attnum=d.refobjsubid "
+                "WHERE d.classid='pg_class'::regclass AND d.objid=c.oid "
+                "AND d.refclassid='pg_class'::regclass AND d.refobjid=:table "
+                "AND a.attname=:column AND d.deptype IN ('a','i')) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:seq"
+            ),
+            {"seq": sequence, "table": table, "column": column},
+        )
+    ).one()
+    assert namespace == schema and kind == "S" and resolved == sequence and default_bound, (
+        "nonlocal sequence default"
+    )
+    assert ownership_bound is owned, "incorrect sequence ownership"
+
+
+def _diagnostic_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _public_fixture_components(state, content, bindings):
+    """Allowlisted observations only. Never serialize the raw acceptance state."""
+    result = {}
+    for name, value in state.items():
+        qualified = "public." + name.removeprefix("sequence:")
+        if value is None:
+            continue
+        if name.startswith("sequence:"):
+            oid, configuration, position, dependencies = value
+            result[qualified] = {
+                "kind": "sequence",
+                "oid": oid,
+                "configuration": _diagnostic_hash(configuration),
+                "value_state": _diagnostic_hash(position),
+                "dependencies": dependencies,
+            }
+        else:
+            oid, identity, rows, catalog, constraints, defaults = value
+            result[qualified] = {
+                "kind": "relation",
+                "oid": oid,
+                "count": rows[0],
+                "identity": _diagnostic_hash(identity),
+                "content": content[name],
+                "versions": rows[1],
+                "catalog": catalog,
+                "constraints": constraints,
+                "defaults": defaults,
+                "bindings": bindings[name],
+            }
+    return result
+
+
+def _public_fixture_delta(before, after):
+    changes = []
+    for name in sorted(before.keys() | after.keys()):
+        old, new = before.get(name), after.get(name)
+        if old == new:
+            continue
+        changes.append(
+            {
+                "object": name,
+                "change": "added" if old is None else "removed" if new is None else "changed",
+                "before_hash": _diagnostic_hash(old),
+                "after_hash": _diagnostic_hash(new),
+                "components": {
+                    key: {"before": (old or {}).get(key), "after": (new or {}).get(key)}
+                    for key in sorted((old or {}).keys() | (new or {}).keys())
+                    if (old or {}).get(key) != (new or {}).get(key)
+                },
+            }
+        )
+    return changes
+
+
+def _emit_public_diagnostic(phase, source, before, after, unchanged):
+    print(
+        json.dumps(
+            {
+                "probe": "public-fixture-drift",
+                "phase": phase,
+                "source": source,
+                "unchanged": unchanged,
+                "writer": "UNKNOWN",
+                "deltas": _public_fixture_delta(before, after),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+async def _public_fixture_state(connection, *, diagnostics=None, schema="public"):
+    """Only identities/digests leave PostgreSQL; never log settings or payloads."""
+    state = {}
+    content, bindings = {}, {}
+    quoted_schema = connection.dialect.identifier_preparer.quote_identifier(schema)
+    for model in FIXTURE_MODELS:
+        name = model.__tablename__
+        oid = (
+            await connection.execute(
+                text("SELECT to_regclass(:name)::oid"), {"name": f"{schema}.{name}"}
+            )
+        ).scalar_one()
+        if oid is None:
+            state[name] = None
+            continue
+        # Include row versions as well as content: even a reverted write is drift.
+        rows = (
+            await connection.execute(
+                text(
+                    "SELECT count(*), md5(coalesce(string_agg(digest, '' ORDER BY digest),'')), "
+                    "md5(coalesce(string_agg(content, '' ORDER BY content),'')) "
+                    f"FROM (SELECT md5(row_to_json(r)::text || r.xmin::text || r.ctid::text) "
+                    f"AS digest, md5(row_to_json(r)::text) AS content "
+                    f'FROM {quoted_schema}."{name}" r) versions'
+                )
+            )
+        ).one()
+        catalog = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(a)::text, '' "
+                    "ORDER BY a.attnum),'')) FROM pg_attribute a WHERE a.attrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        constraints = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(c)::text, '' "
+                    "ORDER BY c.oid),'')) FROM pg_constraint c WHERE c.conrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        defaults = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(d)::text, '' "
+                    "ORDER BY d.adnum),'')) FROM pg_attrdef d WHERE d.adrelid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        identity = (
+            await connection.execute(
+                text(
+                    "SELECT relnamespace,relkind::text,relowner,relfilenode "
+                    "FROM pg_class WHERE oid=:oid"
+                ),
+                {"oid": oid},
+            )
+        ).one()
+        state[name] = (oid, tuple(identity), tuple(rows[:2]), catalog, constraints, defaults)
+        content[name] = rows[2]
+        # Structural identities only: no expressions, row JSON or SQL parameters.
+        references = (
+            await connection.execute(
+                text(
+                    "SELECT DISTINCT n.nspname,c.relname,c.oid FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid IN ("
+                    "SELECT confrelid FROM pg_constraint WHERE conrelid=:oid AND contype='f' "
+                    "UNION SELECT d.refobjid FROM pg_depend d JOIN pg_attrdef a "
+                    "ON d.classid='pg_attrdef'::regclass AND d.objid=a.oid "
+                    "WHERE a.adrelid=:oid AND d.refclassid='pg_class'::regclass "
+                    "UNION SELECT d.objid FROM pg_depend d "
+                    "WHERE d.refclassid='pg_class'::regclass AND d.refobjid=:oid "
+                    "AND d.classid='pg_class'::regclass AND d.deptype IN ('a','i')) "
+                    "ORDER BY n.nspname,c.relname,c.oid"
+                ),
+                {"oid": oid},
+            )
+        ).all()
+        resolved = (
+            await connection.execute(text("SELECT to_regclass(:name)::oid"), {"name": name})
+        ).scalar_one()
+        bindings[name] = {
+            "qualified": f"{schema}.{name}",
+            "local_oid": oid,
+            "resolved_oid": resolved,
+            "references": [
+                {"qualified": f"{namespace}.{relation}", "oid": reference}
+                for namespace, relation, reference in references
+            ],
+        }
+    sequences = (
+        await connection.execute(
+            text(
+                "SELECT c.oid, c.relname, row_to_json(s)::text FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_sequence s "
+                "ON s.seqrelid=c.oid WHERE n.nspname=:schema ORDER BY c.relname"
+            ),
+            {"schema": schema},
+        )
+    ).all()
+    for oid, name, configuration in sequences:
+        # Identifier quoting from the dialect, not values from settings.
+        quoted = connection.dialect.identifier_preparer.quote_identifier(name)
+        value = (
+            await connection.execute(
+                text(f"SELECT last_value,is_called FROM {quoted_schema}.{quoted}")
+            )
+        ).one()
+        dependencies = (
+            await connection.execute(
+                text(
+                    "SELECT md5(coalesce(string_agg(row_to_json(d)::text, '' "
+                    "ORDER BY d.classid,d.objid,d.objsubid,d.refclassid,d.refobjid,"
+                    "d.refobjsubid,d.deptype),'')) FROM pg_depend d "
+                    "WHERE (d.refclassid='pg_class'::regclass AND d.refobjid=:oid) "
+                    "OR (d.classid='pg_class'::regclass AND d.objid=:oid)"
+                ),
+                {"oid": oid},
+            )
+        ).scalar_one()
+        state["sequence:" + name] = (oid, configuration, tuple(value), dependencies)
+    if diagnostics is not None:
+        components = _public_fixture_components(state, content, bindings)
+        diagnostics.update(
+            {key.replace("public.", schema + ".", 1): value for key, value in components.items()}
+        )
+    return state
 
 
 def _source_receipt(receipt, environment=None):
@@ -112,12 +1633,262 @@ def _source_receipt(receipt, environment=None):
     return {"commit": proof["commit"], "source_manifest_sha256": proof["digest"]}
 
 
+async def _cleanup_lifecycle_storage(
+    *,
+    engine,
+    control,
+    schema,
+    created,
+    retained,
+    public_baseline,
+    diagnostic_baseline,
+    source,
+    emit_receipt,
+    logging_engine=None,
+):
+    """Every cleanup obligation is independent, including when diagnostics fail."""
+    state = {
+        "schema_removed": False,
+        "public_manual_storage_unchanged": False,
+        "public_fixture_storage_unchanged": False,
+    }
+    observations = {}
+
+    async def compare(phase):
+        diagnostics = {}
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            manual = await retained_storage_state(connection) == retained
+            unchanged = (
+                await _public_fixture_state(connection, diagnostics=diagnostics) == public_baseline
+            )
+        # Record acceptance before attempting potentially failing serialization.
+        observations[phase] = (manual, unchanged)
+        state["public_manual_storage_unchanged"] = (
+            all(value[0] for value in observations.values()) and len(observations) == 2
+        )
+        state["public_fixture_storage_unchanged"] = (
+            all(value[1] for value in observations.values()) and len(observations) == 2
+        )
+        _emit_public_diagnostic(phase, source, diagnostic_baseline, diagnostics, unchanged)
+
+    async def drop():
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            await connection.execute(DropSchema(schema, cascade=True))
+
+    async def verify_absence():
+        async with control.begin() as connection:
+            await guard_owned_database(connection)
+            state["schema_removed"] = (
+                await connection.execute(
+                    text("SELECT to_regnamespace(:schema)"), {"schema": schema}
+                )
+            ).scalar_one() is None
+
+    async def receipt():
+        emit_receipt(state)
+
+    async def check():
+        if created:
+            public_unchanged = state["public_manual_storage_unchanged"]
+            fixture_public_unchanged = state["public_fixture_storage_unchanged"]
+            removed = state["schema_removed"]
+            assert public_unchanged, "public manual storage drift"
+            assert fixture_public_unchanged, "public fixture storage/sequence drift"
+            assert removed, "owned fixture schema remains"
+
+    stages = []
+    if created:
+        if logging_engine is not None:
+            stages.append(("engine-dispose", logging_engine.dispose))
+        stages.extend(
+            [
+                ("pre-drop", lambda: compare("pre-drop")),
+                ("drop", drop),
+                ("absence", verify_absence),
+                ("post-drop", lambda: compare("post-drop")),
+            ]
+        )
+    stages.extend(
+        [
+            ("engine-dispose", engine.dispose),
+            ("control-dispose", control.dispose),
+            ("receipt", receipt),
+            ("acceptance", check),
+        ]
+    )
+    failures, failed_stages = [], []
+    for phase, action in stages:
+        _investigation_stage(phase, source)
+        try:
+            await action()
+        except BaseException as exc:
+            failures.append(exc)
+            failed_stages.append(phase)
+            try:
+                print(
+                    json.dumps(
+                        {
+                            "probe": "public-fixture-drift-error",
+                            "phase": phase,
+                            "source": source,
+                            "exception": type(exc).__name__,
+                            "writer": "UNKNOWN",
+                        }
+                    )
+                )
+            except BaseException as diagnostic_error:
+                failures.append(diagnostic_error)
+    if failures:
+        raise BaseExceptionGroup("fixture cleanup failed: " + ", ".join(failed_stages), failures)
+
+
+def _logging_child_identity(receipt, source):
+    """Only the canonical isolated phase child may use non-unwinding containment."""
+    phase = os.environ["COP_MANUAL_TEST_PHASE"]
+    assert re.fullmatch(r"[a-z0-9-]+", phase), "invalid logging child phase"
+    root = Path(receipt["temp_root"]) / "evidence"
+    assert Path(os.environ["COP_MANUAL_TEST_EVIDENCE"]) == root
+    process = json.loads((root / phase / "process.json").read_text(encoding="utf-8"))
+    assert process["pid"] == process["pgid"] == os.getpid() == os.getpgrp() == os.getsid(0)
+    assert process["parent_pid"] == os.getppid()
+    assert process["commit"] == source["commit"]
+    assert process["source_manifest_sha256"] == source["source_manifest_sha256"]
+    assert process["revision"] == receipt["revision"]
+    assert "--noconftest" in process["command"] and "pytest" in process["command"]
+    assert "exit" not in process and "finished_at" not in process
+    return (os.getpid(), os.getppid(), os.getpgrp())
+
+
+def _exit_unsettled_logging(identity):
+    """Test child ONLY. No finally/pytest unwinding; failed profile is not reusable."""
+    assert (identity[0], identity[2]) == (os.getpid(), os.getpgrp())
+    assert os.getpid() == os.getsid(0) == os.getpgrp()
+    os._exit(86)
+
+
+def _assert_logging_accounting(status, *, complete):
+    """Cumulative phase totals, never a per-fixture baseline that hides prior loss."""
+    counts = status["counts"]
+    assert not any(status["drops"].values()), "logging phase rejected or lost rows"
+    for name in (
+        "batch_failures",
+        "writer_cancellations",
+        "attempt_timeouts",
+        "retried_rows",
+        "admitted_loss",
+        "unsettled_shutdowns",
+        "shutdown_expirations",
+        "task_creation_failures",
+        "writer_cancel_requests",
+        "caller_cancellations",
+        "flusher_failures",
+    ):
+        assert counts.get(name, 0) == 0, f"logging phase failure: {name}"
+    assert counts.get("admitted", 0) == (
+        counts.get("acknowledged", 0) + status["owned_rows"] - status["encoding_rows"]
+    ), "logging conservation failure"
+    if complete:
+        assert status["owned_rows"] == status["inflight_rows"] == 0
+        assert status["state"] == "SETTLED"
+
+
+async def _finish_logging_fixture(
+    *, lease, child_identity, verify_logging, cleanup_storage, saved_logging
+):
+    """Called inside finish_owned_cleanup; includes every independent finalizer."""
+    from packages.core import log_sink
+
+    failures = []
+    if lease is not None:
+        try:
+            await log_sink.shutdown_log_sink()
+        except BaseException as exc:
+            if log_sink.log_sink_status()["state"] != "SETTLED":
+                _exit_unsettled_logging(child_identity)
+            failures.append(exc)
+        try:
+            _assert_logging_accounting(log_sink.log_sink_status(), complete=True)
+            await verify_logging()
+        except BaseException as exc:
+            failures.append(exc)
+    try:
+        await cleanup_storage()
+    except BaseException as exc:
+        failures.append(exc)
+    finally:
+        if lease is not None:
+            try:
+                lease.release()
+            except BaseException as exc:
+                failures.append(exc)
+        # Restoring processors is deliberately NOT sink configuration/restart.
+        structlog.configure(**saved_logging)
+    if failures:
+        raise BaseExceptionGroup("owned logging/fixture cleanup failed", failures)
+
+
+@pytest.fixture(scope="session")
+def _logging_phase():
+    from packages.core import log_sink
+
+    _assert_logging_accounting(log_sink.log_sink_status(), complete=False)
+    yield
+    _assert_logging_accounting(log_sink.log_sink_status(), complete=True)
+
+
+def _logging_session_factory(maker, commits):
+    """Supply the logging transaction context and its committed-write notifications."""
+
+    @asynccontextmanager
+    async def sessions():
+        async with maker() as session:
+            wrote = False
+
+            def before_flush(current, _context, _instances):
+                nonlocal wrote
+                # Capture pending ORM writes BEFORE autoflush empties these sets,
+                # including seed rows whose first flush happens inside commit.
+                wrote |= bool(current.new or current.dirty or current.deleted)
+
+            def orm_execute(state):
+                nonlocal wrote
+                # Bulk ORM DML need not populate new/dirty/deleted at all.
+                wrote |= state.is_insert or state.is_update or state.is_delete
+
+            target = session.sync_session
+            event.listen(target, "before_flush", before_flush)
+            event.listen(target, "do_orm_execute", orm_execute)
+            try:
+                yield session
+                await session.commit()
+                if wrote:
+                    commits.put_nowait(True)
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                event.remove(target, "do_orm_execute", orm_execute)
+                event.remove(target, "before_flush", before_flush)
+
+    return sessions
+
+
 @pytest_asyncio.fixture
-async def lifecycle_database(request, tmp_path, monkeypatch):
+async def lifecycle_database(request, tmp_path, monkeypatch, _logging_phase):
     assert request.config.option.noconftest, "coordinator-owned suite requires --noconftest"
     assert os.name == "posix", "owned harness requires Linux Unix-socket/process semantics"
     receipt = owned_test_environment()
     source = _source_receipt(receipt)
+    child_identity = _logging_child_identity(receipt, source)
+    from packages.core import log_sink
+    from packages.core.runtime_ownership import finish_owned_cleanup
+
+    initial = log_sink.log_sink_status()
+    assert initial["state"] in ("IDLE", "SETTLED") and not initial["explicit_binding"]
+    assert initial["owned_rows"] == 0, "startup before binding cannot be adopted"
+    _investigation_stage("baseline", source)
     root = Path(receipt["temp_root"])
     assert tmp_path.resolve().is_relative_to(root), "pytest basetemp must be coordinator-owned"
     model_dir = tmp_path / "artifact-fixtures"
@@ -130,10 +1901,22 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
         poolclass=NullPool,
         connect_args={"server_settings": {"search_path": schema + ", public"}},
     )
+    # Deliberately separate from application-engine listeners, NOT a model-wide bind.
+    logging_engine = create_async_engine(
+        os.environ["DATABASE_URL"],
+        poolclass=NullPool,
+        connect_args={"server_settings": {"search_path": schema + ", public"}},
+    )
+    saved_logging = structlog.get_config().copy()
+    logging_lease = None
+    logging_marker = "owned-logging-" + uuid.uuid4().hex
+    logging_commits = asyncio.Queue()
     started = dt.datetime.now(dt.timezone.utc)
     created = False
-    removed = False
-    public_unchanged = False
+    ownership_checked = False
+    public_baseline = None
+    diagnostic_baseline = {}
+    retained = None
     with owned_test_network():
         try:
             async with control.begin() as connection:
@@ -144,14 +1927,41 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                     await connection.execute(text("SELECT version_num FROM public.alembic_version"))
                 ).scalar_one() == head
                 retained = await retained_storage_state(connection)
+                public_baseline = await _public_fixture_state(
+                    connection, diagnostics=diagnostic_baseline
+                )
+            async with control.begin() as connection:
+                await guard_owned_database(connection)
+                immediate = {}
+                stable = (
+                    await _public_fixture_state(connection, diagnostics=immediate)
+                    == public_baseline
+                )
+            _emit_public_diagnostic(
+                "baseline-repeat", source, diagnostic_baseline, immediate, stable
+            )
+            assert stable, "public fixture baseline unstable"
+            async with control.begin() as connection:
+                await guard_owned_database(connection)
                 await connection.execute(CreateSchema(schema))
             created = True
             async with engine.begin() as connection:
                 await connection.run_sync(
-                    lambda current: _pre_lifecycle_device_table().create(current)
+                    lambda current: _pre_lifecycle_device_table(schema).create(current)
                 )
                 await connection.run_sync(lambda current: _run_migration(current, "upgrade"))
+                await connection.run_sync(
+                    lambda current: _fixture_metadata(schema).create_all(current, checkfirst=False)
+                )
+                await _assert_fixture_storage(connection, schema)
+                # Verify logging's own connection resolves relation/default/sequence locally.
+            async with logging_engine.begin() as connection:
+                await _assert_fixture_storage(connection, schema)
+                ownership_checked = True
             maker = async_sessionmaker(engine, expire_on_commit=False)
+            from packages.core import database as database_module
+
+            monkeypatch.setattr(database_module, "async_session_factory", maker)
 
             @asynccontextmanager
             async def sessions():
@@ -163,25 +1973,40 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         await session.rollback()
                         raise
 
+            logging_maker = async_sessionmaker(logging_engine, expire_on_commit=False)
+            logging_sessions = _logging_session_factory(logging_maker, logging_commits)
+
+            _assert_logging_accounting(log_sink.log_sink_status(), complete=False)
+            logging_lease = log_sink.bind_log_session_factory(logging_sessions)
+            # Matches the real API's import + lifespan configuration; no disabling,
+            # interval changes, forced flush or application-listener filtering.
+            log_sink.configure_structlog_with_db("api")
+            async with logging_sessions() as session:
+                session.add(
+                    AppLogRecord(
+                        event=logging_marker + "-expired",
+                        level="INFO",
+                        service="owned-test",
+                        ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25),
+                    )
+                )
+            log_sink._db_log_processor(None, "info", {"event": logging_marker})
+
+            _investigation_stage("call", source)
             yield SimpleNamespace(
                 lifecycle=Lifecycle(sessions),
                 sessions=sessions,
                 maker=maker,
                 engine=engine,
                 model_dir=model_dir,
+                schema=schema,
+                logging_engine=logging_engine,
+                logging_sessions=logging_sessions,
+                logging_commits=logging_commits,
             )
         finally:
-            try:
-                await engine.dispose()
-                if created:
-                    async with control.begin() as connection:
-                        await guard_owned_database(connection)
-                        public_unchanged = await retained_storage_state(connection) == retained
-                        await connection.execute(DropSchema(schema, cascade=True))
-                    removed = True
-                    assert public_unchanged, "public manual storage drift"
-            finally:
-                await control.dispose()
+
+            def emit_receipt(state):
                 write_lifecycle_receipt(
                     root / "evidence",
                     {
@@ -192,10 +2017,53 @@ async def lifecycle_database(request, tmp_path, monkeypatch):
                         "started_at": started.isoformat(),
                         "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                         "schema_owned": created,
-                        "schema_removed": removed,
-                        "public_manual_storage_unchanged": public_unchanged,
+                        "fixture_storage_ownership_checked": ownership_checked,
+                        **state,
                     },
                 )
+
+            async def verify_logging():
+                async with logging_maker() as session:
+                    rows = (
+                        (
+                            await session.execute(
+                                select(AppLogRecord.event).where(
+                                    AppLogRecord.event.in_(
+                                        [logging_marker, logging_marker + "-expired"]
+                                    )
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                assert rows == [logging_marker], "logging INSERT/retention not committed"
+
+            async def cleanup_storage():
+                await _cleanup_lifecycle_storage(
+                    engine=engine,
+                    control=control,
+                    logging_engine=logging_engine,
+                    schema=schema,
+                    created=created,
+                    retained=retained,
+                    public_baseline=public_baseline,
+                    diagnostic_baseline=diagnostic_baseline,
+                    source=source,
+                    emit_receipt=emit_receipt,
+                )
+
+            async def cleanup():
+                await _finish_logging_fixture(
+                    lease=logging_lease,
+                    child_identity=child_identity,
+                    verify_logging=verify_logging,
+                    cleanup_storage=cleanup_storage,
+                    saved_logging=saved_logging,
+                )
+
+            # Includes disposal, receipts, lease and processor restoration, not just drain.
+            await finish_owned_cleanup(cleanup)
 
 
 async def _readiness_source_fixture(database, monkeypatch):
@@ -222,7 +2090,7 @@ async def _readiness_source_fixture(database, monkeypatch):
             WeatherRecord,
         ):
             await connection.run_sync(
-                lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                lambda current, table=model.__table__: _require_local_table(current, table)
             )
     monkeypatch.setattr(database_module, "async_session_factory", database.maker)
     values = {
@@ -233,6 +2101,9 @@ async def _readiness_source_fixture(database, monkeypatch):
     values.update(
         {
             "timezone": "UTC",
+            "comfort_temp_min": "18",
+            "comfort_temp_target": "20.5",
+            "comfort_temp_max": "25",
             "comfort_reference_sensor_id": "selected-room",
             "smartthings_device_ids": "selected-room",
             "weather_provider": "open-meteo",
@@ -300,10 +2171,10 @@ async def _readiness_source_fixture(database, monkeypatch):
 
 
 async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeypatch):
+    from packages.core import settings_service
     from packages.core.models import (
         ConsumptionRecord,
         IndoorTempReading,
-        SettingRecord,
         WeatherRecord,
     )
     from packages.ml import model_status, thermal
@@ -311,7 +2182,7 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
     database = lifecycle_database
     source = await _readiness_source_fixture(database, monkeypatch)
     lease = await _owner(database)
-    old_artifact = _artifact(database, "ur2-old-reference")
+    old_artifact = await _artifact(database, "ur2-old-reference", device_id="audit-device")
     before = await database.lifecycle.read()
     assert (
         await database.lifecycle.publish(
@@ -322,7 +2193,6 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
             expected_incumbent=None,
         )
     ).committed
-    new_artifact = _artifact(database, "ur2-new-reference")
     reached, changed = asyncio.Event(), asyncio.Event()
     original = thermal.materialize_thermal_inputs
     calls = 0
@@ -341,31 +2211,20 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
             route="ur2-real-pg", as_of=source.now, components=("demand", "thermal")
         )
     )
-    await asyncio.wait_for(reached.wait(), 3)
     try:
+        await asyncio.wait_for(reached.wait(), 3)
         async with database.sessions() as session:
             latest_before = (
                 await session.execute(select(func.max(IndoorTempReading.timestamp)))
             ).scalar_one()
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "comfort_reference_sensor_id")
-                .values(value="second-room")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "smartthings_device_ids")
-                .values(value="second-room")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "weather_provider")
-                .values(value="smhi")
-            )
-            await session.execute(
-                update(SettingRecord)
-                .where(SettingRecord.key == "timezone")
-                .values(value="Europe/Stockholm")
+            await settings_service.set_settings_bulk(
+                {
+                    "comfort_reference_sensor_id": "second-room",
+                    "smartthings_device_ids": "second-room",
+                    "weather_provider": "smhi",
+                    "timezone": "Europe/Stockholm",
+                },
+                session=session,
             )
             await session.execute(
                 update(IndoorTempReading)
@@ -393,6 +2252,7 @@ async def test_UR2_SR1_repeatable_read_in_place_edit(lifecycle_database, monkeyp
                 .where(ConsumptionRecord.ts == source.start + dt.timedelta(hours=1))
                 .values(heat_kwh=2.0)
             )
+        new_artifact = await _artifact(database, "ur2-new-reference", device_id="audit-device")
         current = await database.lifecycle.read()
         assert (
             await database.lifecycle.publish(
@@ -726,7 +2586,7 @@ async def test_UR3_SR2_native_dto_to_qualification_no_incumbent_R06(
     async with lifecycle_database.engine.begin() as connection:
         for model in (PlanRecord, PlanActionRecord):
             await connection.run_sync(
-                lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                lambda current, table=model.__table__: _require_local_table(current, table)
             )
     monkeypatch.setattr(database_module, "async_session_factory", lifecycle_database.maker)
     await test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
@@ -747,7 +2607,7 @@ async def test_UR3_UR4_SR2_SR3_real_enabled_cycle_and_owner_without_incumbent(
     source = await _readiness_source_fixture(database, monkeypatch)
     async with database.engine.begin() as connection:
         await connection.run_sync(
-            lambda current: OverrideRecord.__table__.create(current, checkfirst=True)
+            lambda current: _require_local_table(current, OverrideRecord.__table__)
         )
     timer = {
         "status": "known",
@@ -938,13 +2798,20 @@ async def test_UR3_SR2_real_owner_off_and_rejection_counts(lifecycle_database, m
         await owner.close()
 
 
-def _artifact(database, fit_id, *, checkpoint=None):
+async def _artifact(database, fit_id, *, device_id="fixture-device", checkpoint=None):
+    from packages.ml.forecast_quality import locked_demand_scope
+
+    async with database.sessions() as session:
+        async with locked_demand_scope(device_id, session=session) as (scope, _session):
+            manifest_scope = scope
     return publish_signed_artifact(
         {"fit_id": fit_id, "weights": [1.25, 3.5]},
         component="demand",
         schema_version="demand_lifecycle_v1",
         manifest={
             "fit_id": fit_id,
+            "device_id": device_id,
+            "scope": manifest_scope,
             "data_cutoff": dt.datetime.now(dt.timezone.utc).isoformat(),
             "input_schema": "native_inputs_v1",
             "output_schema": "demand_v1",
@@ -960,7 +2827,29 @@ def _exact_fit(restored, fit_id):
     assert restored == {"fit_id": fit_id, "weights": [1.25, 3.5]}
 
 
-async def _owner(database):
+async def _prepare_demand_fixture(database):
+    """Opt-in current inputs, never added to readiness/thermal or empty-authority cohorts."""
+    from packages.core import settings_service
+    from packages.core.house_contract import ensure_current_contract
+
+    async with database.sessions() as session:
+        await settings_service.set_settings_bulk(
+            {
+                "timezone": "UTC",
+                "comfort_temp_min": "18",
+                "comfort_temp_target": "20.5",
+                "comfort_temp_max": "25",
+            },
+            session=session,
+        )
+        await ensure_current_contract(session)
+        now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+        session.add(DeviceStatusRecord(ts=now, device_id="fixture-device"))
+
+
+async def _owner(database, *, demand=False):
+    if demand:
+        await _prepare_demand_fixture(database)
     await database.lifecycle.initialize()
     await database.lifecycle.set_maintenance_enabled(True)
     lease = await database.lifecycle.acquire("worker-" + uuid.uuid4().hex)
@@ -969,9 +2858,9 @@ async def _owner(database):
 
 
 async def _native_fixture(database, count, *, incumbent_fit=None):
-    lease = await _owner(database)
+    lease = await _owner(database, demand=True)
     if incumbent_fit is not None:
-        incumbent = _artifact(database, incumbent_fit)
+        incumbent = await _artifact(database, incumbent_fit)
         state = await database.lifecycle.read()
         assert (
             await database.lifecycle.publish(
@@ -982,7 +2871,7 @@ async def _native_fixture(database, count, *, incumbent_fit=None):
                 expected_incumbent=None,
             )
         ).committed
-    artifact = _artifact(database, "native-fixture")
+    artifact = await _artifact(database, "native-fixture")
     state = await database.lifecycle.read()
     assert (
         await database.lifecycle.publish(
@@ -1020,6 +2909,149 @@ async def _native_fixture(database, count, *, incumbent_fit=None):
         for index in range(count)
     ]
     return lease, reference, rows
+
+
+@contextmanager
+def _trace_thermal_materializers(monkeypatch, observations, *, source="actual-hook"):
+    """Observe the real hook; return objects and exceptions are never replaced."""
+    from packages.ml import forecast_quality as quality, thermal
+
+    native = quality.materialize_native_inputs
+    history = thermal.materialize_thermal_inputs
+
+    async def observed_native(*args, **kwargs):
+        entry = {
+            "call": "native",
+            "capabilities": list(kwargs.get("capabilities", ())),
+        }
+        observations.append(entry)
+        try:
+            result = await native(*args, **kwargs)
+        except BaseException as exc:
+            entry["exception"] = type(exc).__name__
+            raise
+        entry["result"] = "None" if result is None else "present"
+        if result is not None:
+            entry["sensor_kind"] = result["sensor_basis"]["kind"]
+            entry["capability"] = result["capability"]
+        return result
+
+    async def observed_history(*args, **kwargs):
+        entry = {"call": "thermal_history"}
+        observations.append(entry)
+        try:
+            result = await history(*args, **kwargs)
+        except BaseException as exc:
+            entry["exception"] = type(exc).__name__
+            raise
+        entry["result"] = "None" if result is None else "present"
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(quality, "materialize_native_inputs", observed_native)
+        patch.setattr(thermal, "materialize_thermal_inputs", observed_history)
+        try:
+            yield
+        finally:
+            print(
+                json.dumps({"probe": "G3-materializers", "source": source, "calls": observations})
+            )
+
+
+async def _thermal_prerequisite_probe(database, monkeypatch, now):
+    """Prerequisite-only differential. Every probe rolls back; no hook fit/commit."""
+    from packages.ml import forecast_quality as quality, thermal
+
+    async with database.sessions() as session:
+        installation = await session.get(HouseInstallationRecord, 1)
+        local, resolved = (
+            await session.execute(
+                text("SELECT to_regclass(:local)::oid,to_regclass('house_installations')::oid"),
+                {"local": database.schema + ".house_installations"},
+            )
+        ).one()
+    print(
+        json.dumps(
+            {
+                "probe": "G3-prerequisite",
+                "local_oid": local,
+                "resolved_oid": resolved,
+                "singleton_present": installation is not None,
+            }
+        )
+    )
+    assert local is not None and local == resolved
+    if installation is not None:
+        print(json.dumps({"probe": "G3-boundary", "reason": "installation_already_present"}))
+        return
+    for present in (False, True):
+        observations = []
+        rolled_back = False
+        try:
+            async with database.engine.connect() as connection:
+                transaction = await connection.begin()
+                try:
+                    maker = async_sessionmaker(
+                        connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+                    )
+
+                    @asynccontextmanager
+                    async def diagnostic_sessions():
+                        async with maker() as session:
+                            yield session
+                            await session.commit()
+
+                    with monkeypatch.context() as patch:
+                        patch.setattr(quality, "get_session", diagnostic_sessions)
+                        patch.setattr(thermal, "get_session", diagnostic_sessions)
+                        if present:
+                            async with diagnostic_sessions() as session:
+                                session.add(
+                                    HouseInstallationRecord(
+                                        singleton_id=1,
+                                        installation_id=uuid.UUID(int=1),
+                                        house_id=uuid.UUID(int=2),
+                                        demand_dependency_generation=1,
+                                        indoor_dependency_generation=1,
+                                    )
+                                )
+                        with _trace_thermal_materializers(
+                            patch,
+                            observations,
+                            source="prerequisite-present" if present else "prerequisite-absent",
+                        ):
+                            # Same family selection as the hook, but never fit/publish/qualify.
+                            inputs = await quality.materialize_native_inputs("thermal", now=now)
+                            indoor = await quality.materialize_native_inputs(
+                                "thermal",
+                                now=now,
+                                device_id=inputs["device_id"] if inputs else None,
+                                capabilities=("indoor_heating", "indoor_cooling"),
+                            )
+                            if indoor is not None:
+                                await thermal.materialize_thermal_inputs(
+                                    indoor["device_id"],
+                                    indoor["reference_sensor_id"],
+                                    indoor["weather_provider"],
+                                    now,
+                                    selected_ids=indoor["configured_sensor_ids"],
+                                )
+                finally:
+                    await transaction.rollback()
+                    rolled_back = True
+        except Exception as exc:
+            # Diagnostic failure is evidence, never a replacement for the actual hook result.
+            observations.append({"probe_exception": type(exc).__name__})
+        print(
+            json.dumps(
+                {
+                    "probe": "G3-installation-differential",
+                    "installation_present": present,
+                    "rolled_back": rolled_back,
+                    "calls": observations,
+                }
+            )
+        )
 
 
 async def test_issue_outcome_uniqueness_and_immutable_snapshot_under_concurrency(
@@ -1107,7 +3139,9 @@ async def test_R03_saved_plan_JSON_readers_preserve_integer_identity(
     database = lifecycle_database
     async with database.engine.begin() as connection:
         for model in (PlanRecord, PlanActionRecord, IndoorTempReading):
-            await connection.run_sync(lambda current, table=model.__table__: table.create(current))
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
     async with database.sessions() as session:
 
         def saved_history(plans, readings, _unresolved):
@@ -1192,6 +3226,35 @@ async def test_R06_family_identity_survives_queue_transitions_and_claim(lifecycl
         ).scalar_one() == 0
 
 
+async def _initialize_thermal_installation(database):
+    """Opt-in prerequisite only; callers must already have proved local storage."""
+    installation_id, house_id = uuid.uuid4(), uuid.uuid4()
+    async with database.sessions() as session:
+        assert await session.get(HouseInstallationRecord, 1) is None
+        session.add(
+            HouseInstallationRecord(
+                singleton_id=1,
+                installation_id=installation_id,
+                house_id=house_id,
+                demand_dependency_generation=1,
+                indoor_dependency_generation=1,
+                current_revision_id=None,
+            )
+        )
+        await session.flush()
+        await session.refresh(await session.get(HouseInstallationRecord, 1))
+        row = await session.get(HouseInstallationRecord, 1)
+        assert row is not None
+        assert (row.installation_id, row.house_id) == (installation_id, house_id)
+        assert (row.demand_dependency_generation, row.indoor_dependency_generation) == (1, 1)
+        assert row.current_revision_id is None
+    async with database.sessions() as session:
+        row = await session.get(HouseInstallationRecord, 1)
+        assert row is not None and row.installation_id == installation_id
+        assert row.house_id == house_id and row.current_revision_id is None
+        assert (row.demand_dependency_generation, row.indoor_dependency_generation) == (1, 1)
+
+
 async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong_skill=False):
     from unittest.mock import AsyncMock
     from packages.core import settings_service
@@ -1205,8 +3268,17 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
     from tests.test_ml_lifecycle import TestR06ThermalQualificationRoute
 
     async with database.engine.begin() as connection:
-        for model in (ConsumptionRecord, IndoorTempReading, PriceRecord, WeatherRecord):
-            await connection.run_sync(lambda current, table=model.__table__: table.create(current))
+        for model in (
+            ConsumptionRecord,
+            IndoorTempReading,
+            PriceRecord,
+            WeatherRecord,
+            HouseInstallationRecord,
+        ):
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
+    await _initialize_thermal_installation(database)
     async with database.sessions() as session:
         current = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     frozen_at = current - dt.timedelta(hours=360)
@@ -1276,29 +3348,53 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
     )
     monkeypatch.setattr(module, "_now", lambda: clock[0])
     lease = await _owner(database)
-    owner = module.MaintenanceRunner(
-        database.lifecycle, enabled_reader=AsyncMock(return_value=True)
-    )
+    owner = None
     try:
-        hook = owner.hooks["thermal"]
-        heating, cooling = thermal._extract_indoor_rate_samples(readings, records, weather)
-        source_counts = {
-            name: thermal._rate_sample_counts(samples)
-            for name, samples in (("indoor_heating", heating), ("indoor_cooling", cooling))
-        }
-        assert all(
-            counts["train"] >= 20 and counts["holdout"] >= 3 for counts in source_counts.values()
+        observations = []
+        with _trace_thermal_materializers(monkeypatch, observations):
+            owner = module.MaintenanceRunner(
+                database.lifecycle, enabled_reader=AsyncMock(return_value=True)
+            )
+            hook = owner.hooks["thermal"]
+            heating, cooling = thermal._extract_indoor_rate_samples(readings, records, weather)
+            source_counts = {
+                name: thermal._rate_sample_counts(samples)
+                for name, samples in (("indoor_heating", heating), ("indoor_cooling", cooling))
+            }
+            assert all(
+                counts["train"] >= 20 and counts["holdout"] >= 3
+                for counts in source_counts.values()
+            )
+            assert (await database.lifecycle.read()).reference("thermal") is None
+            queued = await database.lifecycle.enqueue(
+                "thermal", "scheduled", family="indoor_", dedup_key="r06-indoor-fit", lease=lease
+            )
+            assert isinstance(queued, module.MaintenanceRequest)
+            assert queued.details == {"family": "indoor_"}
+            claimed = await database.lifecycle.claim_request(lease, "thermal")
+            assert isinstance(claimed, module.MaintenanceRequest)
+            assert claimed.id == queued.id and claimed.details == {"family": "indoor_"}
+            try:
+                materialized = await hook.materialize(claimed)
+            except BaseException as exc:
+                print(json.dumps({"probe": "G3-actual-hook", "exception": type(exc).__name__}))
+                raise
+        print(
+            json.dumps(
+                {
+                    "probe": "G3-actual-hook",
+                    "result": "None" if materialized is None else "present",
+                    "requested_family": claimed.details.get("family"),
+                }
+            )
         )
-        assert (await database.lifecycle.read()).reference("thermal") is None
-        queued = await database.lifecycle.enqueue(
-            "thermal", "scheduled", family="indoor_", dedup_key="r06-indoor-fit", lease=lease
-        )
-        assert isinstance(queued, module.MaintenanceRequest)
-        assert queued.details == {"family": "indoor_"}
-        claimed = await database.lifecycle.claim_request(lease, "thermal")
-        assert isinstance(claimed, module.MaintenanceRequest)
-        assert claimed.id == queued.id and claimed.details == {"family": "indoor_"}
-        materialized = await hook.materialize(claimed)
+        if materialized is None:
+            try:
+                await _thermal_prerequisite_probe(database, monkeypatch, clock[0])
+            except Exception as exc:
+                print(
+                    json.dumps({"probe": "G3-diagnostic-failure", "exception": type(exc).__name__})
+                )
         assert materialized is not None
         assert materialized["requested_family"] == "indoor_"
         fitted = hook.fit(materialized)
@@ -1331,9 +3427,75 @@ async def _thermal_route_owner(database, monkeypatch, *, foreign_count=0, strong
             source_counts=source_counts,
         )
     except BaseException:
-        await owner.close()
-        await database.lifecycle.release(lease)
+        try:
+            if owner is not None:
+                await owner.close()
+        finally:
+            await database.lifecycle.release(lease)
         raise
+
+
+async def _seed_current_thermal_publication_inputs(database, route):
+    """Synthetic availability only: never training or prospective evidence."""
+    from packages.ml import forecast_quality as quality
+
+    frozen = route.fitted["inputs"]
+    assert route.clock[0] == route.current == route.frozen_at + dt.timedelta(hours=360)
+    assert route.current > dt.datetime.fromisoformat(route.reference.manifest["data_cutoff"])
+    assert frozen["sensor_basis"]["sensor_ids"] == [frozen["reference_sensor_id"]]
+    temperature = frozen["sensor_history"][-1]["temperature"]
+    assert quality._finite_number(temperature) and 5 <= temperature <= 35
+    async with database.engine.begin() as connection:
+        for model in (DeviceStatusRecord, IndoorTempReading):
+            await connection.run_sync(
+                lambda current, table=model.__table__: _require_local_table(current, table)
+            )
+
+    # Copy source values into NEW rows; neither ORM history nor the frozen fit is retimestamped.
+    source = frozen["status_history"][-1]
+    status = DeviceStatusRecord(
+        **{
+            column.name: deepcopy(source.get(column.name))
+            for column in DeviceStatusRecord.__table__.columns
+            if column.name not in {"id", "ts"}
+        }
+    )
+    assert status.device_id == frozen["device_id"]
+    status.ts = route.current
+    status.native_policy_provenance = {
+        **(status.native_policy_provenance or {}),
+        "timer": {**deepcopy(frozen["timer"]), "fetched_at": route.current.isoformat()},
+    }
+    reading = IndoorTempReading(
+        timestamp=route.current,
+        temperature=temperature,
+        device_id=frozen["reference_sensor_id"],
+        is_stale=False,
+    )
+    async with database.sessions() as session:
+        session.add_all([status, reading])
+
+    # Exercise the production reader/preparer, not a replacement publication gate.
+    current = await quality.materialize_native_inputs(
+        "thermal",
+        now=route.current,
+        device_id=frozen["device_id"],
+        capabilities=tuple(frozen["capabilities"]),
+    )
+    assert current is not None
+    for key in (
+        "device_id",
+        "installation_id",
+        "indoor_dependency_generation",
+        "configured_sensor_ids",
+        "reference_sensor_id",
+        "sensor_basis",
+        "native_settings",
+        "weather_provider",
+        "timezone",
+    ):
+        assert current[key] == frozen[key], key
+    assert quality.native_scope(current) == route.reference.manifest["scope"]
 
 
 def _thermal_native_snapshot(route, issued, capability):
@@ -1341,13 +3503,27 @@ def _thermal_native_snapshot(route, issued, capability):
 
     inputs = TestR06ThermalQualificationRoute.native_inputs(issued)
     frozen = route.fitted["inputs"]
+    assert capability in frozen["capabilities"] and capability.startswith("indoor_")
+    for key in (
+        "installation_id",
+        "indoor_dependency_generation",
+        "configured_sensor_ids",
+        "reference_sensor_id",
+        "sensor_basis",
+        "native_settings",
+        "schemas",
+        "capabilities",
+        "device_id",
+        "weather_provider",
+        "timezone",
+    ):
+        inputs[key] = deepcopy(frozen[key])
+    if "tzdata_version" in frozen:
+        inputs["tzdata_version"] = deepcopy(frozen["tzdata_version"])
     inputs.update(
         {
             "capability": capability,
-            "sensor_basis": frozen["sensor_basis"],
-            "native_settings": frozen["native_settings"],
-            "schemas": frozen["schemas"],
-            "timer": {**frozen["timer"], "fetched_at": issued.isoformat()},
+            "timer": {**deepcopy(frozen["timer"]), "fetched_at": issued.isoformat()},
         }
     )
     active = capability == "indoor_heating"
@@ -1386,7 +3562,7 @@ async def test_R06_R07_R34_automatic_indoor_fit_has_positive_prospective_sql_rou
         async with database.engine.begin() as connection:
             for model in (PlanRecord, PlanActionRecord, OverrideRecord):
                 await connection.run_sync(
-                    lambda current, table=model.__table__: table.create(current)
+                    lambda current, table=model.__table__: _require_local_table(current, table)
                 )
         for issued, capability, rate in (
             (first, "indoor_heating", 0.6),
@@ -1512,7 +3688,7 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
 
             async with database.engine.begin() as connection:
                 await connection.run_sync(
-                    lambda current: OverrideRecord.__table__.create(current, checkfirst=True)
+                    lambda current: _require_local_table(current, OverrideRecord.__table__)
                 )
         for index in range(0, len(pairs), 3):
             group = pairs[index : index + 3]
@@ -1680,6 +3856,62 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         assert result["control_ready"] is False and result["ordinary_writes_allowed"] is False
         assert await database.lifecycle.claim_decision(route.lease, route.reference, 0)
         await database.lifecycle.finish_decision(route.lease, route.reference, 0, result)
+        from packages.core.models import IndoorTempReading
+
+        # Availability maintenance is strictly after all prospective targets and the decision.
+        assert route.current > max(
+            dt.datetime.fromisoformat(pair["target_at"])
+            + shift
+            + dt.timedelta(hours=2 if real_outcomes else 0)
+            for pair in pairs
+        )
+        preserved = await database.lifecycle.read()
+        frozen_inputs = deepcopy(route.fitted["inputs"])
+        original_artifact, original_payload = module.verify_reference(route.reference)
+        original_bytes = original_artifact.path.read_bytes()
+        historical = []
+        async with database.sessions() as session:
+            for model, timestamp in (
+                (DeviceStatusRecord, DeviceStatusRecord.ts),
+                (IndoorTempReading, IndoorTempReading.timestamp),
+            ):
+                historical.append(
+                    (
+                        await session.execute(
+                            select(model.__table__)
+                            .where(timestamp < route.current)
+                            .order_by(*model.__table__.primary_key.columns)
+                        )
+                    ).all()
+                )
+        await _seed_current_thermal_publication_inputs(database, route)
+        assert await database.lifecycle.read() == preserved
+        assert route.fitted["inputs"] == frozen_inputs
+        assert module.verify_reference(route.reference) == (original_artifact, original_payload)
+        assert original_artifact.path.read_bytes() == original_bytes
+        assert await database.lifecycle.decision_evidence(
+            route.lease, route.reference, window_end=route.frozen_at + dt.timedelta(hours=336)
+        ) == (materialized, complete)
+        async with database.sessions() as session:
+            for (model, timestamp), previous in zip(
+                (
+                    (DeviceStatusRecord, DeviceStatusRecord.ts),
+                    (IndoorTempReading, IndoorTempReading.timestamp),
+                ),
+                historical,
+            ):
+                assert (
+                    await session.execute(
+                        select(model.__table__)
+                        .where(timestamp < route.current)
+                        .order_by(*model.__table__.primary_key.columns)
+                    )
+                ).all() == previous
+                assert (
+                    await session.execute(
+                        select(func.count()).select_from(model).where(timestamp == route.current)
+                    )
+                ).scalar_one() == 1
         before = await database.lifecycle.read()
         artifact, _payload = module.verify_reference(route.reference)
         publication = await database.lifecycle.publish(
@@ -1712,6 +3944,9 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         }
         captured_values.update(
             {
+                "comfort_temp_min": "18",
+                "comfort_temp_target": "20.5",
+                "comfort_temp_max": "25",
                 "comfort_reference_sensor_id": "selected-room",
                 "smartthings_device_ids": "selected-room",
                 "weather_provider": "open-meteo",
@@ -1727,7 +3962,7 @@ async def test_R06_scoped_qualification_keeps_heads_and_refuses_v1_reuse(
         async with database.engine.begin() as connection:
             for model in (PlanRecord, PlanActionRecord):
                 await connection.run_sync(
-                    lambda current, table=model.__table__: table.create(current, checkfirst=True)
+                    lambda current, table=model.__table__: _require_local_table(current, table)
                 )
         monkeypatch.setattr(database_module, "async_session_factory", database.maker)
         dto = await model_status.get_readiness_snapshot(
@@ -1987,7 +4222,7 @@ async def test_R13_damaged_candidate_invalidation_is_durable_and_fences_publicat
         repaired_state.checkpoints["invalidated:" + reference.artifact_hash]["reason"]
         == "artifact_integrity_failure"
     )
-    replacement = _artifact(database, "repair-after-invalidation")
+    replacement = await _artifact(database, "repair-after-invalidation")
     stale = await database.lifecycle.publish(
         lease, replacement, expected_revision=before.revision, expected_incumbent=incumbent_hash
     )
@@ -2410,7 +4645,7 @@ async def test_cycle_retention_is_bounded_and_preserves_protected_evidence(
         created_at=old,
     )
     await database.lifecycle.record_native_issues(lease, reference, [protected], slot=0)
-    unreferenced = _artifact(database, "expired-unreferenced-fit")
+    unreferenced = await _artifact(database, "expired-unreferenced-fit")
     async with database.sessions() as session:
         session.add(
             MLArtifactRecord(
@@ -2622,8 +4857,8 @@ async def test_two_maintenance_owners_contend_for_one_lease(lifecycle_database):
 
 async def test_concurrent_publication_has_one_CAS_winner(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifacts = [_artifact(database, "fit-1"), _artifact(database, "fit-2")]
+    lease = await _owner(database, demand=True)
+    artifacts = [await _artifact(database, "fit-1"), await _artifact(database, "fit-2")]
     results = await asyncio.gather(
         *(
             database.lifecycle.publish(
@@ -2649,7 +4884,7 @@ async def test_concurrent_publication_has_one_CAS_winner(lifecycle_database):
 
 async def test_lease_loss_fences_late_worker(lifecycle_database):
     database = lifecycle_database
-    old = await _owner(database)
+    old = await _owner(database, demand=True)
     async with database.sessions() as session:
         await session.execute(
             update(MLLifecycleStateRecord).values(
@@ -2660,7 +4895,7 @@ async def test_lease_loss_fences_late_worker(lifecycle_database):
     assert current is not None and current.fence > old.fence and current.revision > old.revision
     stale = await database.lifecycle.publish(
         old,
-        _artifact(database, "late-fit"),
+        await _artifact(database, "late-fit"),
         expected_revision=old.revision,
         expected_incumbent=None,
     )
@@ -2671,7 +4906,7 @@ async def test_lease_loss_fences_late_worker(lifecycle_database):
     assert renewed.fence == current.fence
     result = await database.lifecycle.publish(
         renewed,
-        _artifact(database, "current-fit"),
+        await _artifact(database, "current-fit"),
         expected_revision=current.revision,
         expected_incumbent=None,
     )
@@ -2694,7 +4929,7 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
     lifecycle_database, stage
 ):
     database = lifecycle_database
-    lease = await _owner(database)
+    lease = await _owner(database, demand=stage != "before_file")
     installed = []
     if stage == "before_file":
         with pytest.raises(LifecycleUnavailable):
@@ -2708,12 +4943,12 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
                 raise OSError("injected publication interruption")
 
         with pytest.raises(OSError, match="injected publication interruption"):
-            _artifact(database, "interrupted-fit", checkpoint=crash)
+            await _artifact(database, "interrupted-fit", checkpoint=crash)
         with pytest.raises(LifecycleUnavailable):
             await database.lifecycle.load_committed("demand", role="candidate")
         assert len(list(database.model_dir.rglob("*.pkl"))) == int(stage != "file_synced")
         return
-    artifact = _artifact(database, "commit-fit")
+    artifact = await _artifact(database, "commit-fit")
     fired = False
 
     @asynccontextmanager
@@ -2772,8 +5007,8 @@ async def test_crash_before_file_after_file_before_commit_after_commit_and_lost_
 
 async def test_pruning_races_and_reset_never_recreate_epoch(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifact = _artifact(database, "racing-fit")
+    lease = await _owner(database, demand=True)
+    artifact = await _artifact(database, "racing-fit")
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)).timestamp()
     os.utime(artifact.path, (old, old))
     enumerated = asyncio.Event()
@@ -2857,8 +5092,12 @@ async def test_restart_and_rollback_preserve_restore_and_embargo(lifecycle_datab
     now = dt.datetime.now(dt.timezone.utc)
     before = await database.lifecycle.initialize()
     async with database.engine.begin() as connection:
-        await connection.run_sync(lambda current: PlanRecord.__table__.create(current))
-        await connection.run_sync(lambda current: PlanActionRecord.__table__.create(current))
+        await connection.run_sync(
+            lambda current: _require_local_table(current, PlanRecord.__table__)
+        )
+        await connection.run_sync(
+            lambda current: _require_local_table(current, PlanActionRecord.__table__)
+        )
     async with database.sessions() as session:
         session.add(
             PlanRecord(

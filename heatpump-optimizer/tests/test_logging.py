@@ -9,6 +9,21 @@ from packages.core import logging as logging_module
 from packages.core import log_sink
 
 
+@pytest.fixture(autouse=True)
+def _isolated_logging_setup(monkeypatch):
+    import sys
+    import structlog
+    from tests.test_logging_ownership_contracts import load_sink
+
+    fresh, saved = load_sink(monkeypatch)
+    # These pre-existing helper-level tests start with an already configured sink.
+    fresh._OWNER = fresh._Owner(state="RUNNING")
+    fresh._CLOSING = False
+    monkeypatch.setattr(sys.modules[__name__], "log_sink", fresh)
+    yield
+    structlog.configure(**saved)
+
+
 def test_configure_logging_delegates_to_log_sink(monkeypatch):
     calls: list[str] = []
 

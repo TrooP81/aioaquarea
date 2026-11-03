@@ -3066,7 +3066,7 @@ class TestOrchestratorFallback:
         assert version == (f"{milp.VERSION}+ml" if trained else milp.VERSION)
 
     @pytest.mark.asyncio
-    async def test_run_optimization_with_rules_only(self):
+    async def test_run_optimization_with_rules_only(self, monkeypatch):
         """End-to-end: rules_only setting should produce a rules plan."""
         from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
@@ -3078,6 +3078,9 @@ class TestOrchestratorFallback:
         )
 
         session, records = _refused_plan_session()
+        from tests.planning_contract_support import install_local_contract_revision
+
+        install_local_contract_revision(monkeypatch, session=session)
         with patch(
             "packages.optimizer.main.get_setting", new_callable=AsyncMock, return_value="rules_only"
         ):
@@ -3121,7 +3124,7 @@ class TestOrchestratorFallback:
     @pytest.mark.parametrize(
         "failure", [SolverTimeoutError("timeout"), InfeasibleError("infeasible")]
     )
-    async def test_milp_failure_falls_back_to_rules(self, failure):
+    async def test_milp_failure_falls_back_to_rules(self, failure, monkeypatch):
         """When MILP raises, the orchestrator should fall back to rules."""
         from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
@@ -3134,6 +3137,9 @@ class TestOrchestratorFallback:
 
         mock_plan = _admissible_plan(version="rules_v3")
         session, records = _refused_plan_session()
+        from tests.planning_contract_support import install_local_contract_revision
+
+        install_local_contract_revision(monkeypatch, session=session)
 
         with patch(
             "packages.optimizer.main.get_setting",
@@ -3189,11 +3195,14 @@ class TestOrchestratorFallback:
         assert record.status == "diagnostic"
 
     @pytest.mark.asyncio
-    async def test_planning_quality_check_failure_blocks_plan(self):
+    async def test_planning_quality_check_failure_blocks_plan(self, monkeypatch):
         """An unavailable planning-quality gate must not permit a rules fallback."""
         from packages.optimizer import main as optimizer_main
         from packages.optimizer.main import run_optimization
         from tests.test_optimizer_api_contracts import _INACTIVE, _admissible_plan
+        from tests.planning_contract_support import install_local_contract_revision
+
+        install_local_contract_revision(monkeypatch)
 
         plan = _admissible_plan(version="milp_v2")
         plan["planning_data_quality"] = {
@@ -3338,11 +3347,13 @@ class TestOrchestratorFallback:
 
     @pytest.mark.asyncio
     async def test_active_learning_state_reaches_normal_admission_checks(
-        self, optimization_learning_gate
+        self, optimization_learning_gate, monkeypatch
     ):
         from packages.optimizer.executor_core import LearningModeState
         from packages.optimizer.main import run_optimization
+        from tests.planning_contract_support import install_local_contract_revision
 
+        install_local_contract_revision(monkeypatch)
         optimization_learning_gate.return_value = LearningModeState.ACTIVE
         optimizer = AsyncMock()
         with (
@@ -3497,3 +3508,89 @@ class TestModelCheckpointRetention:
 
         with pytest.raises(ValueError, match="keep must be >= 0"):
             prune_old_models("*.pkl", keep=-1, model_dir=tmp_path)
+
+
+async def test_P2_contract_freshness_and_target_guards_reject_stale_inputs(monkeypatch):
+    from packages.core import house_contract
+    from packages.optimizer import main as optimizer_main
+
+    current_revision = SimpleNamespace(id=8, contract_hash="b" * 64)
+    monkeypatch.setattr(
+        house_contract,
+        "ensure_current_contract",
+        AsyncMock(return_value=current_revision),
+    )
+    assert (
+        await house_contract.current_revision_matches(
+            SimpleNamespace(), revision_id=7, contract_hash="a" * 64
+        )
+        is False
+    )
+
+    expected = [
+        {
+            "ts": dt.datetime(2026, 10, 18, 1, tzinfo=dt.timezone.utc),
+            "target": 20.0,
+            "comfort_hour": True,
+        }
+    ]
+    stale = {"target_schedule": [{**expected[0], "target": 19.0}]}
+    assert not optimizer_main._target_schedule_matches_contract(stale, expected)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_start",
+        "missing_end",
+        "missing_target",
+        "missing_membership",
+        "missing_ts",
+        "bad_start",
+        "reversed_interval",
+        "nan_target",
+        "non_boolean_membership",
+        "non_mapping",
+        "gap",
+        "overlap",
+    ],
+)
+def test_p21_target_guard_rejects_malformed_projection(malformation):
+    from packages.optimizer import main as optimizer_main
+
+    interval = {
+        "interval_start_utc": "2026-10-18T00:00:00+00:00",
+        "interval_end_utc": "2026-10-18T01:00:00+00:00",
+        "ts": "2026-10-18T01:00:00+00:00",
+        "target": 20.05,
+        "comfort_hour": True,
+    }
+    plan = {"target_schedule": [dict(interval)]}
+    assert optimizer_main._target_schedule_matches_contract(plan, [interval])
+    malformed = dict(interval)
+    if malformation.startswith("missing_"):
+        key = {
+            "start": "interval_start_utc",
+            "end": "interval_end_utc",
+            "membership": "comfort_hour",
+        }.get(malformation[8:], malformation[8:])
+        malformed.pop(key)
+    elif malformation == "bad_start":
+        malformed["interval_start_utc"] = "not-an-instant"
+    elif malformation == "reversed_interval":
+        malformed["interval_end_utc"] = interval["interval_start_utc"]
+    elif malformation == "nan_target":
+        malformed["target"] = float("nan")
+    elif malformation == "non_boolean_membership":
+        malformed["comfort_hour"] = 1
+    elif malformation == "non_mapping":
+        malformed = None
+    if malformation in {"gap", "overlap"}:
+        malformed["interval_start_utc"] = (
+            "2026-10-18T02:00:00+00:00" if malformation == "gap" else "2026-10-18T00:30:00+00:00"
+        )
+        malformed["interval_end_utc"] = "2026-10-18T03:00:00+00:00"
+        projection = [interval, malformed]
+    else:
+        projection = [malformed]
+    assert not optimizer_main._target_schedule_matches_contract(plan, projection)

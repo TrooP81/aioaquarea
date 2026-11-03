@@ -80,6 +80,18 @@ function calendarDate(timezone: string, granularity: Granularity) {
     }
 }
 
+function settingsRevision(response: Response): string | null {
+    const header = response.headers.get("X-Contract-Revision");
+    const rawEtag = response.headers.get("ETag");
+    if (rawEtag !== null && !/^"[1-9]\d*"$/.test(rawEtag)) return null;
+    const etag = rawEtag?.slice(1, -1) ?? null;
+    const revision = header ?? etag;
+    if (!revision || !/^[1-9]\d*$/.test(revision) || (header !== null && etag !== null && header !== etag)) {
+        return null;
+    }
+    return revision;
+}
+
 export function ManualCOPMonitoring() {
     const [device, setDevice] = useState("");
     const [granularity, setGranularity] = useState<Granularity>("day");
@@ -223,11 +235,16 @@ export function ManualCOPMonitoring() {
         const current = beginMutation();
         setPendingEnabled(enabled);
         try {
+            const metadata = await fetch("/api/settings", { cache: "no-store" });
+            if (!metadata.ok) throw new Error("Settings metadata unavailable");
+            const revision = settingsRevision(metadata);
+            if (!revision) throw new Error("Settings revision unavailable");
             const response = await fetch("/api/settings", {
-                method: "PUT", headers: { "Content-Type": "application/json" },
+                method: "PUT", headers: { "Content-Type": "application/json", "If-Match": revision },
                 body: JSON.stringify({ settings: { manual_cop_monitoring_enabled: enabled ? "true" : "false" } }),
             });
             if (current !== generation.current) return;
+            if (response.status === 409) throw new Error("Settings changed elsewhere; reload and retry");
             if (!response.ok) throw new Error(`Forecast setting failed (${response.status})`);
             setRefreshNonce((previous) => previous + 1);
         } catch (failure) {

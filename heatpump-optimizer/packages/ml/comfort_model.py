@@ -614,9 +614,16 @@ class ComfortModel:
         self._training_lock = asyncio.Lock()
         self._lock_strategy = lock_strategy or PostgresTrainingLock()
         self._qualified_reference = None
+        self._serving_generation = 0
 
     def reset(self) -> None:
         """Discard the trained model and learned metadata."""
+        changed = (
+            self._qualified_reference is not None
+            or self._model is not None
+            or bool(self._direct_models)
+            or bool(self._passive_direct_models)
+        )
         self._model = None
         self._direct_models = {}
         self._passive_direct_models = {}
@@ -627,6 +634,8 @@ class ComfortModel:
         self._last_dataset_evidence = {"active_heating_rows": 0}
         self._training_notice = None
         self._qualified_reference = None
+        if changed:
+            self._serving_generation += 1
 
     # ------------------------------------------------------------------
     # Public API
@@ -1936,8 +1945,7 @@ class ComfortModel:
     async def arefresh_committed(self, *, lifecycle=None, scope: dict | None = None) -> bool:
         from packages.ml.forecast_quality import (
             check_exact_fit,
-            materialize_native_inputs,
-            native_scope,
+            locked_native_scope,
         )
         from packages.ml.lifecycle import Lifecycle, reference_is_qualified
 
@@ -1946,15 +1954,12 @@ class ComfortModel:
             reference = (await authority.read()).reference("comfort")
             if not reference_is_qualified(reference):
                 raise ValueError("comfort_not_qualified")
-            if scope is None:
-                inputs = await materialize_native_inputs(
-                    "comfort",
-                    now=dt.datetime.now(dt.timezone.utc),
-                    device_id=reference.manifest["device_id"],
-                )
-                if inputs is None:
-                    raise ValueError("current_comfort_scope_unavailable")
-                scope = native_scope(inputs)
+            async with locked_native_scope(
+                "comfort", device_id=reference.manifest["device_id"]
+            ) as (current_scope, _):
+                if scope is not None and scope != current_scope:
+                    raise ValueError("comfort_scope_mismatch")
+                scope = current_scope
             if not reference_is_qualified(reference, scope=scope):
                 raise ValueError("comfort_scope_mismatch")
             payload = await authority.load_committed(
@@ -1963,21 +1968,30 @@ class ComfortModel:
             if payload.get("format_version") != COMFORT_MODEL_FORMAT_VERSION:
                 raise ValueError("comfort_schema_mismatch")
             await asyncio.to_thread(check_exact_fit, "comfort", payload)
-            if (await authority.read()).reference("comfort") != reference:
-                raise ValueError("comfort_authority_changed")
+            async with locked_native_scope(
+                "comfort", device_id=reference.manifest["device_id"]
+            ) as (latest_scope, session):
+                latest = (await authority.read(session=session)).reference("comfort")
+                if (
+                    latest != reference
+                    or latest_scope != scope
+                    or not reference_is_qualified(latest, scope=latest_scope)
+                ):
+                    raise ValueError("comfort_authority_or_dependency_changed")
+                self._model = payload["model"]
+                self._direct_models = dict(payload["direct_models"])
+                self._passive_direct_models = dict(payload["passive_direct_models"])
+                self._metrics = dict(payload["metrics"])
+                self._last_trained = payload["trained_at"]
+                self._training_samples = payload["samples"]
+                self._thermal_lag_minutes = payload["thermal_lag"]
+                self._qualified_reference = reference
+                self._serving_generation += 1
         except Exception as error:
             self.reset()
             self._artifact_refresh_reason = "lifecycle_unavailable"
             logger.warning("comfort_committed_unavailable", error_type=type(error).__name__)
             return False
-        self._model = payload["model"]
-        self._direct_models = dict(payload["direct_models"])
-        self._passive_direct_models = dict(payload["passive_direct_models"])
-        self._metrics = dict(payload["metrics"])
-        self._last_trained = payload["trained_at"]
-        self._training_samples = payload["samples"]
-        self._thermal_lag_minutes = payload["thermal_lag"]
-        self._qualified_reference = reference
         self._artifact_refresh_reason = None
         return True
 

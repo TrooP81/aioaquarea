@@ -52,7 +52,7 @@ from packages.core.settings_service import (
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 _COMFORT_ASSESSMENT_CACHE_TTL_S = 30.0
-_comfort_assessment_cache: tuple[float, dict[str, object] | None] | None = None
+_comfort_assessment_cache: tuple[float, tuple, dict[str, object] | None] | None = None
 _comfort_assessment_lock = asyncio.Lock()
 
 
@@ -305,32 +305,62 @@ async def get_dashboard():
     )
 
 
+async def _comfort_assessment_context() -> tuple:
+    """Qualify warnings (including absent warnings) against current inputs."""
+    import hashlib
+    import json
+    from packages.core.house_contract import ensure_current_contract
+    from packages.core.models import HouseInstallationRecord
+    from packages.core.settings_service import get_all_settings
+
+    async with get_session() as session:
+        revision = await ensure_current_contract(session)
+        installation = await session.get(HouseInstallationRecord, 1)
+        values = await get_all_settings(session=session)
+        return (
+            revision.id,
+            revision.contract_hash,
+            installation.demand_dependency_generation,
+            installation.indoor_dependency_generation,
+            hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest(),
+        )
+
+
 async def _get_comfort_assessment() -> dict[str, object] | None:
     global _comfort_assessment_cache
 
-    cached = _comfort_assessment_cache
-    if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
-        return cached[1]
+    try:
+        # Coalesce refreshes, but re-read context after acquiring the lock and
+        # after prediction: a settings write may have committed during either.
+        async with _comfort_assessment_lock:
+            for _ in range(2):
+                context = await _comfort_assessment_context()
+                cached = _comfort_assessment_cache
+                if (
+                    cached is not None
+                    and cached[1] == context
+                    and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S
+                ):
+                    return cached[2]
+                from packages.api.routers.models_router import get_indoor_forecast
 
-    # Coalesce concurrent cache refreshes for this read-only endpoint.
-    async with _comfort_assessment_lock:
-        cached = _comfort_assessment_cache
-        if cached is not None and time.monotonic() - cached[0] < _COMFORT_ASSESSMENT_CACHE_TTL_S:
-            return cached[1]
-        try:
-            from packages.api.routers.models_router import get_indoor_forecast
-
-            forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
-            assessment = forecast.get("comfort_assessment") if isinstance(forecast, dict) else None
-            comfort_assessment = assessment if isinstance(assessment, dict) else None
-            _comfort_assessment_cache = (time.monotonic(), comfort_assessment)
-            return comfort_assessment
-        except Exception as exc:
-            logger.warning(
-                "control_state_comfort_assessment_unavailable",
-                error_type=type(exc).__name__,
-            )
-            return None
+                forecast = await asyncio.wait_for(get_indoor_forecast(hours=24), timeout=1.0)
+                assessment = (
+                    forecast.get("comfort_assessment") if isinstance(forecast, dict) else None
+                )
+                comfort_assessment = assessment if isinstance(assessment, dict) else None
+                if context != await _comfort_assessment_context():
+                    continue
+                _comfort_assessment_cache = (time.monotonic(), context, comfort_assessment)
+                return comfort_assessment
+            # Continuous churn is unavailable, never a cached stale/no-warning result.
+            _comfort_assessment_cache = None
+    except Exception as exc:
+        logger.warning(
+            "control_state_comfort_assessment_unavailable",
+            error_type=type(exc).__name__,
+        )
+    return None
 
 
 @router.get("/api/control-state", response_model=ControlStateResponse)

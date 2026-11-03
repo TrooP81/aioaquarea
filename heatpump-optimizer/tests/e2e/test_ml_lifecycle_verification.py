@@ -34,7 +34,7 @@ from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from packages.core.models import MLLifecycleStateRecord
+from packages.core.models import AppLogRecord, MLLifecycleStateRecord, SettingRecord
 from packages.ml.lifecycle import Lifecycle, LifecycleUnavailable, invalidate_lifecycle
 from packages.ml.model_status import get_model_status
 from tests.e2e.test_manual_cop_postgresql import (
@@ -63,13 +63,110 @@ from tests.e2e.test_manual_cop_postgresql import (
 )
 from tests.e2e.test_ml_lifecycle_postgresql import (
     _artifact,
+    _logging_phase as _logging_phase,
     _owner,
+    _public_fixture_state,
     _run_migration,
     _source_receipt,
     lifecycle_database as lifecycle_database,
 )
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+
+def _assert_exact_two_updates(statements):
+    """Require two typed UPDATEs, including ORM annotations, without filtering SQL."""
+    from sqlalchemy.sql.dml import Update
+
+    assert len(statements) == 2, "expected exactly two application UPDATE statements"
+    assert all(isinstance(clause, Update) for clause in statements), (
+        "expected only SQLAlchemy UPDATE statements"
+    )
+
+
+async def test_owned_periodic_logging_coexists_with_unfiltered_application_guards(
+    lifecycle_database,
+):
+    """A normal periodic turn in each guard window, never a forced/early flush."""
+    from packages.core import log_sink
+    from sqlalchemy import update
+
+    database = lifecycle_database
+    async with database.sessions() as session:
+        session.add(SettingRecord(key="logging-guard-probe", value="first"))
+
+    async def periodic_turn(label):
+        while not database.logging_commits.empty():
+            database.logging_commits.get_nowait()
+        marker = "periodic-guard-" + label
+        log_sink._db_log_processor(None, "info", {"event": marker})
+        # This waits for real transaction completion on the ordinary two-second
+        # flusher, while the application listener remains installed.
+        async with asyncio.timeout(10):
+            while True:
+                await database.logging_commits.get()
+                async with database.logging_sessions() as session:
+                    found = (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(AppLogRecord)
+                            .where(AppLogRecord.event == marker)
+                        )
+                    ).scalar_one()
+                if found:
+                    assert found == 1
+                    return
+
+    statements = []
+
+    def readonly(_connection, _cursor, statement, _parameters, _context, _many):
+        import re
+
+        statements.append(statement)
+        assert not re.search(
+            r"\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE)\b", statement, re.I
+        ), statement
+
+    event.listen(database.engine.sync_engine, "before_cursor_execute", readonly)
+    try:
+        async with database.sessions() as session:
+            await session.execute(select(SettingRecord.value))
+        await periodic_turn("read-only")
+        assert statements
+        statements.clear()
+        await periodic_turn("no-sql")
+        assert statements == []
+        # Application-originated log writes still use the guarded engine.
+        with pytest.raises(AssertionError, match="INSERT"):
+            async with database.sessions() as session:
+                session.add(AppLogRecord(event="must-be-caught", level="INFO", service="test"))
+        assert any("INSERT" in statement for statement in statements)
+    finally:
+        event.remove(database.engine.sync_engine, "before_cursor_execute", readonly)
+
+    dml = []
+
+    def exact_dml(_connection, clause, *_args):
+        dml.append(clause)
+
+    event.listen(database.engine.sync_engine, "before_execute", exact_dml)
+    try:
+        async with database.sessions() as session:
+            await session.execute(
+                update(SettingRecord)
+                .where(SettingRecord.key == "logging-guard-probe")
+                .values(value="second")
+            )
+            await session.execute(
+                update(SettingRecord)
+                .where(SettingRecord.key == "logging-guard-probe")
+                .values(value="first")
+            )
+        await periodic_turn("exact-dml")
+        _assert_exact_two_updates(dml)
+    finally:
+        event.remove(database.engine.sync_engine, "before_execute", exact_dml)
+
 
 TABLES = (
     "ml_lifecycle_state",
@@ -78,6 +175,56 @@ TABLES = (
     "ml_forecast_issues",
     "ml_forecast_outcomes",
 )
+
+
+async def test_owned_fingerprint_read_stability_reverted_write_and_sequence_rollback(
+    lifecycle_database,
+):
+    """Exercise the diagnostic primitive without intentionally writing public storage."""
+    database = lifecycle_database
+    schema = database.schema
+    quoted = database.engine.dialect.identifier_preparer.quote_identifier(schema)
+
+    async def observe():
+        components = {}
+        async with database.engine.begin() as connection:
+            state = await _public_fixture_state(connection, schema=schema, diagnostics=components)
+        return state, components
+
+    async with database.engine.begin() as connection:
+        await connection.execute(
+            text(f"INSERT INTO {quoted}.settings (key,value) VALUES (:key,:value)"),
+            {"key": "fingerprint-diagnostic-only", "value": "synthetic-not-logged"},
+        )
+    before, baseline = await observe()
+    repeated, repeat_components = await observe()
+    assert repeated == before and repeat_components == baseline
+    async with database.engine.begin() as connection:
+        await connection.execute(
+            text(f"UPDATE {quoted}.settings SET value=value WHERE key=:key"),
+            {"key": "fingerprint-diagnostic-only"},
+        )
+    changed, after = await observe()
+    relation = f"{schema}.settings"
+    assert changed != before
+    assert after[relation]["content"] == baseline[relation]["content"]
+    assert after[relation]["versions"] != baseline[relation]["versions"]
+    assert after[relation]["catalog"] == baseline[relation]["catalog"]
+    async with database.engine.connect() as connection:
+        transaction = await connection.begin()
+        try:
+            await connection.execute(
+                text("SELECT nextval(CAST(:sequence AS regclass))"),
+                {"sequence": f"{schema}.ml_lifecycle_token_seq"},
+            )
+        finally:
+            await transaction.rollback()
+    advanced, sequence_after = await observe()
+    sequence = f"{schema}.ml_lifecycle_token_seq"
+    assert advanced != changed
+    assert sequence_after[sequence]["value_state"] != after[sequence]["value_state"]
+    assert sequence_after[sequence]["configuration"] == after[sequence]["configuration"]
+    assert sequence_after[sequence]["dependencies"] == after[sequence]["dependencies"]
 
 
 async def _marker(engine):
@@ -186,7 +333,7 @@ class TestOBS5RealMigration:
 
 async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch):
     database = lifecycle_database
-    lease = await _owner(database)
+    lease = await _owner(database, demand=True)
     events = []
     real_fsync = os.fsync
 
@@ -203,7 +350,7 @@ async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch
     monkeypatch.setattr(os, "fsync", fsync)
     event.listen(database.engine.sync_engine, "before_cursor_execute", before_execute)
     try:
-        artifact = _artifact(database, "real-linux-order")
+        artifact = await _artifact(database, "real-linux-order")
         publication_end = len(events)
         assert any(kind == "file" for kind, _ in events)
         assert ("directory", str(artifact.path.parent)) in events
@@ -226,8 +373,11 @@ async def test_real_linux_fsync_precedes_sql_cas(lifecycle_database, monkeypatch
 
 async def test_real_cas_loser_never_installs(lifecycle_database):
     database = lifecycle_database
-    lease = await _owner(database)
-    artifacts = [_artifact(database, "install-first"), _artifact(database, "install-second")]
+    lease = await _owner(database, demand=True)
+    artifacts = [
+        await _artifact(database, "install-first"),
+        await _artifact(database, "install-second"),
+    ]
     installed = []
     results = await asyncio.gather(
         *(
@@ -295,8 +445,8 @@ async def test_maintenance_off_admin_reset_only_revokes_existing_state(
     queued = None
     before = None
     if initialized:
-        lease = await _owner(database)
-        artifact = _artifact(database, "maintenance-off-reset")
+        lease = await _owner(database, demand=True)
+        artifact = await _artifact(database, "maintenance-off-reset")
         published = await database.lifecycle.publish(
             lease, artifact, expected_revision=lease.revision, expected_incumbent=None
         )

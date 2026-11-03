@@ -518,6 +518,23 @@ async def plan_measurement(
 ) -> dict[str, object]:
     """Return the measured portion of one immutable plan."""
 
+    if getattr(plan, "contract_revision_id", None) is not None:
+        from packages.core.house_contract import validate_plan_contract_snapshot
+
+        try:
+            snapshot = json.loads(plan.plan_json)["house_contract_snapshot"]
+        except (KeyError, TypeError, ValueError):
+            snapshot = None
+        if not validate_plan_contract_snapshot(plan, snapshot):
+            return {
+                "state": "unknown",
+                "reason": "historical_contract_unavailable",
+                "contract_snapshot_state": "unavailable",
+            }
+        comfort_min_c = float(snapshot["comfort_temp_min"])
+        comfort_max_c = float(snapshot["comfort_temp_max"])
+        timezone_name = snapshot["timezone"]
+
     now = now or dt.datetime.now(dt.timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)

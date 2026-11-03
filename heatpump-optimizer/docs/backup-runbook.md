@@ -18,14 +18,108 @@ The deployment-only primary root is `D:\backups\heatpump-optimizer\`, never
 `D:\backups\`. Replica is disabled and not required. These paths must not be
 created or written during implementation/testing.
 
+## Explicit legacy transition and archive-preserving one-shot
+
+The owner’s **2026-10-26T12:59:01.369+01:00 “go ahead”** approves implementation
+and testing of the independently reviewed HIGH design (including F1), **not live
+execution or archive deletion**. New-candidate independent tests, CODE review,
+CI and release gates remain required. Historical `3cd0ba6` CI is not acceptance
+of these source changes. API-up / poller-and-backup-held remains the operational
+boundary; this document does not authorize changing the local stack.
+
+The worker has three distinct invocation contracts:
+
+| Invocation | Contract |
+|---|---|
+| No arguments | Existing normal scheduler and retention policy. |
+| `--once` | Existing single due evaluation; may do nothing and still exit zero; retention remains enabled. |
+| `--once-preserve-archives` | One due evaluation only; never enters retention or its diagnostic operation, never sleeps into scheduling. Zero means a completed, durably reported backup success, **not restore qualification**. Busy, not due, preflight/CAS rejection, failure, or unresolved reporting is nonzero. |
+| `--once-preserve-archives --transition-legacy` | Same preservation contract, with narrowly authorized atomic conversion of one exact legacy row into a genuine running worker attempt. |
+
+Unknown/duplicate options, mixed one-shot modes, and transition without
+preservation mode fail before locks, tools or destination mutation. These modes
+do not change persisted settings, Compose restart policy, or service state.
+Any separately approved operational launch must explicitly disable restart;
+the worker cannot enforce an external orchestrator's restart policy.
+
+Preservation invocations require independently obtained
+`BACKUP_EXPECTED_SOURCE_ID` and `BACKUP_EXPECTED_SCHEMA_REVISION` (the reviewed
+operation is `039`). The explicit transition additionally requires
+`BACKUP_LEGACY_EXPECTED_SHA256` and `BACKUP_LEGACY_EXPECTED_UPDATED_AT`. These are
+invocation fences, not defaults or stored settings. Under separately approved
+execution, prepare the SHA-256 from PostgreSQL's original UTF-8 **text**, not
+reserialized JSON, and the original `timestamptz`. Keep the raw row and effective
+configuration private; never pass raw legacy text through shell arguments or
+publish it in logs. A changed timestamp, text digest, source, schema, observed
+state, unsupported shape, duplicate JSON member, or competing owner rejects
+the transaction without creating output or replacing the row.
+
+Only an existing JSON object with exactly one `status: "ok"` member qualifies.
+Ordinary version1 activation remains supported; no implicit legacy acceptance
+is added. The status transaction saves original `service`, timestamp, exact text
+and digest atomically with the genuine running attempt in the private
+`legacy_transition` envelope. It records the real first terminal outcome when
+available. A failed first attempt remains failed after a later successful retry;
+unsettled first-attempt reporting remains incomplete, never fabricated.
+
+Retry using **only** `--once-preserve-archives`, with the same independently
+checked source/schema fences. Retry spacing, success-anchored due time,
+stale-running deadline, destination lock, server-side settlement and locked SQL
+CAS still apply. Never clear/reset the row or restore legacy state over actual
+history. A source-bound per-attempt application name lets cancellation settle
+the worker's actual server-side activity; inability to prove settlement leaves
+incomplete evidence rather than claiming completion.
+
+Terminal outcomes and their bindings are immutable. Exact terminal replay is a
+no-write operation, including unchanged heartbeat time. Lost acknowledgements
+are reconciled using the same attempt/event; committed success is never
+relabeled failed. In normal mode only, retention refusal uses a separate,
+ownership/binding-fenced `backup_retention_diagnostic` operation. It may add only
+`last_attempt.reason_code=backup_retention_blocked`; replay is no-write and does
+not clear that overlay. It never rewrites `last_success`, verification or the
+original/first-attempt audit. Preservation mode skips both operations and cannot
+manufacture a retention warning or clear historical diagnostics.
+
+Output paths are collision/symlink checked before ownership; publication refuses
+overwrite. Cleanup is restricted to invocation-owned scratch, never archives.
+Rollback means hold execution and preserve all original/new history and
+artifacts, not deletion, live restore, migration, downgrade or automatic restart.
+
+Focused real-SQL qualification is in `tests/helpers/qualify_backup_status_postgresql.py`,
+required by canonical `backend-e2e` through the existing owned runner's
+`backup-status-inventory` and `backup-status` phases. The separate full
+collection inventory is reconciled with every executed setup/call/teardown
+before the full seal; absent phases, omitted/deselected cases, skips, failed
+teardown, source drift or out-of-manifest modules refuse the seal. Ordinary
+unit/E2E discovery and its existing partitions remain unchanged.
+
+The parent retains its prepared-profile SQL/platform and exact-source guards;
+only these two children's environments omit `DATABASE_URL`, retaining the
+matrix's refusal to consume any configured database. The helper can also be
+run explicitly with `--noconftest` and no `DATABASE_URL` for focused disposable
+checks; that alone cannot satisfy the canonical seal. It uses only an
+already-present immutable PG16/Timescale2.26.4 image, a creation-owned
+networkless/read-only container with disposable tmpfs, and synthetic schema039
+data. It covers actual SQL/CAS, concurrency, replay, lost acknowledgements,
+server-side cancellation, collision preservation and a checksum-bound synthetic
+dump/restore. That focused database round-trip is **not** the owned coordinator
+qualification, new-candidate CI, or BAK2 household acceptance. The existing
+supplementary `tests/e2e/test_backup_roundtrip.py` now exercises the explicit
+legacy/current039 preservation path within its existing proof/receipt boundary.
+Neither test authorizes any household operation.
+
 ## Required qualification before activation
 
 1. Run offline unit checks with the complete disposable environment set before
    imports. Exercise health histories, merged-policy validation, API/webhook
    allowlists, retention guards and lifecycle failures.
 2. Execute the existing **owned Linux CI `backend-e2e`** preparation, inventories
-   and all ordinary/manual/lifecycle phases. The supplementary `backup-roundtrip`
-   follows `check-ordinary`, then `check-backup`, then the full seal. It cannot
+   and all ordinary/manual/lifecycle phases. The required `backup-status` matrix
+   follows `check-ordinary` and precedes supplementary `backup-roundtrip`, then
+   `check-backup` and the full seal. The SQL phase keeps the same 600-second
+   child / 660-second external-parent bounds. Adding its literal source binding
+   increases the exact required-source counts from 43/48 to 44/49, without
+   relaxing uniqueness or completeness. These phases cannot
    substitute for existing phases, skip/xfail nodes, or fabricate ownership.
 3. Use the pinned coordinator base below. Dockerfile and CI have the same checked-in
    default; no `HPO_RESTORE_COORDINATOR_BASE_IMAGE` repository variable is required.

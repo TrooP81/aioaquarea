@@ -93,7 +93,25 @@ def test_rejects_tampered_model(model_dir: Path) -> None:
 
 
 @pytest.fixture
-def artifact_manifest() -> dict:
+def artifact_manifest(monkeypatch) -> dict:
+    from packages.ml import forecast_quality
+
+    inputs = {
+        "device_id": "persistence-test-device",
+        "sensor_basis": {"kind": "heatpump_counter", "sensor_ids": ["persistence-test-device"]},
+        "native_settings": {},
+        "timer": {"status": "unknown"},
+        "schemas": {"artifact": "demand_lifecycle_v1"},
+        "installation_id": "persistence-test-installation",
+        "timezone": "UTC",
+        "tzdata_version": "test",
+        "demand_dependency_generation": 1,
+        "weather_provider": "open-meteo",
+        "max_rate_kw": 12.0,
+    }
+    monkeypatch.setattr(
+        forecast_quality, "materialize_native_inputs", AsyncMock(return_value=inputs)
+    )
     return {
         "fit_id": "fit-1",
         "data_cutoff": "2026-10-08T00:00:00+00:00",
@@ -101,6 +119,8 @@ def artifact_manifest() -> dict:
         "output_schema": "demand_v1",
         "runtime_versions": {"python": "3.11"},
         "evidence_hashes": [],
+        "device_id": inputs["device_id"],
+        "scope": forecast_quality.native_scope(inputs),
     }
 
 
@@ -338,7 +358,7 @@ class PublicationSessions:
         self.committed = False
         self.final_revision = 11
 
-    async def execute(self, statement):
+    async def execute(self, statement, parameters=None):
         from packages.core.models import MLLifecycleStateRecord
 
         self.statements.append(statement)
@@ -901,7 +921,10 @@ async def test_publication_conflict_never_commits_or_installs(
         on_committed=install,
     )
     assert not result.committed and not sessions.committed
-    assert sessions.statements == []
+    assert all(
+        str(statement).startswith("SELECT pg_advisory_xact_lock(")
+        for statement in sessions.statements
+    )
     install.assert_not_called()
     assert artifact.path.exists()
 
@@ -931,7 +954,11 @@ async def test_file_loss_before_cas_never_commits_or_installs(
             expected_incumbent=None,
             on_committed=install,
         )
-    assert not sessions.committed and sessions.statements == []
+    assert not sessions.committed
+    assert all(
+        str(statement).startswith("SELECT pg_advisory_xact_lock(")
+        for statement in sessions.statements
+    )
     install.assert_not_called()
 
 
@@ -964,7 +991,11 @@ async def test_cas_refuses_reference_when_directory_durability_cannot_be_confirm
             expected_incumbent=None,
             on_committed=install,
         )
-    assert not sessions.committed and sessions.statements == []
+    assert not sessions.committed
+    assert all(
+        str(statement).startswith("SELECT pg_advisory_xact_lock(")
+        for statement in sessions.statements
+    )
     assert artifact.path.exists()
     install.assert_not_called()
 

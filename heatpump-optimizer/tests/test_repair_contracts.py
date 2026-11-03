@@ -31,6 +31,7 @@ async def test_R24_indoor_forecast_route_without_device_status_is_schema_valid(m
     from packages.api.routers import models_router
     from packages.api.schemas import IndoorForecastResponse
     from packages.core.control_temperature import ControlTemperature
+    from packages.core import house_contract
     from tests.test_optimizer_api_contracts import _session_context
 
     async def execute(statement):
@@ -39,7 +40,25 @@ async def test_R24_indoor_forecast_route_without_device_status_is_schema_valid(m
             scalars=lambda: SimpleNamespace(all=lambda: []),
         )
 
-    thermal = SimpleNamespace(arefresh_if_changed=AsyncMock(return_value=False))
+    thermal = SimpleNamespace(
+        arefresh_if_changed=AsyncMock(return_value=False),
+        capture_dependency_context=Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        house_contract,
+        "ensure_current_contract",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=7,
+                contract_hash="a" * 64,
+                contract_json={
+                    "installation_id": "00000000-0000-0000-0000-000000000001",
+                    "timezone": "UTC",
+                    "comfort_schedule": {"weekday": [], "weekend": []},
+                },
+            )
+        ),
+    )
     monkeypatch.setattr("packages.ml.thermal.thermal_model", thermal)
     monkeypatch.setattr(
         models_router,
@@ -48,7 +67,22 @@ async def test_R24_indoor_forecast_route_without_device_status_is_schema_valid(m
     )
     monkeypatch.setattr(models_router, "get_price_area", AsyncMock(return_value="SE3"))
     monkeypatch.setattr(
-        models_router, "get_session", lambda: _session_context(SimpleNamespace(execute=execute))
+        "packages.core.settings_service.get_setting", AsyncMock(return_value="open-meteo")
+    )
+    monkeypatch.setattr(
+        models_router,
+        "get_session",
+        lambda: _session_context(
+            SimpleNamespace(
+                execute=execute,
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        installation_id="00000000-0000-0000-0000-000000000001",
+                        indoor_dependency_generation=1,
+                    )
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(
         "packages.core.control_temperature.get_control_temperature",

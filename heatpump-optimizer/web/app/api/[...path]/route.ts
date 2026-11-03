@@ -27,7 +27,7 @@ async function proxy(
   target.search = request.nextUrl.search;
 
   const headers = new Headers();
-  for (const name of ["accept", "content-type", "x-request-id"]) {
+  for (const name of ["accept", "content-type", "x-request-id", "if-match"]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }

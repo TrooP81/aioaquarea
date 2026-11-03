@@ -8,7 +8,12 @@ import json
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.models import PlanActionRecord, PlanRecord
+from packages.core.models import (
+    HouseContractRevisionRecord,
+    HouseInstallationRecord,
+    PlanActionRecord,
+    PlanRecord,
+)
 
 ACTIVE_PLAN_STATUS = "active"
 DIAGNOSTIC_PLAN_STATUS = "diagnostic"
@@ -94,16 +99,56 @@ async def supersede_active_plan(
 
 
 def active_plan_query(now: dt.datetime):
-    """Return the canonical query for the currently executable plan."""
+    """Return only an active plan bound to the current committed contract."""
 
     return (
         select(PlanRecord)
+        .join(HouseInstallationRecord, HouseInstallationRecord.singleton_id == 1)
+        .join(
+            HouseContractRevisionRecord,
+            and_(
+                HouseContractRevisionRecord.id == HouseInstallationRecord.current_revision_id,
+                HouseContractRevisionRecord.installation_id
+                == HouseInstallationRecord.installation_id,
+            ),
+        )
         .where(
             and_(
                 PlanRecord.status == ACTIVE_PLAN_STATUS,
+                PlanRecord.contract_state == "current",
+                PlanRecord.contract_revision_id == HouseContractRevisionRecord.id,
+                PlanRecord.contract_hash == HouseContractRevisionRecord.contract_hash,
                 PlanRecord.horizon_end > now,
             )
         )
         .order_by(PlanRecord.created_at.desc())
+        .limit(1)
+    )
+
+
+def current_diagnostic_query(now: dt.datetime):
+    """Select the newest in-horizon diagnostic bound to the current revision."""
+    return (
+        select(PlanRecord)
+        .join(HouseInstallationRecord, HouseInstallationRecord.singleton_id == 1)
+        .join(
+            HouseContractRevisionRecord,
+            and_(
+                HouseContractRevisionRecord.id == HouseInstallationRecord.current_revision_id,
+                HouseContractRevisionRecord.installation_id
+                == HouseInstallationRecord.installation_id,
+            ),
+        )
+        .where(
+            and_(
+                PlanRecord.status == DIAGNOSTIC_PLAN_STATUS,
+                PlanRecord.contract_state == "current",
+                PlanRecord.contract_revision_id == HouseContractRevisionRecord.id,
+                PlanRecord.contract_hash == HouseContractRevisionRecord.contract_hash,
+                PlanRecord.horizon_start <= now,
+                PlanRecord.horizon_end > now,
+            )
+        )
+        .order_by(PlanRecord.created_at.desc(), PlanRecord.id.desc())
         .limit(1)
     )

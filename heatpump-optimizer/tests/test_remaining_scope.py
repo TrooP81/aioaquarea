@@ -421,7 +421,7 @@ async def test_S4_QR2_actual_rules_generation_without_optional_solver(monkeypatc
         ),
     )
     monkeypatch.setattr(rules, "get_int_setting", AsyncMock(return_value=0))
-    monkeypatch.setattr(rules, "get_effective_schedule", AsyncMock(return_value={}))
+    monkeypatch.setattr(rules, "get_comfort_schedule", AsyncMock(return_value={}))
     monkeypatch.setattr(rules, "get_user_tz", AsyncMock(return_value="UTC"))
     monkeypatch.setattr(rules, "panasonic_tank_heating_available", lambda *a: True)
     monkeypatch.setattr(rules, "panasonic_zone_heating_available", lambda *a: False)
@@ -543,10 +543,14 @@ class _PublicationSession:
     def __init__(self, main, *, flush_error=None, commit_error=None):
         self.main, self.flush_error, self.commit_error = main, flush_error, commit_error
         self.records, self.committed, self.events, self.opened = [], [], [], 0
+        self.contract_revision = None
 
     def add(self, record):
         record.id = 321
         self.records.append(record)
+
+    async def get(self, _model, _key):
+        return self.contract_revision
 
     async def flush(self):
         self.events.append(("flush", self.main._last_plan_generated_at))
@@ -576,7 +580,9 @@ _COOLDOWN_SENTINEL = -123456.0
 def _publication_harness(monkeypatch, plan, session):
     from packages.optimizer import main
     from packages.optimizer.executor_core import LearningModeState
+    from tests.planning_contract_support import install_local_contract_revision
 
+    session.contract_revision = install_local_contract_revision(monkeypatch, session=session)
     monkeypatch.setattr(main, "_last_plan_generated_at", _COOLDOWN_SENTINEL)
     monkeypatch.setattr(main, "get_session", session.factory())
     monkeypatch.setattr(main, "get_setting", AsyncMock(return_value="rules_only"))
@@ -897,7 +903,7 @@ def test_R28_MILP_owner_preserves_actual_states_and_only_represented_commands(mo
         row["ts"] for row in snapshot["forecast_with_plan"]
     ]
     assert [row["ts"] for row in snapshot["weather_forecast"]] == [
-        row["ts"] for row in snapshot["forecast_with_plan"]
+        row["interval_start_utc"] for row in snapshot["forecast_with_plan"]
     ]
 
 

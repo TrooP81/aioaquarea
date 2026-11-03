@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "./fixtures";
+import { mockPlanningSettings, planningInstallationId, test, expect, type Page } from "./fixtures";
 
 const sensors = [
   { device_id: "dev-living", label: "Living Room Sensor", room_id: "room-1" },
@@ -22,7 +22,12 @@ async function mockSettings(page: Page, deviceIds: string) {
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" })
   );
   await page.route("**/api/settings", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(settingsPayload(deviceIds)) })
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "X-Installation-ID": planningInstallationId, "X-Contract-Revision": "7" },
+      body: JSON.stringify(settingsPayload(deviceIds)),
+    })
   );
   await page.route("**/api/currency", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "EUR", prefix: "EUR ", suffix: "", multiplier: 100, price_label: "EUR c/kWh" }) })
@@ -39,6 +44,7 @@ async function mockSettings(page: Page, deviceIds: string) {
   await page.route("**/api/smartthings/devices", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ devices: sensors }) })
   );
+  await mockPlanningSettings(page);
 }
 
 test.describe("SmartThings sensor selector", () => {
@@ -64,9 +70,19 @@ test.describe("SmartThings sensor selector", () => {
       if (route.request().method() === "PUT") {
         const body = JSON.parse(route.request().postData() || "{}");
         savedDeviceIds = body.settings?.smartthings_device_ids;
-        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "updated", count: 1 }) });
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: { "X-Contract-Revision": "8" },
+          body: JSON.stringify({ status: "updated", count: 1 }),
+        });
       }
-      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(settingsPayload("")) });
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "X-Installation-ID": planningInstallationId, "X-Contract-Revision": "7" },
+        body: JSON.stringify(settingsPayload("")),
+      });
     });
 
     await page.goto("/settings");

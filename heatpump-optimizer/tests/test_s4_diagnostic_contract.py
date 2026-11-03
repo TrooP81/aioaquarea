@@ -480,7 +480,7 @@ def _deadline_generator_inputs(
         monkeypatch.setattr(
             module, "_resolve_learning_mode", AsyncMock(return_value=LearningModeState.ACTIVE)
         )
-        monkeypatch.setattr(module, "get_effective_schedule", AsyncMock(return_value=schedule))
+        monkeypatch.setattr(module, "get_comfort_schedule", AsyncMock(return_value=schedule))
         monkeypatch.setattr(
             module, "get_float_setting", AsyncMock(side_effect=lambda name: values[name])
         )

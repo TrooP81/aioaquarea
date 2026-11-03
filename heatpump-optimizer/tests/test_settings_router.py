@@ -6,6 +6,78 @@ from fastapi import HTTPException
 from packages.api.routers import settings
 
 
+@pytest.mark.parametrize("if_match", ['"7"', 'W/"7"'])
+async def test_planning_settings_revision_conflict_returns_current_revision(if_match):
+    from fastapi import Response
+
+    from packages.core.house_contract import ContractRevisionConflict
+
+    write = AsyncMock(side_effect=ContractRevisionConflict(8))
+    response = Response()
+    with patch.object(settings, "set_settings_bulk", new=write):
+        with pytest.raises(HTTPException) as exc_info:
+            await settings.update_settings(
+                settings.SettingsUpdate(settings={"comfort_temp_target": "20.5"}),
+                response=response,
+                if_match=if_match,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "reason": "contract_revision_changed",
+        "current_revision": 8,
+    }
+    assert response.headers["X-Contract-Revision"] == "8"
+    write.assert_awaited_once_with(
+        {"comfort_temp_target": "20.5"},
+        expected_revision_id=7,
+        source="versioned_api",
+    )
+
+
+@pytest.mark.parametrize("if_match", ['"7"', 'W/"7"'])
+async def test_non_contract_settings_revision_conflict_returns_current_revision(if_match):
+    from fastapi import Response
+
+    from packages.core.house_contract import ContractRevisionConflict
+
+    write = AsyncMock(side_effect=ContractRevisionConflict(8))
+    response = Response()
+    with patch.object(settings, "set_settings_bulk", new=write):
+        with pytest.raises(HTTPException) as exc_info:
+            await settings.update_settings(
+                settings.SettingsUpdate(settings={"manual_price_eur_per_kwh": "0.20"}),
+                response=response,
+                if_match=if_match,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "reason": "contract_revision_changed",
+        "current_revision": 8,
+    }
+    assert response.headers["X-Contract-Revision"] == "8"
+    write.assert_awaited_once_with(
+        {"manual_price_eur_per_kwh": "0.20"},
+        expected_revision_id=7,
+        source="versioned_api",
+    )
+
+
+@pytest.mark.parametrize("if_match", ["0", '"nope"', "W/invalid"])
+async def test_planning_settings_rejects_malformed_revision_header(if_match):
+    from fastapi import Response
+
+    with pytest.raises(HTTPException) as exc_info:
+        await settings.update_settings(
+            settings.SettingsUpdate(settings={"comfort_temp_target": "20.5"}),
+            response=Response(),
+            if_match=if_match,
+        )
+
+    assert exc_info.value.status_code == 400
+
+
 @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "NaN"])
 @pytest.mark.parametrize(
     "key", ["comfort_temp_target", "sh_max_power_kw", "manual_price_eur_per_kwh"]
