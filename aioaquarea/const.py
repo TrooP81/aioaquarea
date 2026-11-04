@@ -24,7 +24,7 @@ AUTH_BROWSER_USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36
 
 INVALID_TEMPERATURE = 126
 
-DEFAULT_X_APP_VERSION = "4.4.0"
+DEFAULT_X_APP_VERSION = "5.1.2"
 
 # Public Google Play listing of the Android app whose OAuth identity and
 # ``x-app-type: 1`` the SDK uses; the source of the validated app version.
